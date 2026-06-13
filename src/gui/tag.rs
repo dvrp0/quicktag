@@ -26,7 +26,7 @@ use crate::gui::get_string_for_hash;
 use crate::gui::hexview::TagHexView;
 use crate::material::{
     MaterialPreviewKind, MaterialTagPreview, TechniquePreview, TextureSlotBindingPreview,
-    WideHashPreview,
+    TfxBytecodePreview, WideHashPreview,
 };
 use crate::util::ui_image_rotated;
 use crate::{texture::Texture, texture::cache::TextureCache};
@@ -2262,8 +2262,8 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
 
                         ui.label("Constants");
                         ui.monospace(format!(
-                            "{} vec4, {} bytecode bytes",
-                            stage.constant_count, stage.bytecode_len
+                            "{} vec4, {} bytecode bytes, {} decoded ops",
+                            stage.constant_count, stage.bytecode_len, stage.bytecode.decoded_ops
                         ));
                         ui.end_row();
 
@@ -2283,10 +2283,47 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
                     ui.separator();
                     open_new_tag = open_new_tag.or(texture_slot_bindings_ui(ui, &stage.textures));
                 }
+
+                if stage.bytecode.total_bytes > 0 {
+                    ui.separator();
+                    tfx_bytecode_ui(ui, &stage.bytecode);
+                }
             });
     }
 
     open_new_tag
+}
+
+fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
+    ui.monospace(format!(
+        "TFX bytecode: {} bytes, {} decoded ops, {} unknown",
+        bytecode.total_bytes, bytecode.decoded_ops, bytecode.unknown_ops
+    ));
+    if bytecode.truncated {
+        ui.label(RichText::new("Opcode list truncated for UI").color(Color32::YELLOW));
+    }
+
+    CollapsingHeader::new("TFX opcodes")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Offset");
+                    ui.strong("Op");
+                    ui.strong("Name");
+                    ui.strong("Detail");
+                    ui.end_row();
+
+                    for op in &bytecode.ops {
+                        ui.monospace(format!("0x{:04X}", op.offset));
+                        ui.monospace(format!("0x{:02X}", op.opcode));
+                        ui.monospace(op.name);
+                        ui.monospace(&op.detail);
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 fn texture_slot_bindings_ui(

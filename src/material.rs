@@ -32,12 +32,30 @@ pub struct TechniqueStagePreview {
     pub bytecode_len: usize,
     pub constant_buffer_slot: Option<i32>,
     pub constant_buffer: Option<TagHash>,
+    pub bytecode: TfxBytecodePreview,
 }
 
 #[derive(Debug, Clone)]
 pub struct TextureSlotBindingPreview {
     pub slot: u32,
     pub texture: WideHashPreview,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TfxBytecodePreview {
+    pub total_bytes: usize,
+    pub ops: Vec<TfxBytecodeOpPreview>,
+    pub decoded_ops: usize,
+    pub unknown_ops: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TfxBytecodeOpPreview {
+    pub offset: usize,
+    pub opcode: u8,
+    pub name: &'static str,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,9 +122,10 @@ fn parse_technique_stage(
             })
         })
         .collect();
-    let bytecode_len = read_array(data, constants_offset, 1, endian)
-        .map(|bytecode| bytecode.len())
+    let bytecode = read_array(data, constants_offset, 1, endian)
+        .map(parse_tfx_bytecode)
         .unwrap_or_default();
+    let bytecode_len = bytecode.total_bytes;
     let constant_count = read_array(data, constants_offset + 0x10, 0x10, endian)
         .map(|constants| constants.len() / 0x10)
         .unwrap_or_default();
@@ -141,7 +160,281 @@ fn parse_technique_stage(
         bytecode_len,
         constant_buffer_slot,
         constant_buffer,
+        bytecode,
     })
+}
+
+fn parse_tfx_bytecode(data: &[u8]) -> TfxBytecodePreview {
+    const MAX_UI_OPS: usize = 160;
+
+    let mut cursor = 0usize;
+    let mut ops = Vec::with_capacity(data.len().min(MAX_UI_OPS));
+    let mut decoded_ops = 0usize;
+    let mut unknown_ops = 0usize;
+
+    while cursor < data.len() {
+        let offset = cursor;
+        let opcode = data[cursor];
+        cursor += 1;
+
+        let Some(op) = parse_tfx_bytecode_op(data, &mut cursor, offset, opcode) else {
+            unknown_ops += 1;
+            if ops.len() < MAX_UI_OPS {
+                ops.push(TfxBytecodeOpPreview {
+                    offset,
+                    opcode,
+                    name: "unknown",
+                    detail: String::new(),
+                });
+            }
+            break;
+        };
+
+        decoded_ops += 1;
+        if ops.len() < MAX_UI_OPS {
+            ops.push(op);
+        }
+    }
+
+    TfxBytecodePreview {
+        total_bytes: data.len(),
+        decoded_ops,
+        unknown_ops,
+        truncated: decoded_ops > ops.len(),
+        ops,
+    }
+}
+
+fn parse_tfx_bytecode_op(
+    data: &[u8],
+    cursor: &mut usize,
+    offset: usize,
+    opcode: u8,
+) -> Option<TfxBytecodeOpPreview> {
+    let mut read_u8 = || {
+        let value = *data.get(*cursor)?;
+        *cursor += 1;
+        Some(value)
+    };
+
+    let (name, detail) = match opcode {
+        0x01 => ("add", String::new()),
+        0x02 => ("subtract", String::new()),
+        0x03 => ("multiply", String::new()),
+        0x04 => ("divide", String::new()),
+        0x05 => ("multiply2", String::new()),
+        0x06 => ("add2", String::new()),
+        0x07 => ("is_zero", String::new()),
+        0x08 => ("min", String::new()),
+        0x09 => ("max", String::new()),
+        0x0a => ("less_than", String::new()),
+        0x0b => ("dot", String::new()),
+        0x0c => ("merge_1_3", String::new()),
+        0x0d => ("merge_2_2", String::new()),
+        0x0e => ("merge_3_1", String::new()),
+        0x0f => ("cubic", String::new()),
+        0x10 => ("lerp", String::new()),
+        0x11 => ("lerp_saturated", String::new()),
+        0x12 => ("multiply_add", String::new()),
+        0x13 => ("clamp", String::new()),
+        0x14 => ("unk14", String::new()),
+        0x15 => ("abs", String::new()),
+        0x16 => ("signum", String::new()),
+        0x17 => ("floor", String::new()),
+        0x18 => ("ceil", String::new()),
+        0x19 => ("round", String::new()),
+        0x1a => ("frac", String::new()),
+        0x1b => ("unk1b", String::new()),
+        0x1c => ("unk1c", String::new()),
+        0x1d => ("negate", String::new()),
+        0x1e => ("vector_rotations_sin", String::new()),
+        0x1f => ("vector_rotations_cos", String::new()),
+        0x20 => ("vector_rotations_sin_cos", String::new()),
+        0x21 => ("permute_extend_x", ".xxxx".to_string()),
+        0x22 => ("permute", format!("fields=0x{:02X}", read_u8()?)),
+        0x23 => ("saturate", String::new()),
+        0x24 => ("unk24", String::new()),
+        0x25 => ("unk25", String::new()),
+        0x26 => ("unk26", String::new()),
+        0x27 => ("triangle", String::new()),
+        0x28 => ("jitter", String::new()),
+        0x29 => ("wander", String::new()),
+        0x2a => ("rand", String::new()),
+        0x2b => ("rand_smooth", String::new()),
+        0x2c => ("unk2c", String::new()),
+        0x2d => ("unk2d", String::new()),
+        0x2e => ("transform_vec4", String::new()),
+        0x34 => ("push_const_vec4", format!("constant={}", read_u8()?)),
+        0x35 => ("lerp_constant", format!("start={}", read_u8()?)),
+        0x36 => ("lerp_constant_saturated", format!("start={}", read_u8()?)),
+        0x37 => ("spline4_const", format!("start={}", read_u8()?)),
+        0x38 => ("spline8_const", format!("start={}", read_u8()?)),
+        0x39 => ("spline8_chain_const", format!("start={}", read_u8()?)),
+        0x3a => ("gradient4_const", format!("start={}", read_u8()?)),
+        0x3b => ("unk3b", format!("start={}", read_u8()?)),
+        0x3c => {
+            let extern_ = read_u8()?;
+            let offset = read_u8()?;
+            (
+                "push_extern_float",
+                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 4),
+            )
+        }
+        0x3d => {
+            let extern_ = read_u8()?;
+            let offset = read_u8()?;
+            (
+                "push_extern_vec4",
+                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 16),
+            )
+        }
+        0x3e => {
+            let extern_ = read_u8()?;
+            let offset = read_u8()?;
+            (
+                "push_extern_mat4",
+                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 16),
+            )
+        }
+        0x3f => {
+            let extern_ = read_u8()?;
+            let offset = read_u8()?;
+            (
+                "push_extern_texture",
+                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 8),
+            )
+        }
+        0x40 => {
+            let extern_ = read_u8()?;
+            let offset = read_u8()?;
+            (
+                "push_extern_u32",
+                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 4),
+            )
+        }
+        0x41 => {
+            let extern_ = read_u8()?;
+            let offset = read_u8()?;
+            (
+                "push_extern_uav",
+                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 8),
+            )
+        }
+        0x42 => ("unk42", String::new()),
+        0x43 => ("push_from_output", format!("element={}", read_u8()?)),
+        0x44 => ("pop_output", format!("element={}", read_u8()?)),
+        0x45 => ("pop_output_mat4", format!("element={}", read_u8()?)),
+        0x46 => ("push_temp", format!("slot={}", read_u8()?)),
+        0x47 => ("pop_temp", format!("slot={}", read_u8()?)),
+        0x48 => {
+            let value = read_u8()?;
+            (
+                "set_shader_texture",
+                format!("{} slot={}", tfx_shader_stage_name(value), value & 0x1f),
+            )
+        }
+        0x49 => ("unk49", format!("value={}", read_u8()?)),
+        0x4a => {
+            let value = read_u8()?;
+            (
+                "set_shader_sampler",
+                format!("{} slot={}", tfx_shader_stage_name(value), value & 0x1f),
+            )
+        }
+        0x4b => {
+            let value = read_u8()?;
+            (
+                "set_shader_uav",
+                format!("{} slot={}", tfx_shader_stage_name(value), value & 0x1f),
+            )
+        }
+        0x4c => ("unk4c", format!("value={}", read_u8()?)),
+        0x4d => ("push_sampler", format!("index={}", read_u8()?)),
+        0x4e => {
+            let hash = read_be_u32(data.get(*cursor..*cursor + 4)?)?;
+            *cursor += 4;
+            ("push_object_channel", format!("0x{hash:08X}"))
+        }
+        0x4f => ("push_global_channel", format!("index={}", read_u8()?)),
+        0x50 => ("unk50", format!("value={}", read_u8()?)),
+        0x51 => ("unk51", String::new()),
+        0x52 => {
+            let index = read_u8()?;
+            let fields = read_u8()?;
+            (
+                "push_tex_dimensions",
+                format!("index={index} fields=0x{fields:02X}"),
+            )
+        }
+        0x53 => {
+            let index = read_u8()?;
+            let fields = read_u8()?;
+            (
+                "push_tex_tiling_params",
+                format!("index={index} fields=0x{fields:02X}"),
+            )
+        }
+        0x54 => {
+            let index = read_u8()?;
+            let fields = read_u8()?;
+            (
+                "push_tex_tile_layer_count",
+                format!("index={index} fields=0x{fields:02X}"),
+            )
+        }
+        0x55 => ("unk55", String::new()),
+        0x56 => ("unk56", String::new()),
+        0x57 => ("unk57", String::new()),
+        0x58 => ("unk58", String::new()),
+        _ => return None,
+    };
+
+    Some(TfxBytecodeOpPreview {
+        offset,
+        opcode,
+        name,
+        detail,
+    })
+}
+
+fn read_be_u32(data: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
+}
+
+fn tfx_shader_stage_name(value: u8) -> &'static str {
+    match value >> 5 {
+        1 => "PS",
+        2 => "VS",
+        3 => "GS",
+        4 => "HS",
+        5 => "CS",
+        6 => "DS",
+        _ => "??",
+    }
+}
+
+fn tfx_extern_name(value: u8) -> &'static str {
+    match value {
+        0 => "None",
+        1 => "Frame",
+        2 => "View",
+        3 => "Deferred",
+        4 => "DeferredLight",
+        5 => "DeferredUberLight",
+        6 => "DeferredShadow",
+        7 => "Atmosphere",
+        8 => "RigidModel",
+        9 => "EditorMesh",
+        10 => "EditorMeshMaterial",
+        15 => "SimpleGeometry",
+        25 => "Generic",
+        38 => "TextureSet",
+        39 => "Transparent",
+        41 => "GlobalLighting",
+        44 => "Decal",
+        67 => "Water",
+        _ => "Extern",
+    }
 }
 
 fn read_array(data: &[u8], vec_offset: usize, elem_size: usize, endian: Endian) -> Option<&[u8]> {
@@ -244,5 +537,25 @@ mod tests {
 
         assert_eq!(u16::from_le_bytes([array[0], array[1]]), 0x1122);
         assert_eq!(u16::from_le_bytes([array[2], array[3]]), 0x3344);
+    }
+
+    #[test]
+    fn decodes_tfx_binding_opcodes() {
+        let bytecode = [
+            0x34, 0x02, // push_const_vec4 constant 2
+            0x4d, 0x01, // push_sampler index 1
+            0x4a, 0x20, // set_shader_sampler PS slot 0
+            0x48, 0x40, // set_shader_texture VS slot 0
+            0x4e, 0x12, 0x34, 0x56, 0x78, // push_object_channel
+        ];
+
+        let decoded = parse_tfx_bytecode(&bytecode);
+
+        assert_eq!(decoded.decoded_ops, 5);
+        assert_eq!(decoded.unknown_ops, 0);
+        assert_eq!(decoded.ops[0].name, "push_const_vec4");
+        assert_eq!(decoded.ops[2].detail, "PS slot=0");
+        assert_eq!(decoded.ops[3].detail, "VS slot=0");
+        assert_eq!(decoded.ops[4].detail, "0x12345678");
     }
 }
