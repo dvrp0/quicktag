@@ -6,6 +6,7 @@ use quicktag_core::tagtypes::TagType;
 use quicktag_scanner::TagCache;
 use std::sync::Arc;
 use tiger_pkg::{TagHash, Version, package::UEntryHeader, package_manager};
+use wgpu::util::DeviceExt;
 
 const MAX_PREVIEW_VERTICES: usize = 200_000;
 const MAX_PREVIEW_INDICES: usize = 300_000;
@@ -120,6 +121,75 @@ pub struct MeshSourcePreview {
     pub vertex0_buffer: TagHash,
     pub vertex1_buffer: TagHash,
     pub color_buffer: TagHash,
+    pub uv_transform: Option<UvTransformPreview>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UvTransformPreview {
+    pub scale: [f32; 2],
+    pub offset: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuPreviewVertex {
+    pub position: [f32; 3],
+}
+
+pub struct GpuWireframePreview {
+    pub vertex_buffer: wgpu::Buffer,
+    pub index_buffer: Option<wgpu::Buffer>,
+    pub vertex_count: u32,
+    pub index_count: u32,
+    pub line_count: u32,
+}
+
+impl GpuWireframePreview {
+    pub fn create(device: &wgpu::Device, wireframe: &WireframePreview) -> Option<Self> {
+        if wireframe.vertices.is_empty() {
+            return None;
+        }
+
+        let vertices = wireframe
+            .vertices
+            .iter()
+            .map(|position| GpuPreviewVertex {
+                position: *position,
+            })
+            .collect_vec();
+        let line_indices = triangle_indices_to_line_indices(&wireframe.indices);
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quicktag_geometry_preview_vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = (!line_indices.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("quicktag_geometry_preview_indices"),
+                contents: bytemuck::cast_slice(&line_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            })
+        });
+
+        Some(Self {
+            vertex_buffer,
+            index_buffer,
+            vertex_count: vertices.len() as u32,
+            index_count: line_indices.len() as u32,
+            line_count: line_indices.len() as u32 / 2,
+        })
+    }
+
+    pub fn has_vertex_buffer(&self) -> bool {
+        let _ = &self.vertex_buffer;
+        true
+    }
+
+    pub fn has_index_buffer(&self) -> bool {
+        self.index_buffer.is_some()
+    }
 }
 
 impl GeometryTagPreview {
@@ -149,6 +219,14 @@ impl GeometryTagPreview {
         model_label_for_reference(entry.reference).map(|label| Self {
             kind: GeometryPreviewKind::Model(load_model_preview(cache, tag, entry, label)),
         })
+    }
+
+    pub fn wireframe(&self) -> Option<&WireframePreview> {
+        match &self.kind {
+            GeometryPreviewKind::VertexBuffer(buffer) => buffer.wireframe.as_ref(),
+            GeometryPreviewKind::IndexBuffer(_) => None,
+            GeometryPreviewKind::Model(model) => model.wireframe.as_ref(),
+        }
     }
 }
 
@@ -364,6 +442,15 @@ fn build_model_wireframe(
     Some(wireframe)
 }
 
+fn triangle_indices_to_line_indices(indices: &[u32]) -> Vec<u32> {
+    let mut lines = Vec::with_capacity(indices.len().saturating_mul(2));
+    for tri in indices.chunks_exact(3).take(20_000) {
+        lines.extend_from_slice(&[tri[0], tri[1], tri[1], tri[2], tri[2], tri[0]]);
+    }
+
+    lines
+}
+
 fn parse_model_wireframe(
     tag: TagHash,
     entry: &UEntryHeader,
@@ -419,6 +506,7 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         vertex0_buffer: buffers.vertex0_buffer,
         vertex1_buffer: buffers.vertex1_buffer,
         color_buffer: buffers.color_buffer,
+        uv_transform: read_static_uv_transform(data, endian),
     };
     let wireframe = build_wireframe_from_refs(
         source.vertex0_buffer,
@@ -433,7 +521,10 @@ fn parse_dynamic_model_wireframe(tag: TagHash) -> Option<(MeshSourcePreview, Wir
     let data = package_manager().read_tag(tag).ok()?;
     let endian = package_manager().version.endian();
     let mesh_array = read_array(data.get(..)?, 0x10, 0x80, endian)?;
-    parse_dynamic_mesh_wireframe(mesh_array.chunks_exact(0x80).next()?)
+    let (mut source, wireframe) =
+        parse_dynamic_mesh_wireframe(mesh_array.chunks_exact(0x80).next()?)?;
+    source.uv_transform = read_dynamic_model_uv_transform(&data, endian);
+    Some((source, wireframe))
 }
 
 fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, WireframePreview)> {
@@ -455,6 +546,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         vertex0_buffer: TagHash(read_u32(data.get(0x0..0x4)?, endian)),
         vertex1_buffer: TagHash(read_u32(data.get(0x4..0x8)?, endian)),
         color_buffer: TagHash(read_u32(data.get(0x14..0x18)?, endian)),
+        uv_transform: None,
     };
     let wireframe = build_wireframe_from_refs(
         source.vertex0_buffer,
@@ -624,6 +716,31 @@ fn read_array(data: &[u8], vec_offset: usize, elem_size: usize, endian: Endian) 
 
 fn first_dynamic_input_layout(data: &[u8]) -> Option<u8> {
     data.get(0x62..0x62 + 24)?.iter().copied().find(|v| *v != 0)
+}
+
+fn read_static_uv_transform(data: &[u8], endian: Endian) -> Option<UvTransformPreview> {
+    let scale = read_f32(data.get(0x54..0x58)?, endian);
+    let offset = [
+        read_f32(data.get(0x58..0x5c)?, endian),
+        read_f32(data.get(0x5c..0x60)?, endian),
+    ];
+    Some(UvTransformPreview {
+        scale: [scale, scale],
+        offset,
+    })
+}
+
+fn read_dynamic_model_uv_transform(data: &[u8], endian: Endian) -> Option<UvTransformPreview> {
+    Some(UvTransformPreview {
+        scale: [
+            read_f32(data.get(0x60..0x64)?, endian),
+            read_f32(data.get(0x64..0x68)?, endian),
+        ],
+        offset: [
+            read_f32(data.get(0x68..0x6c)?, endian),
+            read_f32(data.get(0x6c..0x70)?, endian),
+        ],
+    })
 }
 
 fn is_highest_detail_lod(lod: u8) -> bool {

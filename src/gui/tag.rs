@@ -19,8 +19,8 @@ use super::{
     },
 };
 use crate::geometry::{
-    GeometryPreviewKind, GeometryTagPreview, IndexBufferPreview, ModelPreview, VertexBufferPreview,
-    WireframePreview,
+    GeometryPreviewKind, GeometryTagPreview, GpuWireframePreview, IndexBufferPreview, ModelPreview,
+    VertexBufferPreview, WireframePreview,
 };
 use crate::gui::get_string_for_hash;
 use crate::gui::hexview::TagHexView;
@@ -107,6 +107,7 @@ pub struct TagView {
     mode: TagViewMode,
 
     geometry_preview: Option<GeometryTagPreview>,
+    geometry_gpu_preview: Option<GpuWireframePreview>,
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
@@ -341,6 +342,10 @@ impl TagView {
 
         let geometry_preview =
             GeometryTagPreview::load(cache.clone(), tag, &tag_entry, tag_type, &tag_data);
+        let geometry_gpu_preview = geometry_preview
+            .as_ref()
+            .and_then(|preview| preview.wireframe())
+            .and_then(|wireframe| GpuWireframePreview::create(&render_state.device, wireframe));
 
         let mut string_hashes_hexview = string_hashes
             .iter()
@@ -391,6 +396,7 @@ impl TagView {
             render_state,
             texture_cache,
             geometry_preview,
+            geometry_gpu_preview,
             preview_yaw: 0.4,
             preview_pitch: 0.25,
             preview_zoom: 1.0,
@@ -896,6 +902,18 @@ impl TagView {
             pitch: &mut self.preview_pitch,
             zoom: &mut self.preview_zoom,
         };
+
+        if let Some(gpu) = &self.geometry_gpu_preview {
+            ui.label(format!(
+                "GPU preview buffers: VB={} IB={} | {} vertices, {} line indices, {} lines",
+                gpu.has_vertex_buffer(),
+                gpu.has_index_buffer(),
+                gpu.vertex_count,
+                gpu.index_count,
+                gpu.line_count
+            ));
+            ui.separator();
+        }
 
         match &preview.kind {
             GeometryPreviewKind::VertexBuffer(buffer) => vertex_buffer_ui(ui, buffer, orbit),
@@ -2051,6 +2069,16 @@ fn model_preview_ui(
                     source.vertex1_buffer,
                     source.color_buffer
                 ));
+                ui.end_row();
+                ui.label("UV scale/offset");
+                if let Some(uv) = source.uv_transform {
+                    ui.monospace(format!(
+                        "[{:.6}, {:.6}] / [{:.6}, {:.6}]",
+                        uv.scale[0], uv.scale[1], uv.offset[0], uv.offset[1]
+                    ));
+                } else {
+                    ui.monospace("unknown");
+                }
                 ui.end_row();
             });
     }
