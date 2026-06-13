@@ -2231,6 +2231,8 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
         technique.used_scopes,
         technique.compatible_scopes
     ));
+    scope_bits_ui(ui, "Used scopes", &technique.used_scope_names());
+    scope_bits_ui(ui, "Compatible scopes", &technique.compatible_scope_names());
 
     if technique.stages.is_empty() {
         ui.label(RichText::new("No populated shader stages found").color(Color32::YELLOW));
@@ -2305,6 +2307,19 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
     }
 
     open_new_tag
+}
+
+fn scope_bits_ui(ui: &mut egui::Ui, label: &str, scopes: &[&str]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        if scopes.is_empty() {
+            ui.monospace("none");
+        } else {
+            for scope in scopes {
+                ui.monospace(*scope);
+            }
+        }
+    });
 }
 
 fn sampler_bindings_ui(ui: &mut egui::Ui, samplers: &[WideHashPreview]) -> Option<TagHash> {
@@ -2396,6 +2411,30 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
                             ui.monospace(binding.stage);
                             ui.monospace(binding.slot.to_string());
                             ui.monospace(&binding.source);
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    if !bytecode.externs.is_empty() {
+        CollapsingHeader::new(format!("TFX extern refs ({})", bytecode.externs.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new(ui.next_auto_id())
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Op");
+                        ui.strong("Type");
+                        ui.strong("Scope");
+                        ui.strong("Offset");
+                        ui.end_row();
+
+                        for extern_ref in &bytecode.externs {
+                            ui.monospace(format!("0x{:04X}", extern_ref.op_offset));
+                            ui.monospace(extern_ref.value_type);
+                            ui.monospace(&extern_ref.scope);
+                            ui.monospace(format!("0x{:X}", extern_ref.byte_offset));
                             ui.end_row();
                         }
                     });

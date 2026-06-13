@@ -22,6 +22,16 @@ pub struct TechniquePreview {
     pub stages: Vec<TechniqueStagePreview>,
 }
 
+impl TechniquePreview {
+    pub fn used_scope_names(&self) -> Vec<&'static str> {
+        tfx_scope_names(self.used_scopes)
+    }
+
+    pub fn compatible_scope_names(&self) -> Vec<&'static str> {
+        tfx_scope_names(self.compatible_scopes)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TechniqueStagePreview {
     pub stage: &'static str,
@@ -47,6 +57,7 @@ pub struct TfxBytecodePreview {
     pub total_bytes: usize,
     pub ops: Vec<TfxBytecodeOpPreview>,
     pub bindings: Vec<TfxBindingPreview>,
+    pub externs: Vec<TfxExternRefPreview>,
     pub decoded_ops: usize,
     pub unknown_ops: usize,
     pub truncated: bool,
@@ -58,6 +69,14 @@ pub struct TfxBindingPreview {
     pub stage: &'static str,
     pub slot: u8,
     pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TfxExternRefPreview {
+    pub op_offset: usize,
+    pub value_type: &'static str,
+    pub scope: String,
+    pub byte_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -230,15 +249,41 @@ fn parse_tfx_bytecode(data: &[u8]) -> TfxBytecodePreview {
     }
 
     let bindings = summarize_tfx_bindings(&ops);
+    let externs = summarize_tfx_externs(&ops);
 
     TfxBytecodePreview {
         total_bytes: data.len(),
         bindings,
+        externs,
         decoded_ops,
         unknown_ops,
         truncated: decoded_ops > ops.len(),
         ops,
     }
+}
+
+fn summarize_tfx_externs(ops: &[TfxBytecodeOpPreview]) -> Vec<TfxExternRefPreview> {
+    ops.iter()
+        .filter_map(|op| {
+            let value_type = op.name.strip_prefix("push_extern_")?;
+            let (scope, offset_hex) = op.detail.split_once("+0x")?;
+            let byte_offset = usize::from_str_radix(offset_hex, 16).ok()?;
+            Some(TfxExternRefPreview {
+                op_offset: op.offset,
+                value_type: match value_type {
+                    "float" => "float",
+                    "vec4" => "vec4",
+                    "mat4" => "mat4",
+                    "texture" => "texture",
+                    "u32" => "u32",
+                    "uav" => "uav",
+                    _ => "value",
+                },
+                scope: scope.to_string(),
+                byte_offset,
+            })
+        })
+        .collect()
 }
 
 fn summarize_tfx_bindings(ops: &[TfxBytecodeOpPreview]) -> Vec<TfxBindingPreview> {
@@ -578,6 +623,67 @@ fn tfx_extern_name(value: u8) -> &'static str {
     }
 }
 
+fn tfx_scope_names(mask: u64) -> Vec<&'static str> {
+    const SCOPES: &[(usize, &str)] = &[
+        (0, "Frame"),
+        (1, "View"),
+        (2, "RigidModel"),
+        (3, "EditorMesh"),
+        (4, "EditorTerrain"),
+        (5, "CuiView"),
+        (6, "CuiObject"),
+        (7, "Skinning"),
+        (8, "SpeedTree"),
+        (9, "ChunkModel"),
+        (10, "Decal"),
+        (11, "Instances"),
+        (12, "SpeedTreeLodDrawcallData"),
+        (13, "Transparent"),
+        (14, "TransparentAdvanced"),
+        (15, "SdsmBiasAndScaleTextures"),
+        (16, "Terrain"),
+        (17, "Postprocess"),
+        (18, "CuiBitmap"),
+        (19, "CuiStandard"),
+        (20, "UiFont"),
+        (21, "CuiHud"),
+        (22, "ParticleTransforms"),
+        (23, "ParticleLocationMetadata"),
+        (24, "CubemapVolume"),
+        (25, "GearPlatedTextures"),
+        (26, "GearDye0"),
+        (27, "GearDye1"),
+        (28, "GearDye2"),
+        (29, "GearDyeDecal"),
+        (30, "GenericArray"),
+        (31, "GearDyeSkin"),
+        (32, "GearDyeLips"),
+        (33, "GearDyeHair"),
+        (34, "GearDyeFacialLayer0Mask"),
+        (35, "GearDyeFacialLayer0Material"),
+        (36, "GearDyeFacialLayer1Mask"),
+        (37, "GearDyeFacialLayer1Material"),
+        (38, "PlayerCenteredCascadedGrid"),
+        (39, "GearDye012"),
+        (40, "ColorGradingUbershader"),
+    ];
+
+    let mut names = SCOPES
+        .iter()
+        .filter_map(|(bit, name)| ((mask & (1u64 << bit)) != 0).then_some(*name))
+        .collect::<Vec<_>>();
+    if mask != 0 {
+        let known_mask = SCOPES
+            .iter()
+            .fold(0u64, |acc, (bit, _)| acc | (1u64 << bit));
+        let unknown = mask & !known_mask;
+        if unknown != 0 {
+            names.push("UnknownScopeBits");
+        }
+    }
+    names
+}
+
 fn read_array(data: &[u8], vec_offset: usize, elem_size: usize, endian: Endian) -> Option<&[u8]> {
     let count = read_u64(data.get(vec_offset..vec_offset + 8)?, endian) as usize;
     if count == 0 || elem_size == 0 {
@@ -705,6 +811,7 @@ mod tests {
         assert_eq!(decoded.bindings[0].source, "sampler[1]");
         assert_eq!(decoded.bindings[1].kind, "texture");
         assert_eq!(decoded.bindings[1].stage, "VS");
+        assert!(decoded.externs.is_empty());
         assert_eq!(decoded.ops[0].name, "push_const_vec4");
         assert_eq!(decoded.ops[2].detail, "PS slot=0");
         assert_eq!(decoded.ops[3].detail, "VS slot=0");
@@ -723,5 +830,28 @@ mod tests {
         assert_eq!(constants.len(), 2);
         assert_eq!(constants[0], [1.0, -2.5, 3.25, 4.5]);
         assert_eq!(constants[1], [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn decodes_extern_refs() {
+        let decoded = parse_tfx_bytecode(&[
+            0x3d, 0x02, 0x03, // push_extern_vec4 View+0x30
+            0x3f, 0x26, 0x04, // push_extern_texture TextureSet+0x20
+        ]);
+
+        assert_eq!(decoded.externs.len(), 2);
+        assert_eq!(decoded.externs[0].value_type, "vec4");
+        assert_eq!(decoded.externs[0].scope, "View");
+        assert_eq!(decoded.externs[0].byte_offset, 0x30);
+        assert_eq!(decoded.externs[1].value_type, "texture");
+        assert_eq!(decoded.externs[1].scope, "TextureSet");
+        assert_eq!(decoded.externs[1].byte_offset, 0x20);
+    }
+
+    #[test]
+    fn decodes_scope_bits() {
+        let names = tfx_scope_names((1 << 0) | (1 << 2) | (1 << 40));
+
+        assert_eq!(names, vec!["Frame", "RigidModel", "ColorGradingUbershader"]);
     }
 }
