@@ -509,7 +509,7 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         uv_transform: read_static_uv_transform(data, endian),
     };
     let wireframe = build_wireframe_from_refs(
-        source.vertex0_buffer,
+        &[source.vertex0_buffer, source.vertex1_buffer],
         source.index_buffer,
         Some(source.index_start as usize..(source.index_start + source.index_count) as usize),
     )?;
@@ -549,7 +549,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         uv_transform: None,
     };
     let wireframe = build_wireframe_from_refs(
-        source.vertex0_buffer,
+        &[source.vertex0_buffer, source.vertex1_buffer],
         source.index_buffer,
         Some(source.index_start as usize..(source.index_start + source.index_count) as usize),
     )?;
@@ -558,15 +558,17 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
 }
 
 fn build_wireframe_from_refs(
-    vertex_tag: TagHash,
+    vertex_tags: &[TagHash],
     index_tag: TagHash,
     index_range: Option<std::ops::Range<usize>>,
 ) -> Option<WireframePreview> {
-    let vertex_entry = package_manager().get_entry(vertex_tag)?;
-    let vertex_header = package_manager().read_tag(vertex_tag).ok()?;
-    let vertex_preview =
-        load_vertex_buffer_preview_for_tag(vertex_tag, &vertex_entry, &vertex_header).ok()?;
-    let mut wireframe = vertex_preview.wireframe?;
+    let (vertex_tag, mut wireframe) = vertex_tags.iter().copied().find_map(|vertex_tag| {
+        let vertex_entry = package_manager().get_entry(vertex_tag)?;
+        let vertex_header = package_manager().read_tag(vertex_tag).ok()?;
+        let vertex_preview =
+            load_vertex_buffer_preview_for_tag(vertex_tag, &vertex_entry, &vertex_header).ok()?;
+        Some((vertex_tag, vertex_preview.wireframe?))
+    })?;
 
     let index_entry = package_manager().get_entry(index_tag)?;
     let index_header = package_manager().read_tag(index_tag).ok()?;

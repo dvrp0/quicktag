@@ -19,8 +19,8 @@ use super::{
     },
 };
 use crate::geometry::{
-    GeometryPreviewKind, GeometryTagPreview, GpuWireframePreview, IndexBufferPreview, ModelPreview,
-    VertexBufferPreview, WireframePreview,
+    GeometryPreviewKind, GeometryTagPreview, GpuPreviewVertex, GpuWireframePreview,
+    IndexBufferPreview, ModelPreview, VertexBufferPreview, WireframePreview,
 };
 use crate::gui::get_string_for_hash;
 use crate::gui::hexview::TagHexView;
@@ -30,7 +30,9 @@ use anyhow::Context;
 use binrw::{BinReaderExt, Endian, binread};
 use eframe::egui::Sense;
 use eframe::egui::{RichText, TextureId, collapsing_header::CollapsingState, vec2};
-use eframe::egui_wgpu::RenderState;
+use eframe::egui_wgpu::{
+    Callback, CallbackResources, CallbackTrait, RenderState, ScreenDescriptor,
+};
 use eframe::wgpu::naga::{FastHashSet, FastIndexMap};
 use eframe::{
     egui::{self, CollapsingHeader},
@@ -54,6 +56,7 @@ use tiger_pkg::{
     DestinyVersion, GameVersion, PackagePlatform, TagHash, TagHash64, Version,
     package::UEntryHeader, package_manager,
 };
+use wgpu::util::DeviceExt as _;
 
 #[derive(Copy, Clone, PartialEq)]
 enum TagViewMode {
@@ -107,7 +110,7 @@ pub struct TagView {
     mode: TagViewMode,
 
     geometry_preview: Option<GeometryTagPreview>,
-    geometry_gpu_preview: Option<GpuWireframePreview>,
+    geometry_gpu_preview: Option<Arc<GpuWireframePreview>>,
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
@@ -345,7 +348,8 @@ impl TagView {
         let geometry_gpu_preview = geometry_preview
             .as_ref()
             .and_then(|preview| preview.wireframe())
-            .and_then(|wireframe| GpuWireframePreview::create(&render_state.device, wireframe));
+            .and_then(|wireframe| GpuWireframePreview::create(&render_state.device, wireframe))
+            .map(Arc::new);
 
         let mut string_hashes_hexview = string_hashes
             .iter()
@@ -916,9 +920,21 @@ impl TagView {
         }
 
         match &preview.kind {
-            GeometryPreviewKind::VertexBuffer(buffer) => vertex_buffer_ui(ui, buffer, orbit),
+            GeometryPreviewKind::VertexBuffer(buffer) => vertex_buffer_ui(
+                ui,
+                buffer,
+                orbit,
+                self.geometry_gpu_preview.as_ref(),
+                self.render_state.target_format,
+            ),
             GeometryPreviewKind::IndexBuffer(buffer) => index_buffer_ui(ui, buffer),
-            GeometryPreviewKind::Model(model) => model_preview_ui(ui, model, orbit),
+            GeometryPreviewKind::Model(model) => model_preview_ui(
+                ui,
+                model,
+                orbit,
+                self.geometry_gpu_preview.as_ref(),
+                self.render_state.target_format,
+            ),
         }
     }
 }
@@ -1921,10 +1937,263 @@ struct PreviewOrbit<'a> {
     zoom: &'a mut f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GeometryUniform {
+    center: [f32; 4],
+    params0: [f32; 4],
+    params1: [f32; 4],
+}
+
+struct GeometryPipelineResources {
+    target_format: wgpu::TextureFormat,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
+struct GeometryDrawResources {
+    _uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+struct GeometryPaintCallback {
+    gpu_preview: Arc<GpuWireframePreview>,
+    target_format: wgpu::TextureFormat,
+    uniform: GeometryUniform,
+}
+
+impl GeometryPaintCallback {
+    fn new(
+        gpu_preview: Arc<GpuWireframePreview>,
+        target_format: wgpu::TextureFormat,
+        wireframe: &WireframePreview,
+        yaw: f32,
+        pitch: f32,
+        zoom: f32,
+        rect: egui::Rect,
+    ) -> Self {
+        let center = [
+            (wireframe.min[0] + wireframe.max[0]) * 0.5,
+            (wireframe.min[1] + wireframe.max[1]) * 0.5,
+            (wireframe.min[2] + wireframe.max[2]) * 0.5,
+        ];
+        let extent = [
+            wireframe.max[0] - wireframe.min[0],
+            wireframe.max[1] - wireframe.min[1],
+            wireframe.max[2] - wireframe.min[2],
+        ];
+        let radius = extent.into_iter().fold(0.0_f32, f32::max).max(1.0);
+        let aspect_scale = (rect.height() / rect.width().max(1.0)).max(0.05);
+
+        Self {
+            gpu_preview,
+            target_format,
+            uniform: GeometryUniform {
+                center: [center[0], center[1], center[2], 0.0],
+                params0: [radius, yaw, pitch, zoom],
+                params1: [aspect_scale, 0.0, 0.0, 0.0],
+            },
+        }
+    }
+}
+
+impl CallbackTrait for GeometryPaintCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _screen_descriptor: &ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let needs_pipeline = callback_resources
+            .get::<GeometryPipelineResources>()
+            .is_none_or(|resources| resources.target_format != self.target_format);
+
+        if needs_pipeline {
+            callback_resources.insert(create_geometry_pipeline_resources(
+                device,
+                self.target_format,
+            ));
+        }
+
+        let Some(bind_group_layout) = callback_resources
+            .get::<GeometryPipelineResources>()
+            .map(|resources| resources.bind_group_layout.clone())
+        else {
+            return Vec::new();
+        };
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quicktag_geometry_preview_uniform"),
+            contents: bytemuck::bytes_of(&self.uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("quicktag_geometry_preview_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        callback_resources.insert(GeometryDrawResources {
+            _uniform_buffer: uniform_buffer,
+            bind_group,
+        });
+
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &CallbackResources,
+    ) {
+        let Some(pipeline_resources) = callback_resources.get::<GeometryPipelineResources>() else {
+            return;
+        };
+        let Some(draw_resources) = callback_resources.get::<GeometryDrawResources>() else {
+            return;
+        };
+        let Some(index_buffer) = &self.gpu_preview.index_buffer else {
+            return;
+        };
+
+        render_pass.set_pipeline(&pipeline_resources.pipeline);
+        render_pass.set_bind_group(0, &draw_resources.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.gpu_preview.vertex_buffer.slice(..));
+        render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        render_pass.draw_indexed(0..self.gpu_preview.index_count, 0, 0..1);
+    }
+}
+
+fn create_geometry_pipeline_resources(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+) -> GeometryPipelineResources {
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("quicktag_geometry_preview_bind_group_layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("quicktag_geometry_preview_pipeline_layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quicktag_geometry_preview_shader"),
+        source: wgpu::ShaderSource::Wgsl(GEOMETRY_PREVIEW_SHADER.into()),
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("quicktag_geometry_preview_pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuPreviewVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                }],
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    GeometryPipelineResources {
+        target_format,
+        bind_group_layout,
+        pipeline,
+    }
+}
+
+const GEOMETRY_PREVIEW_SHADER: &str = r#"
+struct Uniforms {
+    center: vec4<f32>,
+    params0: vec4<f32>,
+    params1: vec4<f32>,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    let local = input.position - uniforms.center.xyz;
+    let cy = cos(uniforms.params0.y);
+    let sy = sin(uniforms.params0.y);
+    let cp = cos(uniforms.params0.z);
+    let sp = sin(uniforms.params0.z);
+    let xz = local.x * cy + local.z * sy;
+    let zz = -local.x * sy + local.z * cy;
+    let yz = local.y * cp - zz * sp;
+    let scale = 0.84 * uniforms.params0.w / max(uniforms.params0.x, 1.0);
+
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(xz * scale * uniforms.params1.x, yz * scale, 0.0, 1.0);
+    out.color = vec4<f32>(0.55, 0.82, 1.0, 0.92);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return input.color;
+}
+"#;
+
 fn vertex_buffer_ui(
     ui: &mut egui::Ui,
     buffer: &VertexBufferPreview,
     orbit: PreviewOrbit<'_>,
+    gpu_preview: Option<&Arc<GpuWireframePreview>>,
+    target_format: wgpu::TextureFormat,
 ) -> Option<TagHash> {
     ui.heading("Vertex buffer");
     ui.label(buffer.summary());
@@ -1943,7 +2212,7 @@ fn vertex_buffer_ui(
 
     if let Some(wireframe) = &buffer.wireframe {
         ui.separator();
-        wireframe_preview_ui(ui, wireframe, orbit);
+        wireframe_preview_ui(ui, wireframe, orbit, gpu_preview, target_format);
     }
 
     ui.separator();
@@ -2014,6 +2283,8 @@ fn model_preview_ui(
     ui: &mut egui::Ui,
     model: &ModelPreview,
     orbit: PreviewOrbit<'_>,
+    gpu_preview: Option<&Arc<GpuWireframePreview>>,
+    target_format: wgpu::TextureFormat,
 ) -> Option<TagHash> {
     let mut open_new_tag = None;
     ui.heading(model.label);
@@ -2023,7 +2294,7 @@ fn model_preview_ui(
 
     if let Some(wireframe) = &model.wireframe {
         ui.separator();
-        wireframe_preview_ui(ui, wireframe, orbit);
+        wireframe_preview_ui(ui, wireframe, orbit, gpu_preview, target_format);
     } else {
         ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));
     }
@@ -2100,7 +2371,13 @@ fn model_preview_ui(
     open_new_tag
 }
 
-fn wireframe_preview_ui(ui: &mut egui::Ui, wireframe: &WireframePreview, orbit: PreviewOrbit<'_>) {
+fn wireframe_preview_ui(
+    ui: &mut egui::Ui,
+    wireframe: &WireframePreview,
+    orbit: PreviewOrbit<'_>,
+    gpu_preview: Option<&Arc<GpuWireframePreview>>,
+    target_format: wgpu::TextureFormat,
+) {
     ui.horizontal(|ui| {
         ui.label(format!(
             "{} vertices, {} indices ({})",
@@ -2145,6 +2422,23 @@ fn wireframe_preview_ui(ui: &mut egui::Ui, wireframe: &WireframePreview, orbit: 
         egui::Stroke::new(1.0, Color32::from_rgb(60, 70, 80)),
         egui::StrokeKind::Middle,
     );
+
+    if let Some(gpu_preview) = gpu_preview
+        && gpu_preview.has_index_buffer()
+    {
+        let callback = GeometryPaintCallback::new(
+            gpu_preview.clone(),
+            target_format,
+            wireframe,
+            *orbit.yaw,
+            *orbit.pitch,
+            *orbit.zoom,
+            rect,
+        );
+        ui.painter()
+            .add(Callback::new_paint_callback(rect, callback));
+        return;
+    }
 
     let Some(projected) = project_vertices(wireframe, *orbit.yaw, *orbit.pitch, *orbit.zoom, rect)
     else {
