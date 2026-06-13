@@ -20,6 +20,7 @@ use super::{
 };
 use crate::geometry::{
     GeometryPreviewKind, GeometryTagPreview, IndexBufferPreview, ModelPreview, VertexBufferPreview,
+    WireframePreview,
 };
 use crate::gui::get_string_for_hash;
 use crate::gui::hexview::TagHexView;
@@ -106,6 +107,9 @@ pub struct TagView {
     mode: TagViewMode,
 
     geometry_preview: Option<GeometryTagPreview>,
+    preview_yaw: f32,
+    preview_pitch: f32,
+    preview_zoom: f32,
     decompiled_shader: Option<Result<String, String>>,
 }
 
@@ -387,6 +391,9 @@ impl TagView {
             render_state,
             texture_cache,
             geometry_preview,
+            preview_yaw: 0.4,
+            preview_pitch: 0.25,
+            preview_zoom: 1.0,
             decompiled_shader,
         })
     }
@@ -412,6 +419,9 @@ impl TagView {
             tv.search_tagtype = self.search_tagtype;
             tv.search_reference = self.search_reference;
             tv.search_depth_limit = self.search_depth_limit;
+            tv.preview_yaw = self.preview_yaw;
+            tv.preview_pitch = self.preview_pitch;
+            tv.preview_zoom = self.preview_zoom;
 
             *self = tv;
         } else {
@@ -881,118 +891,17 @@ impl TagView {
             return None;
         };
 
+        let orbit = PreviewOrbit {
+            yaw: &mut self.preview_yaw,
+            pitch: &mut self.preview_pitch,
+            zoom: &mut self.preview_zoom,
+        };
+
         match &preview.kind {
-            GeometryPreviewKind::VertexBuffer(buffer) => self.vertex_buffer_ui(ui, buffer),
-            GeometryPreviewKind::IndexBuffer(buffer) => self.index_buffer_ui(ui, buffer),
-            GeometryPreviewKind::Model(model) => self.model_preview_ui(ui, model),
+            GeometryPreviewKind::VertexBuffer(buffer) => vertex_buffer_ui(ui, buffer, orbit),
+            GeometryPreviewKind::IndexBuffer(buffer) => index_buffer_ui(ui, buffer),
+            GeometryPreviewKind::Model(model) => model_preview_ui(ui, model, orbit),
         }
-    }
-
-    fn vertex_buffer_ui(&self, ui: &mut egui::Ui, buffer: &VertexBufferPreview) -> Option<TagHash> {
-        ui.heading("Vertex buffer");
-        ui.label(buffer.summary());
-        ui.monospace(format!(
-            "data_size={} stride={} vtype={} marker=0x{:08X}",
-            buffer.header.data_size,
-            buffer.header.stride,
-            buffer.header.vtype,
-            buffer.header.deadbeef
-        ));
-        ui.monospace(format!(
-            "data_tag={} data_len={}",
-            buffer.data_tag, buffer.data_len
-        ));
-
-        for warning in &buffer.warnings {
-            ui.label(RichText::new(warning).color(Color32::YELLOW));
-        }
-
-        ui.separator();
-        ui.heading("Position candidates");
-        if buffer.candidates.is_empty() {
-            ui.label("No plausible position stream found at offset 0");
-        } else {
-            egui::Grid::new("vertex_position_candidates")
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Format");
-                    ui.strong("Offset");
-                    ui.strong("Valid");
-                    ui.strong("Min");
-                    ui.strong("Max");
-                    ui.end_row();
-
-                    for candidate in &buffer.candidates {
-                        ui.monospace(candidate.label);
-                        ui.monospace(format!("+{}", candidate.offset));
-                        ui.monospace(format!(
-                            "{}/{}",
-                            candidate.valid_vertices, candidate.sampled_vertices
-                        ));
-                        ui.monospace(format_vec3(candidate.min));
-                        ui.monospace(format_vec3(candidate.max));
-                        ui.end_row();
-                    }
-                });
-        }
-
-        None
-    }
-
-    fn index_buffer_ui(&self, ui: &mut egui::Ui, buffer: &IndexBufferPreview) -> Option<TagHash> {
-        ui.heading("Index buffer");
-        ui.label(buffer.summary());
-        ui.monospace(format!(
-            "is_32bit={} unk0={} unk1={} zero={} zero1={} marker=0x{:08X}",
-            buffer.header.is_32bit,
-            buffer.header.unk0,
-            buffer.header.unk1,
-            buffer.header.zero,
-            buffer.header.zero1,
-            buffer.header.deadbeef
-        ));
-        ui.monospace(format!(
-            "data_tag={} data_len={}",
-            buffer.data_tag, buffer.data_len
-        ));
-
-        if let (Some(min), Some(max)) = (buffer.min_index, buffer.max_index) {
-            ui.monospace(format!("index range: {min}..={max}"));
-        }
-
-        for warning in &buffer.warnings {
-            ui.label(RichText::new(warning).color(Color32::YELLOW));
-        }
-
-        ui.separator();
-        ui.heading("First indices");
-        ui.monospace(buffer.first_indices.iter().join(", "));
-
-        None
-    }
-
-    fn model_preview_ui(&self, ui: &mut egui::Ui, model: &ModelPreview) -> Option<TagHash> {
-        let mut open_new_tag = None;
-        ui.heading(model.label);
-        if let Some(class_name) = &model.class_name {
-            ui.monospace(class_name);
-        }
-
-        ui.separator();
-        open_new_tag = open_new_tag.or(related_tag_list_ui(
-            ui,
-            "Vertex buffers",
-            &model.vertex_buffers,
-        ));
-        open_new_tag = open_new_tag.or(related_tag_list_ui(
-            ui,
-            "Index buffers",
-            &model.index_buffers,
-        ));
-        open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Textures", &model.textures));
-        open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Shaders", &model.shaders));
-
-        open_new_tag
     }
 }
 
@@ -1986,6 +1895,258 @@ pub fn format_tag_entry(tag: TagHash, entry: Option<&UEntryHeader>) -> String {
     } else {
         format!("{} (pkg entry not found)", tag)
     }
+}
+
+struct PreviewOrbit<'a> {
+    yaw: &'a mut f32,
+    pitch: &'a mut f32,
+    zoom: &'a mut f32,
+}
+
+fn vertex_buffer_ui(
+    ui: &mut egui::Ui,
+    buffer: &VertexBufferPreview,
+    orbit: PreviewOrbit<'_>,
+) -> Option<TagHash> {
+    ui.heading("Vertex buffer");
+    ui.label(buffer.summary());
+    ui.monospace(format!(
+        "data_size={} stride={} vtype={} marker=0x{:08X}",
+        buffer.header.data_size, buffer.header.stride, buffer.header.vtype, buffer.header.deadbeef
+    ));
+    ui.monospace(format!(
+        "data_tag={} data_len={}",
+        buffer.data_tag, buffer.data_len
+    ));
+
+    for warning in &buffer.warnings {
+        ui.label(RichText::new(warning).color(Color32::YELLOW));
+    }
+
+    if let Some(wireframe) = &buffer.wireframe {
+        ui.separator();
+        wireframe_preview_ui(ui, wireframe, orbit);
+    }
+
+    ui.separator();
+    ui.heading("Position candidates");
+    if buffer.candidates.is_empty() {
+        ui.label("No plausible position stream found at offset 0");
+    } else {
+        egui::Grid::new("vertex_position_candidates")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Format");
+                ui.strong("Offset");
+                ui.strong("Valid");
+                ui.strong("Min");
+                ui.strong("Max");
+                ui.end_row();
+
+                for candidate in &buffer.candidates {
+                    ui.monospace(candidate.label);
+                    ui.monospace(format!("+{}", candidate.offset));
+                    ui.monospace(format!(
+                        "{}/{}",
+                        candidate.valid_vertices, candidate.sampled_vertices
+                    ));
+                    ui.monospace(format_vec3(candidate.min));
+                    ui.monospace(format_vec3(candidate.max));
+                    ui.end_row();
+                }
+            });
+    }
+
+    None
+}
+
+fn index_buffer_ui(ui: &mut egui::Ui, buffer: &IndexBufferPreview) -> Option<TagHash> {
+    ui.heading("Index buffer");
+    ui.label(buffer.summary());
+    ui.monospace(format!(
+        "is_32bit={} unk0={} unk1={} zero={} zero1={} marker=0x{:08X}",
+        buffer.header.is_32bit,
+        buffer.header.unk0,
+        buffer.header.unk1,
+        buffer.header.zero,
+        buffer.header.zero1,
+        buffer.header.deadbeef
+    ));
+    ui.monospace(format!(
+        "data_tag={} data_len={}",
+        buffer.data_tag, buffer.data_len
+    ));
+
+    if let (Some(min), Some(max)) = (buffer.min_index, buffer.max_index) {
+        ui.monospace(format!("index range: {min}..={max}"));
+    }
+
+    for warning in &buffer.warnings {
+        ui.label(RichText::new(warning).color(Color32::YELLOW));
+    }
+
+    ui.separator();
+    ui.heading("First indices");
+    ui.monospace(buffer.first_indices.iter().join(", "));
+
+    None
+}
+
+fn model_preview_ui(
+    ui: &mut egui::Ui,
+    model: &ModelPreview,
+    orbit: PreviewOrbit<'_>,
+) -> Option<TagHash> {
+    let mut open_new_tag = None;
+    ui.heading(model.label);
+    if let Some(class_name) = &model.class_name {
+        ui.monospace(class_name);
+    }
+
+    if let Some(wireframe) = &model.wireframe {
+        ui.separator();
+        wireframe_preview_ui(ui, wireframe, orbit);
+    } else {
+        ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));
+    }
+
+    ui.separator();
+    open_new_tag = open_new_tag.or(related_tag_list_ui(
+        ui,
+        "Vertex buffers",
+        &model.vertex_buffers,
+    ));
+    open_new_tag = open_new_tag.or(related_tag_list_ui(
+        ui,
+        "Index buffers",
+        &model.index_buffers,
+    ));
+    open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Textures", &model.textures));
+    open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Shaders", &model.shaders));
+
+    open_new_tag
+}
+
+fn wireframe_preview_ui(ui: &mut egui::Ui, wireframe: &WireframePreview, orbit: PreviewOrbit<'_>) {
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "{} vertices, {} indices ({})",
+            wireframe.vertex_count_total, wireframe.index_count_total, wireframe.position_format
+        ));
+        if ui.button("Reset view").clicked() {
+            *orbit.yaw = 0.4;
+            *orbit.pitch = 0.25;
+            *orbit.zoom = 1.0;
+        }
+    });
+    ui.monospace(format!(
+        "source={} bounds {} .. {}",
+        wireframe.source,
+        format_vec3(wireframe.min),
+        format_vec3(wireframe.max)
+    ));
+
+    let available = ui.available_size();
+    let size = vec2(available.x.max(320.0), available.y.clamp(260.0, 620.0));
+    let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
+
+    if response.dragged() {
+        let delta = response.drag_delta();
+        *orbit.yaw += delta.x * 0.01;
+        *orbit.pitch = (*orbit.pitch + delta.y * 0.01).clamp(-1.45, 1.45);
+        ui.ctx().request_repaint();
+    }
+    if response.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            *orbit.zoom = (*orbit.zoom * (1.0 + scroll * 0.001)).clamp(0.05, 50.0);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, Color32::from_rgb(12, 16, 20));
+    painter.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, Color32::from_rgb(60, 70, 80)),
+        egui::StrokeKind::Middle,
+    );
+
+    let Some(projected) = project_vertices(wireframe, *orbit.yaw, *orbit.pitch, *orbit.zoom, rect)
+    else {
+        return;
+    };
+
+    if wireframe.indices.len() >= 3 {
+        let stroke = egui::Stroke::new(0.7, Color32::from_rgb(140, 210, 255));
+        for tri in wireframe.indices.chunks_exact(3).take(20_000) {
+            let Some(a) = projected.get(tri[0] as usize).copied() else {
+                continue;
+            };
+            let Some(b) = projected.get(tri[1] as usize).copied() else {
+                continue;
+            };
+            let Some(c) = projected.get(tri[2] as usize).copied() else {
+                continue;
+            };
+            painter.line_segment([a, b], stroke);
+            painter.line_segment([b, c], stroke);
+            painter.line_segment([c, a], stroke);
+        }
+    } else {
+        let color = Color32::from_rgb(140, 210, 255);
+        for point in projected.iter().take(50_000) {
+            painter.circle_filled(*point, 1.0, color);
+        }
+    }
+}
+
+fn project_vertices(
+    wireframe: &WireframePreview,
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    rect: egui::Rect,
+) -> Option<Vec<egui::Pos2>> {
+    if wireframe.vertices.is_empty() {
+        return None;
+    }
+
+    let center = [
+        (wireframe.min[0] + wireframe.max[0]) * 0.5,
+        (wireframe.min[1] + wireframe.max[1]) * 0.5,
+        (wireframe.min[2] + wireframe.max[2]) * 0.5,
+    ];
+    let extent = [
+        wireframe.max[0] - wireframe.min[0],
+        wireframe.max[1] - wireframe.min[1],
+        wireframe.max[2] - wireframe.min[2],
+    ];
+    let radius = extent.into_iter().fold(0.0_f32, f32::max).max(1.0);
+    let scale = rect.width().min(rect.height()) * 0.42 * zoom / radius;
+    let cy = yaw.cos();
+    let sy = yaw.sin();
+    let cp = pitch.cos();
+    let sp = pitch.sin();
+    let screen_center = rect.center();
+
+    Some(
+        wireframe
+            .vertices
+            .iter()
+            .map(|position| {
+                let x = position[0] - center[0];
+                let y = position[1] - center[1];
+                let z = position[2] - center[2];
+                let xz = x * cy + z * sy;
+                let zz = -x * sy + z * cy;
+                let yz = y * cp - zz * sp;
+
+                egui::pos2(screen_center.x + xz * scale, screen_center.y - yz * scale)
+            })
+            .collect(),
+    )
 }
 
 fn related_tag_list_ui(

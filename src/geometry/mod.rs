@@ -7,6 +7,9 @@ use quicktag_scanner::TagCache;
 use std::sync::Arc;
 use tiger_pkg::{TagHash, Version, package::UEntryHeader, package_manager};
 
+const MAX_PREVIEW_VERTICES: usize = 200_000;
+const MAX_PREVIEW_INDICES: usize = 300_000;
+
 #[derive(Debug, Clone)]
 pub struct GeometryTagPreview {
     pub kind: GeometryPreviewKind,
@@ -26,6 +29,7 @@ pub struct VertexBufferPreview {
     pub data_len: usize,
     pub element_count: u32,
     pub candidates: Vec<VertexPositionCandidate>,
+    pub wireframe: Option<WireframePreview>,
     pub warnings: Vec<String>,
 }
 
@@ -38,6 +42,7 @@ pub struct IndexBufferPreview {
     pub min_index: Option<u32>,
     pub max_index: Option<u32>,
     pub first_indices: Vec<u32>,
+    pub indices: Vec<u32>,
     pub warnings: Vec<String>,
 }
 
@@ -49,6 +54,7 @@ pub struct ModelPreview {
     pub index_buffers: Vec<(TagHash, UEntryHeader)>,
     pub textures: Vec<(TagHash, UEntryHeader)>,
     pub shaders: Vec<(TagHash, UEntryHeader)>,
+    pub wireframe: Option<WireframePreview>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,12 +78,32 @@ pub struct IndexBufferHeader {
 
 #[derive(Debug, Clone)]
 pub struct VertexPositionCandidate {
+    pub format: PositionFormat,
     pub label: &'static str,
     pub offset: usize,
     pub valid_vertices: usize,
     pub sampled_vertices: usize,
     pub min: [f32; 3],
     pub max: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionFormat {
+    F32x3,
+    I16x4,
+    I16x3,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireframePreview {
+    pub source: String,
+    pub position_format: &'static str,
+    pub vertices: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub vertex_count_total: usize,
+    pub index_count_total: usize,
 }
 
 impl GeometryTagPreview {
@@ -91,7 +117,7 @@ impl GeometryTagPreview {
         if matches!(tag_type, TagType::VertexBuffer { is_header: true }) {
             return Some(Self {
                 kind: GeometryPreviewKind::VertexBuffer(
-                    load_vertex_buffer_preview(entry, tag_data).ok()?,
+                    load_vertex_buffer_preview_for_tag(tag, entry, tag_data).ok()?,
                 ),
             });
         }
@@ -99,7 +125,7 @@ impl GeometryTagPreview {
         if matches!(tag_type, TagType::IndexBuffer { is_header: true }) {
             return Some(Self {
                 kind: GeometryPreviewKind::IndexBuffer(
-                    load_index_buffer_preview(entry, tag_data).ok()?,
+                    load_index_buffer_preview_for_tag(tag, entry, tag_data).ok()?,
                 ),
             });
         }
@@ -139,7 +165,8 @@ pub fn model_label_for_reference(reference: u32) -> Option<&'static str> {
     }
 }
 
-fn load_vertex_buffer_preview(
+fn load_vertex_buffer_preview_for_tag(
+    tag: TagHash,
     entry: &UEntryHeader,
     tag_data: &[u8],
 ) -> anyhow::Result<VertexBufferPreview> {
@@ -174,8 +201,19 @@ fn load_vertex_buffer_preview(
         ));
     }
 
+    let candidates = find_position_candidates(&data, header.stride as usize, endian);
+    let wireframe = build_vertex_wireframe(
+        tag,
+        &data,
+        header.stride as usize,
+        endian,
+        &candidates,
+        element_count as usize,
+    );
+
     Ok(VertexBufferPreview {
-        candidates: find_position_candidates(&data, header.stride as usize, endian),
+        candidates,
+        wireframe,
         header,
         data_tag,
         data_len: data.len(),
@@ -184,7 +222,8 @@ fn load_vertex_buffer_preview(
     })
 }
 
-fn load_index_buffer_preview(
+fn load_index_buffer_preview_for_tag(
+    _tag: TagHash,
     entry: &UEntryHeader,
     tag_data: &[u8],
 ) -> anyhow::Result<IndexBufferPreview> {
@@ -198,6 +237,7 @@ fn load_index_buffer_preview(
     let index_size = if header.is_32bit { 4 } else { 2 };
     let index_count = header.data_size as usize / index_size;
     let mut indices = Vec::with_capacity(index_count.min(64));
+    let mut preview_indices = Vec::with_capacity(index_count.min(MAX_PREVIEW_INDICES));
     let mut min_index = None::<u32>;
     let mut max_index = None::<u32>;
 
@@ -211,6 +251,9 @@ fn load_index_buffer_preview(
         max_index = Some(max_index.map(|v| v.max(value)).unwrap_or(value));
         if indices.len() < 64 {
             indices.push(value);
+        }
+        if preview_indices.len() < MAX_PREVIEW_INDICES {
+            preview_indices.push(value);
         }
     }
 
@@ -234,6 +277,12 @@ fn load_index_buffer_preview(
             index_size
         ));
     }
+    if index_count > MAX_PREVIEW_INDICES {
+        warnings.push(format!(
+            "Preview indices truncated to {} of {}",
+            MAX_PREVIEW_INDICES, index_count
+        ));
+    }
 
     Ok(IndexBufferPreview {
         header,
@@ -243,6 +292,7 @@ fn load_index_buffer_preview(
         min_index,
         max_index,
         first_indices: indices,
+        indices: preview_indices,
         warnings,
     })
 }
@@ -254,14 +304,45 @@ fn load_model_preview(
     label: &'static str,
 ) -> ModelPreview {
     let class_name = get_class_by_id(entry.reference).map(|c| c.name.to_string());
+    let vertex_buffers = find_related_tags(&cache, tag, TagSearchKind::VertexBuffer, 8);
+    let index_buffers = find_related_tags(&cache, tag, TagSearchKind::IndexBuffer, 8);
+    let textures = find_related_tags(&cache, tag, TagSearchKind::Texture, 8);
+    let shaders = find_related_tags(&cache, tag, TagSearchKind::Shader, 8);
+    let wireframe = build_model_wireframe(&vertex_buffers, &index_buffers);
+
     ModelPreview {
         label,
         class_name,
-        vertex_buffers: find_related_tags(&cache, tag, TagSearchKind::VertexBuffer, 8),
-        index_buffers: find_related_tags(&cache, tag, TagSearchKind::IndexBuffer, 8),
-        textures: find_related_tags(&cache, tag, TagSearchKind::Texture, 8),
-        shaders: find_related_tags(&cache, tag, TagSearchKind::Shader, 8),
+        vertex_buffers,
+        index_buffers,
+        textures,
+        shaders,
+        wireframe,
     }
+}
+
+fn build_model_wireframe(
+    vertex_buffers: &[(TagHash, UEntryHeader)],
+    index_buffers: &[(TagHash, UEntryHeader)],
+) -> Option<WireframePreview> {
+    let (vertex_tag, vertex_entry) = vertex_buffers.first()?;
+    let vertex_header_data = package_manager().read_tag(*vertex_tag).ok()?;
+    let vertex_preview =
+        load_vertex_buffer_preview_for_tag(*vertex_tag, vertex_entry, &vertex_header_data).ok()?;
+
+    let mut wireframe = vertex_preview.wireframe?;
+    if let Some((index_tag, index_entry)) = index_buffers.first() {
+        let index_header_data = package_manager().read_tag(*index_tag).ok()?;
+        if let Ok(index_preview) =
+            load_index_buffer_preview_for_tag(*index_tag, index_entry, &index_header_data)
+        {
+            wireframe.index_count_total = index_preview.index_count;
+            wireframe.indices = index_preview.indices;
+            wireframe.source = format!("{vertex_tag} + {index_tag}");
+        }
+    }
+
+    Some(wireframe)
 }
 
 #[derive(Clone, Copy)]
@@ -395,13 +476,20 @@ fn candidate_f32x3(
     offset: usize,
     endian: Endian,
 ) -> Option<VertexPositionCandidate> {
-    build_candidate(data, stride, offset, "f32x3 @ +0", |bytes| {
-        Some([
-            read_f32(bytes.get(0..4)?, endian),
-            read_f32(bytes.get(4..8)?, endian),
-            read_f32(bytes.get(8..12)?, endian),
-        ])
-    })
+    build_candidate(
+        data,
+        stride,
+        offset,
+        PositionFormat::F32x3,
+        "f32x3 @ +0",
+        |bytes| {
+            Some([
+                read_f32(bytes.get(0..4)?, endian),
+                read_f32(bytes.get(4..8)?, endian),
+                read_f32(bytes.get(8..12)?, endian),
+            ])
+        },
+    )
 }
 
 fn candidate_i16x4(
@@ -410,13 +498,20 @@ fn candidate_i16x4(
     offset: usize,
     endian: Endian,
 ) -> Option<VertexPositionCandidate> {
-    build_candidate(data, stride, offset, "i16x4.xyz @ +0", |bytes| {
-        Some([
-            read_i16(bytes.get(0..2)?, endian) as f32,
-            read_i16(bytes.get(2..4)?, endian) as f32,
-            read_i16(bytes.get(4..6)?, endian) as f32,
-        ])
-    })
+    build_candidate(
+        data,
+        stride,
+        offset,
+        PositionFormat::I16x4,
+        "i16x4.xyz @ +0",
+        |bytes| {
+            Some([
+                read_i16(bytes.get(0..2)?, endian) as f32,
+                read_i16(bytes.get(2..4)?, endian) as f32,
+                read_i16(bytes.get(4..6)?, endian) as f32,
+            ])
+        },
+    )
 }
 
 fn candidate_i16x3(
@@ -425,19 +520,27 @@ fn candidate_i16x3(
     offset: usize,
     endian: Endian,
 ) -> Option<VertexPositionCandidate> {
-    build_candidate(data, stride, offset, "i16x3 @ +0", |bytes| {
-        Some([
-            read_i16(bytes.get(0..2)?, endian) as f32,
-            read_i16(bytes.get(2..4)?, endian) as f32,
-            read_i16(bytes.get(4..6)?, endian) as f32,
-        ])
-    })
+    build_candidate(
+        data,
+        stride,
+        offset,
+        PositionFormat::I16x3,
+        "i16x3 @ +0",
+        |bytes| {
+            Some([
+                read_i16(bytes.get(0..2)?, endian) as f32,
+                read_i16(bytes.get(2..4)?, endian) as f32,
+                read_i16(bytes.get(4..6)?, endian) as f32,
+            ])
+        },
+    )
 }
 
 fn build_candidate(
     data: &[u8],
     stride: usize,
     offset: usize,
+    format: PositionFormat,
     label: &'static str,
     mut decode: impl FnMut(&[u8]) -> Option<[f32; 3]>,
 ) -> Option<VertexPositionCandidate> {
@@ -468,6 +571,7 @@ fn build_candidate(
     }
 
     Some(VertexPositionCandidate {
+        format,
         label,
         offset,
         valid_vertices: valid,
@@ -475,6 +579,82 @@ fn build_candidate(
         min,
         max,
     })
+}
+
+fn build_vertex_wireframe(
+    tag: TagHash,
+    data: &[u8],
+    stride: usize,
+    endian: Endian,
+    candidates: &[VertexPositionCandidate],
+    vertex_count_total: usize,
+) -> Option<WireframePreview> {
+    let candidate = candidates
+        .iter()
+        .filter(|candidate| candidate.valid_vertices > 0)
+        .max_by_key(|candidate| candidate.valid_vertices)?;
+    let vertices = decode_positions(data, stride, endian, candidate.format, candidate.offset);
+    let (min, max) = bounds(&vertices)?;
+
+    Some(WireframePreview {
+        source: tag.to_string(),
+        position_format: candidate.label,
+        index_count_total: 0,
+        vertex_count_total,
+        vertices,
+        indices: vec![],
+        min,
+        max,
+    })
+}
+
+fn decode_positions(
+    data: &[u8],
+    stride: usize,
+    endian: Endian,
+    format: PositionFormat,
+    offset: usize,
+) -> Vec<[f32; 3]> {
+    if stride == 0 {
+        return vec![];
+    }
+
+    data.chunks_exact(stride)
+        .take(MAX_PREVIEW_VERTICES)
+        .filter_map(|vertex| {
+            let bytes = vertex.get(offset..)?;
+            match format {
+                PositionFormat::F32x3 => Some([
+                    read_f32(bytes.get(0..4)?, endian),
+                    read_f32(bytes.get(4..8)?, endian),
+                    read_f32(bytes.get(8..12)?, endian),
+                ]),
+                PositionFormat::I16x4 | PositionFormat::I16x3 => Some([
+                    read_i16(bytes.get(0..2)?, endian) as f32,
+                    read_i16(bytes.get(2..4)?, endian) as f32,
+                    read_i16(bytes.get(4..6)?, endian) as f32,
+                ]),
+            }
+        })
+        .filter(|position| position.iter().all(|v| v.is_finite() && v.abs() < 1.0e8))
+        .collect()
+}
+
+fn bounds(vertices: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
+    if vertices.is_empty() {
+        return None;
+    }
+
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for position in vertices {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position[axis]);
+            max[axis] = max[axis].max(position[axis]);
+        }
+    }
+
+    Some((min, max))
 }
 
 fn read_u16(data: &[u8], endian: Endian) -> u16 {
