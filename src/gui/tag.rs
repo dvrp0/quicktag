@@ -24,6 +24,10 @@ use crate::geometry::{
 };
 use crate::gui::get_string_for_hash;
 use crate::gui::hexview::TagHexView;
+use crate::material::{
+    MaterialPreviewKind, MaterialTagPreview, TechniquePreview, TextureSlotBindingPreview,
+    WideHashPreview,
+};
 use crate::util::ui_image_rotated;
 use crate::{texture::Texture, texture::cache::TextureCache};
 use anyhow::Context;
@@ -62,6 +66,7 @@ use wgpu::util::DeviceExt as _;
 enum TagViewMode {
     Traversal,
     Geometry,
+    Material,
     Hex,
     HexReferenced,
     Float,
@@ -111,6 +116,7 @@ pub struct TagView {
 
     geometry_preview: Option<GeometryTagPreview>,
     geometry_gpu_preview: Option<Arc<GpuWireframePreview>>,
+    material_preview: Option<MaterialTagPreview>,
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
@@ -350,6 +356,7 @@ impl TagView {
             .and_then(|preview| preview.wireframe())
             .and_then(|wireframe| GpuWireframePreview::create(&render_state.device, wireframe))
             .map(Arc::new);
+        let material_preview = MaterialTagPreview::load(&tag_entry, &tag_data);
 
         let mut string_hashes_hexview = string_hashes
             .iter()
@@ -401,6 +408,7 @@ impl TagView {
             texture_cache,
             geometry_preview,
             geometry_gpu_preview,
+            material_preview,
             preview_yaw: 0.4,
             preview_pitch: 0.25,
             preview_zoom: 1.0,
@@ -937,6 +945,21 @@ impl TagView {
             ),
         }
     }
+
+    fn material_ui(&mut self, ui: &mut egui::Ui) -> Option<TagHash> {
+        let Some(preview) = &self.material_preview else {
+            ui.label("No material preview available for this tag");
+            return None;
+        };
+
+        if let Some(class_name) = &preview.class_name {
+            ui.monospace(class_name);
+        }
+
+        match &preview.kind {
+            MaterialPreviewKind::Technique(technique) => technique_preview_ui(ui, technique),
+        }
+    }
 }
 
 impl View for TagView {
@@ -1422,6 +1445,9 @@ impl View for TagView {
                 if self.geometry_preview.is_some() {
                     ui.selectable_value(&mut self.mode, TagViewMode::Geometry, "Geometry");
                 }
+                if self.material_preview.is_some() {
+                    ui.selectable_value(&mut self.mode, TagViewMode::Material, "Material");
+                }
                 ui.selectable_value(&mut self.mode, TagViewMode::Hex, "Hex");
                 ui.selectable_value(&mut self.mode, TagViewMode::Float, "Floating point");
                 if self.hexview_referenced.is_some() {
@@ -1443,6 +1469,13 @@ impl View for TagView {
                 TagViewMode::Geometry => {
                     if self.geometry_preview.is_some() {
                         open_new_tag = open_new_tag.or(self.geometry_ui(ui));
+                    } else {
+                        self.mode = TagViewMode::Traversal;
+                    }
+                }
+                TagViewMode::Material => {
+                    if self.material_preview.is_some() {
+                        open_new_tag = open_new_tag.or(self.material_ui(ui));
                     } else {
                         self.mode = TagViewMode::Traversal;
                     }
@@ -2187,6 +2220,120 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return input.color;
 }
 "#;
+
+fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Option<TagHash> {
+    let mut open_new_tag = None;
+    ui.heading("Technique");
+    ui.monospace(format!(
+        "bind_mode={} states=0x{:08X} used_scopes=0x{:016X} compatible_scopes=0x{:016X}",
+        technique.bind_mode,
+        technique.state_selection,
+        technique.used_scopes,
+        technique.compatible_scopes
+    ));
+
+    if technique.stages.is_empty() {
+        ui.label(RichText::new("No populated shader stages found").color(Color32::YELLOW));
+        return None;
+    }
+
+    for stage in &technique.stages {
+        CollapsingHeader::new(RichText::new(stage.stage).strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new(format!("technique_stage_{}", stage.stage))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Shader");
+                        if let Some(shader) = stage.shader {
+                            open_new_tag = open_new_tag.or(tag_button_ui(ui, shader));
+                        } else {
+                            ui.monospace("none");
+                        }
+                        ui.end_row();
+
+                        ui.label("Textures");
+                        ui.monospace(stage.textures.len().to_string());
+                        ui.end_row();
+
+                        ui.label("Samplers");
+                        ui.monospace(stage.sampler_count.to_string());
+                        ui.end_row();
+
+                        ui.label("Constants");
+                        ui.monospace(format!(
+                            "{} vec4, {} bytecode bytes",
+                            stage.constant_count, stage.bytecode_len
+                        ));
+                        ui.end_row();
+
+                        ui.label("Constant buffer");
+                        if let Some(slot) = stage.constant_buffer_slot {
+                            ui.monospace(format!("slot {slot}"));
+                            if let Some(buffer) = stage.constant_buffer {
+                                open_new_tag = open_new_tag.or(tag_button_ui(ui, buffer));
+                            }
+                        } else {
+                            ui.monospace("none");
+                        }
+                        ui.end_row();
+                    });
+
+                if !stage.textures.is_empty() {
+                    ui.separator();
+                    open_new_tag = open_new_tag.or(texture_slot_bindings_ui(ui, &stage.textures));
+                }
+            });
+    }
+
+    open_new_tag
+}
+
+fn texture_slot_bindings_ui(
+    ui: &mut egui::Ui,
+    textures: &[TextureSlotBindingPreview],
+) -> Option<TagHash> {
+    let mut open_new_tag = None;
+    egui::Grid::new(ui.next_auto_id())
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Slot");
+            ui.strong("Texture");
+            ui.strong("Resolved");
+            ui.end_row();
+
+            for binding in textures {
+                ui.monospace(binding.slot.to_string());
+                ui.monospace(format_wide_hash(binding.texture));
+                if let Some(tag) = binding.texture.resolved {
+                    open_new_tag = open_new_tag.or(tag_button_ui(ui, tag));
+                } else {
+                    ui.monospace("unresolved");
+                }
+                ui.end_row();
+            }
+        });
+
+    open_new_tag
+}
+
+fn tag_button_ui(ui: &mut egui::Ui, tag: TagHash) -> Option<TagHash> {
+    let entry = package_manager().get_entry(tag);
+    let response = ui.selectable_label(false, RichText::new(format_tag_entry(tag, entry.as_ref())));
+    if response.tag_context(tag).clicked() {
+        Some(tag)
+    } else {
+        None
+    }
+}
+
+fn format_wide_hash(hash: WideHashPreview) -> String {
+    if hash.is_hash32 {
+        hash.raw32.to_string()
+    } else {
+        hash.raw64.to_string()
+    }
+}
 
 fn vertex_buffer_ui(
     ui: &mut egui::Ui,

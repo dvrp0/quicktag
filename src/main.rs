@@ -1,5 +1,6 @@
 mod geometry;
 mod gui;
+mod material;
 mod panic_handler;
 mod texture;
 mod util;
