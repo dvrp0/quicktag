@@ -50,6 +50,7 @@ pub struct IndexBufferPreview {
 pub struct ModelPreview {
     pub label: &'static str,
     pub class_name: Option<String>,
+    pub mesh_source: Option<MeshSourcePreview>,
     pub vertex_buffers: Vec<(TagHash, UEntryHeader)>,
     pub index_buffers: Vec<(TagHash, UEntryHeader)>,
     pub textures: Vec<(TagHash, UEntryHeader)>,
@@ -104,6 +105,21 @@ pub struct WireframePreview {
     pub max: [f32; 3],
     pub vertex_count_total: usize,
     pub index_count_total: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeshSourcePreview {
+    pub kind: &'static str,
+    pub buffer_index: usize,
+    pub index_start: u32,
+    pub index_count: u32,
+    pub primitive_type: u8,
+    pub lod_category: u8,
+    pub input_layout_index: Option<u8>,
+    pub index_buffer: TagHash,
+    pub vertex0_buffer: TagHash,
+    pub vertex1_buffer: TagHash,
+    pub color_buffer: TagHash,
 }
 
 impl GeometryTagPreview {
@@ -308,11 +324,14 @@ fn load_model_preview(
     let index_buffers = find_related_tags(&cache, tag, TagSearchKind::IndexBuffer, 8);
     let textures = find_related_tags(&cache, tag, TagSearchKind::Texture, 8);
     let shaders = find_related_tags(&cache, tag, TagSearchKind::Shader, 8);
-    let wireframe = build_model_wireframe(&vertex_buffers, &index_buffers);
+    let (mesh_source, wireframe) = parse_model_wireframe(tag, entry)
+        .map(|parsed| (Some(parsed.0), Some(parsed.1)))
+        .unwrap_or_else(|| (None, build_model_wireframe(&vertex_buffers, &index_buffers)));
 
     ModelPreview {
         label,
         class_name,
+        mesh_source,
         vertex_buffers,
         index_buffers,
         textures,
@@ -343,6 +362,272 @@ fn build_model_wireframe(
     }
 
     Some(wireframe)
+}
+
+fn parse_model_wireframe(
+    tag: TagHash,
+    entry: &UEntryHeader,
+) -> Option<(MeshSourcePreview, WireframePreview)> {
+    match entry.reference {
+        0x80806D44 => parse_static_mesh_wireframe(tag),
+        0x80806D30 => {
+            let data = package_manager().read_tag(tag).ok()?;
+            parse_static_mesh_data_wireframe(&data)
+        }
+        0x80806F07 => parse_dynamic_model_wireframe(tag),
+        0x80806EC5 => {
+            let data = package_manager().read_tag(tag).ok()?;
+            parse_dynamic_mesh_wireframe(&data)
+        }
+        _ => None,
+    }
+}
+
+fn parse_static_mesh_wireframe(tag: TagHash) -> Option<(MeshSourcePreview, WireframePreview)> {
+    let data = package_manager().read_tag(tag).ok()?;
+    let endian = package_manager().version.endian();
+    let mesh_data_tag = TagHash(read_u32(data.get(0x8..0xc)?, endian));
+    let mesh_data = package_manager().read_tag(mesh_data_tag).ok()?;
+    parse_static_mesh_data_wireframe(&mesh_data)
+}
+
+fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, WireframePreview)> {
+    let endian = package_manager().version.endian();
+    let parts = read_static_mesh_parts(data, 0x18, endian);
+    let groups = read_static_mesh_groups(data, 0x8, endian);
+    let buffers = read_static_buffer_tuples(data, 0x28, endian);
+    let group = groups
+        .iter()
+        .find(|group| {
+            parts
+                .get(group.part_index as usize)
+                .is_some_and(|part| is_highest_detail_lod(part.lod_category))
+        })
+        .or_else(|| groups.first())?;
+    let part = parts.get(group.part_index as usize)?;
+    let buffers = buffers.get(part.buffer_index as usize)?;
+
+    let source = MeshSourcePreview {
+        kind: "static mesh data",
+        buffer_index: part.buffer_index as usize,
+        index_start: part.index_start,
+        index_count: part.index_count,
+        primitive_type: part.primitive_type,
+        lod_category: part.lod_category,
+        input_layout_index: Some(group.input_layout_index),
+        index_buffer: buffers.index_buffer,
+        vertex0_buffer: buffers.vertex0_buffer,
+        vertex1_buffer: buffers.vertex1_buffer,
+        color_buffer: buffers.color_buffer,
+    };
+    let wireframe = build_wireframe_from_refs(
+        source.vertex0_buffer,
+        source.index_buffer,
+        Some(source.index_start as usize..(source.index_start + source.index_count) as usize),
+    )?;
+
+    Some((source, wireframe))
+}
+
+fn parse_dynamic_model_wireframe(tag: TagHash) -> Option<(MeshSourcePreview, WireframePreview)> {
+    let data = package_manager().read_tag(tag).ok()?;
+    let endian = package_manager().version.endian();
+    let mesh_array = read_array(data.get(..)?, 0x10, 0x80, endian)?;
+    parse_dynamic_mesh_wireframe(mesh_array.chunks_exact(0x80).next()?)
+}
+
+fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, WireframePreview)> {
+    let endian = package_manager().version.endian();
+    let parts = read_dynamic_mesh_parts(data, 0x20, endian);
+    let part = parts
+        .iter()
+        .find(|part| is_highest_detail_lod(part.lod_category))
+        .or_else(|| parts.first())?;
+    let source = MeshSourcePreview {
+        kind: "dynamic mesh",
+        buffer_index: 0,
+        index_start: part.index_start,
+        index_count: part.index_count,
+        primitive_type: part.primitive_type,
+        lod_category: part.lod_category,
+        input_layout_index: first_dynamic_input_layout(data),
+        index_buffer: TagHash(read_u32(data.get(0x10..0x14)?, endian)),
+        vertex0_buffer: TagHash(read_u32(data.get(0x0..0x4)?, endian)),
+        vertex1_buffer: TagHash(read_u32(data.get(0x4..0x8)?, endian)),
+        color_buffer: TagHash(read_u32(data.get(0x14..0x18)?, endian)),
+    };
+    let wireframe = build_wireframe_from_refs(
+        source.vertex0_buffer,
+        source.index_buffer,
+        Some(source.index_start as usize..(source.index_start + source.index_count) as usize),
+    )?;
+
+    Some((source, wireframe))
+}
+
+fn build_wireframe_from_refs(
+    vertex_tag: TagHash,
+    index_tag: TagHash,
+    index_range: Option<std::ops::Range<usize>>,
+) -> Option<WireframePreview> {
+    let vertex_entry = package_manager().get_entry(vertex_tag)?;
+    let vertex_header = package_manager().read_tag(vertex_tag).ok()?;
+    let vertex_preview =
+        load_vertex_buffer_preview_for_tag(vertex_tag, &vertex_entry, &vertex_header).ok()?;
+    let mut wireframe = vertex_preview.wireframe?;
+
+    let index_entry = package_manager().get_entry(index_tag)?;
+    let index_header = package_manager().read_tag(index_tag).ok()?;
+    let index_preview =
+        load_index_buffer_preview_for_tag(index_tag, &index_entry, &index_header).ok()?;
+    wireframe.index_count_total = index_preview.index_count;
+    wireframe.indices = if let Some(range) = index_range {
+        index_preview
+            .indices
+            .get(
+                range.start.min(index_preview.indices.len())
+                    ..range.end.min(index_preview.indices.len()),
+            )
+            .unwrap_or_default()
+            .to_vec()
+    } else {
+        index_preview.indices
+    };
+    wireframe.source = format!("{vertex_tag} + {index_tag}");
+
+    Some(wireframe)
+}
+
+#[derive(Debug, Clone)]
+struct StaticMeshPartPreview {
+    index_start: u32,
+    index_count: u32,
+    buffer_index: u8,
+    lod_category: u8,
+    primitive_type: u8,
+}
+
+#[derive(Debug, Clone)]
+struct StaticMeshGroupPreview {
+    part_index: u16,
+    input_layout_index: u8,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicMeshPartPreview {
+    index_start: u32,
+    index_count: u32,
+    primitive_type: u8,
+    lod_category: u8,
+}
+
+#[derive(Debug, Clone)]
+struct StaticBufferTuple {
+    index_buffer: TagHash,
+    vertex0_buffer: TagHash,
+    vertex1_buffer: TagHash,
+    color_buffer: TagHash,
+}
+
+fn read_static_mesh_parts(
+    data: &[u8],
+    vec_offset: usize,
+    endian: Endian,
+) -> Vec<StaticMeshPartPreview> {
+    read_array(data, vec_offset, 12, endian)
+        .into_iter()
+        .flat_map(|array| array.chunks_exact(12))
+        .filter_map(|part| {
+            Some(StaticMeshPartPreview {
+                index_start: read_u32(part.get(0x0..0x4)?, endian),
+                index_count: read_u32(part.get(0x4..0x8)?, endian),
+                buffer_index: *part.get(0x8)?,
+                lod_category: *part.get(0xa)?,
+                primitive_type: *part.get(0xb)?,
+            })
+        })
+        .collect()
+}
+
+fn read_static_mesh_groups(
+    data: &[u8],
+    vec_offset: usize,
+    endian: Endian,
+) -> Vec<StaticMeshGroupPreview> {
+    read_array(data, vec_offset, 6, endian)
+        .into_iter()
+        .flat_map(|array| array.chunks_exact(6))
+        .filter_map(|group| {
+            Some(StaticMeshGroupPreview {
+                part_index: read_u16(group.get(0x0..0x2)?, endian),
+                input_layout_index: *group.get(0x3)?,
+            })
+        })
+        .collect()
+}
+
+fn read_static_buffer_tuples(
+    data: &[u8],
+    vec_offset: usize,
+    endian: Endian,
+) -> Vec<StaticBufferTuple> {
+    read_array(data, vec_offset, 16, endian)
+        .into_iter()
+        .flat_map(|array| array.chunks_exact(16))
+        .filter_map(|tuple| {
+            Some(StaticBufferTuple {
+                index_buffer: TagHash(read_u32(tuple.get(0x0..0x4)?, endian)),
+                vertex0_buffer: TagHash(read_u32(tuple.get(0x4..0x8)?, endian)),
+                vertex1_buffer: TagHash(read_u32(tuple.get(0x8..0xc)?, endian)),
+                color_buffer: TagHash(read_u32(tuple.get(0xc..0x10)?, endian)),
+            })
+        })
+        .collect()
+}
+
+fn read_dynamic_mesh_parts(
+    data: &[u8],
+    vec_offset: usize,
+    endian: Endian,
+) -> Vec<DynamicMeshPartPreview> {
+    read_array(data, vec_offset, 0x24, endian)
+        .into_iter()
+        .flat_map(|array| array.chunks_exact(0x24))
+        .filter_map(|part| {
+            Some(DynamicMeshPartPreview {
+                primitive_type: *part.get(0x6)?,
+                index_start: read_u32(part.get(0x8..0xc)?, endian),
+                index_count: read_u32(part.get(0xc..0x10)?, endian),
+                lod_category: *part.get(0x1d)?,
+            })
+        })
+        .collect()
+}
+
+fn read_array(data: &[u8], vec_offset: usize, elem_size: usize, endian: Endian) -> Option<&[u8]> {
+    let count = read_u64(data.get(vec_offset..vec_offset + 8)?, endian) as usize;
+    if count == 0 || elem_size == 0 {
+        return Some(&[]);
+    }
+
+    let rel = read_i64(data.get(vec_offset + 8..vec_offset + 16)?, endian);
+    let header_offset = (vec_offset as i64 + 8).checked_add(rel)? as usize;
+    let header_count = read_u64(data.get(header_offset..header_offset + 8)?, endian) as usize;
+    if header_count != count {
+        return None;
+    }
+
+    let data_start = header_offset + 16;
+    let data_end = data_start.checked_add(count.checked_mul(elem_size)?)?;
+    data.get(data_start..data_end)
+}
+
+fn first_dynamic_input_layout(data: &[u8]) -> Option<u8> {
+    data.get(0x62..0x62 + 24)?.iter().copied().find(|v| *v != 0)
+}
+
+fn is_highest_detail_lod(lod: u8) -> bool {
+    matches!(lod, 0 | 1 | 2 | 3 | 10)
 }
 
 #[derive(Clone, Copy)]
@@ -697,6 +982,14 @@ fn read_u64(data: &[u8], endian: Endian) -> u64 {
     }
 }
 
+fn read_i64(data: &[u8], endian: Endian) -> i64 {
+    let bytes = data[0..8].try_into().expect("i64 slice length checked");
+    match endian {
+        Endian::Big => i64::from_be_bytes(bytes),
+        Endian::Little => i64::from_le_bytes(bytes),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +1027,19 @@ mod tests {
         assert_eq!(header.unk1, 0x1234);
         assert_eq!(header.data_size, 0x40);
         assert_eq!(header.deadbeef, 0xDEADBEEF);
+    }
+
+    #[test]
+    fn reads_relative_array_payload() {
+        let mut data = vec![0u8; 0x40];
+        data[0x08..0x10].copy_from_slice(&2u64.to_le_bytes());
+        data[0x10..0x18].copy_from_slice(&0x10i64.to_le_bytes());
+        data[0x20..0x28].copy_from_slice(&2u64.to_le_bytes());
+        data[0x28..0x2c].copy_from_slice(&0x80806D37u32.to_le_bytes());
+        data[0x30..0x34].copy_from_slice(&0x11223344u32.to_le_bytes());
+        data[0x34..0x38].copy_from_slice(&0x55667788u32.to_le_bytes());
+
+        let array = read_array(&data, 0x08, 4, Endian::Little).unwrap();
+        assert_eq!(array, &data[0x30..0x38]);
     }
 }

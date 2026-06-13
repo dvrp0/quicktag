@@ -2010,6 +2010,51 @@ fn model_preview_ui(
         ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));
     }
 
+    if let Some(source) = &model.mesh_source {
+        ui.separator();
+        ui.heading("Selected mesh part");
+        egui::Grid::new("selected_mesh_part")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Source");
+                ui.monospace(source.kind);
+                ui.end_row();
+                ui.label("Buffer index");
+                ui.monospace(source.buffer_index.to_string());
+                ui.end_row();
+                ui.label("Index range");
+                ui.monospace(format!(
+                    "{}..{}",
+                    source.index_start,
+                    source.index_start + source.index_count
+                ));
+                ui.end_row();
+                ui.label("Primitive");
+                ui.monospace(source.primitive_type.to_string());
+                ui.end_row();
+                ui.label("LOD");
+                ui.monospace(source.lod_category.to_string());
+                ui.end_row();
+                ui.label("Input layout");
+                ui.monospace(
+                    source
+                        .input_layout_index
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                );
+                ui.end_row();
+                ui.label("IB/VB0/VB1/Color");
+                ui.monospace(format!(
+                    "{} / {} / {} / {}",
+                    source.index_buffer,
+                    source.vertex0_buffer,
+                    source.vertex1_buffer,
+                    source.color_buffer
+                ));
+                ui.end_row();
+            });
+    }
+
     ui.separator();
     open_new_tag = open_new_tag.or(related_tag_list_ui(
         ui,
