@@ -4,6 +4,7 @@ mod audio_list;
 mod common;
 mod external_file;
 mod hexview;
+mod modellist;
 mod named_tags;
 mod packages;
 mod raw_strings;
@@ -43,6 +44,7 @@ use rustc_hash::FxHashSet;
 use strings::StringViewVariant;
 use tiger_pkg::{TagHash, package_manager};
 
+use self::modellist::ModelsView;
 use self::named_tags::NamedTagView;
 use self::packages::PackagesView;
 use self::raw_strings::RawStringsView;
@@ -61,6 +63,7 @@ pub enum Panel {
     NamedTags,
     Packages,
     Textures,
+    Models,
     Audio,
     AudioEvents,
     Strings,
@@ -116,6 +119,7 @@ pub struct QuickTagApp {
     named_tags_view: NamedTagView,
     packages_view: PackagesView,
     textures_view: TexturesView,
+    models_view: ModelsView,
     audio_view: audio_list::AudioView,
     audio_events_view: audio_events::AudioEventView,
     strings_view: StringsView,
@@ -216,7 +220,8 @@ impl QuickTagApp {
 
             named_tags_view: NamedTagView::new(),
             packages_view: PackagesView::new(texture_cache.clone()),
-            textures_view: TexturesView::new(texture_cache),
+            textures_view: TexturesView::new(texture_cache.clone()),
+            models_view: ModelsView::new(Default::default(), texture_cache),
             audio_view: audio_list::AudioView::new(),
             audio_events_view: audio_events::AudioEventView::new(),
             strings_view: StringsView::new(
@@ -386,6 +391,7 @@ impl eframe::App for QuickTagApp {
             );
 
             self.signatures_view = SignaturesView::new(self.cache.clone());
+            self.models_view.set_cache(self.cache.clone());
 
             // // Dump all raw strings to a csv file
             // if let Ok(mut f) = std::fs::File::create("raw_strings.csv") {
@@ -542,6 +548,7 @@ impl eframe::App for QuickTagApp {
                     ui.selectable_value(&mut self.open_panel, Panel::NamedTags, "Named tags");
                     ui.selectable_value(&mut self.open_panel, Panel::Packages, "Packages");
                     ui.selectable_value(&mut self.open_panel, Panel::Textures, "Textures");
+                    ui.selectable_value(&mut self.open_panel, Panel::Models, "Models");
                     ui.selectable_value(&mut self.open_panel, Panel::Audio, "Audio");
                     ui.selectable_value(&mut self.open_panel, Panel::AudioEvents, "Wwise Events");
                     ui.selectable_value(&mut self.open_panel, Panel::Strings, "Strings");
@@ -579,6 +586,7 @@ impl eframe::App for QuickTagApp {
                     Panel::NamedTags => self.named_tags_view.view(ctx, ui),
                     Panel::Packages => self.packages_view.view(ctx, ui),
                     Panel::Textures => self.textures_view.view(ctx, ui),
+                    Panel::Models => self.models_view.view(ctx, ui),
                     Panel::Audio => self.audio_view.view(ctx, ui),
                     Panel::AudioEvents => self.audio_events_view.view(ctx, ui),
                     Panel::Strings => match self.strings_panel {
@@ -617,6 +625,10 @@ impl eframe::App for QuickTagApp {
                 if let Some(action) = action {
                     match action {
                         ViewAction::OpenTag(t) => self.open_tag(t, true),
+                        ViewAction::ShowTexture(t) => {
+                            self.textures_view.show_texture(t);
+                            self.open_panel = Panel::Textures;
+                        }
                     }
                 }
             });
@@ -675,6 +687,7 @@ impl QuickTagApp {
 
 pub enum ViewAction {
     OpenTag(TagHash),
+    ShowTexture(TagHash),
 }
 
 pub trait View {

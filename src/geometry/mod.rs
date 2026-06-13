@@ -59,6 +59,21 @@ pub struct ModelPreview {
     pub wireframe: Option<WireframePreview>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTagRole {
+    Mesh,
+    MeshData,
+    Geometry,
+    Dynamic,
+    Container,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ModelTagInfo {
+    pub role: ModelTagRole,
+    pub label: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub struct VertexBufferHeader {
     pub data_size: u32,
@@ -249,14 +264,42 @@ impl IndexBufferPreview {
     }
 }
 
-pub fn model_label_for_reference(reference: u32) -> Option<&'static str> {
+pub fn model_info_for_reference(reference: u32) -> Option<ModelTagInfo> {
     match reference {
-        0x80806D44 => Some("Static mesh"),
-        0x80806D30 => Some("Static mesh data"),
-        0x80806F07 => Some("Dynamic model"),
-        0x80806EC5 => Some("Dynamic mesh"),
+        0x80806D44 | 0x80808635 => Some(ModelTagInfo {
+            role: ModelTagRole::Mesh,
+            label: "Mesh",
+        }),
+        0x80806D30 | 0x80808620 => Some(ModelTagInfo {
+            role: ModelTagRole::MeshData,
+            label: "Mesh data",
+        }),
+        0x80808567 => Some(ModelTagInfo {
+            role: ModelTagRole::Mesh,
+            label: "Terrain mesh",
+        }),
+        0x8080881C => Some(ModelTagInfo {
+            role: ModelTagRole::Geometry,
+            label: "Geometry",
+        }),
+        0x80806F07 => Some(ModelTagInfo {
+            role: ModelTagRole::Dynamic,
+            label: "Dynamic model",
+        }),
+        0x80806EC5 => Some(ModelTagInfo {
+            role: ModelTagRole::Dynamic,
+            label: "Dynamic mesh",
+        }),
+        0x8080BADB | 0x8080BAAD => Some(ModelTagInfo {
+            role: ModelTagRole::Container,
+            label: "Model container",
+        }),
         _ => None,
     }
+}
+
+pub fn model_label_for_reference(reference: u32) -> Option<&'static str> {
+    model_info_for_reference(reference).map(|info| info.label)
 }
 
 fn load_vertex_buffer_preview_for_tag(

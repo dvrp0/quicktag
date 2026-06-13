@@ -45,6 +45,41 @@ impl TexturesView {
         }
     }
 
+    pub fn show_texture(&mut self, tag: TagHash) {
+        let package_id = tag.pkg_id();
+        self.selected_package = package_id;
+        self.package_filter.clear();
+        self.filter_texdesc.clear();
+        self.packages_with_textures = Self::search_textures(None);
+
+        if !self.packages_with_textures.contains(&package_id) {
+            self.packages_with_textures.push(package_id);
+        }
+
+        self.textures = Self::package_textures(package_id);
+        self.apply_sorting();
+    }
+
+    fn package_textures(id: u16) -> Vec<(usize, TagHash, TagType, Option<TextureDesc>)> {
+        package_manager()
+            .lookup
+            .tag32_entries_by_pkg
+            .get(&id)
+            .into_iter()
+            .flat_map(|entries| entries.iter().enumerate())
+            .filter_map(|(i, e)| {
+                let st = TagType::from_type_subtype(e.file_type, e.file_subtype);
+
+                let hash = TagHash::new(id, i as u16);
+                if st.is_texture() && st.is_header() {
+                    Some((i, hash, st, Texture::load_desc(hash).ok()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn search_textures(search: Option<String>) -> Vec<u16> {
         let mut packages: Vec<(u16, PackagePath)> = package_manager()
             .package_paths
@@ -131,21 +166,7 @@ impl View for TexturesView {
                                 )
                                 .changed()
                             {
-                                self.textures = package_manager().lookup.tag32_entries_by_pkg[id]
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(i, e)| {
-                                        let st =
-                                            TagType::from_type_subtype(e.file_type, e.file_subtype);
-
-                                        let hash = TagHash::new(*id, i as u16);
-                                        if st.is_texture() && st.is_header() {
-                                            Some((i, hash, st, Texture::load_desc(hash).ok()))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
+                                self.textures = Self::package_textures(*id);
 
                                 update_filters = true;
                             }
