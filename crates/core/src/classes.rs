@@ -276,6 +276,7 @@ pub const CLASSES_GOLIATH: &[TagClass] = &[
     class!(0x80808618 s_static_mesh_instance_group),
     class!(0x8080862F s_static_instance_transform),
     class!(0x8080861F s_static_special_mesh),
+    class!(0x8080881C s_geometry_resource),
     class!(0x808082D5 s_unk_808082d5),
     class!(0x80808567 s_terrain),
     class!(0x8080856C s_terrain_mesh_group),

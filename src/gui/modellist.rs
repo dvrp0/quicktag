@@ -1,13 +1,17 @@
 use std::sync::Arc;
 
-use eframe::egui::{self, Color32, RichText, Sense, Stroke, pos2, vec2};
+use eframe::egui::{
+    self, Color32, RichText, Sense, Stroke,
+    epaint::{Mesh, Vertex},
+    pos2, vec2,
+};
 use quicktag_core::tagtypes::TagType;
 use quicktag_scanner::TagCache;
 use tiger_pkg::{TagHash, manager::PackagePath, package::UEntryHeader, package_manager};
 
 use crate::geometry::{
-    GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, WireframePreview,
-    model_info_for_reference,
+    GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, UvTransformPreview,
+    WireframePreview, model_info_for_reference,
 };
 use crate::gui::common::ResponseExt;
 use crate::gui::tag::format_tag_entry;
@@ -214,6 +218,7 @@ impl View for ModelsView {
                 }
                 ui.label(format!("VB: {}", model.vertex_buffers.len()));
                 ui.label(format!("IB: {}", model.index_buffers.len()));
+                ui.label(format!("Techniques: {}", model.techniques.len()));
                 ui.label(format!("Textures: {}", model.textures.len()));
                 ui.label(format!("Shaders: {}", model.shaders.len()));
             });
@@ -230,6 +235,27 @@ impl View for ModelsView {
                     mesh.primitive_type,
                     mesh.lod_category
                 ));
+
+                if let Some(uv) = mesh.uv_transform {
+                    ui.monospace(format!(
+                        "uv: scale=[{:.6}, {:.6}] offset=[{:.6}, {:.6}]",
+                        uv.scale[0], uv.scale[1], uv.offset[0], uv.offset[1]
+                    ));
+                } else {
+                    ui.monospace("uv: default scale/offset");
+                }
+
+                for constant in &mesh.shader_constants {
+                    ui.monospace(format!(
+                        "shader constant {} = [{:.6}, {:.6}, {:.6}, {:.6}] ({})",
+                        constant.name,
+                        constant.value[0],
+                        constant.value[1],
+                        constant.value[2],
+                        constant.value[3],
+                        constant.source
+                    ));
+                }
             }
 
             ui.separator();
@@ -237,7 +263,19 @@ impl View for ModelsView {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if let Some(wireframe) = &model.wireframe {
-                        model_wireframe_ui(ui, wireframe, preview_yaw, preview_pitch, preview_zoom);
+                        model_wireframe_ui(
+                            ui,
+                            wireframe,
+                            model
+                                .mesh_source
+                                .as_ref()
+                                .and_then(|mesh| mesh.uv_transform),
+                            texture_cache,
+                            &model.textures,
+                            preview_yaw,
+                            preview_pitch,
+                            preview_zoom,
+                        );
                     } else {
                         ui.label(RichText::new("No wireframe assembled yet").italics());
                     }
@@ -350,9 +388,12 @@ impl ModelListEntry {
     }
 }
 
-fn model_wireframe_ui(
+pub(super) fn model_wireframe_ui(
     ui: &mut egui::Ui,
     wireframe: &WireframePreview,
+    uv_transform: Option<UvTransformPreview>,
+    texture_cache: &TextureCache,
+    textures: &[(TagHash, UEntryHeader)],
     yaw: &mut f32,
     pitch: &mut f32,
     zoom: &mut f32,
@@ -368,6 +409,21 @@ fn model_wireframe_ui(
             *zoom = 1.0;
         }
     });
+    let preview_texture = textures
+        .first()
+        .map(|(tag, _entry)| (*tag, texture_cache.get_or_default(*tag)));
+    if let Some((tag, (texture, _tid))) = &preview_texture {
+        let uv_source = wireframe
+            .uv_format
+            .as_deref()
+            .unwrap_or("fallback planar UVs");
+        ui.monospace(format!(
+            "textured preview: {} using {} ({}x{}, {:?})",
+            tag, uv_source, texture.desc.width, texture.desc.height, texture.desc.format
+        ));
+    } else {
+        ui.monospace("textured preview: no related texture resolved");
+    }
     ui.monospace(format!(
         "source={} bounds [{:.3}, {:.3}, {:.3}] .. [{:.3}, {:.3}, {:.3}]",
         wireframe.source,
@@ -411,6 +467,10 @@ fn model_wireframe_ui(
     };
 
     if wireframe.indices.len() >= 3 {
+        if let Some((_tag, (_texture, texture_id))) = preview_texture {
+            draw_textured_model_mesh(&painter, wireframe, &projected, texture_id, uv_transform);
+        }
+
         let stroke = Stroke::new(0.7, Color32::from_rgb(140, 210, 255));
         for tri in wireframe.indices.chunks_exact(3).take(20_000) {
             let Some(a) = projected.get(tri[0] as usize).copied() else {
@@ -431,6 +491,94 @@ fn model_wireframe_ui(
             painter.circle_filled(*point, 1.0, Color32::from_rgb(140, 210, 255));
         }
     }
+}
+
+fn draw_textured_model_mesh(
+    painter: &egui::Painter,
+    wireframe: &WireframePreview,
+    projected: &[egui::Pos2],
+    texture_id: egui::TextureId,
+    uv_transform: Option<UvTransformPreview>,
+) {
+    let mut mesh = Mesh::with_texture(texture_id);
+    let tint = Color32::from_rgba_premultiplied(255, 255, 255, 220);
+
+    for tri in wireframe.indices.chunks_exact(3).take(20_000) {
+        let base = mesh.vertices.len() as u32;
+        for index in tri {
+            let vertex_index = *index as usize;
+            let Some(position) = wireframe.vertices.get(vertex_index).copied() else {
+                continue;
+            };
+            let Some(screen_pos) = projected.get(vertex_index).copied() else {
+                continue;
+            };
+            mesh.vertices.push(Vertex {
+                pos: screen_pos,
+                uv: preview_uv(vertex_index, position, wireframe, uv_transform),
+                color: tint,
+            });
+        }
+
+        if mesh.vertices.len() as u32 == base + 3 {
+            mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+        } else {
+            mesh.vertices.truncate(base as usize);
+        }
+    }
+
+    if !mesh.indices.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+fn preview_uv(
+    vertex_index: usize,
+    position: [f32; 3],
+    wireframe: &WireframePreview,
+    uv_transform: Option<UvTransformPreview>,
+) -> egui::Pos2 {
+    if let Some(uvs) = &wireframe.uvs
+        && let Some(uv) = uvs.get(vertex_index)
+    {
+        return transformed_uv(*uv, uv_transform);
+    }
+
+    planar_preview_uv(position, wireframe, uv_transform)
+}
+
+fn transformed_uv(uv: [f32; 2], uv_transform: Option<UvTransformPreview>) -> egui::Pos2 {
+    let mut u = uv[0];
+    let mut v = uv[1];
+    if let Some(transform) = uv_transform {
+        u = u * transform.scale[0] + transform.offset[0];
+        v = v * transform.scale[1] + transform.offset[1];
+    }
+
+    pos2(u.fract().abs(), v.fract().abs())
+}
+
+fn planar_preview_uv(
+    position: [f32; 3],
+    wireframe: &WireframePreview,
+    uv_transform: Option<UvTransformPreview>,
+) -> egui::Pos2 {
+    let extent_x = (wireframe.max[0] - wireframe.min[0]).abs().max(1.0);
+    let extent_z = (wireframe.max[2] - wireframe.min[2]).abs();
+    let extent_y = (wireframe.max[1] - wireframe.min[1]).abs().max(1.0);
+    let mut u = (position[0] - wireframe.min[0]) / extent_x;
+    let mut v = if extent_z > 0.0001 {
+        (position[2] - wireframe.min[2]) / extent_z.max(1.0)
+    } else {
+        (position[1] - wireframe.min[1]) / extent_y
+    };
+
+    if let Some(uv) = uv_transform {
+        u = u * uv.scale[0] + uv.offset[0];
+        v = v * uv.scale[1] + uv.offset[1];
+    }
+
+    pos2(u.fract().abs(), v.fract().abs())
 }
 
 fn project_vertices(

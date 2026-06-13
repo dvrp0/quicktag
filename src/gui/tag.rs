@@ -17,6 +17,7 @@ use super::{
         ResponseExt, open_audio_file_in_default_application, open_tag_in_default_application,
         tag_context,
     },
+    modellist::model_wireframe_ui,
 };
 use crate::geometry::{
     GeometryPreviewKind, GeometryTagPreview, GpuPreviewVertex, GpuWireframePreview,
@@ -936,13 +937,9 @@ impl TagView {
                 self.render_state.target_format,
             ),
             GeometryPreviewKind::IndexBuffer(buffer) => index_buffer_ui(ui, buffer),
-            GeometryPreviewKind::Model(model) => model_preview_ui(
-                ui,
-                model,
-                orbit,
-                self.geometry_gpu_preview.as_ref(),
-                self.render_state.target_format,
-            ),
+            GeometryPreviewKind::Model(model) => {
+                model_preview_ui(ui, model, orbit, &self.texture_cache)
+            }
         }
     }
 
@@ -2283,6 +2280,15 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
                         ui.end_row();
                     });
 
+                if let Some(buffer) = &stage.constant_buffer_preview {
+                    ui.separator();
+                    ui.monospace(format!(
+                        "constant buffer payload: header={} ({} bytes) data={} ({} bytes)",
+                        buffer.header_tag, buffer.header_len, buffer.data_tag, buffer.data_len
+                    ));
+                    constants_preview_ui(ui, "Constant buffer first vec4s", &buffer.first_values);
+                }
+
                 if !stage.textures.is_empty() {
                     ui.separator();
                     open_new_tag = open_new_tag.or(texture_slot_bindings_ui(ui, &stage.textures));
@@ -2417,6 +2423,34 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
             });
     }
 
+    if !bytecode.expressions.is_empty() {
+        CollapsingHeader::new(format!("TFX expressions ({})", bytecode.expressions.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new(ui.next_auto_id())
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Op");
+                        ui.strong("Target");
+                        ui.strong("Expression");
+                        ui.strong("Value");
+                        ui.end_row();
+
+                        for expression in &bytecode.expressions {
+                            ui.monospace(format!("0x{:04X}", expression.op_offset));
+                            ui.monospace(&expression.target);
+                            ui.monospace(&expression.expression);
+                            if let Some(value) = expression.value {
+                                ui.monospace(format_vec4_list(&[value]));
+                            } else {
+                                ui.monospace("dynamic");
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
     if !bytecode.externs.is_empty() {
         CollapsingHeader::new(format!("TFX extern refs ({})", bytecode.externs.len()))
             .default_open(true)
@@ -2428,6 +2462,7 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
                         ui.strong("Type");
                         ui.strong("Scope");
                         ui.strong("Offset");
+                        ui.strong("Hint");
                         ui.end_row();
 
                         for extern_ref in &bytecode.externs {
@@ -2435,10 +2470,46 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
                             ui.monospace(extern_ref.value_type);
                             ui.monospace(&extern_ref.scope);
                             ui.monospace(format!("0x{:X}", extern_ref.byte_offset));
+                            ui.monospace(extern_ref.hint);
                             ui.end_row();
                         }
                     });
             });
+    }
+
+    if !bytecode.constant_refs.is_empty() {
+        CollapsingHeader::new(format!(
+            "TFX constant refs ({})",
+            bytecode.constant_refs.len()
+        ))
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Op");
+                    ui.strong("Name");
+                    ui.strong("Range");
+                    ui.strong("Values");
+                    ui.end_row();
+
+                    for constant_ref in &bytecode.constant_refs {
+                        ui.monospace(format!("0x{:04X}", constant_ref.op_offset));
+                        ui.monospace(constant_ref.op_name);
+                        ui.monospace(format!(
+                            "{}..{}",
+                            constant_ref.start,
+                            constant_ref.start + constant_ref.count
+                        ));
+                        if constant_ref.values.is_empty() {
+                            ui.monospace("out of range");
+                        } else {
+                            ui.monospace(format_vec4_list(&constant_ref.values));
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
     }
 
     CollapsingHeader::new("TFX opcodes")
@@ -2462,6 +2533,20 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
                     }
                 });
         });
+}
+
+fn format_vec4_list(values: &[[f32; 4]]) -> String {
+    values
+        .iter()
+        .take(3)
+        .map(|value| {
+            format!(
+                "[{:.4}, {:.4}, {:.4}, {:.4}]",
+                value[0], value[1], value[2], value[3]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn texture_slot_bindings_ui(
@@ -2566,6 +2651,35 @@ fn vertex_buffer_ui(
             });
     }
 
+    ui.separator();
+    ui.heading("UV candidates");
+    if buffer.uv_candidates.is_empty() {
+        ui.label("No plausible UV stream found");
+    } else {
+        egui::Grid::new("vertex_uv_candidates")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Format");
+                ui.strong("Offset");
+                ui.strong("Valid");
+                ui.strong("Min");
+                ui.strong("Max");
+                ui.end_row();
+
+                for candidate in &buffer.uv_candidates {
+                    ui.monospace(&candidate.label);
+                    ui.monospace(format!("+{}", candidate.offset));
+                    ui.monospace(format!(
+                        "{}/{}",
+                        candidate.valid_vertices, candidate.sampled_vertices
+                    ));
+                    ui.monospace(format_vec2(candidate.min));
+                    ui.monospace(format_vec2(candidate.max));
+                    ui.end_row();
+                }
+            });
+    }
+
     None
 }
 
@@ -2605,8 +2719,7 @@ fn model_preview_ui(
     ui: &mut egui::Ui,
     model: &ModelPreview,
     orbit: PreviewOrbit<'_>,
-    gpu_preview: Option<&Arc<GpuWireframePreview>>,
-    target_format: wgpu::TextureFormat,
+    texture_cache: &TextureCache,
 ) -> Option<TagHash> {
     let mut open_new_tag = None;
     ui.heading(model.label);
@@ -2616,7 +2729,19 @@ fn model_preview_ui(
 
     if let Some(wireframe) = &model.wireframe {
         ui.separator();
-        wireframe_preview_ui(ui, wireframe, orbit, gpu_preview, target_format);
+        model_wireframe_ui(
+            ui,
+            wireframe,
+            model
+                .mesh_source
+                .as_ref()
+                .and_then(|mesh| mesh.uv_transform),
+            texture_cache,
+            &model.textures,
+            orbit.yaw,
+            orbit.pitch,
+            orbit.zoom,
+        );
     } else {
         ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));
     }
@@ -2674,6 +2799,32 @@ fn model_preview_ui(
                 }
                 ui.end_row();
             });
+
+        if !source.shader_constants.is_empty() {
+            ui.separator();
+            ui.heading("Propagated shader constants");
+            egui::Grid::new("model_shader_constants")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Name");
+                    ui.strong("Value");
+                    ui.strong("Source");
+                    ui.end_row();
+
+                    for constant in &source.shader_constants {
+                        ui.monospace(constant.name);
+                        ui.monospace(format!(
+                            "[{:.6}, {:.6}, {:.6}, {:.6}]",
+                            constant.value[0],
+                            constant.value[1],
+                            constant.value[2],
+                            constant.value[3]
+                        ));
+                        ui.monospace(constant.source);
+                        ui.end_row();
+                    }
+                });
+        }
     }
 
     ui.separator();
@@ -2687,6 +2838,7 @@ fn model_preview_ui(
         "Index buffers",
         &model.index_buffers,
     ));
+    open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Techniques", &model.techniques));
     open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Textures", &model.textures));
     open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Shaders", &model.shaders));
 
@@ -2870,6 +3022,10 @@ fn related_tag_list_ui(
 
 fn format_vec3(value: [f32; 3]) -> String {
     format!("[{:.3}, {:.3}, {:.3}]", value[0], value[1], value[2])
+}
+
+fn format_vec2(value: [f32; 2]) -> String {
+    format!("[{:.3}, {:.3}]", value[0], value[1])
 }
 
 #[binread]
