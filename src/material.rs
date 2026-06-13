@@ -27,8 +27,9 @@ pub struct TechniqueStagePreview {
     pub stage: &'static str,
     pub shader: Option<TagHash>,
     pub textures: Vec<TextureSlotBindingPreview>,
-    pub sampler_count: usize,
-    pub constant_count: usize,
+    pub constants: Vec<[f32; 4]>,
+    pub samplers: Vec<WideHashPreview>,
+    pub inline_constants: Vec<[f32; 4]>,
     pub bytecode_len: usize,
     pub constant_buffer_slot: Option<i32>,
     pub constant_buffer: Option<TagHash>,
@@ -45,9 +46,18 @@ pub struct TextureSlotBindingPreview {
 pub struct TfxBytecodePreview {
     pub total_bytes: usize,
     pub ops: Vec<TfxBytecodeOpPreview>,
+    pub bindings: Vec<TfxBindingPreview>,
     pub decoded_ops: usize,
     pub unknown_ops: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TfxBindingPreview {
+    pub kind: &'static str,
+    pub stage: &'static str,
+    pub slot: u8,
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -126,11 +136,19 @@ fn parse_technique_stage(
         .map(parse_tfx_bytecode)
         .unwrap_or_default();
     let bytecode_len = bytecode.total_bytes;
-    let constant_count = read_array(data, constants_offset + 0x10, 0x10, endian)
-        .map(|constants| constants.len() / 0x10)
+    let constants = read_array(data, constants_offset + 0x10, 0x10, endian)
+        .map(|constants| parse_vec4_array(constants, endian))
         .unwrap_or_default();
-    let sampler_count = read_array(data, constants_offset + 0x20, 0x10, endian)
-        .map(|samplers| samplers.len() / 0x10)
+    let samplers = read_array(data, constants_offset + 0x20, 0x10, endian)
+        .map(|samplers| {
+            samplers
+                .chunks_exact(0x10)
+                .filter_map(|sampler| read_wide_hash(sampler, endian))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let inline_constants = read_array(data, constants_offset + 0x30, 0x10, endian)
+        .map(|constants| parse_vec4_array(constants, endian))
         .unwrap_or_default();
     let constant_buffer_slot = data
         .get(constants_offset + 0x50..constants_offset + 0x54)
@@ -143,8 +161,9 @@ fn parse_technique_stage(
 
     if shader.is_none()
         && textures.is_empty()
-        && sampler_count == 0
-        && constant_count == 0
+        && samplers.is_empty()
+        && constants.is_empty()
+        && inline_constants.is_empty()
         && bytecode_len == 0
         && constant_buffer_slot.is_none()
     {
@@ -155,13 +174,27 @@ fn parse_technique_stage(
         stage,
         shader: shader.is_some().then_some(shader),
         textures,
-        sampler_count,
-        constant_count,
+        constants,
+        samplers,
+        inline_constants,
         bytecode_len,
         constant_buffer_slot,
         constant_buffer,
         bytecode,
     })
+}
+
+fn parse_vec4_array(data: &[u8], endian: Endian) -> Vec<[f32; 4]> {
+    data.chunks_exact(0x10)
+        .map(|chunk| {
+            [
+                read_f32(&chunk[0x0..0x4], endian),
+                read_f32(&chunk[0x4..0x8], endian),
+                read_f32(&chunk[0x8..0xc], endian),
+                read_f32(&chunk[0xc..0x10], endian),
+            ]
+        })
+        .collect()
 }
 
 fn parse_tfx_bytecode(data: &[u8]) -> TfxBytecodePreview {
@@ -196,13 +229,121 @@ fn parse_tfx_bytecode(data: &[u8]) -> TfxBytecodePreview {
         }
     }
 
+    let bindings = summarize_tfx_bindings(&ops);
+
     TfxBytecodePreview {
         total_bytes: data.len(),
+        bindings,
         decoded_ops,
         unknown_ops,
         truncated: decoded_ops > ops.len(),
         ops,
     }
+}
+
+fn summarize_tfx_bindings(ops: &[TfxBytecodeOpPreview]) -> Vec<TfxBindingPreview> {
+    let mut stack = Vec::<String>::new();
+    let mut bindings = Vec::new();
+
+    for op in ops {
+        match op.name {
+            "push_const_vec4"
+            | "push_sampler"
+            | "push_extern_float"
+            | "push_extern_vec4"
+            | "push_extern_mat4"
+            | "push_extern_texture"
+            | "push_extern_u32"
+            | "push_extern_uav"
+            | "push_from_output"
+            | "push_object_channel"
+            | "push_global_channel"
+            | "push_tex_dimensions"
+            | "push_tex_tiling_params"
+            | "push_tex_tile_layer_count"
+            | "push_temp" => stack.push(format_tfx_value(op)),
+            "set_shader_texture" | "set_shader_sampler" | "set_shader_uav" => {
+                if let Some((stage, slot)) = parse_stage_slot(&op.detail) {
+                    bindings.push(TfxBindingPreview {
+                        kind: match op.name {
+                            "set_shader_texture" => "texture",
+                            "set_shader_sampler" => "sampler",
+                            "set_shader_uav" => "uav",
+                            _ => "binding",
+                        },
+                        stage,
+                        slot,
+                        source: stack.pop().unwrap_or_else(|| "<empty stack>".to_string()),
+                    });
+                }
+            }
+            "pop_output" | "pop_output_mat4" | "pop_temp" => {
+                let _ = stack.pop();
+            }
+            "add" | "subtract" | "multiply" | "divide" | "min" | "max" | "less_than" | "dot"
+            | "lerp" | "lerp_saturated" | "multiply_add" | "clamp" => {
+                collapse_stack(&mut stack, op.name, 2);
+            }
+            "abs" | "signum" | "floor" | "ceil" | "round" | "frac" | "negate" | "saturate" => {
+                collapse_stack(&mut stack, op.name, 1);
+            }
+            _ => {}
+        }
+    }
+
+    bindings
+}
+
+fn collapse_stack(stack: &mut Vec<String>, name: &str, inputs: usize) {
+    if stack.len() < inputs {
+        stack.push(format!("{name}(?)"));
+        return;
+    }
+
+    let args = stack.split_off(stack.len() - inputs).join(", ");
+    stack.push(format!("{name}({args})"));
+}
+
+fn format_tfx_value(op: &TfxBytecodeOpPreview) -> String {
+    match op.name {
+        "push_const_vec4" => op
+            .detail
+            .strip_prefix("constant=")
+            .map(|index| format!("constant[{index}]"))
+            .unwrap_or_else(|| op.detail.clone()),
+        "push_sampler" => op
+            .detail
+            .strip_prefix("index=")
+            .map(|index| format!("sampler[{index}]"))
+            .unwrap_or_else(|| op.detail.clone()),
+        "push_temp" => op
+            .detail
+            .strip_prefix("slot=")
+            .map(|slot| format!("temp[{slot}]"))
+            .unwrap_or_else(|| op.detail.clone()),
+        _ => {
+            if op.detail.is_empty() {
+                op.name.to_string()
+            } else {
+                format!("{}({})", op.name.trim_start_matches("push_"), op.detail)
+            }
+        }
+    }
+}
+
+fn parse_stage_slot(detail: &str) -> Option<(&'static str, u8)> {
+    let (stage_text, slot_text) = detail.split_once(" slot=")?;
+    let slot = slot_text.parse().ok()?;
+    let stage = match stage_text {
+        "PS" => "PS",
+        "VS" => "VS",
+        "GS" => "GS",
+        "HS" => "HS",
+        "CS" => "CS",
+        "DS" => "DS",
+        _ => "??",
+    };
+    Some((stage, slot))
 }
 
 fn parse_tfx_bytecode_op(
@@ -492,6 +633,10 @@ fn read_i32(data: &[u8], endian: Endian) -> i32 {
     read_u32(data, endian) as i32
 }
 
+fn read_f32(data: &[u8], endian: Endian) -> f32 {
+    f32::from_bits(read_u32(data, endian))
+}
+
 fn read_u64(data: &[u8], endian: Endian) -> u64 {
     match endian {
         Endian::Little => u64::from_le_bytes([
@@ -553,9 +698,30 @@ mod tests {
 
         assert_eq!(decoded.decoded_ops, 5);
         assert_eq!(decoded.unknown_ops, 0);
+        assert_eq!(decoded.bindings.len(), 2);
+        assert_eq!(decoded.bindings[0].kind, "sampler");
+        assert_eq!(decoded.bindings[0].stage, "PS");
+        assert_eq!(decoded.bindings[0].slot, 0);
+        assert_eq!(decoded.bindings[0].source, "sampler[1]");
+        assert_eq!(decoded.bindings[1].kind, "texture");
+        assert_eq!(decoded.bindings[1].stage, "VS");
         assert_eq!(decoded.ops[0].name, "push_const_vec4");
         assert_eq!(decoded.ops[2].detail, "PS slot=0");
         assert_eq!(decoded.ops[3].detail, "VS slot=0");
         assert_eq!(decoded.ops[4].detail, "0x12345678");
+    }
+
+    #[test]
+    fn parses_vec4_constants() {
+        let mut data = vec![];
+        for value in [1.0_f32, -2.5, 3.25, 4.5, 5.0, 6.0, 7.0, 8.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let constants = parse_vec4_array(&data, Endian::Little);
+
+        assert_eq!(constants.len(), 2);
+        assert_eq!(constants[0], [1.0, -2.5, 3.25, 4.5]);
+        assert_eq!(constants[1], [5.0, 6.0, 7.0, 8.0]);
     }
 }

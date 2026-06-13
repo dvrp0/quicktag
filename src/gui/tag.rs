@@ -2257,13 +2257,15 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
                         ui.end_row();
 
                         ui.label("Samplers");
-                        ui.monospace(stage.sampler_count.to_string());
+                        ui.monospace(stage.samplers.len().to_string());
                         ui.end_row();
 
                         ui.label("Constants");
                         ui.monospace(format!(
                             "{} vec4, {} bytecode bytes, {} decoded ops",
-                            stage.constant_count, stage.bytecode_len, stage.bytecode.decoded_ops
+                            stage.constants.len(),
+                            stage.bytecode_len,
+                            stage.bytecode.decoded_ops
                         ));
                         ui.end_row();
 
@@ -2284,6 +2286,17 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
                     open_new_tag = open_new_tag.or(texture_slot_bindings_ui(ui, &stage.textures));
                 }
 
+                if !stage.samplers.is_empty() {
+                    ui.separator();
+                    open_new_tag = open_new_tag.or(sampler_bindings_ui(ui, &stage.samplers));
+                }
+
+                if !stage.constants.is_empty() || !stage.inline_constants.is_empty() {
+                    ui.separator();
+                    constants_preview_ui(ui, "Bytecode constants", &stage.constants);
+                    constants_preview_ui(ui, "Inline constants", &stage.inline_constants);
+                }
+
                 if stage.bytecode.total_bytes > 0 {
                     ui.separator();
                     tfx_bytecode_ui(ui, &stage.bytecode);
@@ -2294,6 +2307,68 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
     open_new_tag
 }
 
+fn sampler_bindings_ui(ui: &mut egui::Ui, samplers: &[WideHashPreview]) -> Option<TagHash> {
+    let mut open_new_tag = None;
+    CollapsingHeader::new(format!("Samplers ({})", samplers.len()))
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Index");
+                    ui.strong("Sampler");
+                    ui.strong("Resolved");
+                    ui.end_row();
+
+                    for (index, sampler) in samplers.iter().enumerate() {
+                        ui.monospace(index.to_string());
+                        ui.monospace(format_wide_hash(*sampler));
+                        if let Some(tag) = sampler.resolved {
+                            open_new_tag = open_new_tag.or(tag_button_ui(ui, tag));
+                        } else {
+                            ui.monospace("unresolved");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+    open_new_tag
+}
+
+fn constants_preview_ui(ui: &mut egui::Ui, label: &str, constants: &[[f32; 4]]) {
+    if constants.is_empty() {
+        return;
+    }
+
+    CollapsingHeader::new(format!("{label} ({})", constants.len()))
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Index");
+                    ui.strong("x");
+                    ui.strong("y");
+                    ui.strong("z");
+                    ui.strong("w");
+                    ui.end_row();
+
+                    for (index, value) in constants.iter().enumerate().take(128) {
+                        ui.monospace(index.to_string());
+                        for component in value {
+                            ui.monospace(format!("{component:.6}"));
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            if constants.len() > 128 {
+                ui.label(RichText::new("Constant list truncated for UI").color(Color32::YELLOW));
+            }
+        });
+}
+
 fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
     ui.monospace(format!(
         "TFX bytecode: {} bytes, {} decoded ops, {} unknown",
@@ -2301,6 +2376,30 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
     ));
     if bytecode.truncated {
         ui.label(RichText::new("Opcode list truncated for UI").color(Color32::YELLOW));
+    }
+
+    if !bytecode.bindings.is_empty() {
+        CollapsingHeader::new(format!("TFX bindings ({})", bytecode.bindings.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new(ui.next_auto_id())
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Kind");
+                        ui.strong("Stage");
+                        ui.strong("Slot");
+                        ui.strong("Source");
+                        ui.end_row();
+
+                        for binding in &bytecode.bindings {
+                            ui.monospace(binding.kind);
+                            ui.monospace(binding.stage);
+                            ui.monospace(binding.slot.to_string());
+                            ui.monospace(&binding.source);
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     CollapsingHeader::new("TFX opcodes")
