@@ -1,3 +1,4 @@
+mod geometry;
 mod gui;
 mod panic_handler;
 mod texture;

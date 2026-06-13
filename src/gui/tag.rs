@@ -18,6 +18,9 @@ use super::{
         tag_context,
     },
 };
+use crate::geometry::{
+    GeometryPreviewKind, GeometryTagPreview, IndexBufferPreview, ModelPreview, VertexBufferPreview,
+};
 use crate::gui::get_string_for_hash;
 use crate::gui::hexview::TagHexView;
 use crate::util::ui_image_rotated;
@@ -54,6 +57,7 @@ use tiger_pkg::{
 #[derive(Copy, Clone, PartialEq)]
 enum TagViewMode {
     Traversal,
+    Geometry,
     Hex,
     HexReferenced,
     Float,
@@ -101,6 +105,7 @@ pub struct TagView {
     hexview_referenced: Option<TagHexView>,
     mode: TagViewMode,
 
+    geometry_preview: Option<GeometryTagPreview>,
     decompiled_shader: Option<Result<String, String>>,
 }
 
@@ -293,7 +298,12 @@ impl TagView {
             Err(anyhow::anyhow!("Tag is not a texture header"))
         };
 
-        let hexview_referenced = if matches!(tag_type, TagType::ConstantBuffer { .. }) {
+        let hexview_referenced = if matches!(
+            tag_type,
+            TagType::VertexBuffer { .. }
+                | TagType::IndexBuffer { .. }
+                | TagType::ConstantBuffer { .. }
+        ) {
             package_manager()
                 .read_tag(tag_entry.reference)
                 .ok()
@@ -324,6 +334,9 @@ impl TagView {
         } else {
             None
         };
+
+        let geometry_preview =
+            GeometryTagPreview::load(cache.clone(), tag, &tag_entry, tag_type, &tag_data);
 
         let mut string_hashes_hexview = string_hashes
             .iter()
@@ -373,6 +386,7 @@ impl TagView {
             start_time: Instant::now(),
             render_state,
             texture_cache,
+            geometry_preview,
             decompiled_shader,
         })
     }
@@ -860,6 +874,126 @@ impl TagView {
 
         Ok(())
     }
+
+    fn geometry_ui(&mut self, ui: &mut egui::Ui) -> Option<TagHash> {
+        let Some(preview) = &self.geometry_preview else {
+            ui.label("No geometry preview available for this tag");
+            return None;
+        };
+
+        match &preview.kind {
+            GeometryPreviewKind::VertexBuffer(buffer) => self.vertex_buffer_ui(ui, buffer),
+            GeometryPreviewKind::IndexBuffer(buffer) => self.index_buffer_ui(ui, buffer),
+            GeometryPreviewKind::Model(model) => self.model_preview_ui(ui, model),
+        }
+    }
+
+    fn vertex_buffer_ui(&self, ui: &mut egui::Ui, buffer: &VertexBufferPreview) -> Option<TagHash> {
+        ui.heading("Vertex buffer");
+        ui.label(buffer.summary());
+        ui.monospace(format!(
+            "data_size={} stride={} vtype={} marker=0x{:08X}",
+            buffer.header.data_size,
+            buffer.header.stride,
+            buffer.header.vtype,
+            buffer.header.deadbeef
+        ));
+        ui.monospace(format!(
+            "data_tag={} data_len={}",
+            buffer.data_tag, buffer.data_len
+        ));
+
+        for warning in &buffer.warnings {
+            ui.label(RichText::new(warning).color(Color32::YELLOW));
+        }
+
+        ui.separator();
+        ui.heading("Position candidates");
+        if buffer.candidates.is_empty() {
+            ui.label("No plausible position stream found at offset 0");
+        } else {
+            egui::Grid::new("vertex_position_candidates")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Format");
+                    ui.strong("Offset");
+                    ui.strong("Valid");
+                    ui.strong("Min");
+                    ui.strong("Max");
+                    ui.end_row();
+
+                    for candidate in &buffer.candidates {
+                        ui.monospace(candidate.label);
+                        ui.monospace(format!("+{}", candidate.offset));
+                        ui.monospace(format!(
+                            "{}/{}",
+                            candidate.valid_vertices, candidate.sampled_vertices
+                        ));
+                        ui.monospace(format_vec3(candidate.min));
+                        ui.monospace(format_vec3(candidate.max));
+                        ui.end_row();
+                    }
+                });
+        }
+
+        None
+    }
+
+    fn index_buffer_ui(&self, ui: &mut egui::Ui, buffer: &IndexBufferPreview) -> Option<TagHash> {
+        ui.heading("Index buffer");
+        ui.label(buffer.summary());
+        ui.monospace(format!(
+            "is_32bit={} unk0={} unk1={} zero={} zero1={} marker=0x{:08X}",
+            buffer.header.is_32bit,
+            buffer.header.unk0,
+            buffer.header.unk1,
+            buffer.header.zero,
+            buffer.header.zero1,
+            buffer.header.deadbeef
+        ));
+        ui.monospace(format!(
+            "data_tag={} data_len={}",
+            buffer.data_tag, buffer.data_len
+        ));
+
+        if let (Some(min), Some(max)) = (buffer.min_index, buffer.max_index) {
+            ui.monospace(format!("index range: {min}..={max}"));
+        }
+
+        for warning in &buffer.warnings {
+            ui.label(RichText::new(warning).color(Color32::YELLOW));
+        }
+
+        ui.separator();
+        ui.heading("First indices");
+        ui.monospace(buffer.first_indices.iter().join(", "));
+
+        None
+    }
+
+    fn model_preview_ui(&self, ui: &mut egui::Ui, model: &ModelPreview) -> Option<TagHash> {
+        let mut open_new_tag = None;
+        ui.heading(model.label);
+        if let Some(class_name) = &model.class_name {
+            ui.monospace(class_name);
+        }
+
+        ui.separator();
+        open_new_tag = open_new_tag.or(related_tag_list_ui(
+            ui,
+            "Vertex buffers",
+            &model.vertex_buffers,
+        ));
+        open_new_tag = open_new_tag.or(related_tag_list_ui(
+            ui,
+            "Index buffers",
+            &model.index_buffers,
+        ));
+        open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Textures", &model.textures));
+        open_new_tag = open_new_tag.or(related_tag_list_ui(ui, "Shaders", &model.shaders));
+
+        open_new_tag
+    }
 }
 
 impl View for TagView {
@@ -1342,6 +1476,9 @@ impl View for TagView {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.mode, TagViewMode::Traversal, "Traversal");
+                if self.geometry_preview.is_some() {
+                    ui.selectable_value(&mut self.mode, TagViewMode::Geometry, "Geometry");
+                }
                 ui.selectable_value(&mut self.mode, TagViewMode::Hex, "Hex");
                 ui.selectable_value(&mut self.mode, TagViewMode::Float, "Floating point");
                 if self.hexview_referenced.is_some() {
@@ -1359,6 +1496,13 @@ impl View for TagView {
             match self.mode {
                 TagViewMode::Traversal => {
                     open_new_tag = open_new_tag.or(self.traverse_ui(ui));
+                }
+                TagViewMode::Geometry => {
+                    if self.geometry_preview.is_some() {
+                        open_new_tag = open_new_tag.or(self.geometry_ui(ui));
+                    } else {
+                        self.mode = TagViewMode::Traversal;
+                    }
                 }
                 TagViewMode::Hex => {
                     open_new_tag = open_new_tag.or(self.hexview.show(ui, &self.scan));
@@ -1842,6 +1986,40 @@ pub fn format_tag_entry(tag: TagHash, entry: Option<&UEntryHeader>) -> String {
     } else {
         format!("{} (pkg entry not found)", tag)
     }
+}
+
+fn related_tag_list_ui(
+    ui: &mut egui::Ui,
+    label: &str,
+    tags: &[(TagHash, UEntryHeader)],
+) -> Option<TagHash> {
+    let mut open_new_tag = None;
+    CollapsingHeader::new(egui::RichText::new(format!("{label} ({})", tags.len())).strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            if tags.is_empty() {
+                ui.label(RichText::new("None found in traversal cache").italics());
+                return;
+            }
+
+            for (tag, entry) in tags {
+                let tag_type = TagType::from_type_subtype(entry.file_type, entry.file_subtype);
+                let response = ui.selectable_label(
+                    false,
+                    RichText::new(format_tag_entry(*tag, Some(entry)))
+                        .color(tag_type.display_color()),
+                );
+                if response.tag_context(*tag).clicked() {
+                    open_new_tag = Some(*tag);
+                }
+            }
+        });
+
+    open_new_tag
+}
+
+fn format_vec3(value: [f32; 3]) -> String {
+    format!("[{:.3}, {:.3}, {:.3}]", value[0], value[1], value[2])
 }
 
 #[binread]
