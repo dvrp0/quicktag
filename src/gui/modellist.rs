@@ -33,6 +33,19 @@ pub struct ModelsView {
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
+    preview_show_wireframe: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedVertex {
+    pos: egui::Pos2,
+    depth: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedTriangle {
+    indices: [u32; 3],
+    depth: f32,
 }
 
 impl ModelsView {
@@ -50,6 +63,7 @@ impl ModelsView {
             preview_yaw: 0.4,
             preview_pitch: 0.25,
             preview_zoom: 1.0,
+            preview_show_wireframe: true,
         }
     }
 
@@ -193,6 +207,7 @@ impl View for ModelsView {
         let preview_yaw = &mut self.preview_yaw;
         let preview_pitch = &mut self.preview_pitch;
         let preview_zoom = &mut self.preview_zoom;
+        let preview_show_wireframe = &mut self.preview_show_wireframe;
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let Some(model) = preview.and_then(|preview| match &preview.kind {
@@ -225,8 +240,11 @@ impl View for ModelsView {
 
             if let Some(mesh) = &model.mesh_source {
                 ui.monospace(format!(
-                    "{} mesh: ib={} vb0={} vb1={} index_start={} index_count={} prim={} lod={}",
+                    "{} mesh: tech={} ib={} vb0={} vb1={} index_start={} index_count={} prim={} lod={}",
                     mesh.kind,
+                    mesh.technique
+                        .map(|tag| tag.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     mesh.index_buffer,
                     mesh.vertex0_buffer,
                     mesh.vertex1_buffer,
@@ -275,6 +293,7 @@ impl View for ModelsView {
                             preview_yaw,
                             preview_pitch,
                             preview_zoom,
+                            preview_show_wireframe,
                         );
                     } else {
                         ui.label(RichText::new("No wireframe assembled yet").italics());
@@ -397,32 +416,38 @@ pub(super) fn model_wireframe_ui(
     yaw: &mut f32,
     pitch: &mut f32,
     zoom: &mut f32,
+    show_wireframe: &mut bool,
 ) {
     ui.horizontal(|ui| {
         ui.label(format!(
             "{} vertices, {} indices ({})",
             wireframe.vertex_count_total, wireframe.index_count_total, wireframe.position_format
         ));
+        ui.checkbox(show_wireframe, "Wireframe");
         if ui.button("Reset view").clicked() {
             *yaw = 0.4;
             *pitch = 0.25;
             *zoom = 1.0;
         }
     });
-    let preview_texture = textures
-        .first()
+    let preview_texture = wireframe
+        .uv_format
+        .as_ref()
+        .and_then(|_| textures.first())
         .map(|(tag, _entry)| (*tag, texture_cache.get_or_default(*tag)));
-    if let Some((tag, (texture, _tid))) = &preview_texture {
-        let uv_source = wireframe
-            .uv_format
-            .as_deref()
-            .unwrap_or("fallback planar UVs");
-        ui.monospace(format!(
-            "textured preview: {} using {} ({}x{}, {:?})",
-            tag, uv_source, texture.desc.width, texture.desc.height, texture.desc.format
-        ));
-    } else {
+    if let Some(uv_source) = wireframe.uv_format.as_deref() {
+        if let Some((tag, (texture, _tid))) = &preview_texture {
+            ui.monospace(format!(
+                "textured preview: {} using {} ({}x{}, {:?})",
+                tag, uv_source, texture.desc.width, texture.desc.height, texture.desc.format
+            ));
+        } else {
+            ui.monospace("textured preview: no related texture resolved");
+        }
+    } else if textures.is_empty() {
         ui.monospace("textured preview: no related texture resolved");
+    } else {
+        ui.monospace("textured preview: unavailable (no decoded UVs for this tag)");
     }
     ui.monospace(format!(
         "source={} bounds [{:.3}, {:.3}, {:.3}] .. [{:.3}, {:.3}, {:.3}]",
@@ -467,28 +492,32 @@ pub(super) fn model_wireframe_ui(
     };
 
     if wireframe.indices.len() >= 3 {
-        if let Some((_tag, (_texture, texture_id))) = preview_texture {
+        if wireframe.uvs.is_some()
+            && let Some((_tag, (_texture, texture_id))) = preview_texture
+        {
             draw_textured_model_mesh(&painter, wireframe, &projected, texture_id, uv_transform);
         }
 
-        let stroke = Stroke::new(0.7, Color32::from_rgb(140, 210, 255));
-        for tri in wireframe.indices.chunks_exact(3).take(20_000) {
-            let Some(a) = projected.get(tri[0] as usize).copied() else {
-                continue;
-            };
-            let Some(b) = projected.get(tri[1] as usize).copied() else {
-                continue;
-            };
-            let Some(c) = projected.get(tri[2] as usize).copied() else {
-                continue;
-            };
-            painter.line_segment([a, b], stroke);
-            painter.line_segment([b, c], stroke);
-            painter.line_segment([c, a], stroke);
+        if *show_wireframe {
+            let stroke = Stroke::new(0.7, Color32::from_rgb(140, 210, 255));
+            for tri in wireframe.indices.chunks_exact(3) {
+                let Some(a) = projected.get(tri[0] as usize).map(|v| v.pos) else {
+                    continue;
+                };
+                let Some(b) = projected.get(tri[1] as usize).map(|v| v.pos) else {
+                    continue;
+                };
+                let Some(c) = projected.get(tri[2] as usize).map(|v| v.pos) else {
+                    continue;
+                };
+                painter.line_segment([a, b], stroke);
+                painter.line_segment([b, c], stroke);
+                painter.line_segment([c, a], stroke);
+            }
         }
     } else {
         for point in projected.iter().take(50_000) {
-            painter.circle_filled(*point, 1.0, Color32::from_rgb(140, 210, 255));
+            painter.circle_filled(point.pos, 1.0, Color32::from_rgb(140, 210, 255));
         }
     }
 }
@@ -496,27 +525,82 @@ pub(super) fn model_wireframe_ui(
 fn draw_textured_model_mesh(
     painter: &egui::Painter,
     wireframe: &WireframePreview,
-    projected: &[egui::Pos2],
+    projected: &[ProjectedVertex],
     texture_id: egui::TextureId,
     uv_transform: Option<UvTransformPreview>,
 ) {
-    let mut mesh = Mesh::with_texture(texture_id);
-    let tint = Color32::from_rgba_premultiplied(255, 255, 255, 220);
+    let mut triangles = projected_triangles(wireframe, projected);
+    triangles.sort_by(|a, b| a.depth.total_cmp(&b.depth));
 
-    for tri in wireframe.indices.chunks_exact(3).take(20_000) {
+    let mut base_mesh = Mesh::default();
+    add_projected_triangles_to_mesh(
+        &mut base_mesh,
+        wireframe,
+        projected,
+        &triangles,
+        uv_transform,
+        Color32::from_rgb(135, 100, 92),
+    );
+    if !base_mesh.indices.is_empty() {
+        painter.add(egui::Shape::mesh(base_mesh));
+    }
+
+    let mut mesh = Mesh::with_texture(texture_id);
+    add_projected_triangles_to_mesh(
+        &mut mesh,
+        wireframe,
+        projected,
+        &triangles,
+        uv_transform,
+        Color32::WHITE,
+    );
+
+    if !mesh.indices.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+fn projected_triangles(
+    wireframe: &WireframePreview,
+    projected: &[ProjectedVertex],
+) -> Vec<ProjectedTriangle> {
+    wireframe
+        .indices
+        .chunks_exact(3)
+        .filter_map(|tri| {
+            let a = projected.get(tri[0] as usize)?;
+            let b = projected.get(tri[1] as usize)?;
+            let c = projected.get(tri[2] as usize)?;
+            Some(ProjectedTriangle {
+                indices: [tri[0], tri[1], tri[2]],
+                depth: (a.depth + b.depth + c.depth) / 3.0,
+            })
+        })
+        .collect()
+}
+
+fn add_projected_triangles_to_mesh(
+    mesh: &mut Mesh,
+    wireframe: &WireframePreview,
+    projected: &[ProjectedVertex],
+    triangles: &[ProjectedTriangle],
+    uv_transform: Option<UvTransformPreview>,
+    color: Color32,
+) {
+    for tri in triangles {
         let base = mesh.vertices.len() as u32;
-        for index in tri {
-            let vertex_index = *index as usize;
+        for index in tri.indices {
+            let vertex_index = index as usize;
             let Some(position) = wireframe.vertices.get(vertex_index).copied() else {
                 continue;
             };
-            let Some(screen_pos) = projected.get(vertex_index).copied() else {
+            let Some(screen_pos) = projected.get(vertex_index).map(|v| v.pos) else {
                 continue;
             };
             mesh.vertices.push(Vertex {
                 pos: screen_pos,
                 uv: preview_uv(vertex_index, position, wireframe, uv_transform),
-                color: tint,
+                color,
             });
         }
 
@@ -525,10 +609,6 @@ fn draw_textured_model_mesh(
         } else {
             mesh.vertices.truncate(base as usize);
         }
-    }
-
-    if !mesh.indices.is_empty() {
-        painter.add(egui::Shape::mesh(mesh));
     }
 }
 
@@ -544,7 +624,8 @@ fn preview_uv(
         return transformed_uv(*uv, uv_transform);
     }
 
-    planar_preview_uv(position, wireframe, uv_transform)
+    let _ = (position, wireframe, uv_transform);
+    pos2(0.0, 0.0)
 }
 
 fn transformed_uv(uv: [f32; 2], uv_transform: Option<UvTransformPreview>) -> egui::Pos2 {
@@ -558,36 +639,13 @@ fn transformed_uv(uv: [f32; 2], uv_transform: Option<UvTransformPreview>) -> egu
     pos2(u.fract().abs(), v.fract().abs())
 }
 
-fn planar_preview_uv(
-    position: [f32; 3],
-    wireframe: &WireframePreview,
-    uv_transform: Option<UvTransformPreview>,
-) -> egui::Pos2 {
-    let extent_x = (wireframe.max[0] - wireframe.min[0]).abs().max(1.0);
-    let extent_z = (wireframe.max[2] - wireframe.min[2]).abs();
-    let extent_y = (wireframe.max[1] - wireframe.min[1]).abs().max(1.0);
-    let mut u = (position[0] - wireframe.min[0]) / extent_x;
-    let mut v = if extent_z > 0.0001 {
-        (position[2] - wireframe.min[2]) / extent_z.max(1.0)
-    } else {
-        (position[1] - wireframe.min[1]) / extent_y
-    };
-
-    if let Some(uv) = uv_transform {
-        u = u * uv.scale[0] + uv.offset[0];
-        v = v * uv.scale[1] + uv.offset[1];
-    }
-
-    pos2(u.fract().abs(), v.fract().abs())
-}
-
 fn project_vertices(
     wireframe: &WireframePreview,
     yaw: f32,
     pitch: f32,
     zoom: f32,
     rect: egui::Rect,
-) -> Option<Vec<egui::Pos2>> {
+) -> Option<Vec<ProjectedVertex>> {
     if wireframe.vertices.is_empty() {
         return None;
     }
@@ -621,8 +679,12 @@ fn project_vertices(
                 let xz = x * cy + z * sy;
                 let zz = -x * sy + z * cy;
                 let yz = y * cp - zz * sp;
+                let depth = y * sp + zz * cp;
 
-                pos2(screen_center.x + xz * scale, screen_center.y - yz * scale)
+                ProjectedVertex {
+                    pos: pos2(screen_center.x + xz * scale, screen_center.y - yz * scale),
+                    depth,
+                }
             })
             .collect(),
     )

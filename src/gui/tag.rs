@@ -121,6 +121,7 @@ pub struct TagView {
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
+    preview_show_wireframe: bool,
     decompiled_shader: Option<Result<String, String>>,
 }
 
@@ -413,6 +414,7 @@ impl TagView {
             preview_yaw: 0.4,
             preview_pitch: 0.25,
             preview_zoom: 1.0,
+            preview_show_wireframe: true,
             decompiled_shader,
         })
     }
@@ -441,6 +443,7 @@ impl TagView {
             tv.preview_yaw = self.preview_yaw;
             tv.preview_pitch = self.preview_pitch;
             tv.preview_zoom = self.preview_zoom;
+            tv.preview_show_wireframe = self.preview_show_wireframe;
 
             *self = tv;
         } else {
@@ -914,6 +917,7 @@ impl TagView {
             yaw: &mut self.preview_yaw,
             pitch: &mut self.preview_pitch,
             zoom: &mut self.preview_zoom,
+            show_wireframe: &mut self.preview_show_wireframe,
         };
 
         if let Some(gpu) = &self.geometry_gpu_preview {
@@ -1965,6 +1969,7 @@ struct PreviewOrbit<'a> {
     yaw: &'a mut f32,
     pitch: &'a mut f32,
     zoom: &'a mut f32,
+    show_wireframe: &'a mut bool,
 }
 
 #[repr(C)]
@@ -2741,6 +2746,7 @@ fn model_preview_ui(
             orbit.yaw,
             orbit.pitch,
             orbit.zoom,
+            orbit.show_wireframe,
         );
     } else {
         ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));
@@ -2757,6 +2763,14 @@ fn model_preview_ui(
                 ui.end_row();
                 ui.label("Buffer index");
                 ui.monospace(source.buffer_index.to_string());
+                ui.end_row();
+                ui.label("Technique");
+                ui.monospace(
+                    source
+                        .technique
+                        .map(|tag| tag.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                );
                 ui.end_row();
                 ui.label("Index range");
                 ui.monospace(format!(
@@ -2921,7 +2935,7 @@ fn wireframe_preview_ui(
 
     if wireframe.indices.len() >= 3 {
         let stroke = egui::Stroke::new(0.7, Color32::from_rgb(140, 210, 255));
-        for tri in wireframe.indices.chunks_exact(3).take(20_000) {
+        for tri in wireframe.indices.chunks_exact(3) {
             let Some(a) = projected.get(tri[0] as usize).copied() else {
                 continue;
             };

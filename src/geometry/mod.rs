@@ -4,15 +4,27 @@ use itertools::Itertools;
 use quicktag_core::classes::get_class_by_id;
 use quicktag_core::tagtypes::TagType;
 use quicktag_scanner::TagCache;
+use std::cmp::Reverse;
 use std::sync::Arc;
 use tiger_pkg::{TagHash, TagHash64, Version, package::UEntryHeader, package_manager};
 use wgpu::util::DeviceExt;
 
-use crate::material::{is_technique_entry, texture_tags_for_technique};
+use crate::material::{
+    TechniqueTextureBinding, is_technique_entry, texture_bindings_for_technique,
+};
+use crate::texture::Texture;
 
 const MAX_PREVIEW_VERTICES: usize = 200_000;
-const MAX_PREVIEW_INDICES: usize = 300_000;
+const MAX_PREVIEW_INDICES: usize = 900_000;
 const TECHNIQUE_SCAN_CHILD_LIMIT: usize = 128;
+const CLASS_GEOMETRY_RESOURCE: u32 = 0x8080881C;
+const CLASS_GEOMETRY_BUFFER_SET: u32 = 0x808087CB;
+const CLASS_VERTEX_INPUT_LAYOUT_MAPPING: u32 = 0x80808664;
+const CLASS_VERTEX_INPUT_ELEMENT_SETS: u32 = 0x80808668;
+const CLASS_VERTEX_LAYOUT_ARRAY: u32 = 0x80808667;
+const CLASS_VERTEX_INPUT_ELEMENT_ARRAY: u32 = 0x8080866D;
+const CLASS_ENTITY_RESOURCE: u32 = 0x80809B06;
+const SEMANTIC_TEXCOORD: u8 = 0x05;
 
 #[derive(Debug, Clone)]
 pub struct GeometryTagPreview {
@@ -148,115 +160,20 @@ struct InputLayoutTexcoord {
     format: InputLayoutFormat,
 }
 
-const INPUT_LAYOUT_TEXCOORDS: [Option<InputLayoutTexcoord>; 27] = [
-    None,
-    None,
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 8,
-        format: InputLayoutFormat::R32G32Float,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 12,
-        format: InputLayoutFormat::R32G32Float,
-    }),
-    None,
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 8,
-        format: InputLayoutFormat::R32G32Float,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 40,
-        format: InputLayoutFormat::R32G32Float,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 1,
-        offset: 0,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 1,
-        offset: 0,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 8,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    None,
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 8,
-        format: InputLayoutFormat::R32G32B32Float,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 12,
-        format: InputLayoutFormat::R32G32Float,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 1,
-        offset: 0,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 40,
-        format: InputLayoutFormat::R32G32B32A32Float,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 16,
-        format: InputLayoutFormat::R32G32Float,
-    }),
-    None,
-    Some(InputLayoutTexcoord {
-        buffer_index: 1,
-        offset: 0,
-        format: InputLayoutFormat::R32G32B32Float,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 8,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 16,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 16,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 1,
-        offset: 0,
-        format: InputLayoutFormat::R32G32B32Float,
-    }),
-    None,
-    None,
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 12,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 12,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-    Some(InputLayoutTexcoord {
-        buffer_index: 0,
-        offset: 8,
-        format: InputLayoutFormat::R16G16Snorm,
-    }),
-];
+#[derive(Clone, Copy)]
+struct TagArray {
+    class: u32,
+    count: usize,
+    data_offset: usize,
+    end_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct VertexInputElement {
+    semantic: u8,
+    semantic_index: u8,
+    format: u8,
+}
 
 impl std::fmt::Display for InputLayoutFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -297,6 +214,7 @@ pub struct WireframePreview {
 pub struct MeshSourcePreview {
     pub kind: &'static str,
     pub buffer_index: usize,
+    pub technique: Option<TagHash>,
     pub index_start: u32,
     pub index_count: u32,
     pub primitive_type: u8,
@@ -672,23 +590,167 @@ fn find_model_textures(
     tag: TagHash,
     techniques: &[(TagHash, UEntryHeader)],
 ) -> Vec<(TagHash, UEntryHeader)> {
-    let technique_textures = techniques
+    let technique_order = techniques
+        .iter()
+        .enumerate()
+        .map(|(index, (tag, _entry))| (*tag, index))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut textures = techniques
         .iter()
         .map(|(tag, _entry)| *tag)
         .into_iter()
-        .flat_map(texture_tags_from_technique)
+        .enumerate()
+        .flat_map(texture_bindings_from_technique)
         .filter_map(|texture_tag| {
             package_manager()
-                .get_entry(texture_tag)
-                .map(|entry| (texture_tag, entry))
-        });
-    let recursive_textures = find_related_tags(cache, tag, TagSearchKind::Texture, 8);
+                .get_entry(texture_tag.binding.tag)
+                .map(|entry| {
+                    (
+                        texture_tag.binding.tag,
+                        entry,
+                        texture_tag.technique_order,
+                        texture_binding_rank(texture_tag.binding),
+                        (texture_tag.binding.tag.pkg_id() != tag.pkg_id()) as u8,
+                        0usize,
+                        texture_tag.technique_order,
+                        texture_preview_rank(texture_tag.binding.tag),
+                    )
+                })
+        })
+        .chain(
+            find_related_tags(cache, tag, TagSearchKind::Texture, 8)
+                .into_iter()
+                .map(|(texture_tag, entry)| {
+                    let (parent_count, parent_order) =
+                        texture_parent_technique_rank(cache, texture_tag, &technique_order);
+                    (
+                        texture_tag,
+                        entry,
+                        usize::MAX,
+                        200,
+                        (texture_tag.pkg_id() != tag.pkg_id()) as u8,
+                        parent_count,
+                        parent_order,
+                        texture_preview_rank(texture_tag),
+                    )
+                }),
+        )
+        .collect_vec();
 
-    technique_textures
-        .chain(recursive_textures)
-        .unique_by(|(tag, _entry)| *tag)
+    textures.sort_by_key(
+        |(
+            tag,
+            entry,
+            technique_order,
+            rank,
+            locality,
+            parent_count,
+            parent_order,
+            preview_rank,
+        )| {
+            (
+                *technique_order,
+                *rank,
+                *locality,
+                *preview_rank,
+                Reverse(*parent_count),
+                *parent_order,
+                Reverse(entry.file_size),
+                tag.0,
+            )
+        },
+    );
+    textures
+        .into_iter()
+        .unique_by(
+            |(
+                tag,
+                _entry,
+                _technique_order,
+                _rank,
+                _locality,
+                _parent_count,
+                _parent_order,
+                _preview_rank,
+            )| { *tag },
+        )
+        .map(
+            |(
+                tag,
+                entry,
+                _technique_order,
+                _rank,
+                _locality,
+                _parent_count,
+                _parent_order,
+                _preview_rank,
+            )| { (tag, entry) },
+        )
         .take(128)
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TexturePreviewRank {
+    shape: u8,
+    format: u8,
+    area: Reverse<u64>,
+    width: Reverse<u32>,
+}
+
+fn texture_preview_rank(tag: TagHash) -> TexturePreviewRank {
+    let Ok((desc, _data, _comment)) = Texture::load_data_d2(tag, false) else {
+        return TexturePreviewRank {
+            shape: 100,
+            format: 100,
+            area: Reverse(0),
+            width: Reverse(0),
+        };
+    };
+
+    let format = format!("{:?}", desc.format);
+    let format_rank = if format.contains("Srgb") {
+        0
+    } else if format.contains("Bc7") || format.contains("Rgba") {
+        20
+    } else if format.contains("Bc4") {
+        80
+    } else {
+        50
+    };
+    let shape_rank = if desc.depth == 1 && desc.array_size == 1 && desc.width > 1 && desc.height > 1
+    {
+        0
+    } else {
+        50
+    };
+
+    TexturePreviewRank {
+        shape: shape_rank,
+        format: format_rank,
+        area: Reverse(desc.width as u64 * desc.height as u64),
+        width: Reverse(desc.width as u32),
+    }
+}
+
+fn texture_parent_technique_rank(
+    cache: &TagCache,
+    texture_tag: TagHash,
+    technique_order: &rustc_hash::FxHashMap<TagHash, usize>,
+) -> (usize, usize) {
+    let Some(scan) = cache.hashes.get(&texture_tag) else {
+        return (0, usize::MAX);
+    };
+
+    let parents = scan
+        .references
+        .iter()
+        .filter_map(|parent| technique_order.get(parent).copied())
+        .collect_vec();
+    (
+        parents.len(),
+        parents.into_iter().min().unwrap_or(usize::MAX),
+    )
 }
 
 fn find_model_technique_entries(
@@ -704,7 +766,14 @@ fn find_model_technique_entries(
         .collect()
 }
 
-fn texture_tags_from_technique(tag: TagHash) -> Vec<TagHash> {
+struct TechniqueOrderedTextureBinding {
+    technique_order: usize,
+    binding: TechniqueTextureBinding,
+}
+
+fn texture_bindings_from_technique(
+    (technique_order, tag): (usize, TagHash),
+) -> Vec<TechniqueOrderedTextureBinding> {
     let Some(entry) = package_manager().get_entry(tag) else {
         return vec![];
     };
@@ -712,7 +781,31 @@ fn texture_tags_from_technique(tag: TagHash) -> Vec<TagHash> {
         return vec![];
     };
 
-    texture_tags_for_technique(&entry, &data)
+    texture_bindings_for_technique(&entry, &data)
+        .into_iter()
+        .map(|binding| TechniqueOrderedTextureBinding {
+            technique_order,
+            binding,
+        })
+        .collect()
+}
+
+fn texture_binding_rank(binding: TechniqueTextureBinding) -> u8 {
+    let slot_rank = match binding.slot {
+        0 => 0,
+        2 => 20,
+        5 => 50,
+        10 => 60,
+        _ => 100,
+    };
+    let stage_rank = match binding.stage {
+        "PS" => 0,
+        "VS" => 5,
+        "GS" => 10,
+        "CS" => 15,
+        _ => 20,
+    };
+    slot_rank + stage_rank
 }
 
 fn find_model_technique_tags(cache: &TagCache, tag: TagHash, entry: &UEntryHeader) -> Vec<TagHash> {
@@ -738,8 +831,11 @@ fn find_model_technique_tags(cache: &TagCache, tag: TagHash, entry: &UEntryHeade
         0x80806D30 | 0x80808620 => find_static_meshdata_owner_techniques(cache, tag),
         0x80806F07 => dynamic_model_technique_tags(&data, endian),
         0x80806EC5 => dynamic_mesh_technique_tags(&data, endian),
+        CLASS_GEOMETRY_RESOURCE => geometry_resource_technique_tags(&data, endian),
         _ => vec![],
     };
+    let parent_entity_resource_materials =
+        find_parent_entity_resource_material_techniques(cache, tag, endian);
     let raw_current = technique_tags_in_blob(&data, endian);
     let raw_children = find_child_technique_tags(cache, tag, endian);
     let recursive = find_related_tags(cache, tag, TagSearchKind::Technique, 8)
@@ -748,9 +844,61 @@ fn find_model_technique_tags(cache: &TagCache, tag: TagHash, entry: &UEntryHeade
 
     direct
         .into_iter()
+        .chain(parent_entity_resource_materials)
         .chain(raw_current)
         .chain(raw_children)
         .chain(recursive)
+        .unique()
+        .collect()
+}
+
+fn find_parent_entity_resource_material_techniques(
+    cache: &TagCache,
+    tag: TagHash,
+    endian: Endian,
+) -> Vec<TagHash> {
+    cache
+        .hashes
+        .get(&tag)
+        .into_iter()
+        .flat_map(|scan| scan.references.iter().copied())
+        .filter_map(|parent| {
+            let entry = package_manager().get_entry(parent)?;
+            (entry.reference == CLASS_ENTITY_RESOURCE).then_some(parent)
+        })
+        .filter_map(|parent| package_manager().read_tag(parent).ok())
+        .flat_map(|data| entity_resource_material_technique_tags(&data, tag, endian))
+        .unique()
+        .collect()
+}
+
+fn entity_resource_material_technique_tags(
+    data: &[u8],
+    referenced_model: TagHash,
+    endian: Endian,
+) -> Vec<TagHash> {
+    // Alkahest reads SEntityResource.unk18.offset + 0x224 for model,
+    // +0x3c0 for material variant map, +0x400 for material techniques.
+    let Some(resource_offset) = read_u32_at(data, 0x18, endian).map(|offset| offset as usize)
+    else {
+        return vec![];
+    };
+    if resource_offset + 0x410 > data.len() {
+        return vec![];
+    }
+
+    let model_matches = read_tag_at(data, resource_offset + 0x224, endian)
+        .is_some_and(|model| model == referenced_model);
+    let parent_references_model = candidate_tag_hashes_in_blob(data, endian)
+        .into_iter()
+        .any(|tag| tag == referenced_model);
+    if !model_matches && !parent_references_model {
+        return vec![];
+    }
+
+    read_tag_array(data, resource_offset + 0x400, endian)
+        .into_iter()
+        .filter(|tag| is_technique_tag(*tag))
         .unique()
         .collect()
 }
@@ -817,7 +965,7 @@ fn find_child_technique_tags(cache: &TagCache, tag: TagHash, endian: Endian) -> 
 
 fn triangle_indices_to_line_indices(indices: &[u32]) -> Vec<u32> {
     let mut lines = Vec::with_capacity(indices.len().saturating_mul(2));
-    for tri in indices.chunks_exact(3).take(20_000) {
+    for tri in indices.chunks_exact(3) {
         lines.extend_from_slice(&[tri[0], tri[1], tri[1], tri[2], tri[2], tri[0]]);
     }
 
@@ -839,6 +987,7 @@ fn parse_model_wireframe(
             let data = package_manager().read_tag(tag).ok()?;
             parse_dynamic_mesh_wireframe(&data)
         }
+        CLASS_GEOMETRY_RESOURCE => parse_geometry_resource_wireframe(tag),
         _ => None,
     }
 }
@@ -858,11 +1007,13 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
     let buffers = read_static_buffer_tuples(data, 0x28, endian);
     let group = groups
         .iter()
-        .find(|group| {
+        .filter_map(|group| {
             parts
                 .get(group.part_index as usize)
-                .is_some_and(|part| is_highest_detail_lod(part.lod_category))
+                .map(|part| (group, part))
         })
+        .min_by_key(|(_group, part)| (lod_selection_rank(part.lod_category), part.index_start))
+        .map(|(group, _part)| group)
         .or_else(|| groups.first())?;
     let part = parts.get(group.part_index as usize)?;
     let buffers = buffers.get(part.buffer_index as usize)?;
@@ -871,10 +1022,11 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
     let source = MeshSourcePreview {
         kind: "static mesh data",
         buffer_index: part.buffer_index as usize,
+        technique: None,
         index_start: part.index_start,
         index_count: part.index_count,
         primitive_type: part.primitive_type,
-        lod_category: part.lod_category,
+        lod_category: lod_preview_value(part.lod_category),
         input_layout_index: Some(group.input_layout_index),
         index_buffer: buffers.index_buffer,
         vertex0_buffer: buffers.vertex0_buffer,
@@ -886,7 +1038,10 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
     let wireframe = build_wireframe_from_refs(
         &[source.vertex0_buffer, source.vertex1_buffer],
         source.index_buffer,
-        Some(source.index_start as usize..(source.index_start + source.index_count) as usize),
+        &[PreviewIndexRange {
+            range: source.index_start as usize..(source.index_start + source.index_count) as usize,
+            primitive_type: source.primitive_type,
+        }],
         source.input_layout_index,
     )?;
 
@@ -909,15 +1064,16 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
     let parts = read_dynamic_mesh_parts(data, 0x20, endian);
     let part = parts
         .iter()
-        .find(|part| is_highest_detail_lod(part.lod_category))
+        .min_by_key(|part| (lod_selection_rank(part.lod_category), part.index_start))
         .or_else(|| parts.first())?;
     let source = MeshSourcePreview {
         kind: "dynamic mesh",
         buffer_index: 0,
+        technique: Some(part.technique),
         index_start: part.index_start,
         index_count: part.index_count,
         primitive_type: part.primitive_type,
-        lod_category: part.lod_category,
+        lod_category: lod_preview_value(part.lod_category),
         input_layout_index: first_dynamic_input_layout(data),
         index_buffer: TagHash(read_u32(data.get(0x10..0x14)?, endian)),
         vertex0_buffer: TagHash(read_u32(data.get(0x0..0x4)?, endian)),
@@ -929,7 +1085,104 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
     let wireframe = build_wireframe_from_refs(
         &[source.vertex0_buffer, source.vertex1_buffer],
         source.index_buffer,
-        Some(source.index_start as usize..(source.index_start + source.index_count) as usize),
+        &[PreviewIndexRange {
+            range: source.index_start as usize..(source.index_start + source.index_count) as usize,
+            primitive_type: source.primitive_type,
+        }],
+        source.input_layout_index,
+    )?;
+
+    Some((source, wireframe))
+}
+
+fn parse_geometry_resource_wireframe(
+    tag: TagHash,
+) -> Option<(MeshSourcePreview, WireframePreview)> {
+    let data = package_manager().read_tag(tag).ok()?;
+    let endian = package_manager().version.endian();
+    let uv_transform = read_geometry_uv_transform(&data, endian);
+    let ranges = geometry_primary_index_ranges(&data, endian);
+    let range = ranges.first();
+    let index_count = ranges
+        .iter()
+        .map(|range| range.index_count)
+        .fold(0u32, u32::saturating_add);
+
+    let mesh_records = scan_arrays(&data, endian)
+        .into_iter()
+        .filter(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
+        .flat_map(|array| array_records(&data, array, 0x80))
+        .collect_vec();
+
+    if let Some(mesh) = mesh_records.first() {
+        let vertex0_buffer = read_tag_at(mesh, 0x0, endian)?;
+        let vertex1_buffer = read_tag_at(mesh, 0x4, endian).unwrap_or(TagHash(0));
+        let index_buffer = read_tag_at(mesh, 0x10, endian)?;
+        let input_layout_index = geometry_buffer_set_input_layout_id(mesh);
+        let index_ranges = index_ranges_from_geometry_ranges(&ranges);
+        let source = MeshSourcePreview {
+            kind: "geometry resource",
+            buffer_index: 0,
+            technique: range.map(|range| range.technique),
+            index_start: range.map(|range| range.index_start).unwrap_or(0),
+            index_count: if index_count == 0 {
+                u32::MAX
+            } else {
+                index_count
+            },
+            primitive_type: range.map(|range| range.primitive_type).unwrap_or(0),
+            lod_category: range
+                .map(|range| lod_preview_value(range.lod_category))
+                .unwrap_or(0),
+            input_layout_index,
+            index_buffer,
+            vertex0_buffer,
+            vertex1_buffer,
+            color_buffer: TagHash(0),
+            uv_transform,
+            shader_constants: shader_constants_from_uv_transform(uv_transform),
+        };
+        let wireframe = build_wireframe_from_refs(
+            &[source.vertex0_buffer, source.vertex1_buffer],
+            source.index_buffer,
+            index_ranges.as_slice(),
+            source.input_layout_index,
+        )?;
+
+        return Some((source, wireframe));
+    }
+
+    let index_buffer = read_tag_at(&data, 0x140, endian)?;
+    let vertex0_buffer = read_tag_at(&data, 0x130, endian)?;
+    let vertex1_buffer = read_tag_at(&data, 0x134, endian).unwrap_or(TagHash(0));
+    let input_layout_index = geometry_primary_layout_id(&data, endian);
+    let index_ranges = index_ranges_from_geometry_ranges(&ranges);
+    let source = MeshSourcePreview {
+        kind: "geometry resource",
+        buffer_index: 0,
+        technique: range.map(|range| range.technique),
+        index_start: range.map(|range| range.index_start).unwrap_or(0),
+        index_count: if index_count == 0 {
+            u32::MAX
+        } else {
+            index_count
+        },
+        primitive_type: range.map(|range| range.primitive_type).unwrap_or(0),
+        lod_category: range
+            .map(|range| lod_preview_value(range.lod_category))
+            .unwrap_or(0),
+        input_layout_index,
+        index_buffer,
+        vertex0_buffer,
+        vertex1_buffer,
+        color_buffer: TagHash(0),
+        uv_transform,
+        shader_constants: shader_constants_from_uv_transform(uv_transform),
+    };
+    let wireframe = build_wireframe_from_refs(
+        &[source.vertex0_buffer, source.vertex1_buffer],
+        source.index_buffer,
+        index_ranges.as_slice(),
         source.input_layout_index,
     )?;
 
@@ -939,7 +1192,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
 fn build_wireframe_from_refs(
     vertex_tags: &[TagHash],
     index_tag: TagHash,
-    index_range: Option<std::ops::Range<usize>>,
+    index_ranges: &[PreviewIndexRange],
     input_layout_index: Option<u8>,
 ) -> Option<WireframePreview> {
     let mut vertex_previews = vertex_tags
@@ -980,17 +1233,27 @@ fn build_wireframe_from_refs(
     let index_preview =
         load_index_buffer_preview_for_tag(index_tag, &index_entry, &index_header).ok()?;
     wireframe.index_count_total = index_preview.index_count;
-    wireframe.indices = if let Some(range) = index_range {
+    wireframe.indices = if index_ranges.is_empty() {
         index_preview
             .indices
-            .get(
-                range.start.min(index_preview.indices.len())
-                    ..range.end.min(index_preview.indices.len()),
-            )
-            .unwrap_or_default()
-            .to_vec()
+            .into_iter()
+            .take(MAX_PREVIEW_INDICES)
+            .collect()
     } else {
-        index_preview.indices
+        index_ranges
+            .iter()
+            .flat_map(|range| {
+                let source = index_preview
+                    .indices
+                    .get(
+                        range.range.start.min(index_preview.indices.len())
+                            ..range.range.end.min(index_preview.indices.len()),
+                    )
+                    .unwrap_or_default();
+                preview_triangles_from_indices(source, range.primitive_type)
+            })
+            .take(MAX_PREVIEW_INDICES)
+            .collect()
     };
     wireframe.source = format!("{vertex_tag} + {index_tag}");
 
@@ -1021,9 +1284,9 @@ fn input_layout_uvs(
     input_layout_index: Option<u8>,
     vertex_count: usize,
 ) -> Option<(TagHash, InputLayoutFormat, Vec<[f32; 2]>)> {
-    let layout = INPUT_LAYOUT_TEXCOORDS
-        .get(input_layout_index? as usize)?
-        .as_ref()?;
+    let layout_index = input_layout_index?;
+    let layout = resolved_input_layout_texcoord0(layout_index)
+        .or_else(|| alkahest_input_layout_texcoord0(layout_index))?;
     let (tag, preview) = vertex_previews.get(layout.buffer_index)?;
     let entry = package_manager().get_entry(*tag)?;
     let data = package_manager().read_tag(TagHash(entry.reference)).ok()?;
@@ -1032,11 +1295,108 @@ fn input_layout_uvs(
         &data,
         preview.header.stride as usize,
         endian,
-        *layout,
+        layout,
         vertex_count,
     );
 
     (!uvs.is_empty()).then_some((*tag, layout.format, uvs))
+}
+
+fn resolved_input_layout_texcoord0(layout_id: u8) -> Option<InputLayoutTexcoord> {
+    let stream_sets = vertex_layout_stream_sets_for_any_mapping(layout_id)?;
+
+    for element_tag in tags_by_class(CLASS_VERTEX_INPUT_ELEMENT_SETS) {
+        let sets = vertex_input_element_sets(element_tag);
+        for (buffer_index, set_index) in stream_sets.iter().copied().enumerate() {
+            let Some(elements) = sets.get(set_index) else {
+                continue;
+            };
+            let mut offset = 0usize;
+            for element in elements {
+                let size = vertex_input_element_size(*element)?;
+                if element.semantic == SEMANTIC_TEXCOORD && element.semantic_index == 0 {
+                    return Some(InputLayoutTexcoord {
+                        buffer_index,
+                        offset,
+                        format: input_layout_format_from_vertex_format(element.format)?,
+                    });
+                }
+                offset = offset.checked_add(size)?;
+            }
+        }
+    }
+
+    None
+}
+
+fn alkahest_input_layout_texcoord0(layout_id: u8) -> Option<InputLayoutTexcoord> {
+    match layout_id {
+        2 | 5 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 8,
+            format: InputLayoutFormat::R32G32Float,
+        }),
+        3 | 12 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 12,
+            format: InputLayoutFormat::R32G32Float,
+        }),
+        6 | 75 | 76 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 40,
+            format: InputLayoutFormat::R32G32Float,
+        }),
+        7 | 8 | 13 => Some(InputLayoutTexcoord {
+            buffer_index: 1,
+            offset: 0,
+            format: InputLayoutFormat::R16G16Snorm,
+        }),
+        9 | 18 | 26 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 8,
+            format: InputLayoutFormat::R16G16Snorm,
+        }),
+        11 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 8,
+            format: InputLayoutFormat::R32G32B32Float,
+        }),
+        14 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 40,
+            format: InputLayoutFormat::R32G32B32A32Float,
+        }),
+        15 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 16,
+            format: InputLayoutFormat::R32G32Float,
+        }),
+        17 | 21 => Some(InputLayoutTexcoord {
+            buffer_index: 1,
+            offset: 0,
+            format: InputLayoutFormat::R32G32B32Float,
+        }),
+        19 | 20 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 16,
+            format: InputLayoutFormat::R16G16Snorm,
+        }),
+        24 | 25 => Some(InputLayoutTexcoord {
+            buffer_index: 0,
+            offset: 12,
+            format: InputLayoutFormat::R16G16Snorm,
+        }),
+        27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 | 35 | 36 | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44
+        | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 52 | 53 | 54 | 55 | 56 | 57 | 58 | 59 | 60 | 61
+        | 62 | 63 | 64 | 65 | 66 | 67 | 68 | 69 | 70 | 71 | 72 | 73 | 74 => {
+            Some(InputLayoutTexcoord {
+                buffer_index: 0,
+                offset: 0,
+                format: InputLayoutFormat::R32G32B32A32Float,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn decode_input_layout_uvs(
@@ -1140,10 +1500,26 @@ struct StaticMeshGroupPreview {
 
 #[derive(Debug, Clone)]
 struct DynamicMeshPartPreview {
+    technique: TagHash,
     index_start: u32,
     index_count: u32,
     primitive_type: u8,
     lod_category: u8,
+}
+
+#[derive(Debug, Clone)]
+struct GeometryIndexRangePreview {
+    technique: TagHash,
+    index_start: u32,
+    index_count: u32,
+    primitive_type: u8,
+    lod_category: u8,
+}
+
+#[derive(Debug, Clone)]
+struct PreviewIndexRange {
+    range: std::ops::Range<usize>,
+    primitive_type: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -1245,6 +1621,35 @@ fn dynamic_mesh_technique_tags(data: &[u8], endian: Endian) -> Vec<TagHash> {
         .collect()
 }
 
+fn geometry_resource_technique_tags(data: &[u8], endian: Endian) -> Vec<TagHash> {
+    let ranges = geometry_index_range_candidates(data, endian);
+    if ranges.is_empty() {
+        return vec![];
+    }
+
+    let primary_lod = ranges.iter().map(|(_, lod, _)| *lod).min().unwrap_or(0);
+    let primary_pass = ranges
+        .iter()
+        .filter(|(_, lod, pass)| *lod == primary_lod && *pass > 0)
+        .map(|(_, _, pass)| *pass)
+        .min()
+        .unwrap_or(0);
+
+    ranges
+        .into_iter()
+        .sorted_by_key(|(range, lod, pass)| {
+            (
+                *lod != primary_lod,
+                primary_pass != 0 && *pass != primary_pass,
+                range.index_start,
+            )
+        })
+        .map(|(range, _, _)| range.technique)
+        .filter(|tag| tag.is_some())
+        .unique()
+        .collect()
+}
+
 fn technique_tags_in_blob(data: &[u8], endian: Endian) -> Vec<TagHash> {
     let alternate = match endian {
         Endian::Little => Endian::Big,
@@ -1309,6 +1714,7 @@ fn read_dynamic_mesh_parts(
         .flat_map(|array| array.chunks_exact(0x24))
         .filter_map(|part| {
             Some(DynamicMeshPartPreview {
+                technique: TagHash(read_u32(part.get(0x0..0x4)?, endian)),
                 primitive_type: *part.get(0x6)?,
                 index_start: read_u32(part.get(0x8..0xc)?, endian),
                 index_count: read_u32(part.get(0xc..0x10)?, endian),
@@ -1316,6 +1722,337 @@ fn read_dynamic_mesh_parts(
             })
         })
         .collect()
+}
+
+fn geometry_buffer_set_input_layout_id(mesh: &[u8]) -> Option<u8> {
+    mesh.get(0x64)
+        .copied()
+        .filter(|layout| *layout != 0)
+        .or_else(|| mesh.get(0x62).copied().filter(|layout| *layout != 0))
+}
+
+fn geometry_primary_index_ranges(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
+    let candidates = geometry_index_range_candidates(data, endian);
+
+    let Some(primary_lod) = candidates.iter().map(|(_, lod, _)| *lod).min() else {
+        return vec![];
+    };
+    let primary_pass = candidates
+        .iter()
+        .filter(|(_, lod, pass)| *lod == primary_lod && *pass > 0)
+        .map(|(_, _, pass)| *pass)
+        .min()
+        .unwrap_or(0);
+
+    candidates
+        .into_iter()
+        .filter(|(_, lod, pass)| {
+            *lod == primary_lod && (primary_pass == 0 || *pass == primary_pass)
+        })
+        .map(|(range, _, _)| range)
+        .sorted_by_key(|range| range.index_start)
+        .collect()
+}
+
+fn index_ranges_from_geometry_ranges(
+    ranges: &[GeometryIndexRangePreview],
+) -> Vec<PreviewIndexRange> {
+    ranges
+        .iter()
+        .map(|range| PreviewIndexRange {
+            range: range.index_start as usize
+                ..range.index_start.saturating_add(range.index_count) as usize,
+            primitive_type: range.primitive_type,
+        })
+        .collect()
+}
+
+fn preview_triangles_from_indices(indices: &[u32], primitive_type: u8) -> Vec<u32> {
+    if primitive_type != 5 {
+        return indices.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(indices.len().saturating_sub(2).saturating_mul(3));
+    for (i, window) in indices.windows(3).enumerate() {
+        let a = window[0];
+        let b = window[1];
+        let c = window[2];
+        if a == b || b == c || a == c {
+            continue;
+        }
+        if i % 2 == 0 {
+            out.extend_from_slice(&[a, b, c]);
+        } else {
+            out.extend_from_slice(&[b, a, c]);
+        }
+    }
+    out
+}
+
+fn geometry_index_range_candidates(
+    data: &[u8],
+    endian: Endian,
+) -> Vec<(GeometryIndexRangePreview, u8, u8)> {
+    let mut candidates = Vec::<(GeometryIndexRangePreview, u8, u8)>::new();
+
+    for offset in (0..data.len().saturating_sub(0x28)).step_by(4) {
+        let Some(material) = read_tag_at(data, offset, endian) else {
+            continue;
+        };
+        if !package_manager()
+            .get_entry(material)
+            .is_some_and(|entry| is_technique_entry(&entry))
+        {
+            continue;
+        }
+
+        let Some(index_start) = read_u32_at(data, offset + 0x8, endian) else {
+            continue;
+        };
+        let Some(index_count) = read_u32_at(data, offset + 0xc, endian) else {
+            continue;
+        };
+        let Some(triangle_count) = read_u32_at(data, offset + 0x10, endian) else {
+            continue;
+        };
+        let Some(flags) = read_u32_at(data, offset + 0x20, endian) else {
+            continue;
+        };
+        let lod = ((flags >> 8) & 0xff) as u8;
+        let pass = ((flags >> 16) & 0xff) as u8;
+        if index_count < 3 || triangle_count == 0 {
+            continue;
+        }
+
+        candidates.push((
+            GeometryIndexRangePreview {
+                technique: material,
+                index_start,
+                index_count,
+                primitive_type: if index_count == triangle_count.saturating_mul(3) {
+                    3
+                } else {
+                    5
+                },
+                lod_category: lod,
+            },
+            lod,
+            pass,
+        ));
+    }
+
+    candidates
+}
+
+fn geometry_primary_layout_id(data: &[u8], endian: Endian) -> Option<u8> {
+    let mut best = None::<(u8, usize)>;
+
+    for array in scan_arrays(data, endian) {
+        if array.class != CLASS_GEOMETRY_BUFFER_SET {
+            continue;
+        }
+
+        let record =
+            data.get(array.data_offset.min(data.len())..array.end_offset.min(data.len()))?;
+        let mut counts = [0usize; 0x40];
+        for &byte in record.iter().skip(record.len() / 2) {
+            if byte > 0 && (byte as usize) < counts.len() {
+                counts[byte as usize] += 1;
+            }
+        }
+
+        if let Some((layout_id, count)) = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, count)| **count)
+            .filter(|(_, count)| **count >= 4)
+        {
+            let replace = best
+                .map(|(_, best_count)| *count > best_count)
+                .unwrap_or(true);
+            if replace {
+                best = Some((layout_id as u8, *count));
+            }
+        }
+    }
+
+    best.map(|(layout_id, _)| layout_id)
+}
+
+fn read_geometry_uv_transform(data: &[u8], endian: Endian) -> Option<UvTransformPreview> {
+    let scale = [
+        read_f32(data.get(0xc0..0xc4)?, endian),
+        read_f32(data.get(0xc4..0xc8)?, endian),
+    ];
+    let offset = [
+        read_f32(data.get(0xc8..0xcc)?, endian),
+        read_f32(data.get(0xcc..0xd0)?, endian),
+    ];
+    (scale
+        .into_iter()
+        .chain(offset)
+        .all(|value| value.is_finite())
+        && scale.iter().any(|value| value.abs() > 0.000001))
+    .then_some(UvTransformPreview { scale, offset })
+}
+
+fn scan_arrays(data: &[u8], endian: Endian) -> Vec<TagArray> {
+    let marker_offsets = (0..data.len().saturating_sub(4))
+        .step_by(4)
+        .filter(|offset| read_u32_at(data, *offset, endian) == Some(0x8080BFCD))
+        .collect_vec();
+
+    marker_offsets
+        .iter()
+        .enumerate()
+        .filter_map(|(i, marker_offset)| {
+            Some(TagArray {
+                class: read_u32_at(data, marker_offset + 12, endian)?,
+                count: read_u64_at(data, marker_offset + 4, endian)? as usize,
+                data_offset: marker_offset + 20,
+                end_offset: marker_offsets
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(data.len())
+                    .min(data.len()),
+            })
+        })
+        .collect()
+}
+
+fn array_records<'a>(data: &'a [u8], array: TagArray, stride: usize) -> Vec<&'a [u8]> {
+    let start = array.data_offset.min(data.len());
+    let end = array.end_offset.min(data.len());
+    data[start..end]
+        .chunks_exact(stride)
+        .take(array.count)
+        .collect()
+}
+
+fn vertex_layout_stream_sets_for_any_mapping(layout_id: u8) -> Option<Vec<usize>> {
+    for layout_tag in tags_by_class(CLASS_VERTEX_INPUT_LAYOUT_MAPPING) {
+        if let Some(stream_sets) = vertex_layout_stream_sets(layout_tag, layout_id) {
+            return Some(stream_sets);
+        }
+    }
+
+    None
+}
+
+fn vertex_layout_stream_sets(layout_tag: TagHash, layout_id: u8) -> Option<Vec<usize>> {
+    let endian = package_manager().version.endian();
+    let data = package_manager().read_tag(layout_tag).ok()?;
+    for array in scan_arrays(&data, endian) {
+        if array.class != CLASS_VERTEX_LAYOUT_ARRAY {
+            continue;
+        }
+
+        for record in array_records(&data, array, 0x1c) {
+            let record_layout_id = (read_u32_at(record, 0, endian)? & 0xffff) as u8;
+            if record_layout_id != layout_id {
+                continue;
+            }
+
+            let stream_sets = [0x8, 0xc, 0x10, 0x14]
+                .into_iter()
+                .filter_map(|offset| read_u32_at(record, offset, endian))
+                .filter(|set_index| *set_index != u32::MAX)
+                .map(|set_index| set_index as usize)
+                .collect_vec();
+            return (!stream_sets.is_empty()).then_some(stream_sets);
+        }
+    }
+
+    None
+}
+
+fn vertex_input_element_sets(tag: TagHash) -> Vec<Vec<VertexInputElement>> {
+    let endian = package_manager().version.endian();
+    let Ok(data) = package_manager().read_tag(tag) else {
+        return vec![];
+    };
+
+    scan_arrays(&data, endian)
+        .into_iter()
+        .filter(|array| array.class == CLASS_VERTEX_INPUT_ELEMENT_ARRAY)
+        .map(|array| {
+            data[array.data_offset.min(data.len())..array.end_offset.min(data.len())]
+                .chunks_exact(3)
+                .take(array.count)
+                .map(|record| VertexInputElement {
+                    semantic: record[0],
+                    semantic_index: record[1],
+                    format: record[2],
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn vertex_input_element_size(element: VertexInputElement) -> Option<usize> {
+    match element.format {
+        0x00 => Some(0),
+        0x01 => Some(4),
+        0x02 => Some(8),
+        0x03 => Some(12),
+        0x04 => Some(16),
+        0x05 | 0x06 | 0x07 => Some(4),
+        0x08 | 0x09 => Some(8),
+        0x0A => Some(4),
+        0x0B => Some(8),
+        0x0C => Some(4),
+        0x0D => Some(8),
+        0x0E | 0x0F | 0x10 | 0x11 | 0x12 => Some(4),
+        0x13 => Some(8),
+        0x14 => Some(16),
+        0x15 => Some(4),
+        0x16 => Some(8),
+        0x17 => Some(16),
+        0x18 => Some(2),
+        0x19 => Some(1),
+        0x1F | 0x20 => Some(4),
+        0x21 => Some(8),
+        _ => None,
+    }
+}
+
+fn input_layout_format_from_vertex_format(format: u8) -> Option<InputLayoutFormat> {
+    match format {
+        0x02 => Some(InputLayoutFormat::R32G32Float),
+        0x03 => Some(InputLayoutFormat::R32G32B32Float),
+        0x04 => Some(InputLayoutFormat::R32G32B32A32Float),
+        0x0A => Some(InputLayoutFormat::R16G16Snorm),
+        _ => None,
+    }
+}
+
+fn tags_by_class(class: u32) -> Vec<TagHash> {
+    let pm = package_manager();
+    let mut tags = Vec::new();
+    for (pkg_id, entries) in &pm.lookup.tag32_entries_by_pkg {
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.reference == class {
+                tags.push(TagHash::new(*pkg_id, index as u16));
+            }
+        }
+    }
+    tags.sort_by_key(|tag| (tag.pkg_id(), tag.entry_index()));
+    tags
+}
+
+fn read_tag_at(data: &[u8], offset: usize, endian: Endian) -> Option<TagHash> {
+    Some(TagHash(read_u32_at(data, offset, endian)?))
+        .filter(|tag| package_manager().get_entry(*tag).is_some())
+}
+
+fn read_u32_at(data: &[u8], offset: usize, endian: Endian) -> Option<u32> {
+    data.get(offset..offset + 4)
+        .map(|bytes| read_u32(bytes, endian))
+}
+
+fn read_u64_at(data: &[u8], offset: usize, endian: Endian) -> Option<u64> {
+    data.get(offset..offset + 8)
+        .map(|bytes| read_u64(bytes, endian))
 }
 
 fn read_array(data: &[u8], vec_offset: usize, elem_size: usize, endian: Endian) -> Option<&[u8]> {
@@ -1379,8 +2116,29 @@ fn shader_constants_from_uv_transform(
         .unwrap_or_default()
 }
 
-fn is_highest_detail_lod(lod: u8) -> bool {
-    matches!(lod, 0 | 1 | 2 | 3 | 10)
+fn lod_selection_rank(lod: u8) -> u8 {
+    match lod {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        10 => 4,
+        4 => 10,
+        7 => 20,
+        8 => 21,
+        9 => 30,
+        _ => 40,
+    }
+}
+
+fn lod_preview_value(lod: u8) -> u8 {
+    match lod {
+        0 | 1 | 2 | 3 | 10 => 0,
+        4 => 1,
+        7 | 8 => 2,
+        9 => 3,
+        _ => lod,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1928,6 +2686,306 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_sample_model_uvs_and_textures() {
+        init_goliath_test_package_manager();
+
+        let tag = TagHash(0x80B14039);
+        let entry = package_manager().get_entry(tag).expect("sample tag entry");
+        assert_eq!(entry.reference, CLASS_GEOMETRY_RESOURCE);
+
+        let (source, wireframe) = parse_model_wireframe(tag, &entry).expect("sample wireframe");
+        eprintln!(
+            "mesh kind={} technique={:?} layout={:?} ib={} vb0={} vb1={} index_start={} index_count={} lod={} wireframe verts={} indices={} source={} uv={:?}",
+            source.kind,
+            source.technique,
+            source.input_layout_index,
+            source.index_buffer,
+            source.vertex0_buffer,
+            source.vertex1_buffer,
+            source.index_start,
+            source.index_count,
+            source.lod_category,
+            wireframe.vertices.len(),
+            wireframe.indices.len(),
+            wireframe.source,
+            wireframe.uv_format
+        );
+        assert_eq!(source.lod_category, 0, "sample preview should expose lod0");
+        assert_eq!(source.input_layout_index, Some(7));
+        assert_eq!(source.technique, Some(TagHash(0x80B1247F)));
+        assert!(
+            wireframe.uvs.as_ref().is_some_and(|uvs| !uvs.is_empty()),
+            "sample must decode real UVs"
+        );
+        assert!(
+            wireframe
+                .uv_format
+                .as_deref()
+                .is_some_and(|uv| uv.contains("R16G16_SNORM") && uv.contains("layout Some(7)")),
+            "sample must use declared geometry layout UVs, got {:?}",
+            wireframe.uv_format
+        );
+
+        let cache = quicktag_scanner::load_tag_cache();
+        let techniques = find_model_technique_entries(&cache, tag, &entry);
+        eprintln!(
+            "techniques={:?}",
+            techniques
+                .iter()
+                .take(16)
+                .map(|(tag, _)| format!("{tag}"))
+                .collect_vec()
+        );
+        assert!(!techniques.is_empty(), "sample must resolve techniques");
+        assert_eq!(
+            techniques.first().map(|(tag, _)| *tag),
+            source.technique,
+            "selected geometry technique should rank first"
+        );
+
+        let textures = find_model_textures(&cache, tag, &techniques);
+        eprintln!(
+            "textures={:?}",
+            textures
+                .iter()
+                .take(32)
+                .map(|(tag, entry)| {
+                    let desc = crate::texture::Texture::load_data_d2(*tag, false)
+                        .map(|(desc, _, _)| {
+                            format!(
+                                "{}x{}x{} {:?}",
+                                desc.width, desc.height, desc.depth, desc.format
+                            )
+                        })
+                        .unwrap_or_else(|err| format!("load_err={err}"));
+                    format!("{tag}:{}:{desc}", entry.file_size)
+                })
+                .collect_vec()
+        );
+        assert!(!textures.is_empty(), "sample must resolve textures");
+        assert_eq!(
+            textures.first().map(|(tag, _)| *tag),
+            Some(TagHash(0x80B14064))
+        );
+
+        let complete_tag = TagHash(0x80B140B7);
+        let complete_entry = package_manager()
+            .get_entry(complete_tag)
+            .expect("sample complete geometry entry");
+        let Some((complete_source, complete_wireframe)) =
+            parse_model_wireframe(complete_tag, &complete_entry)
+        else {
+            panic!("sample complete geometry should parse");
+        };
+        eprintln!(
+            "complete mesh kind={} technique={:?} index_start={} index_count={} lod={} wireframe indices={}",
+            complete_source.kind,
+            complete_source.technique,
+            complete_source.index_start,
+            complete_source.index_count,
+            complete_source.lod_category,
+            complete_wireframe.indices.len()
+        );
+        assert_eq!(complete_source.lod_category, 0);
+        assert!(
+            complete_source.index_count > 3849,
+            "geometry resources should merge all primary ranges, not just the first range"
+        );
+        assert!(
+            complete_wireframe.indices.len() > 3849,
+            "wireframe should include all primary ranges for 80B140B7"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_model_uv_coverage() {
+        init_goliath_test_package_manager();
+
+        let max_models = std::env::var("QUICKTAG_UV_PROBE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(400);
+        let package_filter = std::env::var("QUICKTAG_UV_PROBE_PACKAGE_FILTER").ok();
+        let tags = package_manager()
+            .get_all_by_reference(CLASS_GEOMETRY_RESOURCE)
+            .into_iter()
+            .filter(|(tag, _entry)| {
+                package_filter.as_ref().is_none_or(|filter| {
+                    package_manager()
+                        .package_paths
+                        .get(&tag.pkg_id())
+                        .is_some_and(|path| path.name.contains(filter))
+                })
+            })
+            .take(max_models)
+            .collect_vec();
+
+        let mut parsed = 0usize;
+        let mut declared = 0usize;
+        let mut heuristic = Vec::new();
+        let mut missing = Vec::new();
+        let mut no_techniques = Vec::new();
+        let mut no_textures = Vec::new();
+        let cache = if std::env::var("QUICKTAG_UV_PROBE_FULL_CACHE").is_ok() {
+            quicktag_scanner::load_tag_cache()
+        } else {
+            TagCache::default()
+        };
+
+        for (tag, entry) in tags {
+            let Some((source, wireframe)) = parse_model_wireframe(tag, &entry) else {
+                continue;
+            };
+            parsed += 1;
+            match wireframe.uv_format.as_deref() {
+                Some(uv) if uv.contains(" layout ") => declared += 1,
+                Some(uv) => heuristic.push((tag, source.input_layout_index, uv.to_string())),
+                None => missing.push((tag, source.input_layout_index)),
+            }
+
+            let techniques = find_model_technique_entries(&cache, tag, &entry);
+            if techniques.is_empty() {
+                no_techniques.push(tag);
+                continue;
+            }
+            if find_model_textures(&cache, tag, &techniques).is_empty() {
+                no_textures.push((tag, techniques.iter().map(|(tag, _)| *tag).collect_vec()));
+            }
+        }
+
+        eprintln!(
+            "goliath uv coverage parsed={parsed} declared={declared} heuristic={} missing={} no_techniques={} no_textures={}",
+            heuristic.len(),
+            missing.len(),
+            no_techniques.len(),
+            no_textures.len()
+        );
+        eprintln!(
+            "heuristic first={:?}",
+            heuristic
+                .iter()
+                .take(16)
+                .map(|(tag, layout, uv)| format!("{tag}:{layout:?}:{uv}"))
+                .collect_vec()
+        );
+        eprintln!(
+            "missing first={:?}",
+            missing
+                .iter()
+                .take(16)
+                .map(|(tag, layout)| format!("{tag}:{layout:?}"))
+                .collect_vec()
+        );
+        eprintln!(
+            "no_techniques first={:?}",
+            no_techniques
+                .iter()
+                .take(16)
+                .map(|tag| format!("{tag}"))
+                .collect_vec()
+        );
+        eprintln!(
+            "no_textures first={:?}",
+            no_textures
+                .iter()
+                .take(16)
+                .map(|(tag, techniques)| format!("{tag}:{}", techniques.len()))
+                .collect_vec()
+        );
+        for (tag, techniques) in no_textures.iter().take(16) {
+            eprintln!(
+                "no_texture tag={tag} techniques={:?}",
+                techniques
+                    .iter()
+                    .take(16)
+                    .map(|technique| format!("{technique}"))
+                    .collect_vec()
+            );
+            for technique in techniques.iter().take(4) {
+                let entry = package_manager()
+                    .get_entry(*technique)
+                    .expect("technique entry");
+                let data = package_manager()
+                    .read_tag(*technique)
+                    .expect("technique data");
+                eprintln!(
+                    "  technique {technique} texture_bindings={:?}",
+                    texture_bindings_for_technique(&entry, &data)
+                );
+            }
+            if let Some(scan) = cache.hashes.get(tag) {
+                eprintln!(
+                    "  parents={:?}",
+                    scan.references
+                        .iter()
+                        .take(16)
+                        .map(|parent| {
+                            let class_name = package_manager()
+                                .get_entry(*parent)
+                                .and_then(|entry| get_class_by_id(entry.reference))
+                                .map(|class| class.name.to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            format!("{parent}:{class_name}")
+                        })
+                        .collect_vec()
+                );
+                for parent in scan.references.iter().take(8) {
+                    let parent_textures =
+                        find_related_tags(&cache, *parent, TagSearchKind::Texture, 4);
+                    let parent_techniques =
+                        find_related_tags(&cache, *parent, TagSearchKind::Technique, 4);
+                    eprintln!(
+                        "  parent {parent}: textures={:?} techniques={:?}",
+                        parent_textures
+                            .iter()
+                            .take(8)
+                            .map(|(tag, _)| format!("{tag}"))
+                            .collect_vec(),
+                        parent_techniques
+                            .iter()
+                            .take(8)
+                            .map(|(tag, _)| format!("{tag}"))
+                            .collect_vec()
+                    );
+                }
+            }
+        }
+
+        assert!(parsed > 0, "probe found no parseable geometry resources");
+        assert!(
+            heuristic.is_empty(),
+            "some parsed models still use heuristic UVs"
+        );
+    }
+
+    fn init_goliath_test_package_manager() {
+        use std::{path::PathBuf, sync::Arc};
+        use tiger_pkg::{GameVersion, MarathonVersion, PackageManager};
+
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        assert!(
+            packages.exists(),
+            "packages path missing: {}",
+            packages.display()
+        );
+
+        let pm = PackageManager::new(
+            packages.to_string_lossy().to_string(),
+            GameVersion::Marathon(MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+    }
+
+    #[test]
     fn parses_vertex_buffer_header_little_endian() {
         let data = [
             0x80, 0x00, 0x00, 0x00, // data_size
@@ -2092,5 +3150,14 @@ mod tests {
         assert_eq!(constants[0].name, "uv_scale_offset");
         assert_eq!(constants[0].value, [2.0, 3.0, 0.25, 0.5]);
         assert_eq!(constants[0].source, "mesh instance UV transform");
+    }
+
+    #[test]
+    fn reads_geometry_buffer_set_generate_gbuffer_layout() {
+        let mut mesh = vec![0u8; 0x80];
+        mesh[0x62] = 0x57;
+        mesh[0x64] = 0x07;
+
+        assert_eq!(geometry_buffer_set_input_layout_id(&mesh), Some(7));
     }
 }

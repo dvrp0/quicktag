@@ -63,6 +63,13 @@ pub struct TextureSlotBindingPreview {
     pub texture: WideHashPreview,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TechniqueTextureBinding {
+    pub stage: &'static str,
+    pub slot: u32,
+    pub tag: TagHash,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TfxBytecodePreview {
     pub total_bytes: usize,
@@ -145,6 +152,16 @@ pub fn is_technique_entry(entry: &UEntryHeader) -> bool {
 }
 
 pub fn texture_tags_for_technique(entry: &UEntryHeader, data: &[u8]) -> Vec<TagHash> {
+    texture_bindings_for_technique(entry, data)
+        .into_iter()
+        .map(|binding| binding.tag)
+        .collect()
+}
+
+pub fn texture_bindings_for_technique(
+    entry: &UEntryHeader,
+    data: &[u8],
+) -> Vec<TechniqueTextureBinding> {
     if !is_technique_entry(entry) {
         return vec![];
     }
@@ -154,12 +171,18 @@ pub fn texture_tags_for_technique(entry: &UEntryHeader, data: &[u8]) -> Vec<TagH
             technique
                 .stages
                 .into_iter()
-                .flat_map(|stage| stage.textures)
-                .filter_map(|binding| {
-                    binding
-                        .texture
-                        .resolved
-                        .or_else(|| texture_header_tag(binding.texture.raw32))
+                .flat_map(|stage| {
+                    stage.textures.into_iter().filter_map(move |binding| {
+                        Some(TechniqueTextureBinding {
+                            stage: stage.stage,
+                            slot: binding.slot,
+                            tag: binding
+                                .texture
+                                .resolved
+                                .and_then(texture_header_tag)
+                                .or_else(|| texture_header_tag(binding.texture.raw32))?,
+                        })
+                    })
                 })
                 .collect()
         })
