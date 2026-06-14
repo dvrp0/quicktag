@@ -12,11 +12,11 @@ use tiger_pkg::{TagHash, manager::PackagePath, package::UEntryHeader, package_ma
 
 use crate::geometry::{
     GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, UvTransformPreview,
-    WireframePreview, model_info_for_reference,
+    WireframeMaterialLayer, WireframePreview, model_info_for_reference,
 };
 use crate::gui::common::ResponseExt;
 use crate::gui::tag::format_tag_entry;
-use crate::texture::cache::TextureCache;
+use crate::texture::cache::{MaterialTextureKey, TextureCache};
 use crate::util::{format_file_size, ui_image_rotated};
 
 use super::{View, ViewAction};
@@ -41,6 +41,7 @@ pub struct ModelsView {
 struct ProjectedVertex {
     pos: egui::Pos2,
     depth: f32,
+    view: [f32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -48,6 +49,11 @@ struct ProjectedTriangle {
     indices: [u32; 3],
     depth: f32,
     texture: Option<TagHash>,
+    normal: Option<TagHash>,
+    emissive: Option<TagHash>,
+    color_tint: [u8; 4],
+    emissive_strength: u8,
+    light: f32,
 }
 
 impl ModelsView {
@@ -65,7 +71,7 @@ impl ModelsView {
             preview_yaw: 0.4,
             preview_pitch: 0.25,
             preview_zoom: 1.0,
-            preview_show_wireframe: true,
+            preview_show_wireframe: false,
         }
     }
 
@@ -436,9 +442,13 @@ pub(super) fn model_wireframe_ui(
     if let Some(uv_source) = wireframe.uv_format.as_deref() {
         if let Some(tag) = preview_textures.first() {
             let (texture, _tid) = texture_cache.get_or_default(*tag);
+            let (color_count, normal_count, emissive_count) =
+                wireframe_preview_material_texture_counts(wireframe);
             ui.monospace(format!(
-                "textured preview: {} material texture(s), first {} using {} ({}x{}, {:?})",
-                preview_textures.len(),
+                "material preview: color={} normal={} emissive={} first {} using {} ({}x{}, {:?})",
+                color_count,
+                normal_count,
+                emissive_count,
                 tag,
                 uv_source,
                 texture.desc.width,
@@ -483,7 +493,7 @@ pub(super) fn model_wireframe_ui(
     }
 
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, Color32::from_rgb(12, 16, 20));
+    painter.rect_filled(rect, 3.0, Color32::from_rgb(109, 143, 176));
     painter.rect_stroke(
         rect,
         3.0,
@@ -539,7 +549,9 @@ fn draw_textured_model_mesh(
     fallback_textures: &[(TagHash, UEntryHeader)],
     uv_transform: Option<UvTransformPreview>,
 ) {
-    let mut triangles = projected_triangles(wireframe, projected);
+    let mut base_triangles = projected_triangles(wireframe, projected, false);
+    base_triangles.sort_by(|a, b| a.depth.total_cmp(&b.depth));
+    let mut triangles = projected_triangles(wireframe, projected, false);
     triangles.sort_by(|a, b| a.depth.total_cmp(&b.depth));
 
     let mut base_mesh = Mesh::default();
@@ -547,7 +559,7 @@ fn draw_textured_model_mesh(
         &mut base_mesh,
         wireframe,
         projected,
-        &triangles,
+        &base_triangles,
         uv_transform,
         Color32::from_rgb(135, 100, 92),
     );
@@ -555,18 +567,26 @@ fn draw_textured_model_mesh(
         painter.add(egui::Shape::mesh(base_mesh));
     }
 
-    let fallback_texture = fallback_textures.first().map(|(tag, _entry)| *tag);
-    let texture_tags = triangles
+    let fallback_texture = (!wireframe
+        .material_ranges
         .iter()
-        .filter_map(|triangle| triangle.texture.or(fallback_texture))
+        .any(|range| range.texture.is_some()))
+    .then(|| fallback_textures.first().map(|(tag, _entry)| *tag))
+    .flatten();
+    let material_keys = triangles
+        .iter()
+        .filter_map(|triangle| triangle_material_key(triangle, fallback_texture))
         .unique()
         .collect_vec();
-    for texture_tag in texture_tags {
-        let (_texture, texture_id) = texture_cache.get_or_default(texture_tag);
+    for key in material_keys {
+        let texture_id = texture_cache
+            .get_material_or_load(key)
+            .map(|(_texture, texture_id)| texture_id)
+            .unwrap_or_else(|| texture_cache.get_or_default(key.color).1);
         let texture_triangles = triangles
             .iter()
             .copied()
-            .filter(|triangle| triangle.texture.or(fallback_texture) == Some(texture_tag))
+            .filter(|triangle| triangle_material_key(triangle, fallback_texture) == Some(key))
             .collect_vec();
         let mut mesh = Mesh::with_texture(texture_id);
         add_projected_triangles_to_mesh(
@@ -584,16 +604,30 @@ fn draw_textured_model_mesh(
     }
 }
 
+fn triangle_material_key(
+    triangle: &ProjectedTriangle,
+    fallback_texture: Option<TagHash>,
+) -> Option<MaterialTextureKey> {
+    Some(MaterialTextureKey {
+        color: triangle.texture.or(fallback_texture)?,
+        normal: triangle.normal,
+        emissive: triangle.emissive,
+        color_tint: triangle.color_tint,
+        emissive_strength: triangle.emissive_strength,
+    })
+}
+
 fn projected_triangles(
     wireframe: &WireframePreview,
     projected: &[ProjectedVertex],
+    expand_layers: bool,
 ) -> Vec<ProjectedTriangle> {
     let mut material_iter = wireframe.material_ranges.iter().peekable();
     wireframe
         .indices
         .chunks_exact(3)
         .enumerate()
-        .filter_map(|(triangle_index, tri)| {
+        .flat_map(|(triangle_index, tri)| {
             let index_start = triangle_index * 3;
             while material_iter
                 .peek()
@@ -601,23 +635,117 @@ fn projected_triangles(
             {
                 material_iter.next();
             }
-            let texture = material_iter
-                .peek()
-                .filter(|range| {
-                    index_start >= range.index_start
-                        && index_start < range.index_start + range.index_count
+            let material_range = material_iter.peek().filter(|range| {
+                index_start >= range.index_start
+                    && index_start < range.index_start + range.index_count
+            });
+            let Some(a) = projected.get(tri[0] as usize) else {
+                return Vec::new();
+            };
+            let Some(b) = projected.get(tri[1] as usize) else {
+                return Vec::new();
+            };
+            let Some(c) = projected.get(tri[2] as usize) else {
+                return Vec::new();
+            };
+
+            let depth = (a.depth + b.depth + c.depth) / 3.0;
+            let light = face_light(*a, *b, *c);
+            let layers = projected_material_layers(material_range.copied(), expand_layers);
+            layers
+                .into_iter()
+                .map(|layer| ProjectedTriangle {
+                    indices: [tri[0], tri[1], tri[2]],
+                    depth,
+                    texture: layer.color,
+                    normal: layer.normal,
+                    emissive: layer.emissive,
+                    color_tint: layer.color_tint,
+                    emissive_strength: layer.emissive_strength,
+                    light,
                 })
-                .and_then(|range| range.texture);
-            let a = projected.get(tri[0] as usize)?;
-            let b = projected.get(tri[1] as usize)?;
-            let c = projected.get(tri[2] as usize)?;
-            Some(ProjectedTriangle {
-                indices: [tri[0], tri[1], tri[2]],
-                depth: (a.depth + b.depth + c.depth) / 3.0,
-                texture,
-            })
+                .collect_vec()
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedMaterialLayer {
+    color: Option<TagHash>,
+    normal: Option<TagHash>,
+    emissive: Option<TagHash>,
+    color_tint: [u8; 4],
+    emissive_strength: u8,
+}
+
+fn projected_material_layers(
+    range: Option<&crate::geometry::WireframeMaterialRange>,
+    expand_layers: bool,
+) -> Vec<ProjectedMaterialLayer> {
+    let Some(range) = range else {
+        return vec![ProjectedMaterialLayer {
+            color: None,
+            normal: None,
+            emissive: None,
+            color_tint: [255, 255, 255, 255],
+            emissive_strength: 0,
+        }];
+    };
+
+    let source_layers = if expand_layers && !range.textures.layers.is_empty() {
+        range.textures.layers.clone()
+    } else {
+        vec![WireframeMaterialLayer {
+            color: range.textures.color.or(range.texture),
+            normal: range.textures.normal,
+            emissive: range.textures.emissive,
+        }]
+    };
+
+    source_layers
+        .into_iter()
+        .map(|layer| ProjectedMaterialLayer {
+            color: layer.color.or(range.texture),
+            normal: layer.normal,
+            emissive: layer.emissive,
+            color_tint: range.textures.color_tint,
+            emissive_strength: range.textures.emissive_strength,
+        })
+        .collect()
+}
+
+fn face_light(a: ProjectedVertex, b: ProjectedVertex, c: ProjectedVertex) -> f32 {
+    let ab = [
+        b.view[0] - a.view[0],
+        b.view[1] - a.view[1],
+        b.view[2] - a.view[2],
+    ];
+    let ac = [
+        c.view[0] - a.view[0],
+        c.view[1] - a.view[1],
+        c.view[2] - a.view[2],
+    ];
+    let normal = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if len <= f32::EPSILON {
+        return 0.82;
+    }
+
+    let nx = normal[0] / len;
+    let ny = normal[1] / len;
+    let nz = normal[2] / len;
+    let light = [0.35_f32, -0.45, 0.82];
+    let light_len = (light[0] * light[0] + light[1] * light[1] + light[2] * light[2]).sqrt();
+    let ndot1 = nx * light[0] / light_len
+        + ny * light[1] / light_len
+        + nz * light[2] / light_len;
+    let lambert =
+        (nx * light[0] / light_len + ny * light[1] / light_len + nz * light[2] / light_len).abs();
+    (0.85 + lambert * 0.15).clamp(0.00, 1.0)
 }
 
 fn wireframe_preview_textures(
@@ -641,6 +769,31 @@ fn wireframe_preview_textures(
     }
 }
 
+fn wireframe_preview_material_texture_counts(
+    wireframe: &WireframePreview,
+) -> (usize, usize, usize) {
+    (
+        wireframe
+            .material_ranges
+            .iter()
+            .filter_map(|range| range.textures.color)
+            .unique()
+            .count(),
+        wireframe
+            .material_ranges
+            .iter()
+            .filter_map(|range| range.textures.normal)
+            .unique()
+            .count(),
+        wireframe
+            .material_ranges
+            .iter()
+            .filter_map(|range| range.textures.emissive)
+            .unique()
+            .count(),
+    )
+}
+
 fn add_projected_triangles_to_mesh(
     mesh: &mut Mesh,
     wireframe: &WireframePreview,
@@ -651,6 +804,7 @@ fn add_projected_triangles_to_mesh(
 ) {
     for tri in triangles {
         let base = mesh.vertices.len() as u32;
+        let color = shaded_color(color, tri.light);
         for index in tri.indices {
             let vertex_index = index as usize;
             let Some(position) = wireframe.vertices.get(vertex_index).copied() else {
@@ -672,6 +826,16 @@ fn add_projected_triangles_to_mesh(
             mesh.vertices.truncate(base as usize);
         }
     }
+}
+
+fn shaded_color(color: Color32, light: f32) -> Color32 {
+    let rgba = color.to_array();
+    Color32::from_rgba_unmultiplied(
+        (rgba[0] as f32 * light).clamp(0.0, 255.0) as u8,
+        (rgba[1] as f32 * light).clamp(0.0, 255.0) as u8,
+        (rgba[2] as f32 * light).clamp(0.0, 255.0) as u8,
+        rgba[3],
+    )
 }
 
 fn preview_uv(
@@ -746,6 +910,7 @@ fn project_vertices(
                 ProjectedVertex {
                     pos: pos2(screen_center.x + xz * scale, screen_center.y - yz * scale),
                     depth,
+                    view: [xz, yz, depth],
                 }
             })
             .collect(),

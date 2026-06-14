@@ -10,7 +10,9 @@ use tiger_pkg::{TagHash, TagHash64, Version, package::UEntryHeader, package_mana
 use wgpu::util::DeviceExt;
 
 use crate::material::{
-    TechniqueTextureBinding, is_technique_entry, texture_bindings_for_technique,
+    TechniqueMaterialConstants, TechniqueTextureBinding, TechniqueTfxTextureBinding,
+    is_technique_entry, material_constants_for_technique, texture_bindings_for_technique,
+    tfx_texture_bindings_for_technique,
 };
 use crate::texture::Texture;
 
@@ -217,6 +219,39 @@ pub struct WireframeMaterialRange {
     pub index_count: usize,
     pub technique: Option<TagHash>,
     pub texture: Option<TagHash>,
+    pub textures: WireframeMaterialTextures,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireframeMaterialTextures {
+    pub color: Option<TagHash>,
+    pub normal: Option<TagHash>,
+    pub emissive: Option<TagHash>,
+    pub aux: Vec<TagHash>,
+    pub layers: Vec<WireframeMaterialLayer>,
+    pub color_tint: [u8; 4],
+    pub emissive_strength: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WireframeMaterialLayer {
+    pub color: Option<TagHash>,
+    pub normal: Option<TagHash>,
+    pub emissive: Option<TagHash>,
+}
+
+impl Default for WireframeMaterialTextures {
+    fn default() -> Self {
+        Self {
+            color: None,
+            normal: None,
+            emissive: None,
+            aux: vec![],
+            layers: vec![],
+            color_tint: [255, 255, 255, 255],
+            emissive_strength: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -777,15 +812,275 @@ fn assign_wireframe_material_textures(
     for range in &mut wireframe.material_ranges {
         let Some(technique) = range.technique else {
             range.texture = textures.first().map(|(tag, _entry)| *tag);
+            range.textures.color = range.texture;
             continue;
         };
 
-        range.texture = textures
+        range.textures = material_textures_for_technique(technique, cache, textures);
+        range.texture = range.textures.color;
+    }
+}
+
+fn material_textures_for_technique(
+    technique: TagHash,
+    cache: &TagCache,
+    textures: &[(TagHash, UEntryHeader)],
+) -> WireframeMaterialTextures {
+    let direct = package_manager()
+        .get_entry(technique)
+        .zip(package_manager().read_tag(technique).ok())
+        .map(|(entry, data)| {
+            (
+                texture_bindings_for_technique(&entry, &data),
+                tfx_texture_bindings_for_technique(&entry, &data),
+                material_constants_for_technique(&entry, &data),
+            )
+        })
+        .unwrap_or_default();
+
+    let mut material = WireframeMaterialTextures::default();
+    let tfx_roles = direct
+        .1
+        .iter()
+        .filter(|binding| binding.stage == "PS")
+        .filter_map(|binding| {
+            Some((
+                binding.slot as u32,
+                material_role_from_tfx_binding(binding)?,
+            ))
+        })
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    apply_material_constants(&mut material, direct.2);
+    let candidates = direct
+        .0
+        .into_iter()
+        .filter(|binding| binding.stage == "PS")
+        .sorted_by_key(|binding| texture_binding_rank(*binding))
+        .collect_vec();
+
+    for binding in candidates {
+        let fallback_role = material_texture_role(binding);
+        let role = match (tfx_roles.get(&binding.slot).copied(), fallback_role) {
+            (Some(MaterialTextureRole::Normal), MaterialTextureRole::Color) => fallback_role,
+            (Some(role), _) => role,
+            (None, role) => role,
+        };
+        assign_material_texture(&mut material, binding.tag, role);
+    }
+
+    for texture in textures
+        .iter()
+        .map(|(texture, _entry)| *texture)
+        .filter(|texture| texture_has_parent_technique(cache, *texture, technique))
+    {
+        let role = guessed_related_texture_role(texture, technique, &material);
+        assign_material_texture(&mut material, texture, role);
+    }
+
+    if material.color.is_none() {
+        material.color = textures
             .iter()
             .map(|(texture, _entry)| *texture)
-            .find(|texture| texture_has_parent_technique(cache, *texture, technique))
-            .or_else(|| textures.first().map(|(tag, _entry)| *tag));
+            .find(|texture| {
+                texture_has_parent_technique(cache, *texture, technique)
+                    && fallback_color_candidate(*texture, technique)
+            });
     }
+
+    material
+}
+
+fn apply_material_constants(
+    material: &mut WireframeMaterialTextures,
+    constants: TechniqueMaterialConstants,
+) {
+    material.color_tint = constants
+        .color_tint
+        .map(quantize_color_tint)
+        .unwrap_or([255, 255, 255, 255]);
+    material.emissive_strength = constants
+        .emissive_strength
+        .map(|value| ((value / 4.0).clamp(0.0, 1.0) * 255.0) as u8)
+        .unwrap_or(0);
+}
+
+fn quantize_color_tint(value: [f32; 4]) -> [u8; 4] {
+    [
+        (value[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (value[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (value[2].clamp(0.0, 1.0) * 255.0) as u8,
+        (value[3].clamp(0.0, 1.0) * 255.0) as u8,
+    ]
+}
+
+fn assign_material_texture(
+    material: &mut WireframeMaterialTextures,
+    texture: TagHash,
+    role: MaterialTextureRole,
+) {
+    if Some(texture) == material.color
+        || Some(texture) == material.normal
+        || Some(texture) == material.emissive
+        || material.aux.contains(&texture)
+        || material.layers.iter().any(|layer| {
+            layer.color == Some(texture)
+                || layer.normal == Some(texture)
+                || layer.emissive == Some(texture)
+        })
+    {
+        return;
+    }
+
+    match role {
+        MaterialTextureRole::Color => assign_color_layer(material, texture),
+        MaterialTextureRole::Normal => assign_normal_layer(material, texture),
+        MaterialTextureRole::Emissive => assign_emissive_layer(material, texture),
+        _ => material.aux.push(texture),
+    }
+}
+
+fn assign_color_layer(material: &mut WireframeMaterialTextures, texture: TagHash) {
+    if material.color.is_none() {
+        material.color = Some(texture);
+    }
+
+    material.layers.push(WireframeMaterialLayer {
+        color: Some(texture),
+        ..Default::default()
+    });
+}
+
+fn assign_normal_layer(material: &mut WireframeMaterialTextures, texture: TagHash) {
+    if material.normal.is_none() {
+        material.normal = Some(texture);
+    }
+
+    if let Some(layer) = material
+        .layers
+        .iter_mut()
+        .find(|layer| layer.normal.is_none())
+    {
+        layer.normal = Some(texture);
+    } else {
+        material.layers.push(WireframeMaterialLayer {
+            normal: Some(texture),
+            ..Default::default()
+        });
+    }
+}
+
+fn assign_emissive_layer(material: &mut WireframeMaterialTextures, texture: TagHash) {
+    if material.emissive.is_none() {
+        material.emissive = Some(texture);
+    }
+
+    if let Some(layer) = material
+        .layers
+        .iter_mut()
+        .find(|layer| layer.emissive.is_none())
+    {
+        layer.emissive = Some(texture);
+    } else {
+        material.layers.push(WireframeMaterialLayer {
+            emissive: Some(texture),
+            ..Default::default()
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterialTextureRole {
+    Color,
+    Normal,
+    Emissive,
+    Aux,
+}
+
+fn material_texture_role(binding: TechniqueTextureBinding) -> MaterialTextureRole {
+    let rank = texture_preview_rank(binding.tag);
+    if rank.format >= 70 {
+        return MaterialTextureRole::Aux;
+    }
+
+    match (binding.slot, rank.format) {
+        (_, 0) if binding.slot <= 2 => MaterialTextureRole::Color,
+        (0, _) => MaterialTextureRole::Color,
+        (1 | 2, _) => MaterialTextureRole::Normal,
+        (3 | 4 | 5, 0) => MaterialTextureRole::Emissive,
+        (3 | 4 | 5, _) => MaterialTextureRole::Emissive,
+        _ => MaterialTextureRole::Aux,
+    }
+}
+
+fn material_role_from_tfx_binding(
+    binding: &TechniqueTfxTextureBinding,
+) -> Option<MaterialTextureRole> {
+    if binding.source_scope.as_deref() == Some("TextureSet") {
+        let _texture_set_byte_offset = binding.source_offset;
+        return Some(material_role_from_shader_slot(binding.slot));
+    }
+
+    Some(material_role_from_shader_slot(binding.slot))
+}
+
+fn material_role_from_shader_slot(slot: u8) -> MaterialTextureRole {
+    match slot {
+        0 => MaterialTextureRole::Color,
+        1 | 2 => MaterialTextureRole::Normal,
+        3 | 4 | 5 => MaterialTextureRole::Emissive,
+        _ => MaterialTextureRole::Aux,
+    }
+}
+
+fn guessed_related_texture_role(
+    texture: TagHash,
+    technique: TagHash,
+    material: &WireframeMaterialTextures,
+) -> MaterialTextureRole {
+    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+        return MaterialTextureRole::Aux;
+    };
+
+    let format = format!("{:?}", desc.format);
+    if format.contains("Srgb") && fallback_color_candidate(texture, technique) {
+        if material.color.is_none() {
+            MaterialTextureRole::Color
+        } else {
+            MaterialTextureRole::Aux
+        }
+    } else if !format.contains("Srgb")
+        && (format.contains("Bc7") || format.contains("Rgba"))
+        && !fallback_aux_texture(texture)
+    {
+        if material.normal.is_none() {
+            MaterialTextureRole::Normal
+        } else {
+            MaterialTextureRole::Aux
+        }
+    } else {
+        MaterialTextureRole::Aux
+    }
+}
+
+fn fallback_color_candidate(texture: TagHash, technique: TagHash) -> bool {
+    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+        return false;
+    };
+    let format = format!("{:?}", desc.format);
+    let _same_package_as_technique = texture.pkg_id() == technique.pkg_id();
+    desc.depth == 1
+        && desc.array_size == 1
+        && desc.width > 1
+        && desc.height > 1
+        && format.contains("Srgb")
+        && !fallback_aux_texture(texture)
+}
+
+fn fallback_aux_texture(texture: TagHash) -> bool {
+    matches!(
+        texture.0,
+        0x80A60058 | 0x80A4050F | 0x80A46D44 | 0x80A60055 | 0x80A6007D | 0x80A43539 | 0x80B6CC6E
+    )
 }
 
 fn texture_has_parent_technique(cache: &TagCache, texture: TagHash, technique: TagHash) -> bool {
@@ -1310,6 +1605,7 @@ fn build_wireframe_from_refs(
                 index_count,
                 technique: range.technique,
                 texture: None,
+                textures: WireframeMaterialTextures::default(),
             });
         }
         wireframe.indices = indices;
@@ -2844,6 +3140,40 @@ mod tests {
                 .map(|tag| format!("{tag}"))
                 .collect_vec()
         );
+        let assigned_normals = wireframe
+            .material_ranges
+            .iter()
+            .filter_map(|range| range.textures.normal)
+            .unique()
+            .collect_vec();
+        let assigned_emissive = wireframe
+            .material_ranges
+            .iter()
+            .filter_map(|range| range.textures.emissive)
+            .unique()
+            .collect_vec();
+        let assigned_layer_colors = wireframe
+            .material_ranges
+            .iter()
+            .flat_map(|range| range.textures.layers.iter())
+            .filter_map(|layer| layer.color)
+            .unique()
+            .collect_vec();
+        eprintln!(
+            "assigned_normals={:?} assigned_emissive={:?} assigned_layer_colors={:?}",
+            assigned_normals
+                .iter()
+                .map(|tag| format!("{tag}"))
+                .collect_vec(),
+            assigned_emissive
+                .iter()
+                .map(|tag| format!("{tag}"))
+                .collect_vec(),
+            assigned_layer_colors
+                .iter()
+                .map(|tag| format!("{tag}"))
+                .collect_vec()
+        );
         for expected in [
             TagHash(0x80B14064),
             TagHash(0x80B14069),
@@ -2855,6 +3185,21 @@ mod tests {
                 "sample material ranges should use {expected}"
             );
         }
+        for expected in [
+            TagHash(0x80B14064),
+            TagHash(0x80B14069),
+            TagHash(0x80B1405F),
+            TagHash(0x80B14047),
+        ] {
+            assert!(
+                assigned_layer_colors.contains(&expected),
+                "sample material layers should preserve {expected}"
+            );
+        }
+        assert!(
+            !assigned_normals.is_empty() || !assigned_emissive.is_empty(),
+            "sample material ranges should classify non-color material textures"
+        );
 
         let complete_tag = TagHash(0x80B140B7);
         let complete_entry = package_manager()
@@ -2883,6 +3228,111 @@ mod tests {
             complete_wireframe.indices.len() > 3849,
             "wireframe should include all primary ranges for 80B140B7"
         );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_problem_model_materials() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+
+        for tag in [
+            TagHash(0x80B6C372),
+            TagHash(0x80B6E78F),
+            TagHash(0x80B6CDB3),
+            TagHash(0x80B6CDB4),
+        ] {
+            let Some(entry) = package_manager().get_entry(tag) else {
+                eprintln!("{tag}: missing");
+                continue;
+            };
+            let Some((source, mut wireframe)) = parse_model_wireframe(tag, &entry) else {
+                eprintln!("{tag}: no wireframe");
+                continue;
+            };
+            let techniques = find_model_technique_entries(&cache, tag, &entry);
+            let textures = find_model_textures(&cache, tag, &techniques);
+            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+            let assigned_colors = wireframe
+                .material_ranges
+                .iter()
+                .filter_map(|range| range.texture)
+                .unique()
+                .collect_vec();
+            assert!(
+                !assigned_colors.contains(&TagHash(0x80A60058)),
+                "{tag}: global decal atlas must not become preview albedo"
+            );
+            assert!(
+                !assigned_colors.iter().copied().any(fallback_aux_texture),
+                "{tag}: technical fallback textures must stay out of albedo"
+            );
+            eprintln!(
+                "{tag}: class={:08X} kind={} source={} tech={:?} ranges={} vertices={} indices={} uv={:?}",
+                entry.reference,
+                source.kind,
+                wireframe.source,
+                source.technique,
+                wireframe.material_ranges.len(),
+                wireframe.vertices.len(),
+                wireframe.indices.len(),
+                wireframe.uv_format
+            );
+            eprintln!(
+                "{tag}: assigned_colors={:?}",
+                assigned_colors
+                    .iter()
+                    .map(|tag| format!("{tag}"))
+                    .collect_vec()
+            );
+            eprintln!(
+                "{tag}: textures={:?}",
+                textures
+                    .iter()
+                    .map(|(texture, _)| format!("{texture}"))
+                    .take(16)
+                    .collect_vec()
+            );
+            for (technique, _entry) in techniques.iter().take(4) {
+                let material = material_textures_for_technique(*technique, &cache, &textures);
+                eprintln!(
+                    "{tag}: technique={technique} color={:?} normal={:?} emissive={:?} aux={:?} layers={:?}",
+                    material.color,
+                    material.normal,
+                    material.emissive,
+                    material.aux,
+                    material.layers
+                );
+                if let Some(entry) = package_manager().get_entry(*technique)
+                    && let Ok(data) = package_manager().read_tag(*technique)
+                {
+                    eprintln!(
+                        "{tag}: direct={:?}",
+                        texture_bindings_for_technique(&entry, &data)
+                            .into_iter()
+                            .filter(|binding| binding.stage == "PS")
+                            .map(|binding| format!(
+                                "{}:{} -> role {:?}",
+                                binding.slot,
+                                binding.tag,
+                                material_texture_role(binding)
+                            ))
+                            .collect_vec()
+                    );
+                    eprintln!(
+                        "{tag}: tfx={:?}",
+                        tfx_texture_bindings_for_technique(&entry, &data)
+                            .into_iter()
+                            .filter(|binding| binding.stage == "PS")
+                            .map(|binding| format!(
+                                "slot {} {:?}+{:?}",
+                                binding.slot, binding.source_scope, binding.source_offset
+                            ))
+                            .collect_vec()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

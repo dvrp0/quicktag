@@ -804,6 +804,29 @@ impl Texture {
         )
     }
 
+    pub fn from_rgba8(
+        render_state: &RenderState,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        comment: Option<String>,
+    ) -> anyhow::Result<Texture> {
+        Self::create_texture(
+            render_state,
+            TagHash::NONE,
+            TextureDesc {
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                width,
+                height,
+                array_size: 1,
+                depth: 1,
+                premultiply_alpha: false,
+            },
+            rgba,
+            comment,
+        )
+    }
+
     pub fn to_image(&self, rs: &RenderState, layer: u32) -> anyhow::Result<DynamicImage> {
         let (rgba_data, padded_width, padded_height) = capture_texture(rs, self, layer)?;
         let image = image::RgbaImage::from_raw(padded_width, padded_height, rgba_data)

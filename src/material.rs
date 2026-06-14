@@ -70,6 +70,20 @@ pub struct TechniqueTextureBinding {
     pub tag: TagHash,
 }
 
+#[derive(Debug, Clone)]
+pub struct TechniqueTfxTextureBinding {
+    pub stage: &'static str,
+    pub slot: u8,
+    pub source_scope: Option<String>,
+    pub source_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TechniqueMaterialConstants {
+    pub color_tint: Option<[f32; 4]>,
+    pub emissive_strength: Option<f32>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TfxBytecodePreview {
     pub total_bytes: usize,
@@ -187,6 +201,118 @@ pub fn texture_bindings_for_technique(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub fn tfx_texture_bindings_for_technique(
+    entry: &UEntryHeader,
+    data: &[u8],
+) -> Vec<TechniqueTfxTextureBinding> {
+    if !is_technique_entry(entry) {
+        return vec![];
+    }
+
+    parse_technique(data)
+        .map(|technique| {
+            technique
+                .stages
+                .into_iter()
+                .flat_map(|stage| {
+                    stage
+                        .bytecode
+                        .bindings
+                        .into_iter()
+                        .filter(|binding| binding.kind == "texture")
+                        .map(|binding| {
+                            let (source_scope, source_offset) =
+                                parse_tfx_texture_source(&binding.source)
+                                    .map(|(scope, offset)| (Some(scope), Some(offset)))
+                                    .unwrap_or((None, None));
+                            TechniqueTfxTextureBinding {
+                                stage: binding.stage,
+                                slot: binding.slot,
+                                source_scope,
+                                source_offset,
+                            }
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn material_constants_for_technique(
+    entry: &UEntryHeader,
+    data: &[u8],
+) -> TechniqueMaterialConstants {
+    if !is_technique_entry(entry) {
+        return TechniqueMaterialConstants::default();
+    }
+
+    parse_technique(data)
+        .map(|technique| {
+            let pixel_stage = technique.stages.iter().find(|stage| stage.stage == "PS");
+            TechniqueMaterialConstants {
+                color_tint: pixel_stage.and_then(stage_color_tint),
+                emissive_strength: pixel_stage.and_then(stage_emissive_strength),
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn stage_color_tint(stage: &TechniqueStagePreview) -> Option<[f32; 4]> {
+    stage
+        .bytecode
+        .expressions
+        .iter()
+        .filter(|expression| expression.target.starts_with("output["))
+        .filter_map(|expression| expression.value)
+        .find(sane_color_tint)
+        .or_else(|| stage.constants.iter().copied().find(sane_color_tint))
+        .or_else(|| stage.inline_constants.iter().copied().find(sane_color_tint))
+        .or_else(|| {
+            stage
+                .constant_buffer_preview
+                .as_ref()?
+                .first_values
+                .iter()
+                .copied()
+                .find(sane_color_tint)
+        })
+}
+
+fn stage_emissive_strength(stage: &TechniqueStagePreview) -> Option<f32> {
+    let expression_strength = stage
+        .bytecode
+        .expressions
+        .iter()
+        .filter_map(|expression| expression.value)
+        .flat_map(|value| value.into_iter())
+        .filter(|value| value.is_finite() && *value > 1.0 && *value <= 16.0)
+        .max_by(|a, b| a.total_cmp(b));
+
+    expression_strength.or_else(|| {
+        stage
+            .constant_buffer_preview
+            .as_ref()?
+            .first_values
+            .iter()
+            .flat_map(|value| value.iter().copied())
+            .filter(|value| value.is_finite() && *value > 1.0 && *value <= 16.0)
+            .max_by(|a, b| a.total_cmp(b))
+    })
+}
+
+fn sane_color_tint(value: &[f32; 4]) -> bool {
+    let rgb = [value[0], value[1], value[2]];
+    rgb.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 4.0)
+        && rgb.iter().any(|v| *v > 0.001)
+        && !rgb.iter().all(|v| (*v - 1.0).abs() < 0.001)
+}
+
+fn parse_tfx_texture_source(source: &str) -> Option<(String, usize)> {
+    let inner = source.strip_prefix("extern_texture(")?.strip_suffix(')')?;
+    let (scope, offset) = inner.split_once("+0x")?;
+    Some((scope.to_string(), usize::from_str_radix(offset, 16).ok()?))
 }
 
 fn texture_header_tag(tag: TagHash) -> Option<TagHash> {
@@ -1384,6 +1510,23 @@ mod tests {
     }
 
     #[test]
+    fn decodes_tfx_texture_bind_source() {
+        let decoded = parse_tfx_bytecode(&[
+            0x3f, 0x26, 0x02, // push_extern_texture TextureSet+0x10
+            0x48, 0x20, // set_shader_texture PS slot 0
+        ]);
+
+        assert_eq!(decoded.bindings.len(), 1);
+        assert_eq!(decoded.bindings[0].kind, "texture");
+        assert_eq!(decoded.bindings[0].stage, "PS");
+        assert_eq!(decoded.bindings[0].slot, 0);
+        assert_eq!(
+            parse_tfx_texture_source(&decoded.bindings[0].source),
+            Some(("TextureSet".to_string(), 0x10))
+        );
+    }
+
+    #[test]
     fn propagates_lerp_constant_expression_values() {
         let constants = vec![
             [0.25, 0.25, 0.25, 0.25],
@@ -1405,6 +1548,39 @@ mod tests {
             "lerp_constant(constant[1..3], constant[0])"
         );
         assert_eq!(decoded.expressions[0].value, Some([12.5, 25.0, 37.5, 50.0]));
+    }
+
+    #[test]
+    fn recognizes_constant_tint_values() {
+        assert!(sane_color_tint(&[0.7, 0.6, 0.5, 1.0]));
+        assert!(!sane_color_tint(&[1.0, 1.0, 1.0, 1.0]));
+        assert!(!sane_color_tint(&[8.0, 1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn uses_constant_buffer_values_for_material_summary() {
+        let stage = TechniqueStagePreview {
+            stage: "PS",
+            shader: None,
+            textures: vec![],
+            constants: vec![],
+            samplers: vec![],
+            inline_constants: vec![],
+            bytecode_len: 0,
+            constant_buffer_slot: Some(0),
+            constant_buffer: None,
+            constant_buffer_preview: Some(ConstantBufferPreview {
+                header_tag: TagHash::NONE,
+                data_tag: TagHash::NONE,
+                header_len: 0,
+                data_len: 0x20,
+                first_values: vec![[0.6, 0.5, 0.4, 1.0], [2.5, 1.0, 1.0, 1.0]],
+            }),
+            bytecode: TfxBytecodePreview::default(),
+        };
+
+        assert_eq!(stage_color_tint(&stage), Some([0.6, 0.5, 0.4, 1.0]));
+        assert_eq!(stage_emissive_strength(&stage), Some(2.5));
     }
 
     #[test]
