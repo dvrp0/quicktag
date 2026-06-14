@@ -204,10 +204,19 @@ pub struct WireframePreview {
     pub vertices: Vec<[f32; 3]>,
     pub uvs: Option<Vec<[f32; 2]>>,
     pub indices: Vec<u32>,
+    pub material_ranges: Vec<WireframeMaterialRange>,
     pub min: [f32; 3],
     pub max: [f32; 3],
     pub vertex_count_total: usize,
     pub index_count_total: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireframeMaterialRange {
+    pub index_start: usize,
+    pub index_count: usize,
+    pub technique: Option<TagHash>,
+    pub texture: Option<TagHash>,
 }
 
 #[derive(Debug, Clone)]
@@ -544,9 +553,12 @@ fn load_model_preview(
     let techniques = find_model_technique_entries(&cache, tag, entry);
     let textures = find_model_textures(&cache, tag, &techniques);
     let shaders = find_related_tags(&cache, tag, TagSearchKind::Shader, 8);
-    let (mesh_source, wireframe) = parse_model_wireframe(tag, entry)
+    let (mesh_source, mut wireframe) = parse_model_wireframe(tag, entry)
         .map(|parsed| (Some(parsed.0), Some(parsed.1)))
         .unwrap_or_else(|| (None, build_model_wireframe(&vertex_buffers, &index_buffers)));
+    if let Some(wireframe) = &mut wireframe {
+        assign_wireframe_material_textures(wireframe, &cache, &textures);
+    }
 
     ModelPreview {
         label,
@@ -751,6 +763,36 @@ fn texture_parent_technique_rank(
         parents.len(),
         parents.into_iter().min().unwrap_or(usize::MAX),
     )
+}
+
+fn assign_wireframe_material_textures(
+    wireframe: &mut WireframePreview,
+    cache: &TagCache,
+    textures: &[(TagHash, UEntryHeader)],
+) {
+    if wireframe.material_ranges.is_empty() {
+        return;
+    }
+
+    for range in &mut wireframe.material_ranges {
+        let Some(technique) = range.technique else {
+            range.texture = textures.first().map(|(tag, _entry)| *tag);
+            continue;
+        };
+
+        range.texture = textures
+            .iter()
+            .map(|(texture, _entry)| *texture)
+            .find(|texture| texture_has_parent_technique(cache, *texture, technique))
+            .or_else(|| textures.first().map(|(tag, _entry)| *tag));
+    }
+}
+
+fn texture_has_parent_technique(cache: &TagCache, texture: TagHash, technique: TagHash) -> bool {
+    cache
+        .hashes
+        .get(&texture)
+        .is_some_and(|scan| scan.references.contains(&technique))
 }
 
 fn find_model_technique_entries(
@@ -1041,6 +1083,7 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            technique: source.technique,
         }],
         source.input_layout_index,
     )?;
@@ -1088,6 +1131,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            technique: source.technique,
         }],
         source.input_layout_index,
     )?;
@@ -1233,28 +1277,43 @@ fn build_wireframe_from_refs(
     let index_preview =
         load_index_buffer_preview_for_tag(index_tag, &index_entry, &index_header).ok()?;
     wireframe.index_count_total = index_preview.index_count;
-    wireframe.indices = if index_ranges.is_empty() {
-        index_preview
+    wireframe.material_ranges.clear();
+    if index_ranges.is_empty() {
+        wireframe.indices = index_preview
             .indices
             .into_iter()
             .take(MAX_PREVIEW_INDICES)
-            .collect()
+            .collect();
     } else {
-        index_ranges
-            .iter()
-            .flat_map(|range| {
-                let source = index_preview
-                    .indices
-                    .get(
-                        range.range.start.min(index_preview.indices.len())
-                            ..range.range.end.min(index_preview.indices.len()),
-                    )
-                    .unwrap_or_default();
-                preview_triangles_from_indices(source, range.primitive_type)
-            })
-            .take(MAX_PREVIEW_INDICES)
-            .collect()
-    };
+        let mut indices = Vec::new();
+        for range in index_ranges {
+            let source = index_preview
+                .indices
+                .get(
+                    range.range.start.min(index_preview.indices.len())
+                        ..range.range.end.min(index_preview.indices.len()),
+                )
+                .unwrap_or_default();
+            let triangles = preview_triangles_from_indices(source, range.primitive_type);
+            if triangles.is_empty() {
+                continue;
+            }
+            let available = MAX_PREVIEW_INDICES.saturating_sub(indices.len());
+            if available == 0 {
+                break;
+            }
+            let index_start = indices.len();
+            let index_count = triangles.len().min(available);
+            indices.extend(triangles.into_iter().take(index_count));
+            wireframe.material_ranges.push(WireframeMaterialRange {
+                index_start,
+                index_count,
+                technique: range.technique,
+                texture: None,
+            });
+        }
+        wireframe.indices = indices;
+    }
     wireframe.source = format!("{vertex_tag} + {index_tag}");
 
     Some(wireframe)
@@ -1520,6 +1579,7 @@ struct GeometryIndexRangePreview {
 struct PreviewIndexRange {
     range: std::ops::Range<usize>,
     primitive_type: u8,
+    technique: Option<TagHash>,
 }
 
 #[derive(Debug, Clone)]
@@ -1763,6 +1823,7 @@ fn index_ranges_from_geometry_ranges(
             range: range.index_start as usize
                 ..range.index_start.saturating_add(range.index_count) as usize,
             primitive_type: range.primitive_type,
+            technique: Some(range.technique),
         })
         .collect()
 }
@@ -2510,6 +2571,7 @@ fn build_vertex_wireframe(
         vertices,
         uvs: None,
         indices: vec![],
+        material_ranges: vec![],
         min,
         max,
     })
@@ -2694,7 +2756,7 @@ mod tests {
         let entry = package_manager().get_entry(tag).expect("sample tag entry");
         assert_eq!(entry.reference, CLASS_GEOMETRY_RESOURCE);
 
-        let (source, wireframe) = parse_model_wireframe(tag, &entry).expect("sample wireframe");
+        let (source, mut wireframe) = parse_model_wireframe(tag, &entry).expect("sample wireframe");
         eprintln!(
             "mesh kind={} technique={:?} layout={:?} ib={} vb0={} vb1={} index_start={} index_count={} lod={} wireframe verts={} indices={} source={} uv={:?}",
             source.kind,
@@ -2768,6 +2830,31 @@ mod tests {
             textures.first().map(|(tag, _)| *tag),
             Some(TagHash(0x80B14064))
         );
+        assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+        let assigned_textures = wireframe
+            .material_ranges
+            .iter()
+            .filter_map(|range| range.texture)
+            .unique()
+            .collect_vec();
+        eprintln!(
+            "assigned_textures={:?}",
+            assigned_textures
+                .iter()
+                .map(|tag| format!("{tag}"))
+                .collect_vec()
+        );
+        for expected in [
+            TagHash(0x80B14064),
+            TagHash(0x80B14069),
+            TagHash(0x80B1405F),
+            TagHash(0x80B14047),
+        ] {
+            assert!(
+                assigned_textures.contains(&expected),
+                "sample material ranges should use {expected}"
+            );
+        }
 
         let complete_tag = TagHash(0x80B140B7);
         let complete_entry = package_manager()

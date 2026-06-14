@@ -5,6 +5,7 @@ use eframe::egui::{
     epaint::{Mesh, Vertex},
     pos2, vec2,
 };
+use itertools::Itertools;
 use quicktag_core::tagtypes::TagType;
 use quicktag_scanner::TagCache;
 use tiger_pkg::{TagHash, manager::PackagePath, package::UEntryHeader, package_manager};
@@ -46,6 +47,7 @@ struct ProjectedVertex {
 struct ProjectedTriangle {
     indices: [u32; 3],
     depth: f32,
+    texture: Option<TagHash>,
 }
 
 impl ModelsView {
@@ -430,16 +432,18 @@ pub(super) fn model_wireframe_ui(
             *zoom = 1.0;
         }
     });
-    let preview_texture = wireframe
-        .uv_format
-        .as_ref()
-        .and_then(|_| textures.first())
-        .map(|(tag, _entry)| (*tag, texture_cache.get_or_default(*tag)));
+    let preview_textures = wireframe_preview_textures(wireframe, textures);
     if let Some(uv_source) = wireframe.uv_format.as_deref() {
-        if let Some((tag, (texture, _tid))) = &preview_texture {
+        if let Some(tag) = preview_textures.first() {
+            let (texture, _tid) = texture_cache.get_or_default(*tag);
             ui.monospace(format!(
-                "textured preview: {} using {} ({}x{}, {:?})",
-                tag, uv_source, texture.desc.width, texture.desc.height, texture.desc.format
+                "textured preview: {} material texture(s), first {} using {} ({}x{}, {:?})",
+                preview_textures.len(),
+                tag,
+                uv_source,
+                texture.desc.width,
+                texture.desc.height,
+                texture.desc.format
             ));
         } else {
             ui.monospace("textured preview: no related texture resolved");
@@ -492,10 +496,15 @@ pub(super) fn model_wireframe_ui(
     };
 
     if wireframe.indices.len() >= 3 {
-        if wireframe.uvs.is_some()
-            && let Some((_tag, (_texture, texture_id))) = preview_texture
-        {
-            draw_textured_model_mesh(&painter, wireframe, &projected, texture_id, uv_transform);
+        if wireframe.uvs.is_some() && !preview_textures.is_empty() {
+            draw_textured_model_mesh(
+                &painter,
+                wireframe,
+                &projected,
+                texture_cache,
+                textures,
+                uv_transform,
+            );
         }
 
         if *show_wireframe {
@@ -526,7 +535,8 @@ fn draw_textured_model_mesh(
     painter: &egui::Painter,
     wireframe: &WireframePreview,
     projected: &[ProjectedVertex],
-    texture_id: egui::TextureId,
+    texture_cache: &TextureCache,
+    fallback_textures: &[(TagHash, UEntryHeader)],
     uv_transform: Option<UvTransformPreview>,
 ) {
     let mut triangles = projected_triangles(wireframe, projected);
@@ -545,18 +555,32 @@ fn draw_textured_model_mesh(
         painter.add(egui::Shape::mesh(base_mesh));
     }
 
-    let mut mesh = Mesh::with_texture(texture_id);
-    add_projected_triangles_to_mesh(
-        &mut mesh,
-        wireframe,
-        projected,
-        &triangles,
-        uv_transform,
-        Color32::WHITE,
-    );
+    let fallback_texture = fallback_textures.first().map(|(tag, _entry)| *tag);
+    let texture_tags = triangles
+        .iter()
+        .filter_map(|triangle| triangle.texture.or(fallback_texture))
+        .unique()
+        .collect_vec();
+    for texture_tag in texture_tags {
+        let (_texture, texture_id) = texture_cache.get_or_default(texture_tag);
+        let texture_triangles = triangles
+            .iter()
+            .copied()
+            .filter(|triangle| triangle.texture.or(fallback_texture) == Some(texture_tag))
+            .collect_vec();
+        let mut mesh = Mesh::with_texture(texture_id);
+        add_projected_triangles_to_mesh(
+            &mut mesh,
+            wireframe,
+            projected,
+            &texture_triangles,
+            uv_transform,
+            Color32::WHITE,
+        );
 
-    if !mesh.indices.is_empty() {
-        painter.add(egui::Shape::mesh(mesh));
+        if !mesh.indices.is_empty() {
+            painter.add(egui::Shape::mesh(mesh));
+        }
     }
 }
 
@@ -564,19 +588,57 @@ fn projected_triangles(
     wireframe: &WireframePreview,
     projected: &[ProjectedVertex],
 ) -> Vec<ProjectedTriangle> {
+    let mut material_iter = wireframe.material_ranges.iter().peekable();
     wireframe
         .indices
         .chunks_exact(3)
-        .filter_map(|tri| {
+        .enumerate()
+        .filter_map(|(triangle_index, tri)| {
+            let index_start = triangle_index * 3;
+            while material_iter
+                .peek()
+                .is_some_and(|range| index_start >= range.index_start + range.index_count)
+            {
+                material_iter.next();
+            }
+            let texture = material_iter
+                .peek()
+                .filter(|range| {
+                    index_start >= range.index_start
+                        && index_start < range.index_start + range.index_count
+                })
+                .and_then(|range| range.texture);
             let a = projected.get(tri[0] as usize)?;
             let b = projected.get(tri[1] as usize)?;
             let c = projected.get(tri[2] as usize)?;
             Some(ProjectedTriangle {
                 indices: [tri[0], tri[1], tri[2]],
                 depth: (a.depth + b.depth + c.depth) / 3.0,
+                texture,
             })
         })
         .collect()
+}
+
+fn wireframe_preview_textures(
+    wireframe: &WireframePreview,
+    textures: &[(TagHash, UEntryHeader)],
+) -> Vec<TagHash> {
+    let assigned = wireframe
+        .material_ranges
+        .iter()
+        .filter_map(|range| range.texture)
+        .unique()
+        .collect_vec();
+    if assigned.is_empty() {
+        textures
+            .first()
+            .map(|(tag, _entry)| *tag)
+            .into_iter()
+            .collect()
+    } else {
+        assigned
+    }
 }
 
 fn add_projected_triangles_to_mesh(
