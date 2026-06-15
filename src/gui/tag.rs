@@ -121,6 +121,7 @@ pub struct TagView {
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
+    preview_pan: egui::Vec2,
     preview_show_wireframe: bool,
     decompiled_shader: Option<Result<String, String>>,
 }
@@ -414,6 +415,7 @@ impl TagView {
             preview_yaw: 0.4,
             preview_pitch: 0.25,
             preview_zoom: 1.0,
+            preview_pan: vec2(0.0, 0.0),
             preview_show_wireframe: true,
             decompiled_shader,
         })
@@ -917,6 +919,7 @@ impl TagView {
             yaw: &mut self.preview_yaw,
             pitch: &mut self.preview_pitch,
             zoom: &mut self.preview_zoom,
+            pan: &mut self.preview_pan,
             show_wireframe: &mut self.preview_show_wireframe,
         };
 
@@ -1969,6 +1972,7 @@ struct PreviewOrbit<'a> {
     yaw: &'a mut f32,
     pitch: &'a mut f32,
     zoom: &'a mut f32,
+    pan: &'a mut egui::Vec2,
     show_wireframe: &'a mut bool,
 }
 
@@ -2746,6 +2750,7 @@ fn model_preview_ui(
             orbit.yaw,
             orbit.pitch,
             orbit.zoom,
+            orbit.pan,
             orbit.show_wireframe,
         );
     } else {

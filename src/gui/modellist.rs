@@ -34,6 +34,7 @@ pub struct ModelsView {
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
+    preview_pan: egui::Vec2,
     preview_show_wireframe: bool,
 }
 
@@ -71,6 +72,7 @@ impl ModelsView {
             preview_yaw: 0.4,
             preview_pitch: 0.25,
             preview_zoom: 1.0,
+            preview_pan: vec2(0.0, 0.0),
             preview_show_wireframe: false,
         }
     }
@@ -215,6 +217,7 @@ impl View for ModelsView {
         let preview_yaw = &mut self.preview_yaw;
         let preview_pitch = &mut self.preview_pitch;
         let preview_zoom = &mut self.preview_zoom;
+        let preview_pan = &mut self.preview_pan;
         let preview_show_wireframe = &mut self.preview_show_wireframe;
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -301,6 +304,7 @@ impl View for ModelsView {
                             preview_yaw,
                             preview_pitch,
                             preview_zoom,
+                            preview_pan,
                             preview_show_wireframe,
                         );
                     } else {
@@ -424,6 +428,7 @@ pub(super) fn model_wireframe_ui(
     yaw: &mut f32,
     pitch: &mut f32,
     zoom: &mut f32,
+    pan: &mut egui::Vec2,
     show_wireframe: &mut bool,
 ) {
     ui.horizontal(|ui| {
@@ -436,6 +441,7 @@ pub(super) fn model_wireframe_ui(
             *yaw = 0.4;
             *pitch = 0.25;
             *zoom = 1.0;
+            *pan = vec2(0.0, 0.0);
         }
     });
     let preview_textures = wireframe_preview_textures(wireframe, textures);
@@ -478,12 +484,26 @@ pub(super) fn model_wireframe_ui(
     let size = vec2(available.x.max(320.0), available.y.clamp(320.0, 620.0));
     let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
 
-    if response.dragged() {
-        let delta = response.drag_delta();
-        *yaw += delta.x * 0.01;
-        *pitch = (*pitch + delta.y * 0.01).clamp(-1.45, 1.45);
+    let pointer_delta = ui.input(|i| i.pointer.delta());
+
+    if response.dragged_by(egui::PointerButton::Primary) {
+        // Left mouse button: horizontal rotation only
+        *yaw += pointer_delta.x * 0.01;
         ui.ctx().request_repaint();
     }
+
+    if response.dragged_by(egui::PointerButton::Secondary) {
+        // Right mouse button: vertical rotation only
+        *pitch = (*pitch + pointer_delta.y * 0.01).clamp(-1.45, 1.45);
+        ui.ctx().request_repaint();
+    }
+
+    if response.dragged_by(egui::PointerButton::Middle) {
+        // Middle mouse button / wheel button: pan only
+        *pan += pointer_delta;
+        ui.ctx().request_repaint();
+    }
+
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
@@ -501,7 +521,7 @@ pub(super) fn model_wireframe_ui(
         egui::StrokeKind::Middle,
     );
 
-    let Some(projected) = project_vertices(wireframe, *yaw, *pitch, *zoom, rect) else {
+    let Some(projected) = project_vertices(wireframe, *yaw, *pitch, *zoom, *pan, rect) else {
         return;
     };
 
@@ -740,12 +760,9 @@ fn face_light(a: ProjectedVertex, b: ProjectedVertex, c: ProjectedVertex) -> f32
     let nz = normal[2] / len;
     let light = [0.35_f32, -0.45, 0.82];
     let light_len = (light[0] * light[0] + light[1] * light[1] + light[2] * light[2]).sqrt();
-    let ndot1 = nx * light[0] / light_len
-        + ny * light[1] / light_len
-        + nz * light[2] / light_len;
     let lambert =
         (nx * light[0] / light_len + ny * light[1] / light_len + nz * light[2] / light_len).abs();
-    (0.85 + lambert * 0.15).clamp(0.00, 1.0)
+    (0.85 + lambert * 0.15).clamp(0.75, 1.0)
 }
 
 fn wireframe_preview_textures(
@@ -870,6 +887,7 @@ fn project_vertices(
     yaw: f32,
     pitch: f32,
     zoom: f32,
+    pan: egui::Vec2,
     rect: egui::Rect,
 ) -> Option<Vec<ProjectedVertex>> {
     if wireframe.vertices.is_empty() {
@@ -892,7 +910,7 @@ fn project_vertices(
     let sy = yaw.sin();
     let cp = pitch.cos();
     let sp = pitch.sin();
-    let screen_center = rect.center();
+    let screen_center = rect.center() + pan;
 
     Some(
         wireframe
