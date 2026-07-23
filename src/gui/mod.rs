@@ -3,7 +3,9 @@ mod audio_events;
 mod audio_list;
 mod common;
 mod external_file;
+mod gear;
 mod hexview;
+mod model_renderer;
 mod modellist;
 mod named_tags;
 mod packages;
@@ -17,10 +19,11 @@ mod texturelist;
 
 use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 use eframe::egui::{CornerRadius, PointerButton, RichText, TextEdit, Widget};
 use eframe::egui_wgpu::RenderState;
@@ -39,11 +42,15 @@ use quicktag_core::util::fnv1;
 use quicktag_scanner::context::ScannerContext;
 use quicktag_scanner::signatures::SIGNATURES_HASH;
 use quicktag_scanner::{ScanStatus, TagCache, load_tag_cache, scanner_progress};
-use quicktag_strings::localized::{RawStringHashCache, StringCache, create_stringmap};
-use rustc_hash::FxHashSet;
+use quicktag_strings::localized::{
+    LocalizedLanguage, RawStringHashCache, StringCache, create_stringmap,
+    create_stringmap_for_language, supported_languages,
+};
+use rustc_hash::{FxHashMap, FxHashSet};
 use strings::StringViewVariant;
 use tiger_pkg::{TagHash, package_manager};
 
+use self::gear::GearView;
 use self::modellist::ModelsView;
 use self::named_tags::NamedTagView;
 use self::packages::PackagesView;
@@ -64,6 +71,7 @@ pub enum Panel {
     Packages,
     Textures,
     Models,
+    Gear,
     Audio,
     AudioEvents,
     Strings,
@@ -86,6 +94,99 @@ lazy_static! {
         RwLock::new(None);
 }
 
+const GAME_LANGUAGE_STORAGE_KEY: &str = "quicktag_game_language";
+
+struct LocalizedBundle {
+    language: LocalizedLanguage,
+    strings: Arc<StringCache>,
+    gear: GearView,
+}
+
+fn load_localized_bundle(language: LocalizedLanguage) -> Result<LocalizedBundle, String> {
+    let strings = Arc::new(
+        create_stringmap_for_language(language)
+            .map_err(|error| format!("Failed to load {} strings: {error:#}", language.label()))?,
+    );
+    if strings.is_empty() {
+        return Err(format!(
+            "The game packages did not contain any {} strings",
+            language.label()
+        ));
+    }
+
+    let gear = GearView::new_for_language(strings.clone(), language);
+    if matches!(
+        package_manager().version,
+        tiger_pkg::GameVersion::Marathon(_)
+    ) && let Some(error) = gear.load_error()
+    {
+        return Err(error.to_owned());
+    }
+
+    Ok(LocalizedBundle {
+        language,
+        strings,
+        gear,
+    })
+}
+
+fn add_localization_font_fallback(fonts: &mut egui::FontDefinitions) {
+    let mut candidates = Vec::<PathBuf>::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        let windows = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let font_dir = windows.join("Fonts");
+        for filename in [
+            "NotoSansCJKkr-Regular.otf",
+            "malgun.ttf",
+            "meiryo.ttc",
+            "msyh.ttc",
+            "msjh.ttc",
+        ] {
+            candidates.push(font_dir.join(filename));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    candidates.extend([
+        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf"),
+        PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+    ]);
+
+    #[cfg(target_os = "macos")]
+    candidates.extend([
+        PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+        PathBuf::from("/System/Library/Fonts/AppleSDGothicNeo.ttc"),
+        PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    ]);
+
+    let Some((path, data)) = candidates
+        .into_iter()
+        .find_map(|path| std::fs::read(&path).ok().map(|data| (path, data)))
+    else {
+        log::warn!("No system CJK font fallback found; some localized glyphs may be unavailable");
+        return;
+    };
+
+    const FONT_NAME: &str = "quicktag_localization_fallback";
+    fonts.font_data.insert(
+        FONT_NAME.to_owned(),
+        Arc::new(egui::FontData::from_owned(data)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push(FONT_NAME.to_owned());
+    }
+    info!("Loaded localization font fallback from {}", path.display());
+}
+
 pub fn get_string_for_hash(hash: u32) -> Option<String> {
     let lookup = RAW_STRING_HASH_LOOKUP.read();
     let lookup = lookup.as_ref()?;
@@ -102,6 +203,11 @@ pub struct QuickTagApp {
     tag_history: Rc<RefCell<TagHistory>>,
     strings: Arc<StringCache>,
     raw_strings: Arc<RawStringHashCache>,
+    language: LocalizedLanguage,
+    loading_language: Option<LocalizedLanguage>,
+    language_load: Option<Promise<Result<LocalizedBundle, String>>>,
+    localized_string_cache: FxHashMap<LocalizedLanguage, Arc<StringCache>>,
+    localized_gear_cache: FxHashMap<LocalizedLanguage, GearView>,
 
     texture_cache: TextureCache,
 
@@ -120,6 +226,7 @@ pub struct QuickTagApp {
     packages_view: PackagesView,
     textures_view: TexturesView,
     models_view: ModelsView,
+    gear_view: GearView,
     audio_view: audio_list::AudioView,
     audio_events_view: audio_events::AudioEventView,
     strings_view: StringsView,
@@ -171,10 +278,42 @@ impl QuickTagApp {
             }
         }
 
+        add_localization_font_fallback(&mut fonts);
+
         cc.egui_ctx.set_fonts(fonts);
 
-        let strings = Arc::new(create_stringmap().unwrap());
+        let requested_language = cc
+            .storage
+            .and_then(|storage| storage.get_string(GAME_LANGUAGE_STORAGE_KEY))
+            .as_deref()
+            .and_then(LocalizedLanguage::from_code)
+            .filter(|language| supported_languages().contains(language))
+            .unwrap_or_default();
+
+        let initial_bundle = load_localized_bundle(requested_language).or_else(|error| {
+            log::error!(
+                "Could not restore {} localization: {error}",
+                requested_language.label()
+            );
+            load_localized_bundle(LocalizedLanguage::English)
+        });
+        let (language, strings, gear_view) = match initial_bundle {
+            Ok(bundle) => (bundle.language, bundle.strings, bundle.gear),
+            Err(error) => {
+                log::error!("Could not load localized strings: {error}");
+                let strings = Arc::new(create_stringmap().unwrap_or_default());
+                (
+                    LocalizedLanguage::English,
+                    strings.clone(),
+                    GearView::new(strings),
+                )
+            }
+        };
+        let mut localized_string_cache = FxHashMap::default();
+        localized_string_cache.insert(language, strings.clone());
         let texture_cache = TextureCache::new(cc.wgpu_render_state.clone().unwrap());
+        let mut models_view = ModelsView::new(Default::default(), texture_cache.clone());
+        models_view.set_weapon_catalog(gear_view.model_weapon_catalog());
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut schemafile_watcher = notify::recommended_watcher(tx).unwrap();
@@ -221,7 +360,8 @@ impl QuickTagApp {
             named_tags_view: NamedTagView::new(),
             packages_view: PackagesView::new(texture_cache.clone()),
             textures_view: TexturesView::new(texture_cache.clone()),
-            models_view: ModelsView::new(Default::default(), texture_cache),
+            models_view,
+            gear_view,
             audio_view: audio_list::AudioView::new(),
             audio_events_view: audio_events::AudioEventView::new(),
             strings_view: StringsView::new(
@@ -240,6 +380,11 @@ impl QuickTagApp {
 
             strings,
             raw_strings: Default::default(),
+            language,
+            loading_language: None,
+            language_load: None,
+            localized_string_cache,
+            localized_gear_cache: Default::default(),
 
             _schemafile_watcher: schemafile_watcher,
             schemafile_update_rx: rx,
@@ -250,7 +395,13 @@ impl QuickTagApp {
 }
 
 impl eframe::App for QuickTagApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(GAME_LANGUAGE_STORAGE_KEY, self.language.code().to_owned());
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.finish_language_load(ctx);
+
         if self.reload_cache {
             self.cache_load = Some(Promise::spawn_thread("load_cache", move || {
                 load_tag_cache()
@@ -391,6 +542,9 @@ impl eframe::App for QuickTagApp {
             );
 
             self.signatures_view = SignaturesView::new(self.cache.clone());
+            self.gear_view.reconcile_weapon_skin_models(&self.cache);
+            self.models_view
+                .set_weapon_catalog(self.gear_view.model_weapon_catalog());
             self.models_view.set_cache(self.cache.clone());
 
             // // Dump all raw strings to a csv file
@@ -443,6 +597,36 @@ impl eframe::App for QuickTagApp {
                             ui.close();
                         }
                     });
+
+                    ui.separator();
+                    ui.label("Game text:");
+                    let mut requested_language = None;
+                    ui.add_enabled_ui(self.language_load.is_none(), |ui| {
+                        egui::ComboBox::from_id_salt("game_localization_language")
+                            .selected_text(self.language.label())
+                            .width(176.0)
+                            .show_ui(ui, |ui| {
+                                for &language in supported_languages() {
+                                    if ui
+                                        .selectable_label(
+                                            self.language == language,
+                                            language.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        requested_language = Some(language);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    });
+                    if let Some(language) = self.loading_language {
+                        ui.spinner();
+                        ui.weak(format!("Loading {}…", language.label()));
+                    }
+                    if let Some(language) = requested_language {
+                        self.request_language(language, ctx);
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
                         if self.current_signatures_hash != self.cache.signatures_hash && self.current_wordlist_hash != self.cache.wordlist_hash {
@@ -549,6 +733,7 @@ impl eframe::App for QuickTagApp {
                     ui.selectable_value(&mut self.open_panel, Panel::Packages, "Packages");
                     ui.selectable_value(&mut self.open_panel, Panel::Textures, "Textures");
                     ui.selectable_value(&mut self.open_panel, Panel::Models, "Models");
+                    ui.selectable_value(&mut self.open_panel, Panel::Gear, "Gear");
                     ui.selectable_value(&mut self.open_panel, Panel::Audio, "Audio");
                     ui.selectable_value(&mut self.open_panel, Panel::AudioEvents, "Wwise Events");
                     ui.selectable_value(&mut self.open_panel, Panel::Strings, "Strings");
@@ -587,6 +772,7 @@ impl eframe::App for QuickTagApp {
                     Panel::Packages => self.packages_view.view(ctx, ui),
                     Panel::Textures => self.textures_view.view(ctx, ui),
                     Panel::Models => self.models_view.view(ctx, ui),
+                    Panel::Gear => self.gear_view.view(ctx, ui),
                     Panel::Audio => self.audio_view.view(ctx, ui),
                     Panel::AudioEvents => self.audio_events_view.view(ctx, ui),
                     Panel::Strings => match self.strings_panel {
@@ -644,6 +830,89 @@ impl eframe::App for QuickTagApp {
 }
 
 impl QuickTagApp {
+    fn request_language(&mut self, language: LocalizedLanguage, ctx: &egui::Context) {
+        if language == self.language || self.language_load.is_some() {
+            return;
+        }
+
+        if let Some(strings) = self.localized_string_cache.get(&language).cloned()
+            && let Some(gear) = self.localized_gear_cache.remove(&language)
+        {
+            self.apply_localized_bundle(LocalizedBundle {
+                language,
+                strings,
+                gear,
+            });
+            TOASTS
+                .lock()
+                .success(format!("Game text changed to {}", language.label()));
+            return;
+        }
+
+        self.loading_language = Some(language);
+        self.language_load = Some(Promise::spawn_thread("load_localization", move || {
+            load_localized_bundle(language)
+        }));
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    fn finish_language_load(&mut self, ctx: &egui::Context) {
+        let Some(promise) = self.language_load.as_ref() else {
+            return;
+        };
+        if promise.poll().is_pending() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+
+        let result = self
+            .language_load
+            .take()
+            .and_then(|promise| promise.try_take().ok());
+        self.loading_language = None;
+
+        match result {
+            Some(Ok(bundle)) => {
+                let language = bundle.language;
+                self.apply_localized_bundle(bundle);
+                TOASTS
+                    .lock()
+                    .success(format!("Game text changed to {}", language.label()));
+            }
+            Some(Err(error)) => {
+                log::error!("Failed to change game text language: {error}");
+                TOASTS.lock().error(error);
+            }
+            None => {
+                log::error!("Localization loader completed without a result");
+                TOASTS
+                    .lock()
+                    .error("Localization loader completed without a result");
+            }
+        }
+    }
+
+    fn apply_localized_bundle(&mut self, mut bundle: LocalizedBundle) {
+        bundle.gear.inherit_ui_state(&self.gear_view);
+
+        let previous_language = self.language;
+        let previous_gear = std::mem::replace(&mut self.gear_view, bundle.gear);
+        self.gear_view.reconcile_weapon_skin_models(&self.cache);
+        self.models_view
+            .set_weapon_catalog(self.gear_view.model_weapon_catalog());
+        self.localized_gear_cache
+            .insert(previous_language, previous_gear);
+
+        self.language = bundle.language;
+        self.strings = bundle.strings.clone();
+        self.localized_string_cache
+            .insert(bundle.language, bundle.strings.clone());
+        self.strings_view.set_strings(bundle.strings.clone());
+        if let Some(tag_view) = &mut self.tag_view {
+            tag_view.set_string_cache(bundle.strings);
+        }
+    }
+
     fn open_tag(&mut self, tag: TagHash, push_history: bool) {
         let new_view = TagView::create(
             self.cache.clone(),

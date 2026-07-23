@@ -9,7 +9,7 @@ use binrw::{BinRead, BinReaderExt, BinResult, Endian, VecArgs};
 use log::{error, warn};
 use quicktag_core::util::FNV1_BASE;
 use rustc_hash::{FxHashMap, FxHashSet};
-use tiger_pkg::{DestinyVersion, GameVersion, MarathonVersion, TagHash, package_manager};
+use tiger_pkg::{DestinyVersion, GameVersion, TagHash, package_manager};
 
 pub type TablePointer32<T> = _TablePointer<i32, u32, T>;
 pub type TablePointer64<T> = _TablePointer<i64, u64, T>;
@@ -214,6 +214,103 @@ pub struct StringContainer {
     pub language_russian: TagHash,
 }
 
+/// A language stored in the game's localized string containers.
+///
+/// This is deliberately separate from QuickTag's UI language: selecting one
+/// only changes text read from game packages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LocalizedLanguage {
+    #[default]
+    English,
+    Japanese,
+    German,
+    French,
+    Spanish,
+    SpanishLatam,
+    Italian,
+    Korean,
+    ChineseTraditional,
+    ChineseSimplified,
+    Portuguese,
+    Polish,
+    Russian,
+}
+
+impl LocalizedLanguage {
+    pub const ALL: [Self; 13] = [
+        Self::English,
+        Self::Japanese,
+        Self::German,
+        Self::French,
+        Self::Spanish,
+        Self::SpanishLatam,
+        Self::Italian,
+        Self::Korean,
+        Self::ChineseTraditional,
+        Self::ChineseSimplified,
+        Self::Portuguese,
+        Self::Polish,
+        Self::Russian,
+    ];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::Japanese => "ja",
+            Self::German => "de",
+            Self::French => "fr",
+            Self::Spanish => "es",
+            Self::SpanishLatam => "es-419",
+            Self::Italian => "it",
+            Self::Korean => "ko",
+            Self::ChineseTraditional => "zh-Hant",
+            Self::ChineseSimplified => "zh-Hans",
+            Self::Portuguese => "pt",
+            Self::Polish => "pl",
+            Self::Russian => "ru",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::Japanese => "Japanese",
+            Self::German => "German",
+            Self::French => "French",
+            Self::Spanish => "Spanish",
+            Self::SpanishLatam => "Spanish (Latin America)",
+            Self::Italian => "Italian",
+            Self::Korean => "Korean",
+            Self::ChineseTraditional => "Chinese (Traditional)",
+            Self::ChineseSimplified => "Chinese (Simplified)",
+            Self::Portuguese => "Portuguese",
+            Self::Polish => "Polish",
+            Self::Russian => "Russian",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|language| language.code().eq_ignore_ascii_case(code))
+    }
+}
+
+/// Languages supported by the string format of the currently loaded game.
+pub fn supported_languages() -> &'static [LocalizedLanguage] {
+    use tiger_pkg::version::EngineVersion;
+
+    match package_manager().version.engine_version() {
+        EngineVersion::TigerD1Indev | EngineVersion::TigerD1Alpha | EngineVersion::TigerD1v1 => {
+            &LocalizedLanguage::ALL[..1]
+        }
+        EngineVersion::TigerD1v2
+        | EngineVersion::TigerD2v1
+        | EngineVersion::TigerD2v2
+        | EngineVersion::TigerGoliath => &LocalizedLanguage::ALL,
+    }
+}
+
 impl StringContainer {
     pub fn all_languages(&self) -> Vec<(&'static str, TagHash)> {
         vec![
@@ -231,6 +328,24 @@ impl StringContainer {
             ("pl", self.language_polish),
             ("ru", self.language_russian),
         ]
+    }
+
+    pub const fn language_tag(&self, language: LocalizedLanguage) -> TagHash {
+        match language {
+            LocalizedLanguage::English => self.language_english,
+            LocalizedLanguage::Japanese => self.language_japanese,
+            LocalizedLanguage::German => self.language_german,
+            LocalizedLanguage::French => self.language_french,
+            LocalizedLanguage::Spanish => self.language_spanish,
+            LocalizedLanguage::SpanishLatam => self.language_spanish_latam,
+            LocalizedLanguage::Italian => self.language_italian,
+            LocalizedLanguage::Korean => self.language_korean,
+            LocalizedLanguage::ChineseTraditional => self.language_chinese_traditional,
+            LocalizedLanguage::ChineseSimplified => self.language_chinese_simplified,
+            LocalizedLanguage::Portuguese => self.language_portuguese,
+            LocalizedLanguage::Polish => self.language_polish,
+            LocalizedLanguage::Russian => self.language_russian,
+        }
     }
 }
 
@@ -394,19 +509,115 @@ pub fn decode_text(data: &[u8], cipher: u16) -> String {
 }
 
 pub fn create_stringmap() -> anyhow::Result<StringCache> {
+    create_stringmap_for_language(LocalizedLanguage::English)
+}
+
+pub fn create_stringmap_for_language(language: LocalizedLanguage) -> anyhow::Result<StringCache> {
     match package_manager().version.engine_version() {
-        tiger_pkg::version::EngineVersion::TigerD1Indev => create_stringmap_d1_devalpha(),
-        tiger_pkg::version::EngineVersion::TigerD1Alpha => create_stringmap_d1_firstlook(),
-        tiger_pkg::version::EngineVersion::TigerD1v1 => create_stringmap_d1(),
+        tiger_pkg::version::EngineVersion::TigerD1Indev => {
+            require_english(language)?;
+            create_stringmap_d1_devalpha()
+        }
+        tiger_pkg::version::EngineVersion::TigerD1Alpha => {
+            require_english(language)?;
+            create_stringmap_d1_firstlook()
+        }
+        tiger_pkg::version::EngineVersion::TigerD1v1 => {
+            require_english(language)?;
+            create_stringmap_d1()
+        }
         // cohae: Rise of Iron uses the same string format as D2
         tiger_pkg::version::EngineVersion::TigerD1v2
         | tiger_pkg::version::EngineVersion::TigerD2v1
         | tiger_pkg::version::EngineVersion::TigerD2v2
-        | tiger_pkg::version::EngineVersion::TigerGoliath => create_stringmap_d2(),
+        | tiger_pkg::version::EngineVersion::TigerGoliath => {
+            create_stringmap_d2_for_language(language)
+        }
     }
 }
 
+fn require_english(language: LocalizedLanguage) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        language == LocalizedLanguage::English,
+        "{} localization is not available for this game version",
+        language.label()
+    );
+    Ok(())
+}
+
 pub fn create_stringmap_d2() -> anyhow::Result<StringCache> {
+    create_stringmap_d2_for_language(LocalizedLanguage::English)
+}
+
+pub fn create_stringmap_d2_for_language(
+    language: LocalizedLanguage,
+) -> anyhow::Result<StringCache> {
+    let mut tmp_map: FxHashMap<u32, FxHashSet<String>> = Default::default();
+    for container in create_stringcontainers_d2_for_language(language)? {
+        for (hash, value) in container.strings {
+            tmp_map.entry(hash).or_default().insert(value);
+        }
+    }
+
+    Ok(tmp_map
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect())
+}
+
+pub type LocalizedStringSet = FxHashMap<u32, String>;
+
+#[derive(Clone, Debug)]
+pub struct LocalizedStringContainer {
+    pub tag: TagHash,
+    pub strings: LocalizedStringSet,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LocalizedStringResolver {
+    containers: FxHashMap<TagHash, LocalizedStringSet>,
+    scopes: Vec<Option<TagHash>>,
+}
+
+impl LocalizedStringResolver {
+    pub fn get(&self, scope: u32, hash: u32) -> Option<&String> {
+        let container = self.scopes.get(scope as usize)?.as_ref()?;
+        self.containers.get(container)?.get(&hash)
+    }
+
+    pub fn scope_tag(&self, scope: u32) -> Option<TagHash> {
+        self.scopes.get(scope as usize).copied().flatten()
+    }
+}
+
+/// Decode each localized string container independently.
+///
+/// Goliath can reuse the same 32-bit string hash in many containers, so callers
+/// that need an exact value must retain this container scope.
+pub fn create_stringsets_d2() -> anyhow::Result<Vec<LocalizedStringSet>> {
+    create_stringsets_d2_for_language(LocalizedLanguage::English)
+}
+
+pub fn create_stringsets_d2_for_language(
+    language: LocalizedLanguage,
+) -> anyhow::Result<Vec<LocalizedStringSet>> {
+    Ok(create_stringcontainers_d2_for_language(language)?
+        .into_iter()
+        .map(|container| container.strings)
+        .collect())
+}
+
+/// Decode each localized string container while retaining its source tag.
+///
+/// Keeping the tag is required for Goliath consumers that need to associate a
+/// display record with the package-local string container that owns its hashes.
+pub fn create_stringcontainers_d2() -> anyhow::Result<Vec<LocalizedStringContainer>> {
+    create_stringcontainers_d2_for_language(LocalizedLanguage::English)
+}
+
+pub fn create_stringcontainers_d2_for_language(
+    language: LocalizedLanguage,
+) -> anyhow::Result<Vec<LocalizedStringContainer>> {
     let reference_type = match package_manager().version.engine_version() {
         tiger_pkg::version::EngineVersion::TigerD1Indev
         | tiger_pkg::version::EngineVersion::TigerD1Alpha
@@ -419,21 +630,21 @@ pub fn create_stringmap_d2() -> anyhow::Result<StringCache> {
 
     let old_format = matches!(package_manager().version, GameVersion::Destiny(v) if v <= DestinyVersion::Destiny2BeyondLight);
 
-    let mut tmp_map: FxHashMap<u32, FxHashSet<String>> = Default::default();
-    for (t, _) in package_manager()
-        .get_all_by_reference(reference_type)
-        .into_iter()
-    {
+    let mut containers = vec![];
+    let mut container_tags = package_manager().get_all_by_reference(reference_type);
+    container_tags.sort_by_key(|(tag, _)| *tag);
+    for (t, _) in container_tags {
         let Ok(textset_header) = package_manager().read_tag_binrw::<StringContainer>(t) else {
             continue;
         };
 
-        let Ok(data) = package_manager().read_tag(textset_header.language_english) else {
+        let Ok(data) = package_manager().read_tag(textset_header.language_tag(language)) else {
             continue;
         };
         let mut cur = Cursor::new(&data);
         let text_data: StringData = cur.read_le_args((old_format,))?;
 
+        let mut string_set = LocalizedStringSet::default();
         for (combination, hash) in text_data
             .string_combinations
             .iter()
@@ -462,14 +673,130 @@ pub fn create_stringmap_d2() -> anyhow::Result<StringCache> {
                 continue;
             }
 
-            tmp_map.entry(*hash).or_default().insert(final_string);
+            string_set.insert(*hash, final_string);
+        }
+        containers.push(LocalizedStringContainer {
+            tag: t,
+            strings: string_set,
+        });
+    }
+
+    Ok(containers)
+}
+
+/// Build the Goliath localization scope index used by investment display data.
+///
+/// A localized field stores a scope index beside its 32-bit string hash. The
+/// scope table resolves that index to the exact localized string container,
+/// avoiding collisions between containers that reuse the same string hashes.
+pub fn create_stringresolver_d2() -> anyhow::Result<LocalizedStringResolver> {
+    create_stringresolver_d2_for_language(LocalizedLanguage::English)
+}
+
+pub fn create_stringresolver_d2_for_language(
+    language: LocalizedLanguage,
+) -> anyhow::Result<LocalizedStringResolver> {
+    const GOLIATH_SCOPE_TABLE_REFERENCE: u32 = 0x808071C8;
+
+    let containers = create_stringcontainers_d2_for_language(language)?
+        .into_iter()
+        .map(|container| (container.tag, container.strings))
+        .collect::<FxHashMap<_, _>>();
+    let mut scopes = vec![];
+
+    if package_manager().version.engine_version() == tiger_pkg::version::EngineVersion::TigerGoliath
+    {
+        let mut tables = package_manager().get_all_by_reference(GOLIATH_SCOPE_TABLE_REFERENCE);
+        tables.sort_by_key(|(tag, _)| *tag);
+        for (tag, _) in tables {
+            let Ok(data) = package_manager().read_tag(tag) else {
+                continue;
+            };
+            let Some(wide_hashes) = parse_goliath_scope_wide_hashes(&data) else {
+                continue;
+            };
+
+            if scopes.len() < wide_hashes.len() {
+                scopes.resize(wide_hashes.len(), None);
+            }
+            for (destination, wide_hash) in scopes.iter_mut().zip(wide_hashes) {
+                let Some(container_tag) = package_manager()
+                    .lookup
+                    .tag64_entries
+                    .get(&wide_hash)
+                    .map(|entry| entry.hash32)
+                    .filter(|tag| containers.contains_key(tag))
+                else {
+                    continue;
+                };
+                *destination = Some(container_tag);
+            }
         }
     }
 
-    Ok(tmp_map
-        .into_iter()
-        .map(|(k, v)| (k, v.into_iter().collect()))
-        .collect())
+    Ok(LocalizedStringResolver { containers, scopes })
+}
+
+fn parse_goliath_scope_wide_hashes(data: &[u8]) -> Option<Vec<u64>> {
+    const SCOPE_RECORD_SIZE: usize = 0x18;
+
+    let count = usize::try_from(read_u64_at(data, 0x8)?).ok()?;
+    let relative_offset = read_i64_at(data, 0x10)?;
+    // The table pointer is based at 0x10 and uses the standard 0x10-byte
+    // table header before its fixed-size records.
+    let record_base: usize = 0x10_i64
+        .checked_add(relative_offset)?
+        .checked_add(0x10)?
+        .try_into()
+        .ok()?;
+    let record_bytes = count.checked_mul(SCOPE_RECORD_SIZE)?;
+    if record_base.checked_add(record_bytes)? > data.len() {
+        return None;
+    }
+
+    (0..count)
+        .map(|scope| read_u64_at(data, record_base + scope * SCOPE_RECORD_SIZE + 0x10))
+        .collect()
+}
+
+fn read_u64_at(data: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        data.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+fn read_i64_at(data: &[u8], offset: usize) -> Option<i64> {
+    Some(i64::from_le_bytes(
+        data.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_goliath_scope_wide_hashes;
+
+    #[test]
+    fn parses_goliath_localization_scope_table() {
+        let mut data = vec![0_u8; 0x68];
+        data[0x8..0x10].copy_from_slice(&2_u64.to_le_bytes());
+        data[0x10..0x18].copy_from_slice(&0x10_i64.to_le_bytes());
+        data[0x40..0x48].copy_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
+        data[0x58..0x60].copy_from_slice(&0x8877_6655_4433_2211_u64.to_le_bytes());
+
+        assert_eq!(
+            parse_goliath_scope_wide_hashes(&data),
+            Some(vec![0x1122_3344_5566_7788, 0x8877_6655_4433_2211])
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_goliath_localization_scope_table() {
+        let mut data = vec![0_u8; 0x50];
+        data[0x8..0x10].copy_from_slice(&2_u64.to_le_bytes());
+        data[0x10..0x18].copy_from_slice(&0x10_i64.to_le_bytes());
+
+        assert_eq!(parse_goliath_scope_wide_hashes(&data), None);
+    }
 }
 
 pub fn create_stringmap_d1() -> anyhow::Result<StringCache> {

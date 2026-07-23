@@ -1,7 +1,9 @@
 use binrw::Endian;
 use quicktag_core::classes::get_class_by_id;
 use quicktag_core::tagtypes::TagType;
-use tiger_pkg::{TagHash, TagHash64, Version, package::UEntryHeader, package_manager};
+use tiger_pkg::{GameVersion, TagHash, TagHash64, Version, package::UEntryHeader, package_manager};
+
+use crate::texture::Texture;
 
 #[derive(Debug, Clone)]
 pub struct MaterialTagPreview {
@@ -21,6 +23,29 @@ pub struct TechniquePreview {
     pub used_scopes: u64,
     pub compatible_scopes: u64,
     pub stages: Vec<TechniqueStagePreview>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct TechniqueRenderState {
+    pub blend: Option<u8>,
+    pub depth_stencil: Option<u8>,
+    pub rasterizer: Option<u8>,
+    pub depth_bias: Option<u8>,
+}
+
+impl TechniqueRenderState {
+    pub fn from_raw(raw: u32) -> Self {
+        let decode = |shift: u32| {
+            let value = ((raw >> shift) & 0xff) as u8;
+            (value & 0x80 != 0).then_some(value & 0x7f)
+        };
+        Self {
+            blend: decode(0),
+            depth_stencil: decode(8),
+            rasterizer: decode(16),
+            depth_bias: decode(24),
+        }
+    }
 }
 
 impl TechniquePreview {
@@ -81,6 +106,7 @@ pub struct TechniqueTfxTextureBinding {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TechniqueMaterialConstants {
     pub color_tint: Option<[f32; 4]>,
+    pub mask_palette: Option<[[f32; 4]; 2]>,
     pub emissive_strength: Option<f32>,
 }
 
@@ -116,6 +142,7 @@ pub struct TfxExpressionPreview {
 #[derive(Debug, Clone)]
 pub struct TfxExternRefPreview {
     pub op_offset: usize,
+    pub scope_id: u8,
     pub value_type: &'static str,
     pub scope: String,
     pub byte_offset: usize,
@@ -137,6 +164,7 @@ pub struct TfxBytecodeOpPreview {
     pub opcode: u8,
     pub name: &'static str,
     pub detail: String,
+    pub extern_scope_id: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +191,51 @@ impl MaterialTagPreview {
 
 pub fn is_technique_entry(entry: &UEntryHeader) -> bool {
     get_class_by_id(entry.reference).is_some_and(|class| class.name.as_ref() == "s_technique")
+}
+
+pub fn is_sticker_proxy_technique(tag: TagHash) -> bool {
+    let Some(entry) = package_manager().get_entry(tag) else {
+        return false;
+    };
+    let Ok(data) = package_manager().read_tag(tag) else {
+        return false;
+    };
+    let Some(preview) = MaterialTagPreview::load(&entry, &data) else {
+        return false;
+    };
+    let MaterialPreviewKind::Technique(technique) = preview.kind;
+    let no_pixel_textures = texture_bindings_for_technique(&entry, &data)
+        .into_iter()
+        .all(|binding| binding.stage != "PS");
+    no_pixel_textures
+        && technique
+            .stages
+            .iter()
+            .filter(|stage| stage.stage == "PS")
+            .any(|stage| {
+                stage.textures.is_empty()
+                    && stage.constants.is_empty()
+                    && stage.inline_constants.len() <= 4
+                    && stage.inline_constants.first().is_some_and(|color| {
+                        color
+                            .iter()
+                            .zip([1.0_f32; 4])
+                            .all(|(value, expected)| (value - expected).abs() < 0.0001)
+                    })
+            })
+}
+
+pub fn render_state_for_technique(tag: TagHash) -> TechniqueRenderState {
+    package_manager()
+        .get_entry(tag)
+        .filter(is_technique_entry)
+        .and_then(|_entry| package_manager().read_tag(tag).ok())
+        .and_then(|data| {
+            data.get(0x30..0x34)
+                .map(|bytes| read_u32(bytes, package_manager().version.endian()))
+        })
+        .map(TechniqueRenderState::from_raw)
+        .unwrap_or_default()
 }
 
 pub fn texture_tags_for_technique(entry: &UEntryHeader, data: &[u8]) -> Vec<TagHash> {
@@ -203,6 +276,38 @@ pub fn texture_bindings_for_technique(
         .unwrap_or_default()
 }
 
+pub fn primary_sampler_for_technique(entry: &UEntryHeader, data: &[u8]) -> Option<TagHash> {
+    if !is_technique_entry(entry) {
+        return None;
+    }
+
+    let technique = parse_technique(data)?;
+    let stage = technique
+        .stages
+        .into_iter()
+        .find(|stage| stage.stage == "PS")?;
+    let sampler_index = stage
+        .bytecode
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == "sampler" && binding.stage == "PS")
+        .min_by_key(|binding| binding.slot)
+        .and_then(|binding| {
+            binding
+                .source
+                .strip_prefix("sampler[")?
+                .strip_suffix(']')?
+                .parse::<usize>()
+                .ok()
+        })
+        .or_else(|| (!stage.samplers.is_empty()).then_some(0))?;
+    let sampler = stage.samplers.get(sampler_index)?;
+    sampler
+        .resolved
+        .and_then(sampler_header_tag)
+        .or_else(|| sampler_header_tag(sampler.raw32))
+}
+
 pub fn tfx_texture_bindings_for_technique(
     entry: &UEntryHeader,
     data: &[u8],
@@ -240,6 +345,39 @@ pub fn tfx_texture_bindings_for_technique(
         .unwrap_or_default()
 }
 
+pub fn scope_stages(entry: &UEntryHeader, data: &[u8]) -> Vec<TechniqueStagePreview> {
+    if !get_class_by_id(entry.reference).is_some_and(|class| class.name.as_ref() == "s_scope") {
+        return vec![];
+    }
+    let endian = package_manager().version.endian();
+    let (stage_base, stage_stride, marathon_tfx) = match package_manager().version {
+        GameVersion::Marathon(_) => (0x40usize, 0x80usize, true),
+        GameVersion::Destiny(_) => (0x48usize, 0x80usize, false),
+    };
+    ["PS", "VS", "GS", "HS", "CS", "DS"]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, stage)| {
+            parse_technique_stage(
+                data,
+                stage,
+                stage_base + index * stage_stride,
+                endian,
+                marathon_tfx,
+            )
+        })
+        .filter(|stage| {
+            stage.shader.is_some()
+                || !stage.textures.is_empty()
+                || !stage.constants.is_empty()
+                || !stage.samplers.is_empty()
+                || !stage.inline_constants.is_empty()
+                || stage.bytecode_len != 0
+                || stage.constant_buffer.is_some()
+        })
+        .collect()
+}
+
 pub fn material_constants_for_technique(
     entry: &UEntryHeader,
     data: &[u8],
@@ -248,65 +386,101 @@ pub fn material_constants_for_technique(
         return TechniqueMaterialConstants::default();
     }
 
-    parse_technique(data)
-        .map(|technique| {
-            let pixel_stage = technique.stages.iter().find(|stage| stage.stage == "PS");
-            TechniqueMaterialConstants {
-                color_tint: pixel_stage.and_then(stage_color_tint),
-                emissive_strength: pixel_stage.and_then(stage_emissive_strength),
-            }
+    let bindings = texture_bindings_for_technique(entry, data);
+    let primary_is_bc4 = bindings
+        .iter()
+        .find(|binding| binding.stage == "PS" && binding.slot == 0)
+        .is_some_and(|binding| texture_is_bc4(binding.tag));
+    let pixel_binding_count = bindings
+        .iter()
+        .filter(|binding| binding.stage == "PS")
+        .count();
+    let pixel_stage = parse_technique(data).and_then(|technique| {
+        technique
+            .stages
+            .into_iter()
+            .find(|stage| stage.stage == "PS")
+    });
+    let color_tint = primary_is_bc4
+        .then(|| {
+            pixel_stage
+                .as_ref()
+                .and_then(|stage| select_confident_mask_tint(&stage.inline_constants))
         })
-        .unwrap_or_default()
+        .flatten();
+    let mask_palette = (!primary_is_bc4 && pixel_binding_count == 5)
+        .then(|| {
+            pixel_stage
+                .as_ref()
+                .and_then(|stage| compact_mask_palette(&stage.inline_constants))
+        })
+        .flatten();
+
+    TechniqueMaterialConstants {
+        color_tint,
+        mask_palette,
+        emissive_strength: None,
+    }
 }
 
-fn stage_color_tint(stage: &TechniqueStagePreview) -> Option<[f32; 4]> {
-    stage
-        .bytecode
-        .expressions
-        .iter()
-        .filter(|expression| expression.target.starts_with("output["))
-        .filter_map(|expression| expression.value)
-        .find(sane_color_tint)
-        .or_else(|| stage.constants.iter().copied().find(sane_color_tint))
-        .or_else(|| stage.inline_constants.iter().copied().find(sane_color_tint))
-        .or_else(|| {
-            stage
-                .constant_buffer_preview
-                .as_ref()?
-                .first_values
-                .iter()
-                .copied()
-                .find(sane_color_tint)
-        })
-}
-
-fn stage_emissive_strength(stage: &TechniqueStagePreview) -> Option<f32> {
-    let expression_strength = stage
-        .bytecode
-        .expressions
-        .iter()
-        .filter_map(|expression| expression.value)
-        .flat_map(|value| value.into_iter())
-        .filter(|value| value.is_finite() && *value > 1.0 && *value <= 16.0)
-        .max_by(|a, b| a.total_cmp(b));
-
-    expression_strength.or_else(|| {
-        stage
-            .constant_buffer_preview
-            .as_ref()?
-            .first_values
+fn compact_mask_palette(values: &[[f32; 4]]) -> Option<[[f32; 4]; 2]> {
+    let base = *values.get(53)?;
+    let delta = *values.get(54)?;
+    let valid = [base, delta].into_iter().all(|value| {
+        value
             .iter()
-            .flat_map(|value| value.iter().copied())
-            .filter(|value| value.is_finite() && *value > 1.0 && *value <= 16.0)
-            .max_by(|a, b| a.total_cmp(b))
-    })
+            .all(|component| component.is_finite() && (-1.0..=1.0).contains(component))
+    });
+    let chroma = base[..3]
+        .iter()
+        .chain(&delta[..3])
+        .any(|component| component.abs() > 0.02);
+    (valid && chroma).then_some([base, delta])
 }
 
-fn sane_color_tint(value: &[f32; 4]) -> bool {
-    let rgb = [value[0], value[1], value[2]];
-    rgb.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 4.0)
-        && rgb.iter().any(|v| *v > 0.001)
-        && !rgb.iter().all(|v| (*v - 1.0).abs() < 0.001)
+fn texture_is_bc4(tag: TagHash) -> bool {
+    Texture::load_data_d2(tag, false)
+        .map(|(desc, _data, _comment)| format!("{:?}", desc.format).contains("Bc4"))
+        .unwrap_or(false)
+}
+
+fn select_confident_mask_tint(values: &[[f32; 4]]) -> Option<[f32; 4]> {
+    let mut candidates = values
+        .iter()
+        .copied()
+        .filter(|value| {
+            value[..3]
+                .iter()
+                .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
+                && (value[3].abs() < 0.0001 || (value[3] - 1.0).abs() < 0.0001)
+                && !is_luminance_weights(*value)
+        })
+        .map(|value| {
+            let min = value[..3].iter().copied().fold(f32::INFINITY, f32::min);
+            let max = value[..3].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            (min, max - min, value)
+        })
+        .filter(|(min, saturation, _value)| *min > 0.01 && *saturation > 0.15)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let (_best_min, best_saturation, mut best) = *candidates.first()?;
+    let runner_up = candidates
+        .get(1)
+        .map(|candidate| candidate.1)
+        .unwrap_or(0.0);
+    if best_saturation < 0.25 || best_saturation - runner_up < 0.1 {
+        return None;
+    }
+    best[3] = 1.0;
+    Some(best)
+}
+
+fn is_luminance_weights(value: [f32; 4]) -> bool {
+    [0.3, 0.59, 0.11]
+        .into_iter()
+        .zip(value)
+        .take(3)
+        .all(|(expected, actual)| (expected - actual).abs() < 0.03)
 }
 
 fn parse_tfx_texture_source(source: &str) -> Option<(String, usize)> {
@@ -321,12 +495,21 @@ fn texture_header_tag(tag: TagHash) -> Option<TagHash> {
     (tag_type.is_texture() && tag_type.is_header()).then_some(tag)
 }
 
+fn sampler_header_tag(tag: TagHash) -> Option<TagHash> {
+    let entry = package_manager().get_entry(tag)?;
+    (entry.file_type == 34 && entry.file_subtype == 1).then_some(tag)
+}
+
 fn parse_technique(data: &[u8]) -> Option<TechniquePreview> {
     let endian = package_manager().version.endian();
     let bind_mode = read_u32(data.get(0x8..0xc)?, endian);
     let used_scopes = read_u64(data.get(0x20..0x28)?, endian);
     let compatible_scopes = read_u64(data.get(0x28..0x30)?, endian);
     let state_selection = read_u32(data.get(0x30..0x34)?, endian);
+    let (stage_base, stage_stride, marathon_tfx) = match package_manager().version {
+        GameVersion::Marathon(_) => (0x58usize, 0x88usize, true),
+        GameVersion::Destiny(_) => (0x70usize, 0x90usize, false),
+    };
     let stages = [
         ("VS", 0usize),
         ("GS", 3usize),
@@ -334,7 +517,15 @@ fn parse_technique(data: &[u8]) -> Option<TechniquePreview> {
         ("CS", 5usize),
     ]
     .into_iter()
-    .filter_map(|(name, index)| parse_technique_stage(data, name, 0x70 + index * 0x90, endian))
+    .filter_map(|(name, index)| {
+        parse_technique_stage(
+            data,
+            name,
+            stage_base + index * stage_stride,
+            endian,
+            marathon_tfx,
+        )
+    })
     .collect();
 
     Some(TechniquePreview {
@@ -351,6 +542,7 @@ fn parse_technique_stage(
     stage: &'static str,
     offset: usize,
     endian: Endian,
+    marathon_tfx: bool,
 ) -> Option<TechniqueStagePreview> {
     let shader = read_tag(data.get(offset..offset + 4)?, endian);
     let constants_offset = offset + 0x20;
@@ -388,7 +580,9 @@ fn parse_technique_stage(
         .filter(|tag| tag.is_some());
     let constant_buffer_preview = constant_buffer.and_then(load_constant_buffer_preview);
     let bytecode = read_array(data, constants_offset, 1, endian)
-        .map(|bytecode| parse_tfx_bytecode_with_constants(bytecode, &constants))
+        .map(|bytecode| {
+            parse_tfx_bytecode_with_constants_dialect(bytecode, &constants, marathon_tfx)
+        })
         .unwrap_or_default();
     let bytecode_len = bytecode.total_bytes;
 
@@ -462,11 +656,20 @@ fn parse_tfx_bytecode(data: &[u8]) -> TfxBytecodePreview {
     parse_tfx_bytecode_with_constants(data, &[])
 }
 
+#[cfg(test)]
 fn parse_tfx_bytecode_with_constants(data: &[u8], constants: &[[f32; 4]]) -> TfxBytecodePreview {
+    parse_tfx_bytecode_with_constants_dialect(data, constants, false)
+}
+
+fn parse_tfx_bytecode_with_constants_dialect(
+    data: &[u8],
+    constants: &[[f32; 4]],
+    marathon: bool,
+) -> TfxBytecodePreview {
     const MAX_UI_OPS: usize = 160;
 
     let mut cursor = 0usize;
-    let mut ops = Vec::with_capacity(data.len().min(MAX_UI_OPS));
+    let mut all_ops = Vec::with_capacity(data.len());
     let mut decoded_ops = 0usize;
     let mut unknown_ops = 0usize;
 
@@ -475,29 +678,35 @@ fn parse_tfx_bytecode_with_constants(data: &[u8], constants: &[[f32; 4]]) -> Tfx
         let opcode = data[cursor];
         cursor += 1;
 
-        let Some(op) = parse_tfx_bytecode_op(data, &mut cursor, offset, opcode) else {
+        let parsed = if marathon {
+            parse_marathon_tfx_bytecode_op(data, &mut cursor, offset, opcode)
+        } else {
+            parse_tfx_bytecode_op(data, &mut cursor, offset, opcode)
+        };
+        let Some(mut op) = parsed else {
             unknown_ops += 1;
-            if ops.len() < MAX_UI_OPS {
-                ops.push(TfxBytecodeOpPreview {
-                    offset,
-                    opcode,
-                    name: "unknown",
-                    detail: String::new(),
-                });
-            }
+            all_ops.push(TfxBytecodeOpPreview {
+                offset,
+                opcode,
+                name: "unknown",
+                detail: String::new(),
+                extern_scope_id: None,
+            });
             break;
         };
+        op.opcode = opcode;
+        if op.name.starts_with("push_extern_") {
+            op.extern_scope_id = data.get(offset + 1).copied();
+        }
 
         decoded_ops += 1;
-        if ops.len() < MAX_UI_OPS {
-            ops.push(op);
-        }
+        all_ops.push(op);
     }
 
-    let (bindings, expressions) = interpret_tfx_stack(&ops, constants);
-    let externs = summarize_tfx_externs(&ops);
-    let constant_refs = summarize_tfx_constant_refs(&ops, constants);
-
+    let (bindings, expressions) = interpret_tfx_stack(&all_ops, constants);
+    let externs = summarize_tfx_externs(&all_ops);
+    let constant_refs = summarize_tfx_constant_refs(&all_ops, constants);
+    let truncated = all_ops.len() > MAX_UI_OPS;
     TfxBytecodePreview {
         total_bytes: data.len(),
         bindings,
@@ -506,8 +715,112 @@ fn parse_tfx_bytecode_with_constants(data: &[u8], constants: &[[f32; 4]]) -> Tfx
         constant_refs,
         decoded_ops,
         unknown_ops,
-        truncated: decoded_ops > ops.len(),
-        ops,
+        truncated,
+        // Keep the complete program for render-time interpretation. The tag
+        // inspector applies its own display cap; truncating here silently
+        // discarded material outputs after the first 160 instructions.
+        ops: all_ops,
+    }
+}
+
+fn parse_marathon_tfx_bytecode_op(
+    data: &[u8],
+    cursor: &mut usize,
+    offset: usize,
+    opcode: u8,
+) -> Option<TfxBytecodeOpPreview> {
+    let read_u8 = |cursor: &mut usize| {
+        let value = *data.get(*cursor)?;
+        *cursor += 1;
+        Some(value)
+    };
+    let parsed = match opcode {
+        0x57 => Some((
+            "push_marathon_indexed_value",
+            format!("index={}", read_u8(cursor)?),
+        )),
+        0x58 => Some((
+            "marathon_texture_view",
+            format!("index={}", read_u8(cursor)?),
+        )),
+        0x5b => {
+            let value = read_u8(cursor)?;
+            Some((
+                "set_shader_resource",
+                format!("{} slot={}", tfx_shader_stage_name(value), value & 0x1f),
+            ))
+        }
+        0x64 => Some((
+            "push_marathon_texture_metadata",
+            format!("index={}", read_u8(cursor)?),
+        )),
+        0x67..=0x69 => {
+            let index = read_u8(cursor)?;
+            let fields = read_u8(cursor)?;
+            Some((
+                match opcode {
+                    0x67 => "push_tex_dimensions",
+                    0x68 => "push_tex_tiling_params",
+                    0x69 => "push_tex_tile_layer_count",
+                    _ => unreachable!(),
+                },
+                format!("index={index} fields=0x{fields:02X}"),
+            ))
+        }
+        0x6d => Some(("marathon_unknown_no_args", "opcode=0x6D".to_string())),
+        _ => None,
+    };
+    if let Some((name, detail)) = parsed {
+        return Some(TfxBytecodeOpPreview {
+            offset,
+            opcode,
+            name,
+            detail,
+            extern_scope_id: None,
+        });
+    }
+
+    if matches!(opcode, 0x21..=0x27 | 0x36..=0x41 | 0x51) {
+        return Some(TfxBytecodeOpPreview {
+            offset,
+            opcode,
+            name: "marathon_unknown_no_args",
+            detail: format!("opcode=0x{opcode:02X}"),
+            extern_scope_id: None,
+        });
+    }
+
+    let legacy_opcode = marathon_tfx_legacy_opcode(opcode)?;
+    parse_tfx_bytecode_op(data, cursor, offset, legacy_opcode).map(|mut op| {
+        op.opcode = opcode;
+        op
+    })
+}
+
+fn marathon_tfx_legacy_opcode(opcode: u8) -> Option<u8> {
+    match opcode {
+        0x01..=0x20 => Some(opcode),
+        0x28..=0x35 => Some(opcode - 0x07),
+        0x42..=0x49 => Some(opcode - 0x0e),
+        0x4a => Some(0x3c),
+        0x4b => Some(0x3d),
+        0x4c => Some(0x3e),
+        0x4d => Some(0x3f),
+        0x4e => Some(0x40),
+        0x4f => Some(0x41),
+        0x50 => Some(0x42),
+        0x52 => Some(0x43),
+        0x53 => Some(0x44),
+        0x54 => Some(0x45),
+        0x55 => Some(0x46),
+        0x56 => Some(0x47),
+        0x59 => Some(0x48),
+        0x5d => Some(0x4a),
+        0x5e => Some(0x4b),
+        0x61 => Some(0x4d),
+        0x62 => Some(0x4e),
+        0x63 => Some(0x4f),
+        _ => None,
     }
 }
 
@@ -545,9 +858,9 @@ fn tfx_constant_range(op: &TfxBytecodeOpPreview) -> Option<(usize, usize)> {
         "push_const_vec4" => 1,
         "lerp_constant" | "lerp_constant_saturated" => 2,
         "spline4_const" => 5,
-        "spline8_const" | "spline8_chain_const" => 9,
+        "spline8_const" | "spline8_chain_const" => 10,
         "gradient4_const" => 6,
-        "unk3b" => 10,
+        "unk3b" => 11,
         _ => return None,
     };
 
@@ -562,6 +875,7 @@ fn summarize_tfx_externs(ops: &[TfxBytecodeOpPreview]) -> Vec<TfxExternRefPrevie
             let byte_offset = usize::from_str_radix(offset_hex, 16).ok()?;
             Some(TfxExternRefPreview {
                 op_offset: op.offset,
+                scope_id: op.extern_scope_id?,
                 value_type: match value_type {
                     "float" => "float",
                     "vec4" => "vec4",
@@ -597,6 +911,14 @@ fn interpret_tfx_stack(
     ops: &[TfxBytecodeOpPreview],
     constants: &[[f32; 4]],
 ) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
+    interpret_tfx_stack_with_object_channels(ops, constants, &std::collections::HashMap::new())
+}
+
+pub(crate) fn interpret_tfx_stack_with_object_channels(
+    ops: &[TfxBytecodeOpPreview],
+    constants: &[[f32; 4]],
+    object_channels: &std::collections::HashMap<u32, [f32; 4]>,
+) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
     let mut stack = Vec::<TfxStackValue>::new();
     let mut temps = std::collections::BTreeMap::<u8, TfxStackValue>::new();
     let mut outputs = std::collections::BTreeMap::<u8, TfxStackValue>::new();
@@ -617,7 +939,13 @@ fn interpret_tfx_stack(
             | "push_global_channel"
             | "push_tex_dimensions"
             | "push_tex_tiling_params"
-            | "push_tex_tile_layer_count" => stack.push(format_tfx_value(op, constants)),
+            | "push_tex_tile_layer_count"
+            | "push_marathon_texture_metadata"
+            | "push_marathon_indexed_value" => stack.push(format_tfx_value_with_object_channels(
+                op,
+                constants,
+                object_channels,
+            )),
             "push_from_output" => {
                 let element = op
                     .detail
@@ -654,13 +982,17 @@ fn interpret_tfx_stack(
                     stack.push(format_tfx_value(op, constants));
                 }
             }
-            "set_shader_texture" | "set_shader_sampler" | "set_shader_uav" => {
+            "set_shader_texture"
+            | "set_shader_sampler"
+            | "set_shader_uav"
+            | "set_shader_resource" => {
                 if let Some((stage, slot)) = parse_stage_slot(&op.detail) {
                     bindings.push(TfxBindingPreview {
                         kind: match op.name {
                             "set_shader_texture" => "texture",
                             "set_shader_sampler" => "sampler",
                             "set_shader_uav" => "uav",
+                            "set_shader_resource" => "resource",
                             _ => "binding",
                         },
                         stage,
@@ -720,17 +1052,32 @@ fn interpret_tfx_stack(
                     value: value.value,
                 });
             }
-            "add" | "subtract" | "multiply" | "divide" | "min" | "max" | "less_than" | "dot"
-            | "lerp" | "lerp_saturated" => {
+            "add" | "subtract" | "multiply" | "divide" | "min" | "max" | "less_than" | "dot" => {
                 collapse_stack(&mut stack, op.name, 2);
             }
-            "multiply_add" | "clamp" => collapse_stack(&mut stack, op.name, 3),
+            "cubic" => collapse_stack(&mut stack, op.name, 2),
+            "lerp" | "lerp_saturated" | "multiply_add" | "clamp" => {
+                collapse_stack(&mut stack, op.name, 3)
+            }
+            "transform_vec4" => collapse_stack(&mut stack, op.name, 5),
             "merge_1_3" | "merge_2_2" | "merge_3_1" => {
                 collapse_stack(&mut stack, op.name, 2);
             }
             "permute" => collapse_permute(&mut stack, op),
-            "permute_extend_x" | "is_zero" | "abs" | "signum" | "floor" | "ceil" | "round"
-            | "frac" | "negate" | "saturate" => collapse_stack(&mut stack, op.name, 1),
+            "permute_extend_x"
+            | "is_zero"
+            | "abs"
+            | "signum"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "frac"
+            | "negate"
+            | "saturate"
+            | "vector_rotations_sin"
+            | "vector_rotations_cos"
+            | "vector_rotations_sin_cos"
+            | "triangle" => collapse_stack(&mut stack, op.name, 1),
             _ => {}
         }
     }
@@ -854,6 +1201,12 @@ fn collapse_constant_range_op(
         expression: "?".to_string(),
         value: None,
     });
+    let recursion = (op.name == "spline8_chain_const").then(|| {
+        stack.pop().unwrap_or_else(|| TfxStackValue {
+            expression: "?".to_string(),
+            value: None,
+        })
+    });
     let Some((start, count)) = tfx_constant_range(op) else {
         stack.push(TfxStackValue {
             expression: format!("{}({})", op.name, input.expression),
@@ -865,20 +1218,144 @@ fn collapse_constant_range_op(
         .get(start..start.saturating_add(count).min(constants.len()))
         .map(|values| values.len())
         .unwrap_or_default();
+    let values = constants.get(start..start.saturating_add(count));
+    let value = input.value.and_then(|input| match (op.name, values) {
+        ("spline4_const", Some(values)) => eval_spline4(input, values),
+        ("spline8_const", Some(values)) => eval_spline8(input, values),
+        ("spline8_chain_const", Some(values)) => {
+            eval_spline8_chain(input, recursion.as_ref()?.value?, values)
+        }
+        ("gradient4_const", Some(values)) => eval_gradient4(input, values),
+        _ => None,
+    });
     stack.push(TfxStackValue {
         expression: format!(
-            "{}(constant[{}..{}; {} available], {})",
+            "{}(constant[{}..{}; {} available], {}{})",
             op.name,
             start,
             start + count,
             available,
-            input.expression
+            recursion
+                .as_ref()
+                .map(|value| format!("{}, ", value.expression))
+                .unwrap_or_default(),
+            input.expression,
         ),
-        value: None,
+        value,
     });
 }
 
+fn spline_channel_mask(x: [f32; 4], thresholds: [f32; 4]) -> [f32; 4] {
+    let mask = std::array::from_fn::<_, 4, _>(|lane| (x[lane] >= thresholds[lane]) as u8 as f32);
+    [
+        (mask[0] - mask[1]).abs(),
+        (mask[1] - mask[2]).abs(),
+        (mask[2] - mask[3]).abs(),
+        mask[3],
+    ]
+}
+
+fn eval_spline_polynomial(
+    x: [f32; 4],
+    c3: [f32; 4],
+    c2: [f32; 4],
+    c1: [f32; 4],
+    c0: [f32; 4],
+) -> [f32; 4] {
+    std::array::from_fn(|lane| {
+        (c3[lane] * x[lane] + c2[lane]) * x[lane] * x[lane] + c1[lane] * x[lane] + c0[lane]
+    })
+}
+
+fn masked_spline_sum(values: [f32; 4], mask: [f32; 4]) -> f32 {
+    values
+        .iter()
+        .zip(mask)
+        .map(|(value, mask)| value * mask)
+        .sum()
+}
+
+fn eval_spline4(x: [f32; 4], constants: &[[f32; 4]]) -> Option<[f32; 4]> {
+    let [c0, c1, c2, c3, thresholds] = constants.try_into().ok()?;
+    let result = masked_spline_sum(
+        eval_spline_polynomial(x, c3, c2, c1, c0),
+        spline_channel_mask(x, thresholds),
+    );
+    Some([result; 4])
+}
+
+fn eval_spline8(x: [f32; 4], constants: &[[f32; 4]]) -> Option<[f32; 4]> {
+    let [c3, c2, c1, c0, d3, d2, d1, d0, ct, dt] = constants.try_into().ok()?;
+    let c = masked_spline_sum(
+        eval_spline_polynomial(x, c3, c2, c1, c0),
+        spline_channel_mask(x, ct),
+    );
+    let d_mask = spline_channel_mask(x, dt);
+    let d = masked_spline_sum(eval_spline_polynomial(x, d3, d2, d1, d0), d_mask);
+    Some([if x[0] >= dt[0] { d } else { c }; 4])
+}
+
+fn eval_spline8_chain(
+    x: [f32; 4],
+    recursion: [f32; 4],
+    constants: &[[f32; 4]],
+) -> Option<[f32; 4]> {
+    let [c3, c2, c1, c0, d3, d2, d1, d0, ct, dt] = constants.try_into().ok()?;
+    let c = masked_spline_sum(
+        eval_spline_polynomial(x, c3, c2, c1, c0),
+        spline_channel_mask(x, ct),
+    );
+    let d = masked_spline_sum(
+        eval_spline_polynomial(x, d3, d2, d1, d0),
+        spline_channel_mask(x, dt),
+    );
+    let intermediate = if x[0] >= ct[0] { c } else { recursion[0] };
+    Some([if x[0] >= dt[0] { d } else { intermediate }; 4])
+}
+
+fn eval_gradient4(x: [f32; 4], constants: &[[f32; 4]]) -> Option<[f32; 4]> {
+    let [base, red, green, blue, alpha, thresholds] = constants.try_into().ok()?;
+    let percentages = std::array::from_fn::<_, 4, _>(|lane| {
+        let end = if lane == 3 { 1.0 } else { thresholds[lane + 1] };
+        let interval = end - thresholds[lane];
+        if interval.abs() < 1e-19 {
+            (x[lane] > thresholds[lane]) as u8 as f32
+        } else {
+            ((x[lane] - thresholds[lane]) / interval).clamp(0.0, 1.0)
+        }
+    });
+    Some([
+        base[0] + red.iter().zip(percentages).map(|(v, p)| v * p).sum::<f32>(),
+        base[1]
+            + green
+                .iter()
+                .zip(percentages)
+                .map(|(v, p)| v * p)
+                .sum::<f32>(),
+        base[2]
+            + blue
+                .iter()
+                .zip(percentages)
+                .map(|(v, p)| v * p)
+                .sum::<f32>(),
+        base[3]
+            + alpha
+                .iter()
+                .zip(percentages)
+                .map(|(v, p)| v * p)
+                .sum::<f32>(),
+    ])
+}
+
 fn format_tfx_value(op: &TfxBytecodeOpPreview, constants: &[[f32; 4]]) -> TfxStackValue {
+    format_tfx_value_with_object_channels(op, constants, &std::collections::HashMap::new())
+}
+
+fn format_tfx_value_with_object_channels(
+    op: &TfxBytecodeOpPreview,
+    constants: &[[f32; 4]],
+    object_channels: &std::collections::HashMap<u32, [f32; 4]>,
+) -> TfxStackValue {
     let (expression, value) = match op.name {
         "push_const_vec4" => op
             .detail
@@ -898,6 +1375,14 @@ fn format_tfx_value(op: &TfxBytecodeOpPreview, constants: &[[f32; 4]]) -> TfxSta
             .strip_prefix("slot=")
             .map(|slot| (format!("temp[{slot}]"), None))
             .unwrap_or_else(|| (op.detail.clone(), None)),
+        "push_object_channel" => {
+            let value = op
+                .detail
+                .strip_prefix("0x")
+                .and_then(|hash| u32::from_str_radix(hash, 16).ok())
+                .and_then(|hash| object_channels.get(&hash).copied());
+            (format!("object_channel({})", op.detail), value)
+        }
         _ => {
             if op.detail.is_empty() {
                 (op.name.to_string(), None)
@@ -923,11 +1408,13 @@ fn evaluate_stack_op(name: &str, args: &[TfxStackValue]) -> Option<[f32; 4]> {
         ("add", [a, b]) | ("add2", [a, b]) => Some(vec4_zip(*a, *b, |a, b| a + b)),
         ("subtract", [a, b]) => Some(vec4_zip(*a, *b, |a, b| a - b)),
         ("multiply", [a, b]) | ("multiply2", [a, b]) => Some(vec4_zip(*a, *b, |a, b| a * b)),
-        ("divide", [a, b]) => Some(vec4_zip(
-            *a,
-            *b,
-            |a, b| if b == 0.0 { f32::NAN } else { a / b },
-        )),
+        ("divide", [a, b]) => Some(vec4_zip(*a, *b, |a, b| {
+            if b.abs() > 1e-19 {
+                a / b
+            } else {
+                a.signum() * f32::INFINITY
+            }
+        })),
         ("min", [a, b]) => Some(vec4_zip(*a, *b, f32::min)),
         ("max", [a, b]) => Some(vec4_zip(*a, *b, f32::max)),
         ("less_than", [a, b]) => Some(vec4_zip(*a, *b, |a, b| if a < b { 1.0 } else { 0.0 })),
@@ -935,18 +1422,34 @@ fn evaluate_stack_op(name: &str, args: &[TfxStackValue]) -> Option<[f32; 4]> {
             let dot = a.iter().zip(b.iter()).map(|(a, b)| *a * *b).sum();
             Some([dot; 4])
         }
-        ("lerp", [a, b]) | ("lerp_saturated", [a, b]) => {
-            Some(vec4_zip(*a, *b, |a, b| a + (b - a) * 0.5))
-        }
+        ("cubic", [coefficients, x]) => Some(std::array::from_fn(|lane| {
+            let high = coefficients[0] * x[lane] + coefficients[1];
+            let low = coefficients[2] * x[lane] + coefficients[3];
+            high * x[lane] * x[lane] + low
+        })),
+        ("lerp", [a, b, s]) => Some(std::array::from_fn(|lane| {
+            a[lane] + (b[lane] - a[lane]) * s[lane]
+        })),
+        ("lerp_saturated", [a, b, s]) => Some(std::array::from_fn(|lane| {
+            (a[lane] + (b[lane] - a[lane]) * s[lane]).clamp(0.0, f32::MAX)
+        })),
         ("multiply_add", [a, b, c]) => {
             Some(vec4_zip(vec4_zip(*a, *b, |a, b| a * b), *c, |a, c| a + c))
         }
-        ("clamp", [value, min, max]) => {
+        ("clamp", [value, max, min]) => {
             Some(vec4_zip(vec4_zip(*value, *min, f32::max), *max, f32::min))
         }
-        ("merge_1_3", [a, b]) => Some([a[0], b[1], b[2], b[3]]),
-        ("merge_2_2", [a, b]) => Some([a[0], a[1], b[2], b[3]]),
-        ("merge_3_1", [a, b]) => Some([a[0], a[1], a[2], b[3]]),
+        ("merge_1_3", [a, b]) => Some([a[0], b[0], b[1], b[2]]),
+        ("merge_2_2", [a, b]) => Some([a[0], a[1], b[0], b[1]]),
+        ("merge_3_1", [a, b]) => Some([a[0], a[1], a[2], b[0]]),
+        ("transform_vec4", [x_axis, y_axis, z_axis, w_axis, value]) => {
+            Some(std::array::from_fn(|lane| {
+                x_axis[lane] * value[0]
+                    + y_axis[lane] * value[1]
+                    + z_axis[lane] * value[2]
+                    + w_axis[lane] * value[3]
+            }))
+        }
         ("permute_extend_x", [a]) => Some([a[0]; 4]),
         ("is_zero", [a]) => Some(a.map(|v| if v == 0.0 { 1.0 } else { 0.0 })),
         ("abs", [a]) => Some(a.map(f32::abs)),
@@ -957,8 +1460,22 @@ fn evaluate_stack_op(name: &str, args: &[TfxStackValue]) -> Option<[f32; 4]> {
         ("frac", [a]) => Some(a.map(f32::fract)),
         ("negate", [a]) => Some(a.map(|v| -v)),
         ("saturate", [a]) => Some(a.map(|v| v.clamp(0.0, 1.0))),
+        ("vector_rotations_sin", [a]) => Some(tfx_sin_rotations(*a)),
+        ("vector_rotations_cos", [a]) => Some(tfx_sin_rotations(a.map(|value| value + 0.25))),
+        ("vector_rotations_sin_cos", [a]) => {
+            Some(tfx_sin_rotations([a[0], a[1] + 0.25, a[2], a[3] + 0.25]))
+        }
+        ("triangle", [a]) => Some(a.map(|value| (value - value.round()).abs() * 2.0)),
         _ => None,
     }
+}
+
+fn tfx_sin_rotations(value: [f32; 4]) -> [f32; 4] {
+    value.map(|value| {
+        let wrapped = value - value.round();
+        let estimate = wrapped * (-16.0 * wrapped.abs() + 8.0);
+        estimate * (0.225 * estimate.abs() + 0.775)
+    })
 }
 
 fn vec4_zip(a: [f32; 4], b: [f32; 4], f: impl Fn(f32, f32) -> f32) -> [f32; 4] {
@@ -1169,6 +1686,7 @@ fn parse_tfx_bytecode_op(
         opcode,
         name,
         detail,
+        extern_scope_id: None,
     })
 }
 
@@ -1201,13 +1719,92 @@ fn tfx_extern_name(value: u8) -> &'static str {
         8 => "RigidModel",
         9 => "EditorMesh",
         10 => "EditorMeshMaterial",
+        11 => "EditorDecal",
+        12 => "EditorTerrain",
+        13 => "EditorTerrainPatch",
+        14 => "EditorTerrainDebug",
         15 => "SimpleGeometry",
+        16 => "UiFont",
+        17 => "CuiView",
+        18 => "CuiObject",
+        19 => "CuiBitmap",
+        20 => "CuiVideo",
+        21 => "CuiStandard",
+        22 => "CuiHud",
+        23 => "CuiScreenspaceBoxes",
+        24 => "TextureVisualizer",
         25 => "Generic",
+        26 => "Particle",
+        27 => "ParticleDebug",
+        28 => "GearDyeVisualizationMode",
+        29 => "ScreenArea",
+        30 => "Mlaa",
+        31 => "Msaa",
+        32 => "Hdao",
+        33 => "DownsampleTextureGeneric",
+        34 => "DownsampleDepth",
+        35 => "Ssao",
+        36 => "VolumetricObscurance",
+        37 => "Postprocess",
         38 => "TextureSet",
         39 => "Transparent",
+        40 => "Vignette",
         41 => "GlobalLighting",
+        42 => "ShadowMask",
+        43 => "ObjectEffect",
         44 => "Decal",
+        45 => "DecalSetTransform",
+        46 => "DynamicDecal",
+        47 => "DecoratorWind",
+        48 => "TextureCameraLighting",
+        49 => "VolumeFog",
+        50 => "Fxaa",
+        51 => "Smaa",
+        52 => "Letterbox",
+        53 => "DepthOfField",
+        54 => "PostprocessInitialDownsample",
+        55 => "CopyDepth",
+        56 => "DisplacementMotionBlur",
+        57 => "DebugShader",
+        58 => "MinmaxDepth",
+        59 => "SdsmBiasAndScale",
+        60 => "SdsmBiasAndScaleTextures",
+        61 => "ComputeShadowMapData",
+        62 => "ComputeLocalLightShadowMapData",
+        63 => "BilateralUpsample",
+        64 => "HealthOverlay",
+        65 => "LightProbeDominantLight",
+        66 => "LightProbeLightInstance",
         67 => "Water",
+        68 => "LensFlare",
+        69 => "ScreenShader",
+        70 => "Scaler",
+        71 => "GammaControl",
+        72 => "SpeedtreePlacements",
+        73 => "Reticle",
+        74 => "Distortion",
+        75 => "WaterDebug",
+        76 => "ScreenAreaInput",
+        77 => "WaterDepthPrepass",
+        78 => "OverheadVisibilityMap",
+        79 => "ParticleCompute",
+        80 => "CubemapFiltering",
+        81 => "ParticleFastpath",
+        82 => "VolumetricsPass",
+        83 => "TemporalReprojection",
+        84 => "FxaaCompute",
+        85 => "VbCopyCompute",
+        86 => "UberDepth",
+        87 => "GearDye",
+        88 => "Cubemaps",
+        89 => "ShadowBlendWithPrevious",
+        90 => "DebugShadingOutput",
+        91 => "Ssao3d",
+        92 => "WaterDisplacement",
+        93 => "PatternBlending",
+        94 => "UiHdrTransform",
+        95 => "PlayerCenteredCascadedGrid",
+        96 => "SoftDeform",
         _ => "Extern",
     }
 }
@@ -1351,6 +1948,58 @@ fn read_i64(data: &[u8], endian: Endian) -> i64 {
 mod tests {
     use super::*;
 
+    fn stack_value(value: [f32; 4]) -> TfxStackValue {
+        TfxStackValue {
+            expression: "test".to_string(),
+            value: Some(value),
+        }
+    }
+
+    #[test]
+    fn evaluates_alkahest_tfx_vector_semantics() {
+        let lerp = evaluate_stack_op(
+            "lerp",
+            &[
+                stack_value([0.0; 4]),
+                stack_value([10.0, 20.0, 30.0, 40.0]),
+                stack_value([0.25, 0.5, 0.75, 1.0]),
+            ],
+        );
+        assert_eq!(lerp, Some([2.5, 10.0, 22.5, 40.0]));
+
+        let merged = evaluate_stack_op(
+            "merge_3_1",
+            &[stack_value([1.0, 2.0, 3.0, 4.0]), stack_value([9.0; 4])],
+        );
+        assert_eq!(merged, Some([1.0, 2.0, 3.0, 9.0]));
+
+        let transformed = evaluate_stack_op(
+            "transform_vec4",
+            &[
+                stack_value([1.0, 0.0, 0.0, 0.0]),
+                stack_value([0.0, 1.0, 0.0, 0.0]),
+                stack_value([0.0, 0.0, 1.0, 0.0]),
+                stack_value([5.0, 6.0, 7.0, 1.0]),
+                stack_value([1.0, 2.0, 3.0, 1.0]),
+            ],
+        );
+        assert_eq!(transformed, Some([6.0, 8.0, 10.0, 1.0]));
+    }
+
+    #[test]
+    fn decodes_technique_render_state_selection() {
+        let state = TechniqueRenderState::from_raw(0x85838281);
+        assert_eq!(state.blend, Some(1));
+        assert_eq!(state.depth_stencil, Some(2));
+        assert_eq!(state.rasterizer, Some(3));
+        assert_eq!(state.depth_bias, Some(5));
+
+        assert_eq!(
+            TechniqueRenderState::from_raw(0x00000000),
+            TechniqueRenderState::default()
+        );
+    }
+
     #[test]
     fn reads_wide_hash32() {
         let mut data = vec![0; 0x10];
@@ -1422,6 +2071,42 @@ mod tests {
     }
 
     #[test]
+    fn selects_clear_chromatic_mask_tint() {
+        let values = [
+            [0.3, 0.59, 0.11, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.7694378, 0.260424, 0.054473493, 0.0],
+            [0.5, 0.5, 0.5, 1.0],
+        ];
+
+        assert_eq!(
+            select_confident_mask_tint(&values),
+            Some([0.7694378, 0.260424, 0.054473493, 1.0])
+        );
+    }
+
+    #[test]
+    fn extracts_compact_shader_mask_palette_at_authored_registers() {
+        let mut values = vec![[0.0; 4]; 56];
+        values[53] = [0.22, 0.16, 0.09, 1.0];
+        values[54] = [0.23, 0.35, 0.23, 0.0];
+
+        assert_eq!(
+            compact_mask_palette(&values),
+            Some([values[53], values[54]])
+        );
+        assert_eq!(compact_mask_palette(&values[..54]), None);
+    }
+
+    #[test]
+    fn rejects_ambiguous_mask_tints() {
+        let values = [[0.8, 0.1, 0.1, 0.0], [0.1, 0.8, 0.1, 0.0]];
+
+        assert_eq!(select_confident_mask_tint(&values), None);
+    }
+
+    #[test]
     fn maps_tfx_constant_refs_to_values() {
         let constants = vec![
             [1.0, 2.0, 3.0, 4.0],
@@ -1489,6 +2174,25 @@ mod tests {
     }
 
     #[test]
+    fn retains_full_tfx_program_beyond_inspector_display_cap() {
+        let mut bytecode = Vec::new();
+        for output in 0_u8..100 {
+            bytecode.extend([0x34, 0x00, 0x44, output]);
+        }
+
+        let decoded = parse_tfx_bytecode_with_constants(&bytecode, &[[0.25; 4]]);
+
+        assert!(
+            decoded.truncated,
+            "inspector must report display truncation"
+        );
+        assert_eq!(decoded.ops.len(), 200, "render interpreter needs every op");
+        assert_eq!(decoded.expressions.len(), 100);
+        assert_eq!(decoded.expressions[99].target, "output[99]");
+        assert_eq!(decoded.expressions[99].value, Some([0.25; 4]));
+    }
+
+    #[test]
     fn decodes_extern_refs() {
         let decoded = parse_tfx_bytecode(&[
             0x3d, 0x02, 0x03, // push_extern_vec4 View+0x30
@@ -1527,6 +2231,34 @@ mod tests {
     }
 
     #[test]
+    fn decodes_marathon_tfx_sampler_and_extern_prefix() {
+        let decoded = parse_tfx_bytecode_with_constants_dialect(
+            &[
+                0x61, 0x00, // push_sampler 0
+                0x5d, 0x21, // set_shader_sampler PS slot 1
+                0x4b, 0x02, 0x47, // push_extern_vec4 RigidModel+0x470
+                0x53, 0x05, // pop_output 5
+                0x63, 0xca, // push_global_channel 0xca
+                0x29, 0x00, // permute .xxxx
+                0x2a, // saturate
+                0x53, 0x48, // pop_output 72
+                0x62, 0x8c, 0x5e, 0xa3, 0x44, // push_object_channel 0x8c5ea344
+                0x53, 0x49, // pop_output 73
+            ],
+            &[],
+            true,
+        );
+
+        assert_eq!(decoded.unknown_ops, 0);
+        assert_eq!(decoded.decoded_ops, 10);
+        assert_eq!(decoded.bindings.len(), 1);
+        assert_eq!(decoded.bindings[0].kind, "sampler");
+        assert_eq!(decoded.bindings[0].stage, "PS");
+        assert_eq!(decoded.bindings[0].slot, 1);
+        assert_eq!(decoded.expressions.len(), 3);
+    }
+
+    #[test]
     fn propagates_lerp_constant_expression_values() {
         let constants = vec![
             [0.25, 0.25, 0.25, 0.25],
@@ -1548,39 +2280,6 @@ mod tests {
             "lerp_constant(constant[1..3], constant[0])"
         );
         assert_eq!(decoded.expressions[0].value, Some([12.5, 25.0, 37.5, 50.0]));
-    }
-
-    #[test]
-    fn recognizes_constant_tint_values() {
-        assert!(sane_color_tint(&[0.7, 0.6, 0.5, 1.0]));
-        assert!(!sane_color_tint(&[1.0, 1.0, 1.0, 1.0]));
-        assert!(!sane_color_tint(&[8.0, 1.0, 1.0, 1.0]));
-    }
-
-    #[test]
-    fn uses_constant_buffer_values_for_material_summary() {
-        let stage = TechniqueStagePreview {
-            stage: "PS",
-            shader: None,
-            textures: vec![],
-            constants: vec![],
-            samplers: vec![],
-            inline_constants: vec![],
-            bytecode_len: 0,
-            constant_buffer_slot: Some(0),
-            constant_buffer: None,
-            constant_buffer_preview: Some(ConstantBufferPreview {
-                header_tag: TagHash::NONE,
-                data_tag: TagHash::NONE,
-                header_len: 0,
-                data_len: 0x20,
-                first_values: vec![[0.6, 0.5, 0.4, 1.0], [2.5, 1.0, 1.0, 1.0]],
-            }),
-            bytecode: TfxBytecodePreview::default(),
-        };
-
-        assert_eq!(stage_color_tint(&stage), Some([0.6, 0.5, 0.4, 1.0]));
-        assert_eq!(stage_emissive_strength(&stage), Some(2.5));
     }
 
     #[test]
@@ -1608,6 +2307,36 @@ mod tests {
             "is_zero(subtract(constant[0].wzyx, constant[1]))"
         );
         assert_eq!(decoded.expressions[1].value, Some([1.0, 1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn evaluates_tfx_spline4_constants() {
+        let constants = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0; 4],
+            [0.0; 4],
+            [0.0; 4],
+            [0.0, 1.0, 1.0, 1.0],
+        ];
+
+        assert_eq!(eval_spline4([0.5; 4], &constants), Some([2.0; 4]));
+    }
+
+    #[test]
+    fn evaluates_tfx_gradient4_constants() {
+        let constants = [
+            [0.0; 4],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.25, 0.5, 0.75],
+        ];
+
+        assert_eq!(
+            eval_gradient4([0.125; 4], &constants),
+            Some([0.5, 0.0, 0.0, 0.0])
+        );
     }
 
     #[test]

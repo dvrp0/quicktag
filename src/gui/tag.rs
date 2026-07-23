@@ -17,7 +17,7 @@ use super::{
         ResponseExt, open_audio_file_in_default_application, open_tag_in_default_application,
         tag_context,
     },
-    modellist::model_wireframe_ui,
+    modellist::{DEFAULT_MODEL_YAW, model_wireframe_ui},
 };
 use crate::geometry::{
     GeometryPreviewKind, GeometryTagPreview, GpuPreviewVertex, GpuWireframePreview,
@@ -123,6 +123,7 @@ pub struct TagView {
     preview_zoom: f32,
     preview_pan: egui::Vec2,
     preview_show_wireframe: bool,
+    preview_show_stickers: bool,
     decompiled_shader: Option<Result<String, String>>,
 }
 
@@ -412,13 +413,18 @@ impl TagView {
             geometry_preview,
             geometry_gpu_preview,
             material_preview,
-            preview_yaw: 0.4,
-            preview_pitch: 0.25,
+            preview_yaw: DEFAULT_MODEL_YAW,
+            preview_pitch: 0.05,
             preview_zoom: 1.0,
             preview_pan: vec2(0.0, 0.0),
             preview_show_wireframe: true,
+            preview_show_stickers: false,
             decompiled_shader,
         })
+    }
+
+    pub fn set_string_cache(&mut self, string_cache: Arc<StringCache>) {
+        self.string_cache = string_cache;
     }
 
     /// Replaces this view with another tag
@@ -446,6 +452,7 @@ impl TagView {
             tv.preview_pitch = self.preview_pitch;
             tv.preview_zoom = self.preview_zoom;
             tv.preview_show_wireframe = self.preview_show_wireframe;
+            tv.preview_show_stickers = self.preview_show_stickers;
 
             *self = tv;
         } else {
@@ -921,6 +928,7 @@ impl TagView {
             zoom: &mut self.preview_zoom,
             pan: &mut self.preview_pan,
             show_wireframe: &mut self.preview_show_wireframe,
+            show_stickers: &mut self.preview_show_stickers,
         };
 
         if let Some(gpu) = &self.geometry_gpu_preview {
@@ -1974,6 +1982,7 @@ struct PreviewOrbit<'a> {
     zoom: &'a mut f32,
     pan: &'a mut egui::Vec2,
     show_wireframe: &'a mut bool,
+    show_stickers: &'a mut bool,
 }
 
 #[repr(C)]
@@ -2477,7 +2486,7 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
                         for extern_ref in &bytecode.externs {
                             ui.monospace(format!("0x{:04X}", extern_ref.op_offset));
                             ui.monospace(extern_ref.value_type);
-                            ui.monospace(&extern_ref.scope);
+                            ui.monospace(format!("{} ({})", extern_ref.scope, extern_ref.scope_id));
                             ui.monospace(format!("0x{:X}", extern_ref.byte_offset));
                             ui.monospace(extern_ref.hint);
                             ui.end_row();
@@ -2533,7 +2542,7 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
                     ui.strong("Detail");
                     ui.end_row();
 
-                    for op in &bytecode.ops {
+                    for op in bytecode.ops.iter().take(160) {
                         ui.monospace(format!("0x{:04X}", op.offset));
                         ui.monospace(format!("0x{:02X}", op.opcode));
                         ui.monospace(op.name);
@@ -2738,20 +2747,23 @@ fn model_preview_ui(
 
     if let Some(wireframe) = &model.wireframe {
         ui.separator();
+        let mut environment = super::model_renderer::ModelEnvironment::default();
         model_wireframe_ui(
             ui,
             wireframe,
-            model
-                .mesh_source
-                .as_ref()
-                .and_then(|mesh| mesh.uv_transform),
+            model.preview_uv_transform(),
             texture_cache,
             &model.textures,
+            None,
+            None,
             orbit.yaw,
             orbit.pitch,
             orbit.zoom,
             orbit.pan,
             orbit.show_wireframe,
+            orbit.show_stickers,
+            None,
+            &mut environment,
         );
     } else {
         ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));

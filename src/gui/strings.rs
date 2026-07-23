@@ -1,21 +1,12 @@
-use std::{
-    fs::File,
-    io::{Cursor, Read, Seek, SeekFrom, Write},
-    sync::Arc,
-};
-
-use binrw::BinReaderExt;
+use std::sync::Arc;
 
 use eframe::egui::{self, RichText, TextEdit, Widget};
 use itertools::Itertools;
 use quicktag_core::tagtypes::TagType;
 use quicktag_scanner::TagCache;
-use rustc_hash::FxHashMap;
 use tiger_pkg::{DestinyVersion, GameVersion, TagHash, package_manager};
 
-use quicktag_strings::localized::{
-    StringCache, StringCacheVec, StringContainer, StringData, StringPart, decode_text,
-};
+use quicktag_strings::localized::{StringCache, StringCacheVec};
 
 use super::{View, ViewAction, common::ResponseExt, tag::format_tag_entry};
 
@@ -90,6 +81,14 @@ impl StringsView {
             hide_devalpha_str,
             variant,
         }
+    }
+
+    pub fn set_strings(&mut self, strings: Arc<StringCache>) {
+        self.strings = strings;
+        self.selected_string = u32::MAX;
+        self.string_selected_entries.clear();
+        self.update_search = true;
+        self.filter_strings();
     }
 
     fn reset_search(&mut self) {
@@ -210,13 +209,6 @@ impl View for StringsView {
             .resizable(true)
             .min_width(384.0)
             .show_inside(ui, |ui| {
-                if self.variant == StringViewVariant::LocalizedStrings
-                    && ui.button("Dump all languages").clicked()
-                {
-                    dump_all_languages().unwrap();
-                }
-
-                ui.separator();
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.horizontal(|ui| {
                     ui.label("Search:");
@@ -372,67 +364,4 @@ fn truncate_string_stripped(s: &str, max_length: usize) -> String {
     } else {
         s.to_string()
     }
-}
-
-fn dump_all_languages() -> anyhow::Result<()> {
-    let GameVersion::Destiny(version) = package_manager().version else {
-        return Err(anyhow::anyhow!("unsupported version"));
-    };
-
-    std::fs::create_dir("strings").ok();
-    let mut files: FxHashMap<String, File> = Default::default();
-
-    for (t, _) in package_manager()
-        .get_all_by_reference(u32::from_be(if version.is_prebl() {
-            0x889a8080
-        } else {
-            0xEF998080
-        }))
-        .into_iter()
-    {
-        let Ok(textset_header) = package_manager().read_tag_binrw::<StringContainer>(t) else {
-            continue;
-        };
-
-        for (language_code, language_tag) in textset_header.all_languages() {
-            let f = files
-                .entry(language_code.to_string())
-                .or_insert_with(|| File::create(format!("strings/{}.txt", language_code)).unwrap());
-
-            let Ok(data) = package_manager().read_tag(language_tag) else {
-                println!("Failed to read data for language tag {language_tag} ({language_code})",);
-                continue;
-            };
-            let mut cur = Cursor::new(&data);
-            let text_data: StringData = cur.read_le_args((
-                version.is_prebl() || version == DestinyVersion::Destiny2BeyondLight,
-            ))?;
-
-            for (combination, hash) in text_data
-                .string_combinations
-                .iter()
-                .zip(textset_header.string_hashes.iter())
-            {
-                let mut final_string = String::new();
-
-                for ip in 0..combination.part_count {
-                    cur.seek(combination.data.into())?;
-                    cur.seek(SeekFrom::Current(ip * 0x20))?;
-                    let part: StringPart = cur.read_le()?;
-                    if part.variable_hash != 0x811c9dc5 {
-                        final_string += &format!("<{:08X}>", part.variable_hash);
-                    } else {
-                        cur.seek(part.data.into())?;
-                        let mut data = vec![0u8; part.byte_length as usize];
-                        cur.read_exact(&mut data)?;
-                        final_string += &decode_text(&data, part.cipher_shift);
-                    }
-                }
-
-                writeln!(f, "{t}:{hash:08x} : {final_string}")?;
-            }
-        }
-    }
-
-    Ok(())
 }

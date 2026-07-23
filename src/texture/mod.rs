@@ -97,6 +97,109 @@ pub struct TextureDesc {
     pub premultiply_alpha: bool,
 }
 
+/// Return the colour-space view compatible with an 8-bit colour texture.
+///
+/// Tiger resources do not consistently encode material intent in the DXGI
+/// format: the same BC/RGBA storage family can be albedo in one shader and a
+/// packed control map in another. Keep both compatible views available so the
+/// material binding, rather than the container header, decides whether the GPU
+/// performs sRGB decoding.
+pub(crate) fn srgb_texture_format(format: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    match format {
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        }
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        }
+        wgpu::TextureFormat::Bc1RgbaUnorm | wgpu::TextureFormat::Bc1RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc1RgbaUnormSrgb
+        }
+        wgpu::TextureFormat::Bc2RgbaUnorm | wgpu::TextureFormat::Bc2RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc2RgbaUnormSrgb
+        }
+        wgpu::TextureFormat::Bc3RgbaUnorm | wgpu::TextureFormat::Bc3RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc3RgbaUnormSrgb
+        }
+        wgpu::TextureFormat::Bc7RgbaUnorm | wgpu::TextureFormat::Bc7RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc7RgbaUnormSrgb
+        }
+        _ => format,
+    }
+}
+
+pub(crate) fn linear_texture_format(format: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    match format {
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
+            wgpu::TextureFormat::Rgba8Unorm
+        }
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            wgpu::TextureFormat::Bgra8Unorm
+        }
+        wgpu::TextureFormat::Bc1RgbaUnorm | wgpu::TextureFormat::Bc1RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc1RgbaUnorm
+        }
+        wgpu::TextureFormat::Bc2RgbaUnorm | wgpu::TextureFormat::Bc2RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc2RgbaUnorm
+        }
+        wgpu::TextureFormat::Bc3RgbaUnorm | wgpu::TextureFormat::Bc3RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc3RgbaUnorm
+        }
+        wgpu::TextureFormat::Bc7RgbaUnorm | wgpu::TextureFormat::Bc7RgbaUnormSrgb => {
+            wgpu::TextureFormat::Bc7RgbaUnorm
+        }
+        _ => format,
+    }
+}
+
+fn compatible_view_formats(format: wgpu::TextureFormat) -> Vec<wgpu::TextureFormat> {
+    let mut formats = vec![format];
+    for candidate in [linear_texture_format(format), srgb_texture_format(format)] {
+        if !formats.contains(&candidate) {
+            formats.push(candidate);
+        }
+    }
+    formats
+}
+
+fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32) -> usize {
+    let extent = wgpu::Extent3d {
+        width: width.max(1),
+        height: height.max(1),
+        depth_or_array_layers: 1,
+    }
+    .physical_size(format);
+    let (block_width, block_height) = format.block_dimensions();
+    let block_size = format.block_copy_size(None).unwrap_or(4);
+    ((extent.width / block_width) * (extent.height / block_height) * block_size) as usize
+}
+
+/// Infer how much of the tightly packed Tiger mip chain is present.
+///
+/// Large-buffer textures append the small-buffer tail in `load_data_d2`.
+/// Previously that payload was fetched and then silently discarded by a
+/// one-level GPU descriptor. Keep a conservative prefix only: incomplete next
+/// levels never become a declared GPU mip.
+fn available_mip_level_count(desc: &TextureDesc, data_len: usize) -> u32 {
+    let layers = desc.array_size.max(1) as usize;
+    let max_dimension = desc.width.max(desc.height).max(1);
+    let theoretical_levels = u32::BITS - max_dimension.leading_zeros();
+    let mut per_layer_bytes = 0usize;
+    let mut available = 0u32;
+    for level in 0..theoretical_levels {
+        per_layer_bytes = per_layer_bytes.saturating_add(mip_level_byte_size(
+            desc.format,
+            desc.width.checked_shr(level).unwrap_or(0).max(1),
+            desc.height.checked_shr(level).unwrap_or(0).max(1),
+        ));
+        if per_layer_bytes.saturating_mul(layers) > data_len {
+            break;
+        }
+        available = level + 1;
+    }
+    available.max(1)
+}
+
 impl TextureDesc {
     pub fn info(&self) -> String {
         let cubemap = if self.array_size == 6 {
@@ -726,6 +829,8 @@ impl Texture {
             );
         }
 
+        let view_formats = compatible_view_formats(desc.format);
+        let mip_level_count = available_mip_level_count(&desc, data.len());
         let handle = rs.device.create_texture_with_data(
             &rs.queue,
             &wgpu::TextureDescriptor {
@@ -734,12 +839,12 @@ impl Texture {
                     depth_or_array_layers: 1,
                     ..image_size
                 },
-                mip_level_count: 1,
+                mip_level_count,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
                 format: desc.format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[desc.format],
+                view_formats: &view_formats,
             },
             wgpu::util::TextureDataOrder::default(),
             &data,
@@ -758,12 +863,12 @@ impl Texture {
                         depth_or_array_layers: desc.array_size,
                         ..image_size
                     },
-                    mip_level_count: 1,
+                    mip_level_count,
                     sample_count: 1,
                     dimension: TextureDimension::D2,
                     format: desc.format,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[desc.format],
+                    view_formats: &view_formats,
                 },
                 wgpu::util::TextureDataOrder::default(),
                 &data,
@@ -841,4 +946,45 @@ pub enum TextureType {
     Texture2D,
     Texture3D,
     TextureCube,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextureDesc, available_mip_level_count};
+    use eframe::wgpu;
+
+    #[test]
+    fn infers_only_complete_uncompressed_mips() {
+        let desc = TextureDesc {
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            width: 8,
+            height: 4,
+            depth: 1,
+            array_size: 1,
+            premultiply_alpha: false,
+        };
+        assert_eq!(available_mip_level_count(&desc, 8 * 4 * 4), 1);
+        assert_eq!(available_mip_level_count(&desc, (8 * 4 + 4 * 2) * 4), 2);
+        assert_eq!(available_mip_level_count(&desc, (8 * 4 + 4 * 2) * 4 + 4), 2);
+        assert_eq!(
+            available_mip_level_count(&desc, (8 * 4 + 4 * 2 + 2 + 1) * 4),
+            4
+        );
+    }
+
+    #[test]
+    fn infers_block_compressed_array_mips() {
+        let desc = TextureDesc {
+            format: wgpu::TextureFormat::Bc7RgbaUnorm,
+            width: 8,
+            height: 8,
+            depth: 1,
+            array_size: 6,
+            premultiply_alpha: false,
+        };
+        // BC7: 64 + 16 + 16 + 16 bytes per layer for 8, 4, 2, 1.
+        assert_eq!(available_mip_level_count(&desc, 64 * 6), 1);
+        assert_eq!(available_mip_level_count(&desc, (64 + 16) * 6), 2);
+        assert_eq!(available_mip_level_count(&desc, (64 + 16 * 3) * 6), 4);
+    }
 }

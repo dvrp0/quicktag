@@ -10,23 +10,32 @@ use tiger_pkg::{TagHash, TagHash64, Version, package::UEntryHeader, package_mana
 use wgpu::util::DeviceExt;
 
 use crate::material::{
-    TechniqueMaterialConstants, TechniqueTextureBinding, TechniqueTfxTextureBinding,
-    is_technique_entry, material_constants_for_technique, texture_bindings_for_technique,
-    tfx_texture_bindings_for_technique,
+    MaterialPreviewKind, MaterialTagPreview, TechniqueMaterialConstants, TechniqueTextureBinding,
+    interpret_tfx_stack_with_object_channels, is_technique_entry, material_constants_for_technique,
+    primary_sampler_for_technique, texture_bindings_for_technique,
 };
 use crate::texture::Texture;
+
+#[cfg(test)]
+use crate::material::{render_state_for_technique, tfx_texture_bindings_for_technique};
 
 const MAX_PREVIEW_VERTICES: usize = 200_000;
 const MAX_PREVIEW_INDICES: usize = 900_000;
 const TECHNIQUE_SCAN_CHILD_LIMIT: usize = 128;
 const CLASS_GEOMETRY_RESOURCE: u32 = 0x8080881C;
 const CLASS_GEOMETRY_BUFFER_SET: u32 = 0x808087CB;
+const CLASS_GEOMETRY_PART: u32 = 0x808087D1;
 const CLASS_VERTEX_INPUT_LAYOUT_MAPPING: u32 = 0x80808664;
 const CLASS_VERTEX_INPUT_ELEMENT_SETS: u32 = 0x80808668;
 const CLASS_VERTEX_LAYOUT_ARRAY: u32 = 0x80808667;
 const CLASS_VERTEX_INPUT_ELEMENT_ARRAY: u32 = 0x8080866D;
 const CLASS_ENTITY_RESOURCE: u32 = 0x80809B06;
+const CLASS_PATTERN: u32 = 0x8080BAAD;
+const CLASS_PATTERN_COMPONENT: u32 = 0x8080BADB;
+const CLASS_DECORATOR: u32 = 0x80806C98;
+const SEMANTIC_NORMAL: u8 = 0x03;
 const SEMANTIC_TEXCOORD: u8 = 0x05;
+const SEMANTIC_TANGENT: u8 = 0x06;
 
 #[derive(Debug, Clone)]
 pub struct GeometryTagPreview {
@@ -75,7 +84,16 @@ pub struct ModelPreview {
     pub techniques: Vec<(TagHash, UEntryHeader)>,
     pub textures: Vec<(TagHash, UEntryHeader)>,
     pub shaders: Vec<(TagHash, UEntryHeader)>,
+    pub geometry_parts: Vec<TagHash>,
     pub wireframe: Option<WireframePreview>,
+}
+
+impl ModelPreview {
+    pub fn preview_uv_transform(&self) -> Option<UvTransformPreview> {
+        (self.geometry_parts.len() <= 1)
+            .then(|| self.mesh_source.as_ref().and_then(|mesh| mesh.uv_transform))
+            .flatten()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +109,14 @@ pub enum ModelTagRole {
 pub struct ModelTagInfo {
     pub role: ModelTagRole,
     pub label: &'static str,
+}
+
+impl ModelTagInfo {
+    /// Whether this tag represents a complete, user-facing model rather than one
+    /// of the implementation tags consumed while assembling that model.
+    pub fn is_catalog_entry(self) -> bool {
+        matches!(self.role, ModelTagRole::Dynamic) && self.label != "Dynamic mesh"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -153,10 +179,18 @@ enum InputLayoutFormat {
     R32G32B32Float,
     R32G32B32A32Float,
     R16G16Snorm,
+    R16G16B16A16Snorm,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct InputLayoutTexcoord {
+    buffer_index: usize,
+    offset: usize,
+    format: InputLayoutFormat,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InputLayoutVector {
     buffer_index: usize,
     offset: usize,
     format: InputLayoutFormat,
@@ -170,7 +204,7 @@ struct TagArray {
     end_offset: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct VertexInputElement {
     semantic: u8,
     semantic_index: u8,
@@ -184,6 +218,7 @@ impl std::fmt::Display for InputLayoutFormat {
             InputLayoutFormat::R32G32B32Float => "R32G32B32_FLOAT TEXCOORD.xy",
             InputLayoutFormat::R32G32B32A32Float => "R32G32B32A32_FLOAT TEXCOORD.xy",
             InputLayoutFormat::R16G16Snorm => "R16G16_SNORM TEXCOORD",
+            InputLayoutFormat::R16G16B16A16Snorm => "R16G16B16A16_SNORM",
         };
         f.write_str(label)
     }
@@ -204,7 +239,16 @@ pub struct WireframePreview {
     pub position_format: &'static str,
     pub uv_format: Option<String>,
     pub vertices: Vec<[f32; 3]>,
+    pub normals: Option<Vec<[f32; 3]>>,
+    /// Dequantized model-local POSITION consumed by GearDye TEXCOORD5.
+    /// Attachment transforms must not alter this stream.
+    pub procedural_positions: Option<Vec<[f32; 3]>>,
+    /// Model-local NORMAL consumed by GearDye TEXCOORD6.
+    pub procedural_normals: Option<Vec<[f32; 3]>>,
+    pub tangents: Option<Vec<[f32; 4]>>,
     pub uvs: Option<Vec<[f32; 2]>>,
+    pub normal_format: Option<String>,
+    pub tangent_format: Option<String>,
     pub indices: Vec<u32>,
     pub material_ranges: Vec<WireframeMaterialRange>,
     pub min: [f32; 3],
@@ -217,9 +261,18 @@ pub struct WireframePreview {
 pub struct WireframeMaterialRange {
     pub index_start: usize,
     pub index_count: usize,
+    pub render_stage: Option<u8>,
     pub technique: Option<TagHash>,
+    pub gear_dye_change_color_index: Option<u8>,
     pub texture: Option<TagHash>,
     pub textures: WireframeMaterialTextures,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GearDyeMaterial {
+    pub color: [f32; 4],
+    pub roughness_remap: [f32; 4],
+    pub metal_remap: [f32; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -227,10 +280,81 @@ pub struct WireframeMaterialTextures {
     pub color: Option<TagHash>,
     pub normal: Option<TagHash>,
     pub emissive: Option<TagHash>,
+    pub control: Option<TagHash>,
+    pub roughness_channel: u8,
+    pub sampler: Option<TagHash>,
     pub aux: Vec<TagHash>,
     pub layers: Vec<WireframeMaterialLayer>,
     pub color_tint: [u8; 4],
+    pub mask_palette: Option<[[f32; 4]; 2]>,
+    pub gear_dye: Option<GearDyeMaterial>,
+    pub gear_dye_default: Option<[f32; 4]>,
+    pub gear_dye_palette: Option<[GearDyeMaterial; 6]>,
+    pub mod_wear: Option<WeaponModWearMaterial>,
     pub emissive_strength: u8,
+}
+
+/// The three condition tiers authored for Marathon weapon mods. The game uses
+/// rarity as physical age: Enhanced is oldest, Deluxe is the middle tier, and
+/// Superior is newest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WeaponModRarity {
+    Enhanced,
+    Deluxe,
+    Superior,
+}
+
+impl WeaponModRarity {
+    pub fn tier(self) -> u8 {
+        match self {
+            Self::Enhanced => 1,
+            Self::Deluxe => 2,
+            Self::Superior => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeaponModPreviewAttachment {
+    pub model_tag: TagHash,
+    pub rarity: Option<WeaponModRarity>,
+    /// Engine `unique_id` object channel. Pattern spawn assigns a random
+    /// inclusive 0..1 scalar; TFX turns it into wear projection offsets.
+    pub unique_id: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeaponModWearMaterial {
+    /// Additional common-surface texture authored at PS t5.
+    pub scratches: TagHash,
+    /// Additional common-surface texture authored at PS t6.
+    pub grime: TagHash,
+    /// Broad chipped/worn mask authored at PS t7.
+    pub damage: TagHash,
+    /// Triplanar scale/offset read from PS cbuffer 14 for t5.
+    pub scratches_projection: [f32; 4],
+    /// Triplanar scale/offset evaluated from PS TFX output 39 for t6.
+    pub grime_projection: [f32; 4],
+    /// Triplanar scale/offset evaluated from PS TFX output 40 for t7.
+    pub damage_projection: [f32; 4],
+    /// Projection change authored by TFX when `unique_id` moves 0 -> 1.
+    pub grime_projection_unique_delta: [f32; 4],
+    pub damage_projection_unique_delta: [f32; 4],
+    /// PS cbuffer 15/16: `base + t5.r * scale`, before shader's common
+    /// 4.5947933 normalization.
+    pub scratches_remap_base: [f32; 4],
+    pub scratches_remap_scale: [f32; 4],
+    /// PS cbuffer 50: blend between base/scratch branch and t6/t7 wear branch.
+    pub condition_blend: f32,
+    /// PS outputs 24, 42, and 49 for age-channel values 1..3. Rows map to
+    /// Enhanced, Deluxe, Superior. These are shader controls, not guessed
+    /// brightness multipliers.
+    pub condition_controls: [[f32; 3]; 3],
+    /// Per-spawn Pattern object-channel value.
+    pub unique_id: f32,
+    /// `None` while inspecting the standalone mesh; populated for a selected
+    /// mod instance in the weapon simulator.
+    pub rarity: Option<WeaponModRarity>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -246,9 +370,17 @@ impl Default for WireframeMaterialTextures {
             color: None,
             normal: None,
             emissive: None,
+            control: None,
+            roughness_channel: 0,
+            sampler: None,
             aux: vec![],
             layers: vec![],
             color_tint: [255, 255, 255, 255],
+            mask_palette: None,
+            gear_dye: None,
+            gear_dye_default: None,
+            gear_dye_palette: None,
+            mod_wear: None,
             emissive_strength: 0,
         }
     }
@@ -383,6 +515,815 @@ impl GeometryTagPreview {
             GeometryPreviewKind::Model(model) => model.wireframe.as_ref(),
         }
     }
+
+    pub fn load_model_with_weapon_mods(
+        cache: Arc<TagCache>,
+        tag: TagHash,
+        entry: &UEntryHeader,
+        weapon_owner: TagHash,
+        attachments: &[TagHash],
+    ) -> Option<Self> {
+        let attachments = attachments
+            .iter()
+            .copied()
+            .map(|model_tag| WeaponModPreviewAttachment {
+                model_tag,
+                rarity: None,
+                unique_id: 0.5,
+            })
+            .collect_vec();
+        Self::load_model_with_weapon_mod_attachments(
+            cache,
+            tag,
+            entry,
+            tag,
+            weapon_owner,
+            &attachments,
+        )
+    }
+
+    pub fn load_model_with_weapon_mod_attachments(
+        cache: Arc<TagCache>,
+        tag: TagHash,
+        entry: &UEntryHeader,
+        weapon_pattern: TagHash,
+        weapon_owner: TagHash,
+        attachments: &[WeaponModPreviewAttachment],
+    ) -> Option<Self> {
+        let label = model_label_for_reference(entry.reference)?;
+        let mut model_tags = selected_model_geometry_tags(&cache, tag, entry.reference);
+        let authored_default_geometry =
+            weapon_default_mod_patterns(&cache, weapon_pattern, weapon_owner)
+                .into_iter()
+                .flat_map(|pattern| pattern_geometry_tags(&cache, pattern))
+                .collect::<rustc_hash::FxHashSet<_>>();
+        // Concrete weapon Patterns already reference empty-slot meshes. Strip
+        // those branches before rebuilding active slot state below; otherwise
+        // selecting a runtime mod leaves its default underneath it.
+        model_tags.retain(|geometry| !authored_default_geometry.contains(geometry));
+        let explicit_geometry_by_attachment = attachments
+            .iter()
+            .flat_map(|attachment| {
+                let Some(pose) =
+                    weapon_mod_attachment_pose(&cache, weapon_owner, attachment.model_tag)
+                else {
+                    return vec![];
+                };
+                package_manager()
+                    .get_entry(attachment.model_tag)
+                    .map(|entry| match entry.reference {
+                        CLASS_GEOMETRY_RESOURCE => {
+                            vec![(
+                                attachment.model_tag,
+                                attachment.model_tag,
+                                pose,
+                                attachment.rarity,
+                                attachment.unique_id,
+                            )]
+                        }
+                        CLASS_PATTERN | CLASS_PATTERN_COMPONENT => {
+                            pattern_nearest_geometry_tags(&cache, attachment.model_tag)
+                                .into_iter()
+                                .map(|geometry| {
+                                    (
+                                        attachment.model_tag,
+                                        geometry,
+                                        pose,
+                                        attachment.rarity,
+                                        attachment.unique_id,
+                                    )
+                                })
+                                .collect()
+                        }
+                        _ => vec![],
+                    })
+                    .unwrap_or_default()
+            })
+            .unique_by(|(attachment, geometry, _pose, _rarity, _unique_id)| {
+                (*attachment, *geometry)
+            })
+            .collect_vec();
+        let explicit_geometry = explicit_geometry_by_attachment
+            .iter()
+            .map(|(_attachment, geometry, _pose, _rarity, _unique_id)| *geometry)
+            .unique()
+            .collect_vec();
+        // Only the current selector may add mod geometry. Weapon Pattern graphs
+        // also reference unequipped/default visual branches; treating those as
+        // model parts was the abandoned simulator's source of gray ghost mods.
+        model_tags.extend(explicit_geometry);
+        model_tags = model_tags.into_iter().unique().collect();
+        let attachment_poses = explicit_geometry_by_attachment
+            .iter()
+            .map(
+                |(_attachment, geometry, pose, rarity, unique_id)| ResolvedWeaponModAttachment {
+                    geometry: *geometry,
+                    pose: *pose,
+                    rarity: *rarity,
+                    unique_id: *unique_id,
+                },
+            )
+            .collect_vec();
+        Some(Self {
+            kind: GeometryPreviewKind::Model(load_model_preview_from_tags(
+                cache,
+                tag,
+                entry,
+                label,
+                model_tags,
+                &attachment_poses,
+            )),
+        })
+    }
+}
+
+const CLASS_WEAPON_MOD_ATTACHMENTS: u32 = 0x80809F82;
+const CLASS_PATTERN_CHANNEL_BINDINGS: u32 = 0x8080BACC;
+const CLASS_WEAPON_MOD_VISUAL_BINDING: u32 = 0x808032C9;
+const CLASS_SKELETON_NODE_HIERARCHY: u32 = 0x8080AF42;
+const CLASS_SKELETON_TRANSFORMS: u32 = 0x8080BF47;
+const CLASS_VECTOR4: u32 = 0x80800090;
+const CLASS_PATTERN_VECTOR_BINDINGS: u32 = 0x8080AF85;
+const PATTERN_LOCAL_SCOPE_HASH: u32 = 0x811C9DC5;
+
+// The pattern compiler hashes the six material parameters independently from
+// their serialized vector positions. Those positions are intentionally
+// shuffled between patterns, so the binding table is the source of truth.
+const GEAR_DYE_COLOR_PARAMETERS: [u32; 6] = [
+    0x1B3D64F3, 0x1B3D64F6, 0x1B3D64F0, 0x1B3D64F1, 0x1B3D64F7, 0x1B3D64F4,
+];
+const GEAR_DYE_ROUGHNESS_PARAMETERS: [u32; 6] = [
+    0xBF1554A8, 0xBF1554AA, 0xBF1554AB, 0xBF1554AD, 0xBF1554AC, 0xBF1554AF,
+];
+const GEAR_DYE_METAL_PARAMETERS: [u32; 6] = [
+    0xD5754C52, 0xD5754C50, 0xD5754C51, 0xD5754C57, 0xD5754C56, 0xD5754C55,
+];
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedWeaponModAttachment {
+    geometry: TagHash,
+    pose: WeaponModAttachmentPose,
+    rarity: Option<WeaponModRarity>,
+    unique_id: f32,
+}
+
+/// Authored, weapon-specific transform for one visual mod family.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeaponModAttachmentPose {
+    pub family_id: u32,
+    pub variant_id: u32,
+    pub bone_index: u32,
+    pub rotation: [f32; 4],
+    pub translation: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ObjectSpaceTransform {
+    rotation: [f32; 4],
+    translation: [f32; 3],
+    scale: f32,
+}
+
+/// Resolves a mod pattern against the selected weapon's authored socket table.
+/// The family identifier is deliberately discovered from tag structure rather
+/// than inferred from display names or descriptions.
+pub fn weapon_mod_attachment_pose(
+    cache: &TagCache,
+    weapon: TagHash,
+    modification: TagHash,
+) -> Option<WeaponModAttachmentPose> {
+    // A mesh resource can be shared by many weapons. Only walk descendants of
+    // the selected owning container; climbing through parents would merge the
+    // socket tables of unrelated guns and produce plausible-but-wrong poses.
+    let weapon_poses = descendant_pattern_nodes(cache, weapon, 12)
+        .into_iter()
+        .flat_map(|node| {
+            weapon_attachment_poses(node)
+                .into_iter()
+                .map(move |pose| (node, pose))
+        })
+        .collect_vec();
+    if weapon_poses.is_empty() {
+        return None;
+    }
+    let families = weapon_poses
+        .iter()
+        .map(|(_node, pose)| pose.family_id)
+        .collect::<rustc_hash::FxHashSet<_>>();
+
+    let matched_family = mod_attachment_family(cache, modification, &families)?;
+    let mut pose = weapon_poses
+        .into_iter()
+        .find(|(_node, pose)| pose.family_id == matched_family)
+        .map(|(_node, pose)| pose)?;
+    if pose.bone_index != 0 {
+        let bone = weapon_skeleton_bone_transform(cache, weapon, pose.bone_index as usize)?;
+        let local_translation = pose.translation.map(|value| value * bone.scale);
+        let rotated_translation = rotate_quaternion(local_translation, bone.rotation);
+        pose.translation =
+            std::array::from_fn(|axis| bone.translation[axis] + rotated_translation[axis]);
+        pose.rotation = multiply_quaternions(bone.rotation, pose.rotation);
+    }
+    Some(pose)
+}
+
+/// Geometry branch spawned by one visual-mod Pattern. Kept public so Models
+/// integration and live-package verification use same nearest-branch rule as
+/// preview assembly.
+pub fn weapon_mod_geometry_tags(cache: &TagCache, modification: TagHash) -> Vec<TagHash> {
+    if package_manager()
+        .get_entry(modification)
+        .is_some_and(|entry| entry.reference == CLASS_GEOMETRY_RESOURCE)
+    {
+        vec![modification]
+    } else {
+        pattern_nearest_geometry_tags(cache, modification)
+    }
+}
+
+/// Returns attachment Patterns spawned by the weapon Pattern when no runtime
+/// mod overrides their socket family. Defaults are authored as nested Pattern
+/// branches beneath the concrete weapon, while socket transforms live in a
+/// separate Pattern component. Walking only Pattern/PatternComponent edges is
+/// important: shared runtime resources also reference every mod in the game.
+pub fn weapon_default_mod_patterns(
+    cache: &TagCache,
+    weapon_pattern: TagHash,
+    socket_owner: TagHash,
+) -> Vec<TagHash> {
+    let socket_families = descendant_pattern_nodes(cache, socket_owner, 12)
+        .into_iter()
+        .flat_map(weapon_attachment_poses)
+        .map(|pose| pose.family_id)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    if socket_families.is_empty() {
+        return vec![];
+    }
+
+    let mut defaults = rustc_hash::FxHashMap::<u32, (usize, TagHash)>::default();
+    for (pattern, depth) in descendant_pattern_nodes_with_depth(cache, weapon_pattern, 12) {
+        if depth == 0
+            || package_manager()
+                .get_entry(pattern)
+                .is_none_or(|entry| entry.reference != CLASS_PATTERN)
+            || pattern_nearest_geometry_tags(cache, pattern).is_empty()
+        {
+            continue;
+        }
+        let Some(family) = mod_attachment_family(cache, pattern, &socket_families) else {
+            continue;
+        };
+        match defaults.entry(family) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((depth, pattern));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if (depth, pattern) < *entry.get() {
+                    entry.insert((depth, pattern));
+                }
+            }
+        }
+    }
+
+    defaults
+        .into_iter()
+        .sorted_by_key(|(family, (depth, pattern))| (*depth, *family, *pattern))
+        .map(|(_family, (_depth, pattern))| pattern)
+        .collect()
+}
+
+/// Filters authored defaults using same family override rule as engine: an
+/// equipped mod replaces only empty-slot visual sharing its socket family.
+pub fn weapon_unoccupied_default_mod_patterns(
+    cache: &TagCache,
+    weapon_pattern: TagHash,
+    socket_owner: TagHash,
+    equipped_mods: &[TagHash],
+) -> Vec<TagHash> {
+    let occupied_families = equipped_mods
+        .iter()
+        .filter_map(|modification| {
+            weapon_mod_attachment_pose(cache, socket_owner, *modification)
+                .map(|pose| pose.family_id)
+        })
+        .collect::<rustc_hash::FxHashSet<_>>();
+    weapon_default_mod_patterns(cache, weapon_pattern, socket_owner)
+        .into_iter()
+        .filter(|default| {
+            weapon_mod_attachment_pose(cache, socket_owner, *default)
+                .is_some_and(|pose| !occupied_families.contains(&pose.family_id))
+        })
+        .collect()
+}
+
+/// Reusable index of authored weapon socket tables. Building this once avoids
+/// rereading every Pattern component for each weapon in the Models catalog.
+pub struct WeaponModSocketIndex {
+    candidates: Vec<(TagHash, Vec<WeaponModAttachmentPose>)>,
+}
+
+/// Pattern layout with tag references removed, paired with its quantized mesh
+/// bounds transform. Exact payload identity is the strongest match; cosmetic
+/// assets compiled separately from a weapon can still retain its coordinate
+/// frame while meshes, materials, and Pattern topology receive new tag IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ModelPatternStructureSignature {
+    payload: Vec<u8>,
+    geometry_transforms: Vec<ModelGeometryTransformSignature>,
+}
+
+impl ModelPatternStructureSignature {
+    /// Distance between the closest authored geometry quantization frames.
+    /// Weapon skins frequently recompile the mesh and Pattern wrapper, but
+    /// retain the owning weapon's coordinate frame to keep sockets, effects,
+    /// and first-person animation aligned. Tag IDs and mesh topology are not
+    /// stable across those recompiles; this frame is.
+    pub fn closest_geometry_distance(&self, other: &Self) -> Option<f32> {
+        self.geometry_transforms
+            .iter()
+            .cartesian_product(&other.geometry_transforms)
+            .map(|(left, right)| {
+                let normalization = left
+                    .scale
+                    .into_iter()
+                    .chain(right.scale)
+                    .map(i32::unsigned_abs)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1) as f32;
+                left.scale
+                    .into_iter()
+                    .chain(left.offset)
+                    .zip(right.scale.into_iter().chain(right.offset))
+                    .map(|(left, right)| left.abs_diff(right) as f32 / normalization)
+                    .fold(0.0_f32, f32::max)
+            })
+            .min_by(f32::total_cmp)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ModelGeometryTransformSignature {
+    scale: [i32; 3],
+    offset: [i32; 3],
+}
+
+pub fn model_pattern_structure_signature(
+    cache: &TagCache,
+    model: TagHash,
+) -> Option<ModelPatternStructureSignature> {
+    let entry = package_manager().get_entry(model)?;
+    if entry.reference != CLASS_PATTERN {
+        return None;
+    }
+    let payload = normalized_pattern_payload(cache, model)?;
+    const PRECISION: f32 = 100_000.0;
+    let quantize = |value: f32| (value * PRECISION).round() as i32;
+    let geometry_transforms = selected_model_geometry_tags(cache, model, entry.reference)
+        .into_iter()
+        .filter_map(|geometry| package_manager().read_tag(geometry).ok())
+        .filter_map(|data| {
+            let transform =
+                read_geometry_position_transform(&data, package_manager().version.endian())?;
+            Some(ModelGeometryTransformSignature {
+                scale: transform.scale.map(quantize),
+                offset: transform.offset.map(quantize),
+            })
+        })
+        .collect();
+    Some(ModelPatternStructureSignature {
+        payload,
+        geometry_transforms,
+    })
+}
+
+impl WeaponModSocketIndex {
+    pub fn new() -> Self {
+        let candidates = package_manager()
+            .get_all_by_reference(CLASS_PATTERN)
+            .into_iter()
+            .chain(package_manager().get_all_by_reference(CLASS_PATTERN_COMPONENT))
+            .filter_map(|(candidate, _entry)| {
+                let poses = weapon_attachment_poses(candidate);
+                (!poses.is_empty()).then_some((candidate, poses))
+            })
+            .collect();
+        Self { candidates }
+    }
+
+    /// Finds the Pattern component whose attachment family/variant pairs were
+    /// compiled into the selected weapon render Pattern. This joins two
+    /// authored investment branches without names, descriptions, or tag IDs.
+    pub fn owner_for(
+        &self,
+        cache: &TagCache,
+        model: TagHash,
+        modifications: &[TagHash],
+    ) -> Option<TagHash> {
+        weapon_mod_socket_owner_from_index(cache, model, modifications, &self.candidates)
+    }
+}
+
+impl Default for WeaponModSocketIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn weapon_mod_socket_owner_from_index(
+    cache: &TagCache,
+    model: TagHash,
+    modifications: &[TagHash],
+    socket_candidates: &[(TagHash, Vec<WeaponModAttachmentPose>)],
+) -> Option<TagHash> {
+    let rooted = rooted_pattern_equivalent(cache, model);
+    let ancestry = std::iter::once((0usize, model))
+        .chain(rooted.map(|candidate| (0usize, candidate)))
+        .chain(ancestor_pattern_roots(cache, model))
+        .chain(
+            rooted
+                .into_iter()
+                .flat_map(|candidate| ancestor_pattern_roots(cache, candidate)),
+        )
+        .unique_by(|(_depth, candidate)| *candidate)
+        .flat_map(|(root_depth, candidate)| {
+            descendant_pattern_nodes_with_depth(cache, candidate, 12)
+                .into_iter()
+                .filter(|(node, _node_depth)| !weapon_attachment_poses(*node).is_empty())
+                .map(move |(node, node_depth)| (root_depth + node_depth, node))
+        })
+        .unique_by(|(_depth, node)| *node)
+        .filter_map(|(depth, socket)| {
+            let matches = modifications
+                .iter()
+                .filter(|modification| {
+                    weapon_mod_attachment_pose(cache, socket, **modification).is_some()
+                })
+                .count();
+            (matches > 0 && matches == modifications.len()).then_some((matches, depth, socket))
+        })
+        .max_by_key(|(matches, depth, socket)| {
+            (
+                *matches,
+                std::cmp::Reverse(*depth),
+                std::cmp::Reverse(*socket),
+            )
+        })
+        .map(|(_matches, _depth, socket)| socket);
+    if ancestry.is_some() {
+        return ancestry;
+    }
+
+    let model_authored_pairs = model_authored_socket_pairs(cache, model);
+    if model_authored_pairs.is_empty() {
+        return None;
+    }
+    socket_candidates
+        .iter()
+        .filter_map(|(candidate, poses)| {
+            let authored_pair_overlap = poses
+                .iter()
+                .filter(|pose| model_authored_pairs.contains(&(pose.family_id, pose.variant_id)))
+                .count();
+            if authored_pair_overlap == 0 {
+                return None;
+            }
+            let matches = modifications
+                .iter()
+                .filter(|modification| {
+                    weapon_mod_attachment_pose(cache, *candidate, **modification).is_some()
+                })
+                .count();
+            (matches > 0 && matches == modifications.len()).then_some((
+                authored_pair_overlap,
+                matches,
+                *candidate,
+            ))
+        })
+        .max_by_key(|(authored_pair_overlap, matches, candidate)| {
+            (
+                *matches,
+                *authored_pair_overlap,
+                std::cmp::Reverse(*candidate),
+            )
+        })
+        .map(|(_authored_pair_overlap, _matches, candidate)| candidate)
+}
+
+fn model_authored_socket_pairs(
+    cache: &TagCache,
+    model: TagHash,
+) -> rustc_hash::FxHashSet<(u32, u32)> {
+    let endian = package_manager().version.endian();
+    descendant_pattern_nodes(cache, model, 12)
+        .into_iter()
+        .filter_map(|node| package_manager().read_tag(node).ok())
+        .flat_map(|data| {
+            (0..data.len().saturating_sub(7))
+                .step_by(4)
+                .filter_map(move |offset| {
+                    Some((
+                        read_u32_at(&data, offset, endian)?,
+                        read_u32_at(&data, offset + 4, endian)?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn mod_attachment_family(
+    cache: &TagCache,
+    modification: TagHash,
+    weapon_families: &rustc_hash::FxHashSet<u32>,
+) -> Option<u32> {
+    let authored = weapon_mod_authored_families(cache, modification);
+    let authored_matches = authored
+        .intersection(weapon_families)
+        .copied()
+        .collect::<rustc_hash::FxHashSet<_>>();
+    if !authored.is_empty() {
+        // An explicit visual binding is authoritative. Falling through to a
+        // raw word overlap when it does not match this weapon can select an
+        // unrelated behavior channel and place the mod on the wrong socket.
+        return unique_family(authored_matches);
+    }
+
+    let endian = package_manager().version.endian();
+    let mut structural_matches = rustc_hash::FxHashSet::default();
+    let mut fallback_matches = rustc_hash::FxHashSet::default();
+    for node in descendant_pattern_nodes(cache, modification, 8) {
+        let Ok(data) = package_manager().read_tag(node) else {
+            continue;
+        };
+        let arrays = scan_arrays(&data, endian);
+        // The mod visual binding resource authors the socket family as the
+        // first value after its class marker. Later values are material/decal
+        // channels and can also occur in a weapon's socket table, so treating
+        // every raw overlap equally makes multi-part mods ambiguous.
+        for offset in (0..data.len().saturating_sub(7)).step_by(4) {
+            if read_u32_at(&data, offset, endian) == Some(CLASS_WEAPON_MOD_VISUAL_BINDING)
+                && let Some(family) = read_u32_at(&data, offset + 4, endian)
+                && weapon_families.contains(&family)
+            {
+                structural_matches.insert(family);
+            }
+        }
+        for array in arrays
+            .iter()
+            .filter(|array| array.class == CLASS_PATTERN_CHANNEL_BINDINGS)
+        {
+            for offset in (array.data_offset..array.end_offset.saturating_sub(3)).step_by(4) {
+                if let Some(family) = read_u32_at(&data, offset, endian)
+                    && weapon_families.contains(&family)
+                {
+                    structural_matches.insert(family);
+                }
+            }
+        }
+        let socket_ranges = arrays
+            .iter()
+            .filter(|array| array.class == CLASS_WEAPON_MOD_ATTACHMENTS)
+            .map(|array| array.data_offset..array.end_offset)
+            .collect_vec();
+        for offset in (0..data.len().saturating_sub(3)).step_by(4) {
+            if socket_ranges.iter().any(|range| range.contains(&offset)) {
+                continue;
+            }
+            if let Some(family) = read_u32_at(&data, offset, endian)
+                && weapon_families.contains(&family)
+            {
+                fallback_matches.insert(family);
+            }
+        }
+    }
+    unique_family(structural_matches).or_else(|| unique_family(fallback_matches))
+}
+
+/// Socket-family identifiers explicitly authored by a mod's visual binding.
+/// These are the engine join key between investment mods and weapon Pattern
+/// attachment tables; names and compatibility prose are not involved.
+pub fn weapon_mod_authored_families(
+    cache: &TagCache,
+    modification: TagHash,
+) -> rustc_hash::FxHashSet<u32> {
+    let endian = package_manager().version.endian();
+    let mut families = rustc_hash::FxHashSet::default();
+    for node in descendant_pattern_nodes(cache, modification, 8) {
+        let Ok(data) = package_manager().read_tag(node) else {
+            continue;
+        };
+        for offset in (0..data.len().saturating_sub(7)).step_by(4) {
+            if read_u32_at(&data, offset, endian) == Some(CLASS_WEAPON_MOD_VISUAL_BINDING)
+                && let Some(family) = read_u32_at(&data, offset + 4, endian)
+            {
+                families.insert(family);
+            }
+        }
+    }
+    families
+}
+
+#[cfg(test)]
+pub(crate) fn debug_weapon_mod_visual_binding_words(
+    cache: &TagCache,
+    modification: TagHash,
+) -> Vec<(TagHash, usize, [u32; 6])> {
+    let endian = package_manager().version.endian();
+    descendant_pattern_nodes(cache, modification, 8)
+        .into_iter()
+        .filter_map(|node| Some((node, package_manager().read_tag(node).ok()?)))
+        .flat_map(|(node, data)| {
+            (0..data.len().saturating_sub(23))
+                .step_by(4)
+                .filter_map(move |offset| {
+                    (read_u32_at(&data, offset, endian) == Some(CLASS_WEAPON_MOD_VISUAL_BINDING))
+                        .then(|| {
+                            let words = std::array::from_fn(|index| {
+                                read_u32_at(&data, offset + index * 4, endian).unwrap_or_default()
+                            });
+                            (node, offset, words)
+                        })
+                })
+                .collect_vec()
+        })
+        .collect()
+}
+
+fn unique_family(families: rustc_hash::FxHashSet<u32>) -> Option<u32> {
+    (families.len() == 1)
+        .then(|| families.into_iter().next())
+        .flatten()
+}
+
+fn weapon_skeleton_bone_transform(
+    cache: &TagCache,
+    weapon: TagHash,
+    bone_index: usize,
+) -> Option<ObjectSpaceTransform> {
+    let siblings = cache
+        .hashes
+        .get(&weapon)?
+        .references
+        .iter()
+        .copied()
+        .unique()
+        .flat_map(|parent| pattern_graph_children(cache, parent))
+        .filter(|candidate| *candidate != weapon)
+        .unique()
+        .sorted()
+        .collect_vec();
+    let mut transforms = siblings
+        .into_iter()
+        .filter_map(|candidate| skeleton_bone_transform(candidate, bone_index));
+    let first = transforms.next()?;
+    transforms
+        .all(|transform| object_space_transforms_match(first, transform))
+        .then_some(first)
+}
+
+fn object_space_transforms_match(left: ObjectSpaceTransform, right: ObjectSpaceTransform) -> bool {
+    left.rotation
+        .into_iter()
+        .chain(left.translation)
+        .chain([left.scale])
+        .zip(
+            right
+                .rotation
+                .into_iter()
+                .chain(right.translation)
+                .chain([right.scale]),
+        )
+        .all(|(left, right)| (left - right).abs() < 0.000001)
+}
+
+fn skeleton_bone_transform(tag: TagHash, bone_index: usize) -> Option<ObjectSpaceTransform> {
+    let endian = package_manager().version.endian();
+    let data = package_manager().read_tag(tag).ok()?;
+    let arrays = scan_arrays(&data, endian);
+    let hierarchy_index = arrays.iter().position(|array| {
+        array.class == CLASS_SKELETON_NODE_HIERARCHY && array.count > bone_index
+    })?;
+    let hierarchy_count = arrays[hierarchy_index].count;
+    let transforms = arrays
+        .iter()
+        .skip(hierarchy_index + 1)
+        .find(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == hierarchy_count)?;
+    let record = array_records(&data, *transforms, 0x20)
+        .get(bone_index)
+        .copied()?;
+    let rotation = read_vec4_f32(record, 0, endian)?;
+    let translation = read_vec4_f32(record, 0x10, endian)?;
+    Some(ObjectSpaceTransform {
+        rotation,
+        translation: [translation[0], translation[1], translation[2]],
+        scale: translation[3],
+    })
+}
+
+fn descendant_pattern_nodes(cache: &TagCache, root: TagHash, max_depth: usize) -> Vec<TagHash> {
+    let mut frontier = vec![(root, 0usize)];
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut result = vec![];
+    seen.insert(root);
+    while let Some((node, depth)) = frontier.pop() {
+        let Some(entry) = package_manager().get_entry(node) else {
+            continue;
+        };
+        if matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT) {
+            result.push(node);
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        for child in pattern_graph_children(cache, node) {
+            if seen.insert(child)
+                && package_manager().get_entry(child).is_some_and(|entry| {
+                    matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                })
+            {
+                frontier.push((child, depth + 1));
+            }
+        }
+    }
+    result
+}
+
+fn descendant_pattern_nodes_with_depth(
+    cache: &TagCache,
+    root: TagHash,
+    max_depth: usize,
+) -> Vec<(TagHash, usize)> {
+    let mut frontier = std::collections::VecDeque::from([(root, 0usize)]);
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut result = vec![];
+    seen.insert(root);
+    while let Some((node, depth)) = frontier.pop_front() {
+        let Some(entry) = package_manager().get_entry(node) else {
+            continue;
+        };
+        if matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT) {
+            result.push((node, depth));
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        for child in pattern_graph_children(cache, node) {
+            if seen.insert(child)
+                && package_manager().get_entry(child).is_some_and(|entry| {
+                    matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                })
+            {
+                frontier.push_back((child, depth + 1));
+            }
+        }
+    }
+    result
+}
+
+fn weapon_attachment_poses(tag: TagHash) -> Vec<WeaponModAttachmentPose> {
+    let endian = package_manager().version.endian();
+    let Ok(data) = package_manager().read_tag(tag) else {
+        return vec![];
+    };
+    scan_arrays(&data, endian)
+        .into_iter()
+        .filter(|array| array.class == CLASS_WEAPON_MOD_ATTACHMENTS)
+        .flat_map(|array| array_records(&data, array, 0x30))
+        .filter_map(|record| {
+            let rotation = read_vec4_f32(record, 0, endian)?;
+            let translation = read_vec4_f32(record, 0x10, endian)?;
+            let bone_index = read_u32_at(record, 0x24, endian)?;
+            let family_id = read_u32_at(record, 0x28, endian)?;
+            let variant_id = read_u32_at(record, 0x2c, endian)?;
+            (family_id != 0).then_some(WeaponModAttachmentPose {
+                family_id,
+                variant_id,
+                bone_index,
+                rotation,
+                translation: [translation[0], translation[1], translation[2]],
+            })
+        })
+        .collect()
+}
+
+fn pattern_graph_children(cache: &TagCache, tag: TagHash) -> Vec<TagHash> {
+    cache
+        .hashes
+        .get(&tag)
+        .into_iter()
+        .flat_map(|scan| {
+            scan.file_hashes
+                .iter()
+                .map(|reference| reference.hash)
+                .chain(
+                    scan.file_hashes64
+                        .iter()
+                        .filter_map(|reference| tag64_to_hash32(reference.hash)),
+                )
+        })
+        .unique()
+        .collect()
 }
 
 impl VertexBufferPreview {
@@ -426,6 +1367,10 @@ pub fn model_info_for_reference(reference: u32) -> Option<ModelTagInfo> {
             role: ModelTagRole::Dynamic,
             label: "Dynamic model",
         }),
+        CLASS_DECORATOR => Some(ModelTagInfo {
+            role: ModelTagRole::Dynamic,
+            label: "Decorator / trees",
+        }),
         0x80806EC5 => Some(ModelTagInfo {
             role: ModelTagRole::Dynamic,
             label: "Dynamic mesh",
@@ -440,6 +1385,13 @@ pub fn model_info_for_reference(reference: u32) -> Option<ModelTagInfo> {
 
 pub fn model_label_for_reference(reference: u32) -> Option<&'static str> {
     model_info_for_reference(reference).map(|info| info.label)
+}
+
+pub fn is_model_catalog_reference(reference: u32) -> bool {
+    // Marathon gear is exposed through top-level patterns. Pattern components
+    // use CLASS_PATTERN_COMPONENT and are only implementation nodes beneath it.
+    reference == CLASS_PATTERN
+        || model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
 }
 
 fn load_vertex_buffer_preview_for_tag(
@@ -582,18 +1534,319 @@ fn load_model_preview(
     entry: &UEntryHeader,
     label: &'static str,
 ) -> ModelPreview {
-    let class_name = get_class_by_id(entry.reference).map(|c| c.name.to_string());
-    let vertex_buffers = find_related_tags(&cache, tag, TagSearchKind::VertexBuffer, 8);
-    let index_buffers = find_related_tags(&cache, tag, TagSearchKind::IndexBuffer, 8);
-    let techniques = find_model_technique_entries(&cache, tag, entry);
-    let textures = find_model_textures(&cache, tag, &techniques);
-    let shaders = find_related_tags(&cache, tag, TagSearchKind::Shader, 8);
-    let (mesh_source, mut wireframe) = parse_model_wireframe(tag, entry)
-        .map(|parsed| (Some(parsed.0), Some(parsed.1)))
-        .unwrap_or_else(|| (None, build_model_wireframe(&vertex_buffers, &index_buffers)));
-    if let Some(wireframe) = &mut wireframe {
-        assign_wireframe_material_textures(wireframe, &cache, &textures);
+    if entry.reference == CLASS_DECORATOR
+        && let Some(preview) = load_decorator_preview(cache.clone(), tag, entry)
+    {
+        return preview;
     }
+    let model_tags = selected_model_geometry_tags(&cache, tag, entry.reference);
+    load_model_preview_from_tags(cache, tag, entry, label, model_tags, &[])
+}
+
+fn load_decorator_preview(
+    cache: Arc<TagCache>,
+    tag: TagHash,
+    entry: &UEntryHeader,
+) -> Option<ModelPreview> {
+    let endian = package_manager().version.endian();
+    let decorator = package_manager().read_tag(tag).ok()?;
+    let entity = read_tag_array(&decorator, 0x08, endian)
+        .into_iter()
+        .filter_map(|wrapper| package_manager().read_tag(wrapper).ok())
+        .filter_map(|wrapper| read_u32_at(&wrapper, 0x08, endian).map(TagHash))
+        .find(|entity| package_manager().get_entry(*entity).is_some())?;
+    let entity_entry = package_manager().get_entry(entity)?;
+    let mut model = load_model_preview(cache, entity, &entity_entry, "Decorator model");
+    let base = model.wireframe.take()?;
+
+    let placement_resource = TagHash(read_u32_at(&decorator, 0x48, endian)?);
+    let placement_resource = package_manager().read_tag(placement_resource).ok()?;
+    let constants_tag = TagHash(read_u32_at(&placement_resource, 0x14, endian)?);
+    let instance_data_tag = TagHash(read_u32_at(&placement_resource, 0x1C, endian)?);
+    let constants = package_manager().read_tag(constants_tag).ok()?;
+    let instance_data = package_manager().read_tag(instance_data_tag).ok()?;
+    let scale = read_vec4_f32(&constants, 0x00, endian)?;
+    let offset = read_vec4_f32(&constants, 0x10, endian)?;
+    let elements = read_array(&instance_data, 0x08, 0x10, endian)?;
+    let placements = elements
+        .chunks_exact(0x10)
+        .take(512)
+        .map(|element| {
+            let position = [
+                read_u16(&element[0..2], endian) as f32 / 65535.0 * scale[0] + offset[0],
+                read_u16(&element[2..4], endian) as f32 / 65535.0 * scale[1] + offset[1],
+                read_u16(&element[4..6], endian) as f32 / 65535.0 * scale[2] + offset[2],
+            ];
+            let mut rotation = [
+                element[8] as f32 / 127.5 - 1.0,
+                element[9] as f32 / 127.5 - 1.0,
+                element[10] as f32 / 127.5 - 1.0,
+                element[11] as f32 / 127.5 - 1.0,
+            ];
+            let length = rotation
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if length > 0.0001 {
+                rotation.iter_mut().for_each(|value| *value /= length);
+            } else {
+                rotation = [0.0, 0.0, 0.0, 1.0];
+            }
+            DecoratorPlacement { position, rotation }
+        })
+        .collect_vec();
+    model.wireframe = instantiate_decorator_wireframe(&base, &placements);
+    model.label = "Decorator / trees";
+    model.class_name = get_class_by_id(entry.reference).map(|class| class.name.to_string());
+    model.geometry_parts.insert(0, tag);
+    Some(model)
+}
+
+#[derive(Clone, Copy)]
+struct DecoratorPlacement {
+    position: [f32; 3],
+    rotation: [f32; 4],
+}
+
+fn rotate_quaternion(vector: [f32; 3], quaternion: [f32; 4]) -> [f32; 3] {
+    let [qx, qy, qz, qw] = quaternion;
+    let uv = [
+        qy * vector[2] - qz * vector[1],
+        qz * vector[0] - qx * vector[2],
+        qx * vector[1] - qy * vector[0],
+    ];
+    let uuv = [
+        qy * uv[2] - qz * uv[1],
+        qz * uv[0] - qx * uv[2],
+        qx * uv[1] - qy * uv[0],
+    ];
+    [
+        vector[0] + 2.0 * (qw * uv[0] + uuv[0]),
+        vector[1] + 2.0 * (qw * uv[1] + uuv[1]),
+        vector[2] + 2.0 * (qw * uv[2] + uuv[2]),
+    ]
+}
+
+fn multiply_quaternions(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
+    let [lx, ly, lz, lw] = left;
+    let [rx, ry, rz, rw] = right;
+    let mut product = [
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    ];
+    let length = product
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if length > f32::EPSILON {
+        product.iter_mut().for_each(|value| *value /= length);
+    }
+    product
+}
+
+fn instantiate_decorator_wireframe(
+    base: &WireframePreview,
+    placements: &[DecoratorPlacement],
+) -> Option<WireframePreview> {
+    let max_instances = (MAX_PREVIEW_VERTICES / base.vertices.len().max(1))
+        .min(MAX_PREVIEW_INDICES / base.indices.len().max(1))
+        .min(placements.len());
+    let mut output = base.clone();
+    output.source = format!("{} decorator instances", max_instances);
+    output.vertices.clear();
+    output.indices.clear();
+    output.material_ranges.clear();
+    output.normals.as_mut().map(Vec::clear);
+    output.procedural_positions.as_mut().map(Vec::clear);
+    output.procedural_normals.as_mut().map(Vec::clear);
+    output.tangents.as_mut().map(Vec::clear);
+    output.uvs.as_mut().map(Vec::clear);
+    for placement in placements.iter().take(max_instances) {
+        let vertex_base = output.vertices.len() as u32;
+        let index_base = output.indices.len();
+        output.vertices.extend(base.vertices.iter().map(|position| {
+            let rotated = rotate_quaternion(*position, placement.rotation);
+            [
+                rotated[0] + placement.position[0],
+                rotated[1] + placement.position[1],
+                rotated[2] + placement.position[2],
+            ]
+        }));
+        if let (Some(target), Some(source)) =
+            (&mut output.procedural_positions, &base.procedural_positions)
+        {
+            target.extend(source.iter().copied());
+        }
+        if let (Some(target), Some(source)) = (&mut output.normals, &base.normals) {
+            target.extend(
+                source
+                    .iter()
+                    .map(|normal| rotate_quaternion(*normal, placement.rotation)),
+            );
+        }
+        if let (Some(target), Some(source)) =
+            (&mut output.procedural_normals, &base.procedural_normals)
+        {
+            target.extend(source.iter().copied());
+        }
+        if let (Some(target), Some(source)) = (&mut output.tangents, &base.tangents) {
+            target.extend(source.iter().map(|tangent| {
+                let rotated =
+                    rotate_quaternion([tangent[0], tangent[1], tangent[2]], placement.rotation);
+                [rotated[0], rotated[1], rotated[2], tangent[3]]
+            }));
+        }
+        if let (Some(target), Some(source)) = (&mut output.uvs, &base.uvs) {
+            target.extend(source.iter().copied());
+        }
+        output
+            .indices
+            .extend(base.indices.iter().map(|index| index + vertex_base));
+        output
+            .material_ranges
+            .extend(base.material_ranges.iter().cloned().map(|mut range| {
+                range.index_start += index_base;
+                range
+            }));
+    }
+    output.vertex_count_total = output.vertices.len();
+    output.index_count_total = output.indices.len();
+    let (min, max) = bounds(&output.vertices)?;
+    output.min = min;
+    output.max = max;
+    Some(output)
+}
+
+fn read_vec4_f32(data: &[u8], offset: usize, endian: Endian) -> Option<[f32; 4]> {
+    Some(std::array::from_fn(|index| {
+        f32::from_bits(read_u32_at(data, offset + index * 4, endian).unwrap_or_default())
+    }))
+}
+
+fn selected_model_geometry_tags(cache: &TagCache, tag: TagHash, reference: u32) -> Vec<TagHash> {
+    match reference {
+        CLASS_PATTERN => {
+            let nearest = pattern_nearest_geometry_tags(cache, tag);
+            if nearest.is_empty() {
+                pattern_geometry_tags(cache, tag)
+            } else {
+                nearest
+            }
+        }
+        CLASS_GEOMETRY_RESOURCE | CLASS_PATTERN_COMPONENT => {
+            related_pattern_geometry_tags(cache, tag)
+        }
+        _ => vec![tag],
+    }
+}
+
+fn load_model_preview_from_tags(
+    cache: Arc<TagCache>,
+    tag: TagHash,
+    entry: &UEntryHeader,
+    label: &'static str,
+    model_tags: Vec<TagHash>,
+    attachments: &[ResolvedWeaponModAttachment],
+) -> ModelPreview {
+    let class_name = get_class_by_id(entry.reference).map(|c| c.name.to_string());
+    let model_entries = model_tags
+        .iter()
+        .filter_map(|model_tag| {
+            package_manager()
+                .get_entry(*model_tag)
+                .map(|entry| (*model_tag, entry))
+        })
+        .collect_vec();
+    let vertex_buffers = model_tags
+        .iter()
+        .flat_map(|model_tag| find_related_tags(&cache, *model_tag, TagSearchKind::VertexBuffer, 8))
+        .unique_by(|(tag, _entry)| *tag)
+        .collect_vec();
+    let index_buffers = model_tags
+        .iter()
+        .flat_map(|model_tag| find_related_tags(&cache, *model_tag, TagSearchKind::IndexBuffer, 8))
+        .unique_by(|(tag, _entry)| *tag)
+        .collect_vec();
+    let techniques = model_entries
+        .iter()
+        .flat_map(|(model_tag, model_entry)| {
+            find_model_technique_entries(&cache, *model_tag, model_entry)
+        })
+        .unique_by(|(tag, _entry)| *tag)
+        .collect_vec();
+    let textures = model_tags
+        .iter()
+        .flat_map(|model_tag| find_model_textures(&cache, *model_tag, &techniques))
+        .unique_by(|(tag, _entry)| *tag)
+        .take(256)
+        .collect_vec();
+    let shaders = model_tags
+        .iter()
+        .flat_map(|model_tag| find_related_tags(&cache, *model_tag, TagSearchKind::Shader, 8))
+        .unique_by(|(tag, _entry)| *tag)
+        .collect_vec();
+    let mut parsed = model_entries
+        .iter()
+        .filter_map(|(model_tag, model_entry)| {
+            parse_model_wireframe(*model_tag, model_entry)
+                .map(|(source, wireframe)| (*model_tag, source, wireframe))
+        })
+        .collect_vec();
+    apply_weapon_mod_attachment_poses(&mut parsed, attachments);
+    let mesh_source = parsed
+        .iter()
+        .find(|(model_tag, _source, _wireframe)| *model_tag == tag)
+        .or_else(|| parsed.first())
+        .map(|(_model_tag, source, _wireframe)| source.clone());
+    let attached_geometry = attachments
+        .iter()
+        .map(|attachment| {
+            (
+                attachment.geometry,
+                (attachment.rarity, attachment.unique_id),
+            )
+        })
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let gear_dye_palette = (!attached_geometry.is_empty())
+        .then(|| weapon_skin_gear_dye_palette(&cache, tag))
+        .flatten();
+    for (model_tag, _source, wireframe) in &mut parsed {
+        assign_wireframe_material_textures(wireframe, &cache, &textures);
+        if let Some((rarity, unique_id)) = attached_geometry.get(model_tag).copied() {
+            for range in &mut wireframe.material_ranges {
+                if let Some(wear) = &mut range.textures.mod_wear {
+                    wear.rarity = rarity;
+                    wear.unique_id = unique_id.clamp(0.0, 1.0);
+                }
+            }
+        }
+        if attached_geometry.contains_key(model_tag)
+            && let Some(palette) = gear_dye_palette
+        {
+            // A selected skin supplies all six GearDye object channels. Mod
+            // Patterns consume those exact materials; their other local
+            // vectors are fallback/category data and must not be promoted to
+            // a color offset.
+            let attachment_palette = palette;
+            for range in &mut wireframe.material_ranges {
+                if let Some(dye) = range
+                    .gear_dye_change_color_index
+                    .and_then(|index| attachment_palette.get(index as usize).copied())
+                {
+                    range.textures.gear_dye = Some(dye);
+                    range.textures.gear_dye_default =
+                        range.technique.and_then(technique_default_gear_dye_color);
+                    range.textures.gear_dye_palette = Some(attachment_palette);
+                }
+            }
+        }
+    }
+    let wireframe = merge_model_wireframes(parsed)
+        .or_else(|| build_model_wireframe(&vertex_buffers, &index_buffers));
 
     ModelPreview {
         label,
@@ -604,8 +1857,697 @@ fn load_model_preview(
         techniques,
         textures,
         shaders,
+        geometry_parts: model_tags,
         wireframe,
     }
+}
+
+fn technique_default_gear_dye_color(technique: TagHash) -> Option<[f32; 4]> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview
+        .stages
+        .into_iter()
+        .find(|stage| stage.stage == "PS")?;
+    // The common Tiger GearDye material reserves cbuffer outputs 8..13 for
+    // the six change-color regions. Output 7 is initialized from inline
+    // constant 7 and is the seventh/default (black-ID) material color.
+    let gear_dye_shader = (8..=13).all(|output| {
+        pixel.bytecode.expressions.iter().any(|expression| {
+            expression.target == format!("output[{output}]")
+                && expression.expression.contains("object_channel")
+        })
+    });
+    let color = gear_dye_shader.then(|| pixel.inline_constants.get(7).copied())??;
+    valid_dye_color(color).then_some(color)
+}
+
+fn weapon_skin_gear_dye_palette(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+) -> Option<[GearDyeMaterial; 6]> {
+    let mut queue = std::collections::VecDeque::from([(selected_pattern, 0usize)]);
+    let mut seen = rustc_hash::FxHashSet::default();
+    seen.insert(selected_pattern);
+
+    while let Some((tag, depth)) = queue.pop_front() {
+        let entry = package_manager().get_entry(tag)?;
+        if entry.reference == CLASS_PATTERN_COMPONENT
+            && let Ok(data) = package_manager().read_tag(tag)
+            && let Some(palette) = decode_weapon_skin_gear_dye_palette(&data)
+        {
+            return Some(palette);
+        }
+        if depth >= 4 {
+            continue;
+        }
+        for child in cache
+            .hashes
+            .get(&tag)
+            .into_iter()
+            .flat_map(|scan| scan.file_hashes.iter().map(|reference| reference.hash))
+            .unique()
+        {
+            let Some(child_entry) = package_manager().get_entry(child) else {
+                continue;
+            };
+            if matches!(
+                child_entry.reference,
+                CLASS_PATTERN | CLASS_PATTERN_COMPONENT
+            ) && seen.insert(child)
+            {
+                queue.push_back((child, depth + 1));
+            }
+        }
+    }
+    None
+}
+
+fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 6]> {
+    let endian = package_manager().version.endian();
+    let arrays = scan_arrays(data, endian);
+    let singleton_vectors = arrays
+        .iter()
+        .copied()
+        .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
+        .collect_vec();
+    if singleton_vectors.len() != 29 {
+        return None;
+    }
+    let vectors = singleton_vectors
+        .iter()
+        .copied()
+        .map(|array| read_serialized_dye_vector(data, array, endian))
+        .collect::<Option<Vec<_>>>()?;
+    let parameter_indices = arrays
+        .iter()
+        .copied()
+        .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+        .flat_map(|array| array_records(data, array, 0x0c))
+        .filter_map(|record| {
+            (read_u32_at(record, 0x00, endian)? == PATTERN_LOCAL_SCOPE_HASH).then_some(())?;
+            Some((
+                read_u32_at(record, 0x04, endian)?,
+                usize::try_from(read_u32_at(record, 0x08, endian)?).ok()?,
+            ))
+        })
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let parameter_vector = |parameter: u32| {
+        parameter_indices
+            .get(&parameter)
+            .and_then(|index| vectors.get(*index))
+            .copied()
+    };
+    let palette = std::array::from_fn(|slot| GearDyeMaterial {
+        color: parameter_vector(GEAR_DYE_COLOR_PARAMETERS[slot]).unwrap_or_default(),
+        roughness_remap: parameter_vector(GEAR_DYE_ROUGHNESS_PARAMETERS[slot]).unwrap_or_default(),
+        metal_remap: parameter_vector(GEAR_DYE_METAL_PARAMETERS[slot]).unwrap_or_default(),
+    });
+    GEAR_DYE_COLOR_PARAMETERS
+        .into_iter()
+        .chain(GEAR_DYE_ROUGHNESS_PARAMETERS)
+        .chain(GEAR_DYE_METAL_PARAMETERS)
+        .all(|parameter| parameter_vector(parameter).is_some())
+        .then_some(())
+        .and_then(|()| {
+            palette
+                .iter()
+                .all(|dye| {
+                    valid_dye_color(dye.color)
+                        && valid_dye_remap(dye.roughness_remap)
+                        && valid_dye_remap(dye.metal_remap)
+                })
+                .then_some(palette)
+        })
+}
+
+fn read_serialized_dye_vector(data: &[u8], array: TagArray, endian: Endian) -> Option<[f32; 4]> {
+    let record = data.get(array.data_offset..array.data_offset + 0x10)?;
+    Some([
+        read_f32(&record[0x0..0x4], endian),
+        read_f32(&record[0x4..0x8], endian),
+        read_f32(&record[0x8..0xc], endian),
+        1.0,
+    ])
+}
+
+fn valid_dye_color(color: [f32; 4]) -> bool {
+    color[..3]
+        .iter()
+        .all(|channel| channel.is_finite() && (0.0..=4.0).contains(channel))
+}
+
+fn valid_dye_remap(remap: [f32; 4]) -> bool {
+    remap[..3]
+        .iter()
+        .all(|component| component.is_finite() && (-16.0..=16.0).contains(component))
+}
+
+fn apply_weapon_mod_attachment_poses(
+    parts: &mut [(TagHash, MeshSourcePreview, WireframePreview)],
+    attachments: &[ResolvedWeaponModAttachment],
+) {
+    let attachment_poses = attachments
+        .iter()
+        .map(|attachment| (attachment.geometry, attachment.pose))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    for (tag, _source, wireframe) in parts.iter_mut() {
+        let Some(pose) = attachment_poses.get(tag) else {
+            continue;
+        };
+        // GearDye VS forwards dequantized, model-local POSITION/NORMAL directly
+        // to PS TEXCOORD5/6. Preserve those before baking socket transforms.
+        wireframe
+            .procedural_positions
+            .get_or_insert_with(|| wireframe.vertices.clone());
+        if wireframe.procedural_normals.is_none() {
+            wireframe.procedural_normals = wireframe.normals.clone();
+        }
+        for vertex in &mut wireframe.vertices {
+            let rotated = rotate_quaternion(*vertex, pose.rotation);
+            *vertex = [
+                rotated[0] + pose.translation[0],
+                rotated[1] + pose.translation[1],
+                rotated[2] + pose.translation[2],
+            ];
+        }
+        if let Some(normals) = &mut wireframe.normals {
+            normals
+                .iter_mut()
+                .for_each(|normal| *normal = rotate_quaternion(*normal, pose.rotation));
+        }
+        if let Some(tangents) = &mut wireframe.tangents {
+            tangents.iter_mut().for_each(|tangent| {
+                let rotated =
+                    rotate_quaternion([tangent[0], tangent[1], tangent[2]], pose.rotation);
+                *tangent = [rotated[0], rotated[1], rotated[2], tangent[3]];
+            });
+        }
+        if let Some((min, max)) = bounds(&wireframe.vertices) {
+            wireframe.min = min;
+            wireframe.max = max;
+        }
+    }
+}
+
+fn pattern_nearest_geometry_tags(cache: &TagCache, root: TagHash) -> Vec<TagHash> {
+    let mut frontier = vec![(root, 0usize)];
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut geometry = vec![];
+    let mut nearest_depth = usize::MAX;
+    seen.insert(root);
+
+    while let Some((parent, depth)) = frontier.pop() {
+        if depth >= nearest_depth {
+            continue;
+        }
+        for child in cache.hashes.get(&parent).into_iter().flat_map(|scan| {
+            scan.file_hashes.iter().map(|child| child.hash).chain(
+                scan.file_hashes64
+                    .iter()
+                    .filter_map(|child| tag64_to_hash32(child.hash)),
+            )
+        }) {
+            let Some(reference) = package_manager()
+                .get_entry(child)
+                .map(|entry| entry.reference)
+            else {
+                continue;
+            };
+            if reference == CLASS_GEOMETRY_RESOURCE {
+                let child_depth = depth + 1;
+                if child_depth < nearest_depth {
+                    nearest_depth = child_depth;
+                    geometry.clear();
+                }
+                if child_depth == nearest_depth {
+                    geometry.push(child);
+                }
+            } else if matches!(reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                && seen.insert(child)
+                && seen.len() < 256
+            {
+                frontier.push((child, depth + 1));
+            }
+        }
+    }
+
+    geometry
+        .into_iter()
+        .unique()
+        .sorted_by_key(|tag| (tag.pkg_id(), tag.entry_index()))
+        .collect()
+}
+
+fn ancestor_pattern_roots(cache: &TagCache, tag: TagHash) -> Vec<(usize, TagHash)> {
+    let mut frontier = vec![(tag, 0usize)];
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut roots = vec![];
+    seen.insert(tag);
+    while let Some((child, depth)) = frontier.pop() {
+        if depth >= 8 {
+            continue;
+        }
+        for parent in cache
+            .hashes
+            .get(&child)
+            .into_iter()
+            .flat_map(|scan| scan.references.iter().copied())
+        {
+            let Some(reference) = package_manager()
+                .get_entry(parent)
+                .map(|entry| entry.reference)
+            else {
+                continue;
+            };
+            if !matches!(reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT) {
+                continue;
+            }
+            if reference == CLASS_PATTERN {
+                roots.push((depth + 1, parent));
+            }
+            if seen.insert(parent) {
+                frontier.push((parent, depth + 1));
+            }
+        }
+    }
+    roots.sort_by_key(|(depth, tag)| (*depth, tag.pkg_id(), tag.entry_index()));
+    roots.dedup_by_key(|(_depth, tag)| *tag);
+    roots
+}
+
+fn rooted_pattern_equivalent(cache: &TagCache, selected: TagHash) -> Option<TagHash> {
+    let selected_entry = package_manager().get_entry(selected)?;
+    if selected_entry.reference != CLASS_PATTERN {
+        return None;
+    }
+    let signature = normalized_pattern_payload(cache, selected)?;
+    let selected_transform = pattern_nearest_geometry_tags(cache, selected)
+        .first()
+        .and_then(|tag| package_manager().read_tag(*tag).ok())
+        .and_then(|data| {
+            read_geometry_position_transform(&data, package_manager().version.endian())
+        });
+    package_manager()
+        .get_all_by_reference(CLASS_PATTERN)
+        .into_iter()
+        .filter(|(tag, entry)| *tag != selected && entry.file_size == selected_entry.file_size)
+        .filter(|(tag, _entry)| {
+            normalized_pattern_payload(cache, *tag).as_ref() == Some(&signature)
+        })
+        .filter(|(tag, _entry)| !ancestor_pattern_roots(cache, *tag).is_empty())
+        .filter(|(tag, _entry)| {
+            let transform = pattern_nearest_geometry_tags(cache, *tag)
+                .first()
+                .and_then(|geometry| package_manager().read_tag(*geometry).ok())
+                .and_then(|data| {
+                    read_geometry_position_transform(&data, package_manager().version.endian())
+                });
+            transforms_match(selected_transform, transform)
+        })
+        .map(|(tag, _entry)| tag)
+        .min()
+}
+
+fn normalized_pattern_payload(cache: &TagCache, tag: TagHash) -> Option<Vec<u8>> {
+    let mut data = package_manager().read_tag(tag).ok()?;
+    let scan = cache.hashes.get(&tag)?;
+    for reference in &scan.file_hashes {
+        let offset = usize::try_from(reference.offset).ok()?;
+        if let Some(bytes) = data.get_mut(offset..offset.saturating_add(4)) {
+            bytes.fill(0);
+        }
+    }
+    for reference in &scan.file_hashes64 {
+        let offset = usize::try_from(reference.offset).ok()?;
+        if let Some(bytes) = data.get_mut(offset..offset.saturating_add(8)) {
+            bytes.fill(0);
+        }
+    }
+    Some(data)
+}
+
+fn transforms_match(
+    left: Option<GeometryPositionTransform>,
+    right: Option<GeometryPositionTransform>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .scale
+            .into_iter()
+            .chain(left.offset)
+            .zip(right.scale.into_iter().chain(right.offset))
+            .all(|(left, right)| (left - right).abs() < 0.00001),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn related_pattern_geometry_tags(cache: &TagCache, tag: TagHash) -> Vec<TagHash> {
+    let mut frontier = vec![(tag, 0usize)];
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut roots = vec![];
+    seen.insert(tag);
+
+    while let Some((child, depth)) = frontier.pop() {
+        if depth >= 8 {
+            continue;
+        }
+        for parent in cache
+            .hashes
+            .get(&child)
+            .into_iter()
+            .flat_map(|scan| scan.references.iter().copied())
+        {
+            let Some(reference) = package_manager()
+                .get_entry(parent)
+                .map(|entry| entry.reference)
+            else {
+                continue;
+            };
+            if !matches!(reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT) {
+                continue;
+            }
+            let parent_depth = depth + 1;
+            if reference == CLASS_PATTERN {
+                roots.push((parent_depth, parent));
+            }
+            if seen.insert(parent) {
+                frontier.push((parent, parent_depth));
+            }
+        }
+    }
+
+    roots.sort_by_key(|(depth, root)| (*depth, root.pkg_id(), root.entry_index()));
+    roots.dedup_by_key(|(_depth, root)| *root);
+    let Some(mut geometry) = roots
+        .iter()
+        .map(|(_depth, root)| pattern_geometry_tags(cache, *root))
+        .find(|geometry| pattern_geometry_is_assembly(geometry))
+        .or_else(|| {
+            roots
+                .last()
+                .map(|(_depth, root)| pattern_geometry_tags(cache, *root))
+        })
+    else {
+        let direct = pattern_geometry_tags(cache, tag);
+        return if direct.is_empty() { vec![tag] } else { direct };
+    };
+
+    geometry.push(tag);
+    geometry
+        .into_iter()
+        .filter(|geometry_tag| {
+            package_manager()
+                .get_entry(*geometry_tag)
+                .is_some_and(|entry| entry.reference == CLASS_GEOMETRY_RESOURCE)
+        })
+        .unique()
+        .sorted_by_key(|geometry_tag| (geometry_tag.pkg_id(), geometry_tag.entry_index()))
+        .take(64)
+        .collect()
+}
+
+fn pattern_geometry_is_assembly(geometry: &[TagHash]) -> bool {
+    if geometry.len() < 2 {
+        return false;
+    }
+    let endian = package_manager().version.endian();
+    let transforms = geometry
+        .iter()
+        .filter_map(|tag| package_manager().read_tag(*tag).ok())
+        .filter_map(|data| read_geometry_position_transform(&data, endian))
+        .collect_vec();
+    if transforms.len() < 2 {
+        return false;
+    }
+    let mut diameters = transforms
+        .iter()
+        .map(|transform| {
+            transform
+                .scale
+                .iter()
+                .map(|scale| scale.abs() * 2.0)
+                .fold(0.0_f32, f32::max)
+        })
+        .collect_vec();
+    diameters.sort_by(f32::total_cmp);
+    let median_part = diameters[diameters.len() / 2].max(0.0001);
+    let assembly_extent = (0..3)
+        .map(|axis| {
+            let min = transforms
+                .iter()
+                .map(|transform| transform.offset[axis] - transform.scale[axis].abs())
+                .fold(f32::INFINITY, f32::min);
+            let max = transforms
+                .iter()
+                .map(|transform| transform.offset[axis] + transform.scale[axis].abs())
+                .fold(f32::NEG_INFINITY, f32::max);
+            max - min
+        })
+        .fold(0.0_f32, f32::max);
+    assembly_extent >= median_part * 2.0
+}
+
+fn pattern_geometry_tags(cache: &TagCache, root: TagHash) -> Vec<TagHash> {
+    let mut geometry = vec![];
+    let mut frontier = vec![root];
+    let mut seen = rustc_hash::FxHashSet::default();
+    seen.insert(root);
+    while let Some(parent) = frontier.pop() {
+        for child in cache.hashes.get(&parent).into_iter().flat_map(|scan| {
+            scan.file_hashes.iter().map(|child| child.hash).chain(
+                scan.file_hashes64
+                    .iter()
+                    .filter_map(|child| tag64_to_hash32(child.hash)),
+            )
+        }) {
+            let Some(reference) = package_manager()
+                .get_entry(child)
+                .map(|entry| entry.reference)
+            else {
+                continue;
+            };
+            if reference == CLASS_GEOMETRY_RESOURCE {
+                geometry.push(child);
+            } else if matches!(reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                && seen.insert(child)
+                && seen.len() < 256
+            {
+                frontier.push(child);
+            }
+        }
+    }
+
+    geometry
+        .into_iter()
+        .filter(|geometry_tag| {
+            package_manager()
+                .get_entry(*geometry_tag)
+                .is_some_and(|entry| entry.reference == CLASS_GEOMETRY_RESOURCE)
+        })
+        .unique()
+        .sorted_by_key(|geometry_tag| (geometry_tag.pkg_id(), geometry_tag.entry_index()))
+        .collect()
+}
+
+fn merge_model_wireframes(
+    parts: Vec<(TagHash, MeshSourcePreview, WireframePreview)>,
+) -> Option<WireframePreview> {
+    if parts.len() == 1 {
+        return parts
+            .into_iter()
+            .next()
+            .map(|(_tag, _source, wireframe)| wireframe);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+
+    let position_format = parts[0].2.position_format;
+    let uv_format = parts
+        .iter()
+        .map(|(_tag, _source, wireframe)| wireframe.uv_format.as_deref())
+        .all_equal_value()
+        .ok()
+        .flatten()
+        .map(|format| format!("{format} (assembled; transforms baked)"));
+    let has_complete_uvs = parts
+        .iter()
+        .all(|(_tag, _source, wireframe)| wireframe.uvs.is_some());
+    let has_complete_normals = parts
+        .iter()
+        .all(|(_tag, _source, wireframe)| wireframe.normals.is_some());
+    let has_complete_tangents = parts
+        .iter()
+        .all(|(_tag, _source, wireframe)| wireframe.tangents.is_some());
+    let normal_format = has_complete_normals
+        .then(|| {
+            parts
+                .iter()
+                .filter_map(|(_tag, _source, wireframe)| wireframe.normal_format.as_deref())
+                .all_equal_value()
+                .ok()
+                .map(|format| format!("{format} (assembled)"))
+        })
+        .flatten();
+    let tangent_format = has_complete_tangents
+        .then(|| {
+            parts
+                .iter()
+                .filter_map(|(_tag, _source, wireframe)| wireframe.tangent_format.as_deref())
+                .all_equal_value()
+                .ok()
+                .map(|format| format!("{format} (assembled)"))
+        })
+        .flatten();
+    let vertex_count_total = parts
+        .iter()
+        .map(|(_tag, _source, wireframe)| wireframe.vertex_count_total)
+        .sum();
+    let index_count_total = parts
+        .iter()
+        .map(|(_tag, _source, wireframe)| wireframe.index_count_total)
+        .sum();
+    let source = format!(
+        "assembled {}",
+        parts
+            .iter()
+            .map(|(tag, _source, _wireframe)| tag)
+            .format(" + ")
+    );
+    let mut vertices = Vec::new();
+    let mut normals = has_complete_normals.then(Vec::new);
+    let mut procedural_positions = Some(Vec::new());
+    let mut procedural_normals = has_complete_normals.then(Vec::new);
+    let mut tangents = has_complete_tangents.then(Vec::new);
+    let mut uvs = has_complete_uvs.then(Vec::new);
+    let mut indices = Vec::new();
+    let mut material_ranges = Vec::new();
+
+    for (_tag, source, wireframe) in parts {
+        let available_vertices = MAX_PREVIEW_VERTICES.saturating_sub(vertices.len());
+        if available_vertices == 0 {
+            break;
+        }
+        let copied_vertices = wireframe.vertices.len().min(available_vertices);
+        let vertex_base = vertices.len() as u32;
+        vertices.extend(wireframe.vertices.iter().copied().take(copied_vertices));
+        if let Some(output_positions) = &mut procedural_positions {
+            output_positions.extend(
+                wireframe
+                    .procedural_positions
+                    .as_ref()
+                    .unwrap_or(&wireframe.vertices)
+                    .iter()
+                    .copied()
+                    .take(copied_vertices),
+            );
+        }
+        if let (Some(output_normals), Some(part_normals)) = (&mut normals, &wireframe.normals) {
+            output_normals.extend(part_normals.iter().copied().take(copied_vertices));
+        }
+        if let Some(output_normals) = &mut procedural_normals {
+            let part_normals = wireframe
+                .procedural_normals
+                .as_ref()
+                .or(wireframe.normals.as_ref());
+            if let Some(part_normals) = part_normals {
+                output_normals.extend(part_normals.iter().copied().take(copied_vertices));
+            }
+        }
+        if let (Some(output_tangents), Some(part_tangents)) = (&mut tangents, &wireframe.tangents) {
+            output_tangents.extend(part_tangents.iter().copied().take(copied_vertices));
+        }
+        if let (Some(output_uvs), Some(part_uvs)) = (&mut uvs, &wireframe.uvs) {
+            output_uvs.extend(part_uvs.iter().copied().take(copied_vertices).map(|uv| {
+                source
+                    .uv_transform
+                    .map(|transform| {
+                        [
+                            uv[0] * transform.scale[0] + transform.offset[0],
+                            uv[1] * transform.scale[1] + transform.offset[1],
+                        ]
+                    })
+                    .unwrap_or(uv)
+            }));
+        }
+
+        let ranges = if wireframe.material_ranges.is_empty() {
+            vec![WireframeMaterialRange {
+                index_start: 0,
+                index_count: wireframe.indices.len(),
+                render_stage: None,
+                technique: None,
+                gear_dye_change_color_index: None,
+                texture: None,
+                textures: WireframeMaterialTextures::default(),
+            }]
+        } else {
+            wireframe.material_ranges
+        };
+        for range in ranges {
+            let source = wireframe
+                .indices
+                .get(
+                    range.index_start.min(wireframe.indices.len())
+                        ..range
+                            .index_start
+                            .saturating_add(range.index_count)
+                            .min(wireframe.indices.len()),
+                )
+                .unwrap_or_default();
+            let index_start = indices.len();
+            for triangle in source.chunks_exact(3) {
+                if indices.len() + 3 > MAX_PREVIEW_INDICES
+                    || triangle
+                        .iter()
+                        .any(|index| *index as usize >= copied_vertices)
+                {
+                    continue;
+                }
+                indices.extend(triangle.iter().map(|index| index + vertex_base));
+            }
+            let index_count = indices.len() - index_start;
+            if index_count > 0 {
+                material_ranges.push(WireframeMaterialRange {
+                    index_start,
+                    index_count,
+                    render_stage: range.render_stage,
+                    technique: range.technique,
+                    gear_dye_change_color_index: range.gear_dye_change_color_index,
+                    texture: range.texture,
+                    textures: range.textures,
+                });
+            }
+        }
+        if indices.len() >= MAX_PREVIEW_INDICES {
+            break;
+        }
+    }
+
+    let (min, max) = bounds(&vertices)?;
+    Some(WireframePreview {
+        source,
+        position_format,
+        uv_format,
+        vertices,
+        normals,
+        procedural_positions,
+        procedural_normals,
+        tangents,
+        uvs,
+        normal_format,
+        tangent_format,
+        indices,
+        material_ranges,
+        min,
+        max,
+        vertex_count_total,
+        index_count_total,
+    })
 }
 
 fn build_model_wireframe(
@@ -832,39 +2774,30 @@ fn material_textures_for_technique(
         .map(|(entry, data)| {
             (
                 texture_bindings_for_technique(&entry, &data),
-                tfx_texture_bindings_for_technique(&entry, &data),
                 material_constants_for_technique(&entry, &data),
+                primary_sampler_for_technique(&entry, &data),
             )
         })
         .unwrap_or_default();
 
     let mut material = WireframeMaterialTextures::default();
-    let tfx_roles = direct
-        .1
-        .iter()
-        .filter(|binding| binding.stage == "PS")
-        .filter_map(|binding| {
-            Some((
-                binding.slot as u32,
-                material_role_from_tfx_binding(binding)?,
-            ))
-        })
-        .collect::<rustc_hash::FxHashMap<_, _>>();
-    apply_material_constants(&mut material, direct.2);
+    apply_material_constants(&mut material, direct.1);
+    material.sampler = direct.2;
     let candidates = direct
         .0
         .into_iter()
         .filter(|binding| binding.stage == "PS")
         .sorted_by_key(|binding| texture_binding_rank(*binding))
         .collect_vec();
+    let normal_slot = material_normal_texture_slot(&candidates);
+    let control_slot = material_control_texture_slot(&candidates, normal_slot);
+    material.mod_wear = weapon_mod_wear_material(technique, &candidates);
 
     for binding in candidates {
-        let fallback_role = material_texture_role(binding);
-        let role = match (tfx_roles.get(&binding.slot).copied(), fallback_role) {
-            (Some(MaterialTextureRole::Normal), MaterialTextureRole::Color) => fallback_role,
-            (Some(role), _) => role,
-            (None, role) => role,
-        };
+        let mut role = material_texture_role(binding, normal_slot, control_slot);
+        if fallback_aux_texture(binding.tag) {
+            role = MaterialTextureRole::Aux;
+        }
         assign_material_texture(&mut material, binding.tag, role);
     }
 
@@ -887,7 +2820,244 @@ fn material_textures_for_technique(
             });
     }
 
+    promote_auxiliary_preview_color(&mut material, technique);
+
     material
+}
+
+const WEAPON_MOD_AGE_CHANNEL: u32 = 0x138D_E801;
+const UNIQUE_ID_CHANNEL: u32 = 0xD358_3E54;
+const WEAPON_MOD_SCRATCHES_PROJECTION_AGE_DELTA: usize = 10;
+const WEAPON_MOD_SCRATCHES_REMAP_BASE_AGE_DELTA: usize = 9;
+const WEAPON_MOD_SCRATCHES_REMAP_SCALE_AGE_DELTA: usize = 8;
+
+/// Marathon's common weapon-part shader exposes extra surface inputs at PS
+/// t5..t7. Inventory rarities share one Pattern and texture set. Runtime sends
+/// the authored tier (1 Enhanced, 2 Deluxe, 3 Superior) through object channel
+/// 0x138DE801; three TFX outputs select progressively cleaner shader branches.
+/// Shader permutations shift every cbuffer register, so output indices are
+/// discovered from the object-channel expressions instead of being hardcoded.
+fn weapon_mod_wear_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<WeaponModWearMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    let output_index = |target: &str| {
+        target
+            .strip_prefix("output[")?
+            .strip_suffix(']')?
+            .parse::<usize>()
+            .ok()
+    };
+    let age_channel = format!("object_channel(0x{WEAPON_MOD_AGE_CHANNEL:08X})");
+    let unique_channel = format!("object_channel(0x{UNIQUE_ID_CHANNEL:08X})");
+    let age_outputs = pixel
+        .bytecode
+        .expressions
+        .iter()
+        .filter(|expression| expression.expression.contains(&age_channel))
+        .filter_map(|expression| {
+            Some((
+                output_index(&expression.target)?,
+                expression.target.as_str(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let unique_outputs = pixel
+        .bytecode
+        .expressions
+        .iter()
+        .filter(|expression| expression.expression.contains(&unique_channel))
+        .filter_map(|expression| {
+            expression
+                .target
+                .starts_with("output[")
+                .then_some(expression.target.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [
+        (first_age_output, first_age_target),
+        (_, middle_age_target),
+        (last_age_output, last_age_target),
+    ] = age_outputs.as_slice()
+    else {
+        return None;
+    };
+    let [grime_projection_target, damage_projection_target] = unique_outputs.as_slice() else {
+        return None;
+    };
+
+    let output_value = |expressions: &[crate::material::TfxExpressionPreview], target: &str| {
+        expressions
+            .iter()
+            .find(|expression| expression.target == target)
+            .and_then(|expression| expression.value)
+    };
+    let valid_projection = |projection: [f32; 4]| {
+        projection.iter().all(|value| value.is_finite())
+            && projection[0].abs() > f32::EPSILON
+            && projection[1].abs() > f32::EPSILON
+    };
+
+    // Unique-id normally shifts wear patches per instance. Zero keeps preview
+    // deterministic while retaining authored scales. Age 1 also gives exact
+    // Enhanced condition controls for same evaluation pass.
+    let enhanced_channels = std::collections::HashMap::from([
+        (UNIQUE_ID_CHANNEL, [0.0; 4]),
+        (WEAPON_MOD_AGE_CHANNEL, [1.0; 4]),
+    ]);
+    let (_bindings, enhanced_expressions) = interpret_tfx_stack_with_object_channels(
+        &pixel.bytecode.ops,
+        &pixel.constants,
+        &enhanced_channels,
+    );
+    // Shader cb0 starts from the technique's inline constant block; TFX pops
+    // overwrite selected registers (including 24, 39, 40, 42, and 49).
+    // The bytecode literal pool is unrelated and must never be used as cb0.
+    let scratches_projection = *pixel
+        .inline_constants
+        .get(first_age_output.checked_sub(WEAPON_MOD_SCRATCHES_PROJECTION_AGE_DELTA)?)
+        .filter(|projection| valid_projection(**projection))?;
+    let scratches_remap_base = *pixel
+        .inline_constants
+        .get(first_age_output.checked_sub(WEAPON_MOD_SCRATCHES_REMAP_BASE_AGE_DELTA)?)?;
+    let scratches_remap_scale = *pixel
+        .inline_constants
+        .get(first_age_output.checked_sub(WEAPON_MOD_SCRATCHES_REMAP_SCALE_AGE_DELTA)?)?;
+    let condition_blend = pixel.inline_constants.get(last_age_output + 1)?[0];
+    if scratches_remap_base
+        .into_iter()
+        .chain(scratches_remap_scale)
+        .chain([condition_blend])
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    let grime_projection = output_value(&enhanced_expressions, grime_projection_target)
+        .filter(|projection| valid_projection(*projection))?;
+    let damage_projection = output_value(&enhanced_expressions, damage_projection_target)
+        .filter(|projection| valid_projection(*projection))?;
+    let unique_channels = std::collections::HashMap::from([
+        (UNIQUE_ID_CHANNEL, [1.0; 4]),
+        (WEAPON_MOD_AGE_CHANNEL, [1.0; 4]),
+    ]);
+    let (_bindings, unique_expressions) = interpret_tfx_stack_with_object_channels(
+        &pixel.bytecode.ops,
+        &pixel.constants,
+        &unique_channels,
+    );
+    let unique_grime_projection = output_value(&unique_expressions, grime_projection_target)
+        .filter(|projection| valid_projection(*projection))?;
+    let unique_damage_projection = output_value(&unique_expressions, damage_projection_target)
+        .filter(|projection| valid_projection(*projection))?;
+    let grime_projection_unique_delta =
+        std::array::from_fn(|axis| unique_grime_projection[axis] - grime_projection[axis]);
+    let damage_projection_unique_delta =
+        std::array::from_fn(|axis| unique_damage_projection[axis] - damage_projection[axis]);
+
+    let mut condition_controls = [[0.0_f32; 3]; 3];
+    for (index, tier) in [1.0_f32, 2.0, 3.0].into_iter().enumerate() {
+        let channels = std::collections::HashMap::from([
+            (UNIQUE_ID_CHANNEL, [0.0; 4]),
+            (WEAPON_MOD_AGE_CHANNEL, [tier; 4]),
+        ]);
+        let (_bindings, expressions) = interpret_tfx_stack_with_object_channels(
+            &pixel.bytecode.ops,
+            &pixel.constants,
+            &channels,
+        );
+        for (control, target) in [*first_age_target, *middle_age_target, *last_age_target]
+            .into_iter()
+            .enumerate()
+        {
+            let value = output_value(&expressions, target)?[0];
+            if !value.is_finite() {
+                return None;
+            }
+            condition_controls[index][control] = value.clamp(0.0, 1.0);
+        }
+    }
+
+    let texture_at = |slot| {
+        bindings
+            .iter()
+            .find(|binding| binding.stage == "PS" && binding.slot == slot)
+            .map(|binding| binding.tag)
+            .filter(|texture| local_surface_texture_candidate(*texture, technique))
+    };
+    Some(WeaponModWearMaterial {
+        scratches: texture_at(5)?,
+        grime: texture_at(6)?,
+        damage: texture_at(7)?,
+        scratches_projection,
+        grime_projection,
+        damage_projection,
+        grime_projection_unique_delta,
+        damage_projection_unique_delta,
+        scratches_remap_base,
+        scratches_remap_scale,
+        condition_blend: condition_blend.clamp(0.0, 1.0),
+        condition_controls,
+        unique_id: 0.0,
+        rarity: None,
+    })
+}
+
+fn promote_auxiliary_preview_color(material: &mut WireframeMaterialTextures, technique: TagHash) {
+    let local_color = material
+        .aux
+        .iter()
+        .copied()
+        .find(|texture| local_surface_texture_candidate(*texture, technique));
+    let replace_common_global = material.color.is_some_and(|texture| {
+        texture.pkg_id() == 0x130 && technique.pkg_id() != 0x130 && local_color.is_some()
+    });
+    if material.color.is_none() || replace_common_global {
+        material.color = local_color;
+    }
+
+    if material.color.is_none() {
+        material.color = material
+            .aux
+            .iter()
+            .copied()
+            .find(|texture| preview_mask_candidate(*texture));
+    }
+}
+
+fn local_surface_texture_candidate(texture: TagHash, technique: TagHash) -> bool {
+    if texture.pkg_id() != technique.pkg_id() || fallback_aux_texture(texture) {
+        return false;
+    }
+    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+        return false;
+    };
+    let format = format!("{:?}", desc.format);
+    desc.depth == 1
+        && desc.array_size == 1
+        && desc.width > 1
+        && desc.height > 1
+        && format.contains("Srgb")
+        && !format.contains("Bc4")
+}
+
+fn preview_mask_candidate(texture: TagHash) -> bool {
+    if fallback_aux_texture(texture) {
+        return false;
+    }
+    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+        return false;
+    };
+    let format = format!("{:?}", desc.format);
+    desc.depth == 1
+        && desc.array_size == 1
+        && desc.width > 1
+        && desc.height > 1
+        && format.contains("Bc4")
 }
 
 fn apply_material_constants(
@@ -898,6 +3068,7 @@ fn apply_material_constants(
         .color_tint
         .map(quantize_color_tint)
         .unwrap_or([255, 255, 255, 255]);
+    material.mask_palette = constants.mask_palette;
     material.emissive_strength = constants
         .emissive_strength
         .map(|value| ((value / 4.0).clamp(0.0, 1.0) * 255.0) as u8)
@@ -921,6 +3092,7 @@ fn assign_material_texture(
     if Some(texture) == material.color
         || Some(texture) == material.normal
         || Some(texture) == material.emissive
+        || Some(texture) == material.control
         || material.aux.contains(&texture)
         || material.layers.iter().any(|layer| {
             layer.color == Some(texture)
@@ -934,7 +3106,10 @@ fn assign_material_texture(
     match role {
         MaterialTextureRole::Color => assign_color_layer(material, texture),
         MaterialTextureRole::Normal => assign_normal_layer(material, texture),
-        MaterialTextureRole::Emissive => assign_emissive_layer(material, texture),
+        MaterialTextureRole::Control(channel) => {
+            material.control = Some(texture);
+            material.roughness_channel = channel;
+        }
         _ => material.aux.push(texture),
     }
 }
@@ -969,67 +3144,127 @@ fn assign_normal_layer(material: &mut WireframeMaterialTextures, texture: TagHas
     }
 }
 
-fn assign_emissive_layer(material: &mut WireframeMaterialTextures, texture: TagHash) {
-    if material.emissive.is_none() {
-        material.emissive = Some(texture);
-    }
-
-    if let Some(layer) = material
-        .layers
-        .iter_mut()
-        .find(|layer| layer.emissive.is_none())
-    {
-        layer.emissive = Some(texture);
-    } else {
-        material.layers.push(WireframeMaterialLayer {
-            emissive: Some(texture),
-            ..Default::default()
-        });
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterialTextureRole {
     Color,
     Normal,
-    Emissive,
+    Control(u8),
     Aux,
 }
 
-fn material_texture_role(binding: TechniqueTextureBinding) -> MaterialTextureRole {
+fn material_texture_role(
+    binding: TechniqueTextureBinding,
+    normal_slot: Option<u32>,
+    control_slot: Option<(u32, u8)>,
+) -> MaterialTextureRole {
+    if let Some((control_slot, channel)) = control_slot
+        && binding.slot == control_slot
+    {
+        return MaterialTextureRole::Control(channel);
+    }
+    let format = texture_preview_format(binding.tag);
+    if binding.slot == 0 && !format.contains("Bc4") {
+        return MaterialTextureRole::Color;
+    }
     let rank = texture_preview_rank(binding.tag);
     if rank.format >= 70 {
         return MaterialTextureRole::Aux;
     }
 
-    match (binding.slot, rank.format) {
-        (_, 0) if binding.slot <= 2 => MaterialTextureRole::Color,
-        (0, _) => MaterialTextureRole::Color,
-        (1 | 2, _) => MaterialTextureRole::Normal,
-        (3 | 4 | 5, 0) => MaterialTextureRole::Emissive,
-        (3 | 4 | 5, _) => MaterialTextureRole::Emissive,
-        _ => MaterialTextureRole::Aux,
-    }
-}
-
-fn material_role_from_tfx_binding(
-    binding: &TechniqueTfxTextureBinding,
-) -> Option<MaterialTextureRole> {
-    if binding.source_scope.as_deref() == Some("TextureSet") {
-        let _texture_set_byte_offset = binding.source_offset;
-        return Some(material_role_from_shader_slot(binding.slot));
-    }
-
-    Some(material_role_from_shader_slot(binding.slot))
-}
-
-fn material_role_from_shader_slot(slot: u8) -> MaterialTextureRole {
-    match slot {
+    match binding.slot {
+        slot if Some(slot) == normal_slot => MaterialTextureRole::Normal,
         0 => MaterialTextureRole::Color,
-        1 | 2 => MaterialTextureRole::Normal,
-        3 | 4 | 5 => MaterialTextureRole::Emissive,
         _ => MaterialTextureRole::Aux,
     }
+}
+
+fn material_control_texture_slot(
+    bindings: &[TechniqueTextureBinding],
+    normal_slot: Option<u32>,
+) -> Option<(u32, u8)> {
+    let max_slot = bindings.iter().map(|binding| binding.slot).max()?;
+    let usable = |slot| {
+        bindings.iter().any(|binding| {
+            binding.slot == slot
+                && !fallback_aux_texture(binding.tag)
+                && material_control_texture_candidate(binding.tag)
+        })
+    };
+    let usable_multichannel = |slot| {
+        bindings.iter().any(|binding| {
+            binding.slot == slot
+                && !fallback_aux_texture(binding.tag)
+                && material_control_texture_candidate(binding.tag)
+                && !texture_preview_format(binding.tag).contains("Bc4")
+        })
+    };
+
+    if max_slot >= 10 && usable_multichannel(2) {
+        return Some((2, 3));
+    }
+    if max_slot <= 4 && normal_slot == Some(2) && usable(1) {
+        return Some((1, 1));
+    }
+    if (5..10).contains(&max_slot) && usable_multichannel(3) {
+        return Some((3, 4));
+    }
+    None
+}
+
+fn texture_preview_format(texture: TagHash) -> String {
+    Texture::load_data_d2(texture, false)
+        .map(|(desc, _data, _comment)| format!("{:?}", desc.format))
+        .unwrap_or_default()
+}
+
+fn material_control_texture_candidate(texture: TagHash) -> bool {
+    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+        return false;
+    };
+    let format = format!("{:?}", desc.format);
+    desc.depth == 1
+        && desc.array_size == 1
+        && desc.width > 1
+        && desc.height > 1
+        && !format.contains("Srgb")
+}
+
+fn material_normal_texture_slot(bindings: &[TechniqueTextureBinding]) -> Option<u32> {
+    let max_slot = bindings.iter().map(|binding| binding.slot).max()?;
+    let usable = |slot| {
+        bindings.iter().any(|binding| {
+            binding.slot == slot
+                && !fallback_aux_texture(binding.tag)
+                && normal_surface_texture_candidate(binding.tag)
+        })
+    };
+
+    // Goliath character shaders bind packed dye/material masks near the front of
+    // the table and their tangent normal near the end. Compact hair shaders use
+    // slot 2, while the common surface family uses slot 1. These layouts match
+    // the bindings Alkahest passes unchanged to the original Tiger shaders.
+    if max_slot >= 10 {
+        return [12, 11, 10].into_iter().find(|slot| usable(*slot));
+    }
+
+    if max_slot <= 4 && usable(2) {
+        return Some(2);
+    }
+
+    usable(1).then_some(1)
+}
+
+fn normal_surface_texture_candidate(texture: TagHash) -> bool {
+    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+        return false;
+    };
+    let format = format!("{:?}", desc.format);
+    desc.depth == 1
+        && desc.array_size == 1
+        && desc.width > 1
+        && desc.height > 1
+        && !format.contains("Srgb")
+        && !format.contains("Bc4")
 }
 
 fn guessed_related_texture_role(
@@ -1045,15 +3280,6 @@ fn guessed_related_texture_role(
     if format.contains("Srgb") && fallback_color_candidate(texture, technique) {
         if material.color.is_none() {
             MaterialTextureRole::Color
-        } else {
-            MaterialTextureRole::Aux
-        }
-    } else if !format.contains("Srgb")
-        && (format.contains("Bc7") || format.contains("Rgba"))
-        && !fallback_aux_texture(texture)
-    {
-        if material.normal.is_none() {
-            MaterialTextureRole::Normal
         } else {
             MaterialTextureRole::Aux
         }
@@ -1079,7 +3305,14 @@ fn fallback_color_candidate(texture: TagHash, technique: TagHash) -> bool {
 fn fallback_aux_texture(texture: TagHash) -> bool {
     matches!(
         texture.0,
-        0x80A60058 | 0x80A4050F | 0x80A46D44 | 0x80A60055 | 0x80A6007D | 0x80A43539 | 0x80B6CC6E
+        0x80A60058
+            | 0x80A4050F
+            | 0x80A46D44
+            | 0x80A46D48
+            | 0x80A60055
+            | 0x80A6007D
+            | 0x80A43539
+            | 0x80B6CC6E
     )
 }
 
@@ -1378,7 +3611,9 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            render_stage: None,
             technique: source.technique,
+            gear_dye_change_color_index: None,
         }],
         source.input_layout_index,
     )?;
@@ -1426,7 +3661,9 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            render_stage: None,
             technique: source.technique,
+            gear_dye_change_color_index: None,
         }],
         source.input_layout_index,
     )?;
@@ -1440,6 +3677,7 @@ fn parse_geometry_resource_wireframe(
     let data = package_manager().read_tag(tag).ok()?;
     let endian = package_manager().version.endian();
     let uv_transform = read_geometry_uv_transform(&data, endian);
+    let position_transform = read_geometry_position_transform(&data, endian);
     let ranges = geometry_primary_index_ranges(&data, endian);
     let range = ranges.first();
     let index_count = ranges
@@ -1481,12 +3719,15 @@ fn parse_geometry_resource_wireframe(
             uv_transform,
             shader_constants: shader_constants_from_uv_transform(uv_transform),
         };
-        let wireframe = build_wireframe_from_refs(
+        let mut wireframe = build_wireframe_from_refs(
             &[source.vertex0_buffer, source.vertex1_buffer],
             source.index_buffer,
             index_ranges.as_slice(),
             source.input_layout_index,
         )?;
+        if let Some(transform) = position_transform {
+            apply_geometry_position_transform(&mut wireframe, transform);
+        }
 
         return Some((source, wireframe));
     }
@@ -1518,12 +3759,15 @@ fn parse_geometry_resource_wireframe(
         uv_transform,
         shader_constants: shader_constants_from_uv_transform(uv_transform),
     };
-    let wireframe = build_wireframe_from_refs(
+    let mut wireframe = build_wireframe_from_refs(
         &[source.vertex0_buffer, source.vertex1_buffer],
         source.index_buffer,
         index_ranges.as_slice(),
         source.input_layout_index,
     )?;
+    if let Some(transform) = position_transform {
+        apply_geometry_position_transform(&mut wireframe, transform);
+    }
 
     Some((source, wireframe))
 }
@@ -1567,6 +3811,35 @@ fn build_wireframe_from_refs(
         wireframe.uvs = Some(uvs);
     }
 
+    if let Some((normal_tag, normal_format, normals)) = input_layout_vectors(
+        &vertex_previews,
+        input_layout_index,
+        SEMANTIC_NORMAL,
+        wireframe.vertices.len(),
+    ) {
+        wireframe.normal_format = Some(format!(
+            "{normal_format} from {normal_tag} layout {input_layout_index:?}"
+        ));
+        wireframe.normals = Some(
+            normals
+                .into_iter()
+                .map(|normal| [normal[0], normal[1], normal[2]])
+                .collect(),
+        );
+        wireframe.procedural_normals = wireframe.normals.clone();
+    }
+    if let Some((tangent_tag, tangent_format, tangents)) = input_layout_vectors(
+        &vertex_previews,
+        input_layout_index,
+        SEMANTIC_TANGENT,
+        wireframe.vertices.len(),
+    ) {
+        wireframe.tangent_format = Some(format!(
+            "{tangent_format} from {tangent_tag} layout {input_layout_index:?}"
+        ));
+        wireframe.tangents = Some(tangents);
+    }
+
     let index_entry = package_manager().get_entry(index_tag)?;
     let index_header = package_manager().read_tag(index_tag).ok()?;
     let index_preview =
@@ -1589,7 +3862,15 @@ fn build_wireframe_from_refs(
                         ..range.range.end.min(index_preview.indices.len()),
                 )
                 .unwrap_or_default();
-            let triangles = preview_triangles_from_indices(source, range.primitive_type);
+            let triangles = preview_triangles_from_indices(source, range.primitive_type)
+                .chunks_exact(3)
+                .filter(|triangle| {
+                    triangle
+                        .iter()
+                        .all(|index| (*index as usize) < wireframe.vertices.len())
+                })
+                .flat_map(|triangle| triangle.iter().copied())
+                .collect_vec();
             if triangles.is_empty() {
                 continue;
             }
@@ -1603,7 +3884,9 @@ fn build_wireframe_from_refs(
             wireframe.material_ranges.push(WireframeMaterialRange {
                 index_start,
                 index_count,
+                render_stage: range.render_stage,
                 technique: range.technique,
+                gear_dye_change_color_index: range.gear_dye_change_color_index,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
             });
@@ -1658,6 +3941,19 @@ fn input_layout_uvs(
 }
 
 fn resolved_input_layout_texcoord0(layout_id: u8) -> Option<InputLayoutTexcoord> {
+    let layout = resolved_input_layout_vector(layout_id, SEMANTIC_TEXCOORD, 0)?;
+    Some(InputLayoutTexcoord {
+        buffer_index: layout.buffer_index,
+        offset: layout.offset,
+        format: layout.format,
+    })
+}
+
+fn resolved_input_layout_vector(
+    layout_id: u8,
+    semantic: u8,
+    semantic_index: u8,
+) -> Option<InputLayoutVector> {
     let stream_sets = vertex_layout_stream_sets_for_any_mapping(layout_id)?;
 
     for element_tag in tags_by_class(CLASS_VERTEX_INPUT_ELEMENT_SETS) {
@@ -1669,8 +3965,8 @@ fn resolved_input_layout_texcoord0(layout_id: u8) -> Option<InputLayoutTexcoord>
             let mut offset = 0usize;
             for element in elements {
                 let size = vertex_input_element_size(*element)?;
-                if element.semantic == SEMANTIC_TEXCOORD && element.semantic_index == 0 {
-                    return Some(InputLayoutTexcoord {
+                if element.semantic == semantic && element.semantic_index == semantic_index {
+                    return Some(InputLayoutVector {
                         buffer_index,
                         offset,
                         format: input_layout_format_from_vertex_format(element.format)?,
@@ -1682,6 +3978,70 @@ fn resolved_input_layout_texcoord0(layout_id: u8) -> Option<InputLayoutTexcoord>
     }
 
     None
+}
+
+fn alkahest_input_layout_vector(layout_id: u8, semantic: u8) -> Option<InputLayoutVector> {
+    match (layout_id, semantic) {
+        (7, SEMANTIC_NORMAL) => Some(InputLayoutVector {
+            buffer_index: 0,
+            offset: 8,
+            format: InputLayoutFormat::R16G16B16A16Snorm,
+        }),
+        (7, SEMANTIC_TANGENT) => Some(InputLayoutVector {
+            buffer_index: 0,
+            offset: 16,
+            format: InputLayoutFormat::R16G16B16A16Snorm,
+        }),
+        _ => None,
+    }
+}
+
+fn input_layout_vectors(
+    vertex_previews: &[(TagHash, VertexBufferPreview)],
+    input_layout_index: Option<u8>,
+    semantic: u8,
+    vertex_count: usize,
+) -> Option<(TagHash, InputLayoutFormat, Vec<[f32; 4]>)> {
+    let layout_index = input_layout_index?;
+    let layout = resolved_input_layout_vector(layout_index, semantic, 0)
+        .or_else(|| alkahest_input_layout_vector(layout_index, semantic))?;
+    let (tag, preview) = vertex_previews.get(layout.buffer_index)?;
+    let entry = package_manager().get_entry(*tag)?;
+    let data = package_manager().read_tag(TagHash(entry.reference)).ok()?;
+    let endian = package_manager().version.endian();
+    let vectors = decode_input_layout_vectors(
+        &data,
+        preview.header.stride as usize,
+        endian,
+        layout,
+        vertex_count,
+    )?
+    .into_iter()
+    .map(|vector| normalize_input_layout_vector(vector, semantic == SEMANTIC_TANGENT))
+    .collect::<Option<Vec<_>>>()?;
+
+    (vectors.len() == vertex_count).then_some((*tag, layout.format, vectors))
+}
+
+fn normalize_input_layout_vector(
+    mut vector: [f32; 4],
+    preserve_handedness: bool,
+) -> Option<[f32; 4]> {
+    let length = vector[..3]
+        .iter()
+        .map(|component| component * component)
+        .sum::<f32>()
+        .sqrt();
+    if !length.is_finite() || length < 0.000001 {
+        return None;
+    }
+    for component in &mut vector[..3] {
+        *component /= length;
+    }
+    if preserve_handedness {
+        vector[3] = if vector[3] < 0.0 { -1.0 } else { 1.0 };
+    }
+    Some(vector)
 }
 
 fn alkahest_input_layout_texcoord0(layout_id: u8) -> Option<InputLayoutTexcoord> {
@@ -1789,11 +4149,64 @@ fn decode_input_layout_uv(
             read_snorm16(bytes.get(0..2)?, endian),
             read_snorm16(bytes.get(2..4)?, endian),
         ],
+        InputLayoutFormat::R16G16B16A16Snorm => return None,
     };
 
     uv.iter()
         .all(|v| v.is_finite() && v.abs() <= 1024.0)
         .then_some(uv)
+}
+
+fn decode_input_layout_vectors(
+    data: &[u8],
+    stride: usize,
+    endian: Endian,
+    layout: InputLayoutVector,
+    vertex_count: usize,
+) -> Option<Vec<[f32; 4]>> {
+    if stride == 0 || layout.offset >= stride {
+        return None;
+    }
+
+    data.chunks_exact(stride)
+        .take(vertex_count.min(MAX_PREVIEW_VERTICES))
+        .map(|vertex| {
+            decode_input_layout_vector(vertex.get(layout.offset..)?, endian, layout.format)
+        })
+        .collect()
+}
+
+fn decode_input_layout_vector(
+    bytes: &[u8],
+    endian: Endian,
+    format: InputLayoutFormat,
+) -> Option<[f32; 4]> {
+    let vector = match format {
+        InputLayoutFormat::R32G32B32Float => [
+            read_f32(bytes.get(0..4)?, endian),
+            read_f32(bytes.get(4..8)?, endian),
+            read_f32(bytes.get(8..12)?, endian),
+            1.0,
+        ],
+        InputLayoutFormat::R32G32B32A32Float => [
+            read_f32(bytes.get(0..4)?, endian),
+            read_f32(bytes.get(4..8)?, endian),
+            read_f32(bytes.get(8..12)?, endian),
+            read_f32(bytes.get(12..16)?, endian),
+        ],
+        InputLayoutFormat::R16G16B16A16Snorm => [
+            read_snorm16(bytes.get(0..2)?, endian),
+            read_snorm16(bytes.get(2..4)?, endian),
+            read_snorm16(bytes.get(4..6)?, endian),
+            read_snorm16(bytes.get(6..8)?, endian),
+        ],
+        InputLayoutFormat::R32G32Float | InputLayoutFormat::R16G16Snorm => return None,
+    };
+
+    vector
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(vector)
 }
 
 fn load_uvs_for_vertex_buffer(
@@ -1864,18 +4277,27 @@ struct DynamicMeshPartPreview {
 
 #[derive(Debug, Clone)]
 struct GeometryIndexRangePreview {
+    record_offset: usize,
+    part_index: usize,
+    render_stage: Option<u8>,
     technique: TagHash,
+    variant_shader_index: u16,
     index_start: u32,
     index_count: u32,
     primitive_type: u8,
+    flags: u32,
+    gear_dye_change_color_index: u8,
     lod_category: u8,
+    lod_run: u8,
 }
 
 #[derive(Debug, Clone)]
 struct PreviewIndexRange {
     range: std::ops::Range<usize>,
     primitive_type: u8,
+    render_stage: Option<u8>,
     technique: Option<TagHash>,
+    gear_dye_change_color_index: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -1978,29 +4400,9 @@ fn dynamic_mesh_technique_tags(data: &[u8], endian: Endian) -> Vec<TagHash> {
 }
 
 fn geometry_resource_technique_tags(data: &[u8], endian: Endian) -> Vec<TagHash> {
-    let ranges = geometry_index_range_candidates(data, endian);
-    if ranges.is_empty() {
-        return vec![];
-    }
-
-    let primary_lod = ranges.iter().map(|(_, lod, _)| *lod).min().unwrap_or(0);
-    let primary_pass = ranges
-        .iter()
-        .filter(|(_, lod, pass)| *lod == primary_lod && *pass > 0)
-        .map(|(_, _, pass)| *pass)
-        .min()
-        .unwrap_or(0);
-
-    ranges
+    geometry_primary_index_ranges(data, endian)
         .into_iter()
-        .sorted_by_key(|(range, lod, pass)| {
-            (
-                *lod != primary_lod,
-                primary_pass != 0 && *pass != primary_pass,
-                range.index_start,
-            )
-        })
-        .map(|(range, _, _)| range.technique)
+        .map(|range| range.technique)
         .filter(|tag| tag.is_some())
         .unique()
         .collect()
@@ -2088,26 +4490,122 @@ fn geometry_buffer_set_input_layout_id(mesh: &[u8]) -> Option<u8> {
 }
 
 fn geometry_primary_index_ranges(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
-    let candidates = geometry_index_range_candidates(data, endian);
-
-    let Some(primary_lod) = candidates.iter().map(|(_, lod, _)| *lod).min() else {
-        return vec![];
-    };
-    let primary_pass = candidates
-        .iter()
-        .filter(|(_, lod, pass)| *lod == primary_lod && *pass > 0)
-        .map(|(_, _, pass)| *pass)
-        .min()
-        .unwrap_or(0);
-
-    candidates
+    let selected_parts = geometry_preview_part_indices(data, endian);
+    let candidates = geometry_index_range_candidates(data, endian)
         .into_iter()
-        .filter(|(_, lod, pass)| {
-            *lod == primary_lod && (primary_pass == 0 || *pass == primary_pass)
+        .filter(|range| {
+            selected_parts
+                .as_ref()
+                .is_none_or(|parts| parts.contains(&range.part_index))
         })
-        .map(|(range, _, _)| range)
-        .sorted_by_key(|range| range.index_start)
-        .collect()
+        .collect_vec();
+    if candidates.is_empty() {
+        return vec![];
+    }
+    let mut ranges = candidates
+        .iter()
+        .filter(|range| is_highest_detail_lod(range.lod_category))
+        .cloned()
+        .collect_vec();
+    if ranges.is_empty() {
+        let fallback_lod = candidates
+            .iter()
+            .min_by_key(|range| lod_selection_rank(range.lod_category))
+            .map(|range| range.lod_category)
+            .unwrap_or_default();
+        ranges.extend(
+            candidates
+                .into_iter()
+                .filter(|range| range.lod_category == fallback_lod),
+        );
+    }
+    ranges.sort_by_key(|range| (lod_selection_rank(range.lod_category), range.index_start));
+    ranges
+}
+
+fn geometry_preview_part_indices(data: &[u8], endian: Endian) -> Option<Vec<usize>> {
+    // Marathon adds one render stage: 26 boundaries for 25 stage ranges.
+    const STAGE_BOUNDARY_COUNT: usize = 26;
+
+    let part_count = scan_arrays(data, endian)
+        .into_iter()
+        .find(|array| array.class == CLASS_GEOMETRY_PART)?
+        .count;
+    let buffer_set = scan_arrays(data, endian)
+        .into_iter()
+        .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)?;
+    let boundaries = (0..STAGE_BOUNDARY_COUNT)
+        .map(|index| {
+            data.get(buffer_set.data_offset + 0x30 + index * 2..)
+                .map(|bytes| read_u16(bytes, endian) as usize)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    preview_part_indices_from_boundaries(&boundaries, part_count)
+}
+
+fn preview_part_indices_from_boundaries(
+    boundaries: &[usize],
+    part_count: usize,
+) -> Option<Vec<usize>> {
+    const PREVIEW_STAGES: [usize; 5] = [0, 1, 2, 6, 7];
+    if boundaries.len() <= PREVIEW_STAGES.into_iter().max()? + 1
+        || boundaries.windows(2).any(|pair| pair[0] > pair[1])
+        || boundaries.last().copied()? > part_count
+    {
+        return None;
+    }
+
+    Some(
+        PREVIEW_STAGES
+            .into_iter()
+            .flat_map(|stage| boundaries[stage]..boundaries[stage + 1])
+            .unique()
+            .collect(),
+    )
+}
+
+fn preview_part_stages_from_boundaries(
+    boundaries: &[usize],
+    part_count: usize,
+) -> Option<Vec<Option<u8>>> {
+    const PREVIEW_STAGES: [usize; 5] = [0, 1, 2, 6, 7];
+    if boundaries.len() <= PREVIEW_STAGES.into_iter().max()? + 1
+        || boundaries.windows(2).any(|pair| pair[0] > pair[1])
+        || boundaries.last().copied()? > part_count
+    {
+        return None;
+    }
+
+    let mut stages = vec![None; part_count];
+    for stage in PREVIEW_STAGES {
+        for part in boundaries[stage]..boundaries[stage + 1] {
+            stages[part] = Some(stage as u8);
+        }
+    }
+    Some(stages)
+}
+
+fn geometry_preview_part_stages(data: &[u8], endian: Endian) -> Option<Vec<Option<u8>>> {
+    const STAGE_BOUNDARY_COUNT: usize = 26;
+    let arrays = scan_arrays(data, endian);
+    let part_count = arrays
+        .iter()
+        .find(|array| array.class == CLASS_GEOMETRY_PART)?
+        .count;
+    let buffer_set = arrays
+        .iter()
+        .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)?;
+    let boundaries = (0..STAGE_BOUNDARY_COUNT)
+        .map(|index| {
+            data.get(buffer_set.data_offset + 0x30 + index * 2..)
+                .map(|bytes| read_u16(bytes, endian) as usize)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    preview_part_stages_from_boundaries(&boundaries, part_count)
+}
+
+fn is_highest_detail_lod(lod: u8) -> bool {
+    matches!(lod, 0 | 1 | 2 | 3 | 10)
 }
 
 fn index_ranges_from_geometry_ranges(
@@ -2119,40 +4617,73 @@ fn index_ranges_from_geometry_ranges(
             range: range.index_start as usize
                 ..range.index_start.saturating_add(range.index_count) as usize,
             primitive_type: range.primitive_type,
+            render_stage: range.render_stage,
             technique: Some(range.technique),
+            gear_dye_change_color_index: (range.gear_dye_change_color_index <= 5)
+                .then_some(range.gear_dye_change_color_index),
         })
         .collect()
 }
 
 fn preview_triangles_from_indices(indices: &[u32], primitive_type: u8) -> Vec<u32> {
     if primitive_type != 5 {
-        return indices.to_vec();
+        return indices
+            .chunks_exact(3)
+            .flat_map(|triangle| triangle.iter().copied())
+            .collect();
     }
 
     let mut out = Vec::with_capacity(indices.len().saturating_sub(2).saturating_mul(3));
-    for (i, window) in indices.windows(3).enumerate() {
-        let a = window[0];
-        let b = window[1];
-        let c = window[2];
-        if a == b || b == c || a == c {
+    let mut strip = Vec::<u32>::with_capacity(3);
+    let mut triangle_index = 0usize;
+    for &index in indices {
+        if matches!(index, 0xFFFF | 0xFFFF_FFFF) {
+            strip.clear();
+            triangle_index = 0;
             continue;
         }
-        if i % 2 == 0 {
+        strip.push(index);
+        if strip.len() < 3 {
+            continue;
+        }
+        let a = strip[strip.len() - 3];
+        let b = strip[strip.len() - 2];
+        let c = strip[strip.len() - 1];
+        if a == b || b == c || a == c {
+            triangle_index += 1;
+            continue;
+        }
+        if triangle_index % 2 == 0 {
             out.extend_from_slice(&[a, b, c]);
         } else {
             out.extend_from_slice(&[b, a, c]);
         }
+        triangle_index += 1;
     }
     out
 }
 
-fn geometry_index_range_candidates(
-    data: &[u8],
-    endian: Endian,
-) -> Vec<(GeometryIndexRangePreview, u8, u8)> {
-    let mut candidates = Vec::<(GeometryIndexRangePreview, u8, u8)>::new();
+fn geometry_index_range_candidates(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
+    let mut candidates = Vec::<GeometryIndexRangePreview>::new();
+    let part_stages = geometry_preview_part_stages(data, endian).unwrap_or_default();
+    let exact_offsets = scan_arrays(data, endian)
+        .into_iter()
+        .filter(|array| array.class == CLASS_GEOMETRY_PART)
+        .flat_map(|array| {
+            (0..array.count).map(move |index| (index, array.data_offset + index * 0x28))
+        })
+        .collect_vec();
+    let offsets = if exact_offsets.is_empty() {
+        (0..data.len().saturating_sub(0x27))
+            .step_by(4)
+            .enumerate()
+            .map(|(index, offset)| (index, offset))
+            .collect_vec()
+    } else {
+        exact_offsets
+    };
 
-    for offset in (0..data.len().saturating_sub(0x28)).step_by(4) {
+    for (part_index, offset) in offsets {
         let Some(material) = read_tag_at(data, offset, endian) else {
             continue;
         };
@@ -2169,36 +4700,65 @@ fn geometry_index_range_candidates(
         let Some(index_count) = read_u32_at(data, offset + 0xc, endian) else {
             continue;
         };
-        let Some(triangle_count) = read_u32_at(data, offset + 0x10, endian) else {
+        let Some(primitive_type) = data.get(offset + 0x6).copied() else {
             continue;
         };
-        let Some(flags) = read_u32_at(data, offset + 0x20, endian) else {
+        // Goliath's 0x28-byte geometry part keeps the LOD category at +0x1c
+        // and the change-color index at +0x1d. Reversing these fields makes
+        // every range look like LOD 0 and renders its high and low-detail
+        // meshes coplanar, which produces camera-dependent z-fighting.
+        let Some(gear_dye_change_color_index) = data.get(offset + 0x1d).copied() else {
             continue;
         };
-        let lod = ((flags >> 8) & 0xff) as u8;
-        let pass = ((flags >> 16) & 0xff) as u8;
-        if index_count < 3 || triangle_count == 0 {
+        let Some(lod_category) = data.get(offset + 0x1c).copied() else {
+            continue;
+        };
+        if index_count < 3
+            || !matches!(primitive_type, 3 | 5)
+            || !matches!(lod_category, 0 | 1 | 2 | 3 | 4 | 7 | 8 | 9 | 10)
+        {
             continue;
         }
+        let Some(variant_shader_index) = data
+            .get(offset + 0x4..offset + 0x6)
+            .map(|bytes| read_u16(bytes, endian))
+        else {
+            continue;
+        };
+        let Some(flags) = read_u32_at(data, offset + 0x18, endian) else {
+            continue;
+        };
+        let Some(lod_run) = data.get(offset + 0x1f).copied() else {
+            continue;
+        };
 
-        candidates.push((
-            GeometryIndexRangePreview {
-                technique: material,
-                index_start,
-                index_count,
-                primitive_type: if index_count == triangle_count.saturating_mul(3) {
-                    3
-                } else {
-                    5
-                },
-                lod_category: lod,
-            },
-            lod,
-            pass,
-        ));
+        candidates.push(GeometryIndexRangePreview {
+            record_offset: offset,
+            part_index,
+            render_stage: part_stages.get(part_index).copied().flatten(),
+            technique: material,
+            variant_shader_index,
+            index_start,
+            index_count,
+            primitive_type,
+            flags,
+            gear_dye_change_color_index,
+            lod_category,
+            lod_run,
+        });
     }
 
     candidates
+        .into_iter()
+        .unique_by(|range| {
+            (
+                range.index_start,
+                range.index_count,
+                range.primitive_type,
+                range.lod_category,
+            )
+        })
+        .collect()
 }
 
 fn geometry_primary_layout_id(data: &[u8], endian: Endian) -> Option<u8> {
@@ -2251,6 +4811,65 @@ fn read_geometry_uv_transform(data: &[u8], endian: Endian) -> Option<UvTransform
         .all(|value| value.is_finite())
         && scale.iter().any(|value| value.abs() > 0.000001))
     .then_some(UvTransformPreview { scale, offset })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GeometryPositionTransform {
+    scale: [f32; 3],
+    offset: [f32; 3],
+}
+
+fn read_geometry_position_transform(
+    data: &[u8],
+    endian: Endian,
+) -> Option<GeometryPositionTransform> {
+    let scale = [
+        read_f32(data.get(0xa0..0xa4)?, endian),
+        read_f32(data.get(0xa4..0xa8)?, endian),
+        read_f32(data.get(0xa8..0xac)?, endian),
+    ];
+    let offset = [
+        read_f32(data.get(0xb0..0xb4)?, endian),
+        read_f32(data.get(0xb4..0xb8)?, endian),
+        read_f32(data.get(0xb8..0xbc)?, endian),
+    ];
+    (scale
+        .into_iter()
+        .chain(offset)
+        .all(|value| value.is_finite())
+        && scale.iter().all(|value| value.abs() > 0.000001))
+    .then_some(GeometryPositionTransform { scale, offset })
+}
+
+fn apply_geometry_position_transform(
+    wireframe: &mut WireframePreview,
+    transform: GeometryPositionTransform,
+) {
+    if !wireframe.position_format.starts_with("i16") {
+        return;
+    }
+    for position in &mut wireframe.vertices {
+        for axis in 0..3 {
+            position[axis] = read_snorm_position(position[axis]) * transform.scale[axis]
+                + transform.offset[axis];
+        }
+    }
+    if let Some(positions) = &mut wireframe.procedural_positions {
+        for position in positions {
+            for axis in 0..3 {
+                position[axis] = read_snorm_position(position[axis]) * transform.scale[axis]
+                    + transform.offset[axis];
+            }
+        }
+    }
+    if let Some((min, max)) = bounds(&wireframe.vertices) {
+        wireframe.min = min;
+        wireframe.max = max;
+    }
+}
+
+fn read_snorm_position(value: f32) -> f32 {
+    (value / 32767.0).clamp(-1.0, 1.0)
 }
 
 fn scan_arrays(data: &[u8], endian: Endian) -> Vec<TagArray> {
@@ -2379,6 +4998,7 @@ fn input_layout_format_from_vertex_format(format: u8) -> Option<InputLayoutForma
         0x03 => Some(InputLayoutFormat::R32G32B32Float),
         0x04 => Some(InputLayoutFormat::R32G32B32A32Float),
         0x0A => Some(InputLayoutFormat::R16G16Snorm),
+        0x0B => Some(InputLayoutFormat::R16G16B16A16Snorm),
         _ => None,
     }
 }
@@ -2864,8 +5484,14 @@ fn build_vertex_wireframe(
         uv_format: None,
         index_count_total: 0,
         vertex_count_total,
+        procedural_positions: Some(vertices.clone()),
         vertices,
+        normals: None,
+        procedural_normals: None,
+        tangents: None,
         uvs: None,
+        normal_format: None,
+        tangent_format: None,
         indices: vec![],
         material_ranges: vec![],
         min,
@@ -3044,6 +5670,217 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotates_decorator_instances_with_normalized_quaternions() {
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let rotated = rotate_quaternion([1.0, 0.0, 0.0], [0.0, 0.0, half, half]);
+        assert!(rotated[0].abs() < 0.0001);
+        assert!((rotated[1] - 1.0).abs() < 0.0001);
+        assert!(rotated[2].abs() < 0.0001);
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_geometry_resource_transforms() {
+        init_goliath_test_package_manager();
+        for tag in [
+            TagHash(0x80B14039),
+            TagHash(0x80B140B7),
+            TagHash(0x80B140E6),
+            TagHash(0x80B1477B),
+        ] {
+            let data = package_manager().read_tag(tag).expect("geometry resource");
+            let endian = package_manager().version.endian();
+            eprintln!("{tag} len={}", data.len());
+            for offset in (0..data.len().min(0x130)).step_by(0x10) {
+                let values = (0..4)
+                    .filter_map(|component| {
+                        data.get(offset + component * 4..offset + component * 4 + 4)
+                    })
+                    .map(|bytes| read_f32(bytes, endian))
+                    .collect_vec();
+                eprintln!("  {offset:03X}: {values:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_problem_surface_materials() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        for tag in [
+            TagHash(0x80B140B7),
+            TagHash(0x80B140E6),
+            TagHash(0x80A9E3DE),
+            TagHash(0x80A9E49B),
+            TagHash(0x80AA03CA),
+            TagHash(0x80B6CD7A),
+        ] {
+            let assembly = related_pattern_geometry_tags(&cache, tag);
+            eprintln!("\n{tag}: assembly={assembly:?}");
+            let entry = package_manager().get_entry(tag).expect("geometry entry");
+            let data = package_manager().read_tag(tag).expect("geometry payload");
+            let techniques = find_model_technique_entries(&cache, tag, &entry);
+            let textures = find_model_textures(&cache, tag, &techniques);
+            let (_, mut wireframe) = parse_model_wireframe(tag, &entry).expect("geometry preview");
+            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+            let parsed = geometry_primary_index_ranges(&data, package_manager().version.endian());
+            eprintln!(
+                "\n{tag}: ranges={} textures={}",
+                parsed.len(),
+                textures.len()
+            );
+            for (range, material) in parsed.iter().zip(&wireframe.material_ranges) {
+                eprintln!(
+                    "  part={} stage={:?} flags={:#010X} tech={} indices={}+{} selected color={:?} tint={:?} mask={:?} normal={:?} control={:?} aux={:?}",
+                    range.part_index,
+                    range.render_stage,
+                    range.flags,
+                    range.technique,
+                    range.index_start,
+                    range.index_count,
+                    material.textures.color,
+                    material.textures.color_tint,
+                    material.textures.mask_palette,
+                    material.textures.normal,
+                    material.textures.control,
+                    material.textures.aux,
+                );
+                if range.technique == TagHash(0x80B140CC) {
+                    assert!(
+                        material.textures.mask_palette.is_some(),
+                        "hair mask shader must expose authored palette constants"
+                    );
+                }
+                if range.technique == TagHash(0x80A9B3FA) {
+                    assert!(
+                        crate::material::is_sticker_proxy_technique(range.technique),
+                        "solid investment proxy must obey Stickers toggle"
+                    );
+                }
+                let technique_entry = package_manager()
+                    .get_entry(range.technique)
+                    .expect("technique entry");
+                let technique_data = package_manager()
+                    .read_tag(range.technique)
+                    .expect("technique payload");
+                if let Some(preview) =
+                    crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
+                {
+                    let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+                    if let Some(stage) = preview.stages.iter().find(|stage| stage.stage == "PS") {
+                        eprintln!(
+                            "    shader={:?} constants={:?} inline={:?} cbuffer={:?}",
+                            stage.shader,
+                            stage.constants,
+                            stage.inline_constants,
+                            stage
+                                .constant_buffer_preview
+                                .as_ref()
+                                .map(|buffer| &buffer.first_values),
+                        );
+                    }
+                }
+                for binding in texture_bindings_for_technique(&technique_entry, &technique_data)
+                    .into_iter()
+                    .filter(|binding| binding.stage == "PS")
+                {
+                    let descriptor = Texture::load_data_d2(binding.tag, false)
+                        .map(|(desc, _, _)| {
+                            format!("{}x{} {:?}", desc.width, desc.height, desc.format)
+                        })
+                        .unwrap_or_else(|_| "non-texture".into());
+                    eprintln!("    PS t{}={} {descriptor}", binding.slot, binding.tag);
+                }
+                eprintln!(
+                    "    TFX {:?}",
+                    tfx_texture_bindings_for_technique(&technique_entry, &technique_data)
+                        .into_iter()
+                        .filter(|binding| binding.stage == "PS")
+                        .map(|binding| format!(
+                            "t{}:{}+{:?}",
+                            binding.slot,
+                            binding.source_scope.as_deref().unwrap_or("?"),
+                            binding.source_offset
+                        ))
+                        .collect_vec()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages and GPU"]
+    fn probes_goliath_face_texture_contact_sheet() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let tag = TagHash(0x80B140B7);
+        let entry = package_manager().get_entry(tag).expect("geometry entry");
+        let model = load_model_preview(cache, tag, &entry, "Geometry");
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("GPU adapter");
+        let required_features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features,
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let target_format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let renderer = eframe::egui_wgpu::Renderer::new(
+            &device,
+            target_format,
+            eframe::egui_wgpu::RendererOptions::default(),
+        );
+        let render_state = eframe::egui_wgpu::RenderState {
+            adapter,
+            available_adapters: vec![],
+            device,
+            queue,
+            target_format,
+            renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
+        };
+
+        let candidates = model
+            .textures
+            .iter()
+            .map(|(texture, _)| *texture)
+            .filter(|texture| {
+                Texture::load_desc(*texture).is_ok_and(|desc| {
+                    desc.kind() == crate::texture::TextureType::Texture2D
+                        && format!("{:?}", desc.format).contains("Srgb")
+                        && desc.width > 16
+                        && desc.height > 16
+                })
+            })
+            .unique()
+            .collect_vec();
+        let tile = 160_u32;
+        let columns = 6_u32;
+        let rows = (candidates.len() as u32).div_ceil(columns);
+        let mut sheet = image::RgbaImage::new(columns * tile, rows * tile);
+        let output = std::path::Path::new("target/quicktag-texture-probe");
+        std::fs::create_dir_all(output).expect("probe directory");
+        for (index, texture) in candidates.iter().copied().enumerate() {
+            let loaded = Texture::load(&render_state, texture, false).expect("texture upload");
+            let image = loaded.to_image(&render_state, 0).expect("texture capture");
+            image
+                .save(output.join(format!("{texture}.png")))
+                .expect("texture export");
+            let thumbnail = image.thumbnail(tile, tile).to_rgba8();
+            let x = index as u32 % columns * tile + (tile - thumbnail.width()) / 2;
+            let y = index as u32 / columns * tile + (tile - thumbnail.height()) / 2;
+            image::imageops::overlay(&mut sheet, &thumbnail, x.into(), y.into());
+            eprintln!("tile {index}: {texture}");
+        }
+        sheet
+            .save(output.join(format!("{tag}-sheet.png")))
+            .expect("contact sheet");
+    }
+
+    #[test]
     #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
     fn probes_goliath_sample_model_uvs_and_textures() {
         init_goliath_test_package_manager();
@@ -3071,7 +5908,34 @@ mod tests {
         );
         assert_eq!(source.lod_category, 0, "sample preview should expose lod0");
         assert_eq!(source.input_layout_index, Some(7));
+        let normal_layout =
+            resolved_input_layout_vector(7, SEMANTIC_NORMAL, 0).expect("layout 7 normal");
+        assert_eq!(normal_layout.buffer_index, 0);
+        assert_eq!(normal_layout.offset, 8);
+        assert_eq!(normal_layout.format, InputLayoutFormat::R16G16B16A16Snorm);
+        let tangent_layout =
+            resolved_input_layout_vector(7, SEMANTIC_TANGENT, 0).expect("layout 7 tangent");
+        assert_eq!(tangent_layout.buffer_index, 0);
+        assert_eq!(tangent_layout.offset, 16);
+        assert_eq!(tangent_layout.format, InputLayoutFormat::R16G16B16A16Snorm);
         assert_eq!(source.technique, Some(TagHash(0x80B1247F)));
+        let source_data = package_manager().read_tag(tag).expect("sample resource");
+        for axis in 0..3 {
+            let expected_min = read_f32(
+                source_data
+                    .get(0xe0 + axis * 4..0xe4 + axis * 4)
+                    .expect("resource minimum"),
+                package_manager().version.endian(),
+            );
+            let expected_max = read_f32(
+                source_data
+                    .get(0xf0 + axis * 4..0xf4 + axis * 4)
+                    .expect("resource maximum"),
+                package_manager().version.endian(),
+            );
+            assert!((wireframe.min[axis] - expected_min).abs() < 0.01);
+            assert!((wireframe.max[axis] - expected_max).abs() < 0.01);
+        }
         assert!(
             wireframe.uvs.as_ref().is_some_and(|uvs| !uvs.is_empty()),
             "sample must decode real UVs"
@@ -3084,9 +5948,128 @@ mod tests {
             "sample must use declared geometry layout UVs, got {:?}",
             wireframe.uv_format
         );
+        assert_eq!(
+            wireframe.normals.as_ref().map(Vec::len),
+            Some(wireframe.vertices.len()),
+            "sample must decode authored normals"
+        );
+        assert_eq!(
+            wireframe.tangents.as_ref().map(Vec::len),
+            Some(wireframe.vertices.len()),
+            "sample must decode authored tangents"
+        );
+        assert!(
+            wireframe
+                .normal_format
+                .as_deref()
+                .is_some_and(|format| format.contains("R16G16B16A16_SNORM")),
+            "unexpected normal format: {:?}",
+            wireframe.normal_format
+        );
+        assert!(
+            wireframe
+                .tangents
+                .as_ref()
+                .is_some_and(|tangents| tangents.iter().all(|tangent| tangent[3].abs() == 1.0)),
+            "sample tangent handedness must be normalized"
+        );
 
-        let cache = quicktag_scanner::load_tag_cache();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let assembled = related_pattern_geometry_tags(&cache, tag);
+        for expected in [
+            TagHash(0x80B14039),
+            TagHash(0x80B140B7),
+            TagHash(0x80B140E6),
+        ] {
+            assert!(
+                assembled.contains(&expected),
+                "root pattern assembly should include {expected}; got {assembled:?}"
+            );
+        }
+        let assembled_preview = load_model_preview(cache.clone(), tag, &entry, "Geometry");
+        assert!(
+            assembled_preview
+                .wireframe
+                .as_ref()
+                .is_some_and(|wireframe| wireframe.source.contains("assembled")),
+            "root pattern geometry should merge into one preview"
+        );
+        assert!(
+            assembled_preview
+                .wireframe
+                .as_ref()
+                .is_some_and(|wireframe| {
+                    wireframe.normals.as_ref().map(Vec::len) == Some(wireframe.vertices.len())
+                        && wireframe.tangents.as_ref().map(Vec::len)
+                            == Some(wireframe.vertices.len())
+                }),
+            "assembled preview should preserve complete authored tangent frames"
+        );
+        let assembled_bounds = assembled_preview
+            .wireframe
+            .as_ref()
+            .expect("assembled bounds");
+        assert!(
+            assembled_bounds.max[2] - assembled_bounds.min[2] > 1.5
+                && assembled_bounds.max[2] - assembled_bounds.min[2] < 2.5,
+            "assembled character should retain authored world scale: {:?}..{:?}",
+            assembled_bounds.min,
+            assembled_bounds.max
+        );
+
+        let second_tag = TagHash(0x80B1477B);
+        let second_entry = package_manager()
+            .get_entry(second_tag)
+            .expect("second character");
+        let second = load_model_preview(cache.clone(), second_tag, &second_entry, "Geometry");
+        let second_wireframe = second.wireframe.as_ref().expect("second assembled preview");
+        let second_extent = (0..3)
+            .map(|axis| second_wireframe.max[axis] - second_wireframe.min[axis])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            second_extent > 1.0 && second_extent < 3.0,
+            "80B1477B sibling parts should share authored scale; extent={second_extent} bounds={:?}..{:?}",
+            second_wireframe.min,
+            second_wireframe.max
+        );
         let techniques = find_model_technique_entries(&cache, tag, &entry);
+        let technique_tag = TagHash(0x80B1247F);
+        let technique_entry = package_manager()
+            .get_entry(technique_tag)
+            .expect("sample technique entry");
+        let technique_data = package_manager()
+            .read_tag(technique_tag)
+            .expect("sample technique data");
+        let technique_preview =
+            crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
+                .expect("sample technique preview");
+        let crate::material::MaterialPreviewKind::Technique(technique_preview) =
+            technique_preview.kind;
+        let pixel_stage = technique_preview
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "PS")
+            .expect("sample pixel stage");
+        assert_eq!(pixel_stage.shader, Some(TagHash(0x80B12478)));
+        assert_eq!(pixel_stage.textures.len(), 15);
+        assert_eq!(pixel_stage.textures[0].slot, 0);
+        assert_eq!(
+            pixel_stage.textures[0].texture.resolved,
+            Some(TagHash(0x80B14069))
+        );
+        assert!(pixel_stage.bytecode_len > 0);
+        let pixel_bytecode = read_array(
+            &technique_data,
+            0x278 + 0x20,
+            1,
+            package_manager().version.endian(),
+        )
+        .expect("sample pixel bytecode");
+        assert!(
+            pixel_stage.bytecode.decoded_ops > 0,
+            "undecoded Marathon TFX prefix: {:02X?}",
+            &pixel_bytecode[..pixel_bytecode.len().min(64)]
+        );
         eprintln!(
             "techniques={:?}",
             techniques
@@ -3122,9 +6105,9 @@ mod tests {
                 .collect_vec()
         );
         assert!(!textures.is_empty(), "sample must resolve textures");
-        assert_eq!(
-            textures.first().map(|(tag, _)| *tag),
-            Some(TagHash(0x80B14064))
+        assert!(
+            textures.iter().any(|(tag, _)| *tag == TagHash(0x80B14064)),
+            "sample must retain body primary texture"
         );
         assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
         let assigned_textures = wireframe
@@ -3234,9 +6217,12 @@ mod tests {
     #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
     fn probes_goliath_problem_model_materials() {
         init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
 
         for tag in [
+            TagHash(0x80B14039),
+            TagHash(0x80B140B7),
+            TagHash(0x80B140E6),
             TagHash(0x80B6C372),
             TagHash(0x80B6E78F),
             TagHash(0x80B6CDB3),
@@ -3267,6 +6253,37 @@ mod tests {
                 !assigned_colors.iter().copied().any(fallback_aux_texture),
                 "{tag}: technical fallback textures must stay out of albedo"
             );
+            if tag == TagHash(0x80B140B7) {
+                let eye_material =
+                    material_textures_for_technique(TagHash(0x80B14088), &cache, &textures);
+                assert_eq!(
+                    material_textures_for_technique(TagHash(0x80B1248B), &cache, &textures).color,
+                    Some(TagHash(0x80B14062)),
+                    "mask-only detail material should retain its local BC4 primary slot"
+                );
+                assert_eq!(
+                    eye_material.color,
+                    Some(TagHash(0x80B140BB)),
+                    "eye material should promote its local tint texture"
+                );
+                assert_eq!(
+                    eye_material.color_tint,
+                    [196, 66, 13, 255],
+                    "eye BC4 mask should use its authored orange inline tint"
+                );
+                assert_eq!(
+                    material_textures_for_technique(TagHash(0x80B124CC), &cache, &textures).color,
+                    Some(TagHash(0x80B14062)),
+                    "decal material should promote its local BC4 mask"
+                );
+            }
+            if tag == TagHash(0x80B140E6) {
+                assert_eq!(
+                    material_textures_for_technique(TagHash(0x80B140CC), &cache, &textures).color,
+                    Some(TagHash(0x80A613F7)),
+                    "hair mask 80B140EF must not replace its slot-0 surface texture"
+                );
+            }
             eprintln!(
                 "{tag}: class={:08X} kind={} source={} tech={:?} ranges={} vertices={} indices={} uv={:?}",
                 entry.reference,
@@ -3295,27 +6312,91 @@ mod tests {
             );
             for (technique, _entry) in techniques.iter().take(4) {
                 let material = material_textures_for_technique(*technique, &cache, &textures);
+                let expected_normal = match technique.0 {
+                    0x80B1247F => Some(TagHash(0x80B1405D)),
+                    0x80B12499 => Some(TagHash(0x80B14057)),
+                    0x80B124B5 => Some(TagHash(0x80B14060)),
+                    0x80B124C1 => Some(TagHash(0x80B14049)),
+                    0x80B1407C => Some(TagHash(0x80B140EB)),
+                    0x80B140CC => Some(TagHash(0x80B140F1)),
+                    0x80A9F7E6 => Some(TagHash(0x80A9F81A)),
+                    _ => None,
+                };
+                if let Some(expected_normal) = expected_normal {
+                    assert_eq!(
+                        material.normal,
+                        Some(expected_normal),
+                        "{technique}: normal must follow its shader-family resource slot"
+                    );
+                }
+                let expected_control = match technique.0 {
+                    0x80B1247F => Some((TagHash(0x80B14052), 3)),
+                    0x80B12499 => Some((TagHash(0x80B14059), 3)),
+                    0x80B124B5 => Some((TagHash(0x80B14051), 3)),
+                    0x80B1407C => Some((TagHash(0x80B140BC), 3)),
+                    0x80B140CC => Some((TagHash(0x80B140EF), 1)),
+                    0x80A9F7E6 => Some((TagHash(0x80A9F814), 4)),
+                    _ => None,
+                };
+                if let Some((expected_control, expected_channel)) = expected_control {
+                    assert_eq!(
+                        (material.control, material.roughness_channel),
+                        (Some(expected_control), expected_channel),
+                        "{technique}: roughness control must follow proven DXIL channel"
+                    );
+                }
+                let expected_sampler = match technique.0 {
+                    0x80B1247F | 0x80B12499 | 0x80B124B5 | 0x80B124C1 | 0x80B1407C => {
+                        Some(TagHash(0x80A60082))
+                    }
+                    0x80B14088 | 0x80B140CC | 0x80A9F7E6 => Some(TagHash(0x80A60020)),
+                    _ => None,
+                };
+                if let Some(expected_sampler) = expected_sampler {
+                    assert_eq!(
+                        material.sampler,
+                        Some(expected_sampler),
+                        "{technique}: PS sampler must follow TFX sampler binding"
+                    );
+                }
+                if *technique != TagHash(0x80B14088) {
+                    assert_eq!(
+                        material.color_tint,
+                        [255, 255, 255, 255],
+                        "{tag}: unresolved TFX constants must not become speculative albedo tint"
+                    );
+                }
+                assert_eq!(material.emissive_strength, 0);
+                let render_state = render_state_for_technique(*technique);
                 eprintln!(
-                    "{tag}: technique={technique} color={:?} normal={:?} emissive={:?} aux={:?} layers={:?}",
+                    "{tag}: technique={technique} state={render_state:?} color={:?} normal={:?} emissive={:?} control={:?}.{} sampler={:?} aux={:?} layers={:?}",
                     material.color,
                     material.normal,
                     material.emissive,
+                    material.control,
+                    material.roughness_channel,
+                    material.sampler,
                     material.aux,
                     material.layers
                 );
                 if let Some(entry) = package_manager().get_entry(*technique)
                     && let Ok(data) = package_manager().read_tag(*technique)
                 {
+                    let direct_bindings = texture_bindings_for_technique(&entry, &data)
+                        .into_iter()
+                        .filter(|binding| binding.stage == "PS")
+                        .collect_vec();
+                    let normal_slot = material_normal_texture_slot(&direct_bindings);
+                    let control_slot = material_control_texture_slot(&direct_bindings, normal_slot);
                     eprintln!(
                         "{tag}: direct={:?}",
-                        texture_bindings_for_technique(&entry, &data)
+                        direct_bindings
                             .into_iter()
-                            .filter(|binding| binding.stage == "PS")
                             .map(|binding| format!(
                                 "{}:{} -> role {:?}",
                                 binding.slot,
                                 binding.tag,
-                                material_texture_role(binding)
+                                material_texture_role(binding, normal_slot, control_slot)
                             ))
                             .collect_vec()
                     );
@@ -3331,6 +6412,478 @@ mod tests {
                             .collect_vec()
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_visible_render_states() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let mut counts = std::collections::BTreeMap::new();
+        let mut techniques = rustc_hash::FxHashSet::default();
+
+        for (&tag, _scan) in &cache.hashes {
+            let Some(entry) = package_manager().get_entry(tag) else {
+                continue;
+            };
+            if entry.reference != CLASS_GEOMETRY_RESOURCE {
+                continue;
+            }
+            let Ok(data) = package_manager().read_tag(tag) else {
+                continue;
+            };
+            for part in geometry_primary_index_ranges(&data, package_manager().version.endian()) {
+                if techniques.insert(part.technique) {
+                    let state = render_state_for_technique(part.technique);
+                    *counts
+                        .entry((
+                            state.blend,
+                            state.depth_stencil,
+                            state.rasterizer,
+                            state.depth_bias,
+                        ))
+                        .or_insert(0usize) += 1;
+                }
+            }
+        }
+
+        eprintln!("visible render states ({})", techniques.len());
+        for (state, count) in counts {
+            eprintln!("  {state:?}: {count}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_render_global_scopes() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        for class in [0x8080B61C, 0x80808070, 0x80808075, 0x808031DC] {
+            eprintln!("class {class:08X}");
+            for (tag, entry) in package_manager().get_all_by_reference(class) {
+                let scan = cache.hashes.get(&tag);
+                eprintln!(
+                    "  {tag} len={} strings={:?} children={:?}",
+                    entry.file_size,
+                    scan.map(|scan| &scan.raw_strings),
+                    scan.into_iter()
+                        .flat_map(|scan| scan.file_hashes.iter())
+                        .map(|child| {
+                            let child_class = package_manager()
+                                .get_entry(child.hash)
+                                .map(|entry| entry.reference)
+                                .unwrap_or_default();
+                            format!("{}@0x{:X}:{child_class:08X}", child.hash, child.offset)
+                        })
+                        .collect_vec()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_gear_dye_scope_buffers() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let endian = package_manager().version.endian();
+
+        for (scope, entry) in package_manager().get_all_by_reference(0x808031DC) {
+            let Some(name) = cache
+                .hashes
+                .get(&scope)
+                .and_then(|scan| scan.raw_strings.first())
+                .filter(|name| name.starts_with("gear_dye"))
+            else {
+                continue;
+            };
+            let data = package_manager().read_tag(scope).expect("scope data");
+            if name == "gear_dye_skin" && scope.pkg_id() == 0x13A {
+                for (line, bytes) in data[..data.len().min(0x100)].chunks(16).enumerate() {
+                    eprintln!(
+                        "{scope} {:04X}: {}",
+                        line * 16,
+                        bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
+                    );
+                }
+                eprintln!(
+                    "{scope} arrays={:?}",
+                    scan_arrays(&data, endian)
+                        .into_iter()
+                        .map(|array| (
+                            array.class,
+                            array.count,
+                            array.data_offset,
+                            array.end_offset
+                        ))
+                        .collect_vec()
+                );
+            }
+            let constant_buffer = data
+                .get(0xAC..0xB0)
+                .map(|bytes| TagHash(read_u32(bytes, endian)))
+                .filter(|tag| tag.is_some());
+            let payload = constant_buffer
+                .and_then(|header| package_manager().get_entry(header))
+                .map(|entry| TagHash(entry.reference))
+                .and_then(|payload| package_manager().read_tag(payload).ok())
+                .unwrap_or_default();
+            let stages = crate::material::scope_stages(&entry, &data);
+            eprintln!(
+                "{scope} {name} len={} cbuffer={constant_buffer:?} payload={} values={:?} stages={:?}",
+                entry.file_size,
+                payload.len(),
+                payload
+                    .chunks_exact(16)
+                    .take(24)
+                    .map(|chunk| [
+                        read_f32(&chunk[0..4], endian),
+                        read_f32(&chunk[4..8], endian),
+                        read_f32(&chunk[8..12], endian),
+                        read_f32(&chunk[12..16], endian),
+                    ])
+                    .collect_vec(),
+                stages
+                    .iter()
+                    .map(|stage| (
+                        stage.stage,
+                        stage.bytecode.decoded_ops,
+                        stage.bytecode.unknown_ops,
+                        stage
+                            .bytecode
+                            .externs
+                            .iter()
+                            .map(|external| (
+                                external.scope.clone(),
+                                external.byte_offset,
+                                external.value_type,
+                            ))
+                            .collect_vec(),
+                        stage
+                            .bytecode
+                            .expressions
+                            .iter()
+                            .map(|expression| (
+                                expression.target.clone(),
+                                expression.expression.clone(),
+                            ))
+                            .collect_vec(),
+                        stage
+                            .bytecode
+                            .ops
+                            .iter()
+                            .map(|op| (op.name, op.detail.clone()))
+                            .collect_vec(),
+                    ))
+                    .collect_vec()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_character_part_metadata() {
+        init_goliath_test_package_manager();
+        for tag in [
+            TagHash(0x80B14039),
+            TagHash(0x80B140B7),
+            TagHash(0x80B140E6),
+            TagHash(0x80B6CD7A),
+            TagHash(0x80AA03CA),
+        ] {
+            let data = package_manager().read_tag(tag).expect("geometry resource");
+            let endian = package_manager().version.endian();
+            eprintln!("{tag}: arrays");
+            for array in scan_arrays(&data, endian) {
+                eprintln!(
+                    "  class={:08X} {} count={} data=0x{:X}..0x{:X}",
+                    array.class,
+                    get_class_by_id(array.class)
+                        .map(|class| class.name)
+                        .unwrap_or_else(|| "unknown".into()),
+                    array.count,
+                    array.data_offset,
+                    array.end_offset
+                );
+                if array.class == CLASS_GEOMETRY_BUFFER_SET {
+                    for (line, bytes) in data[array.data_offset..array.end_offset]
+                        .chunks(16)
+                        .enumerate()
+                    {
+                        eprintln!(
+                            "    {:04X}: {}",
+                            line * 16,
+                            bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
+                        );
+                    }
+                }
+            }
+            eprintln!("{tag}: parts");
+            eprintln!(
+                "{tag}: preview part indices={:?}",
+                geometry_preview_part_indices(&data, endian)
+            );
+            for part in geometry_index_range_candidates(&data, endian) {
+                eprintln!(
+                    "  off=0x{:X} tech={} variant={} idx={}+{} prim={} flags=0x{:08X} dye={} lod={} run={}",
+                    part.record_offset,
+                    part.technique,
+                    part.variant_shader_index,
+                    part.index_start,
+                    part.index_count,
+                    part.primitive_type,
+                    part.flags,
+                    part.gear_dye_change_color_index,
+                    part.lod_category,
+                    part.lod_run
+                );
+            }
+            eprintln!(
+                "{tag}: selected={:?}",
+                geometry_primary_index_ranges(&data, endian)
+                    .iter()
+                    .map(|part| (part.part_index, part.technique, part.lod_category))
+                    .collect_vec()
+            );
+            for technique in geometry_primary_index_ranges(&data, endian)
+                .into_iter()
+                .map(|part| part.technique)
+                .unique()
+            {
+                let Some(entry) = package_manager().get_entry(technique) else {
+                    continue;
+                };
+                let Ok(technique_data) = package_manager().read_tag(technique) else {
+                    continue;
+                };
+                let scopes = crate::material::MaterialTagPreview::load(&entry, &technique_data)
+                    .map(|preview| match preview.kind {
+                        crate::material::MaterialPreviewKind::Technique(technique) => {
+                            technique.used_scope_names()
+                        }
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "  material {technique}: scopes={scopes:?} state={:?} ps={:?}",
+                    render_state_for_technique(technique),
+                    texture_bindings_for_technique(&entry, &technique_data)
+                        .into_iter()
+                        .filter(|binding| binding.stage == "PS")
+                        .map(|binding| (binding.slot, binding.tag))
+                        .collect_vec()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_character_pattern_material_data() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let mut frontier = vec![TagHash(0x80B14039)];
+        let mut seen = rustc_hash::FxHashSet::default();
+
+        while let Some(tag) = frontier.pop() {
+            if !seen.insert(tag) {
+                continue;
+            }
+            let Some(entry) = package_manager().get_entry(tag) else {
+                continue;
+            };
+            let class = get_class_by_id(entry.reference)
+                .map(|class| class.name)
+                .unwrap_or_else(|| "unknown".into());
+            eprintln!("{tag}: class={:08X} {class}", entry.reference);
+            let Some(scan) = cache.hashes.get(&tag) else {
+                continue;
+            };
+            eprintln!("  parents={:?}", scan.references);
+            eprintln!(
+                "  children={:?}",
+                scan.file_hashes
+                    .iter()
+                    .map(|child| {
+                        let class = package_manager()
+                            .get_entry(child.hash)
+                            .map(|entry| entry.reference)
+                            .unwrap_or_default();
+                        format!("{}:{class:08X}", child.hash)
+                    })
+                    .collect_vec()
+            );
+
+            if matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT) {
+                let data = package_manager().read_tag(tag).expect("pattern payload");
+                eprintln!("  payload={} bytes", data.len());
+                for (line, bytes) in data[..data.len().min(0x200)].chunks(16).enumerate() {
+                    eprintln!(
+                        "    {:04X}: {}",
+                        line * 16,
+                        bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
+                    );
+                }
+                for parent in &scan.references {
+                    if package_manager().get_entry(*parent).is_some_and(|entry| {
+                        matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                    }) {
+                        frontier.push(*parent);
+                    }
+                }
+                for child in &scan.file_hashes {
+                    if package_manager()
+                        .get_entry(child.hash)
+                        .is_some_and(|entry| {
+                            matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                        })
+                    {
+                        frontier.push(child.hash);
+                    }
+                }
+            } else {
+                for parent in &scan.references {
+                    if package_manager().get_entry(*parent).is_some_and(|entry| {
+                        matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                    }) {
+                        frontier.push(*parent);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_pattern_value_records() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        for component in (0x80B1403A..=0x80B14042).map(TagHash) {
+            let Some(scan) = cache.hashes.get(&component) else {
+                continue;
+            };
+            eprintln!("component {component}");
+            for child in scan.file_hashes.iter().map(|child| child.hash).unique() {
+                let Some(entry) = package_manager().get_entry(child) else {
+                    continue;
+                };
+                if !matches!(
+                    entry.reference,
+                    0x8080BA53 | 0x8080BAF8 | CLASS_GEOMETRY_RESOURCE
+                ) {
+                    continue;
+                }
+                let data = package_manager().read_tag(child).unwrap_or_default();
+                eprintln!(
+                    "  {child} class={:08X} len={} bytes={} f32={:?}",
+                    entry.reference,
+                    data.len(),
+                    data.iter().map(|byte| format!("{byte:02X}")).join(" "),
+                    data.chunks_exact(4)
+                        .map(|bytes| read_f32(bytes, package_manager().version.endian()))
+                        .collect_vec()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_character_shader_reflection_strings() {
+        init_goliath_test_package_manager();
+        for texture in [
+            TagHash(0x80B14062),
+            TagHash(0x80B140BB),
+            TagHash(0x80B140BF),
+            TagHash(0x80B140EF),
+            TagHash(0x80B140F1),
+            TagHash(0x80A613F7),
+        ] {
+            let (desc, data, _) = Texture::load_data_d2(texture, false).expect("texture");
+            eprintln!(
+                "texture={texture} {}x{} {:?} bytes={}",
+                desc.width,
+                desc.height,
+                desc.format,
+                data.len()
+            );
+        }
+        for technique in [
+            TagHash(0x80B1247F),
+            TagHash(0x80B1407C),
+            TagHash(0x80B14088),
+            TagHash(0x80B14094),
+            TagHash(0x80B140CC),
+            TagHash(0x80A9F7E6),
+            TagHash(0x80B6CD83),
+        ] {
+            let entry = package_manager().get_entry(technique).expect("technique");
+            let data = package_manager()
+                .read_tag(technique)
+                .expect("technique data");
+            let preview = crate::material::MaterialTagPreview::load(&entry, &data)
+                .expect("technique preview");
+            let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+            let Some(shader) = preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .and_then(|stage| stage.shader)
+            else {
+                continue;
+            };
+            let shader_entry = package_manager().get_entry(shader).expect("shader header");
+            let shader_data = package_manager()
+                .read_tag(TagHash(shader_entry.reference))
+                .expect("shader bytecode");
+            let strings = shader_data
+                .split(|byte| !byte.is_ascii_graphic() && *byte != b' ')
+                .filter(|bytes| bytes.len() >= 4)
+                .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+                .unique()
+                .collect_vec();
+            eprintln!(
+                "tech={technique} shader={shader} data={} magic={:?} strings={:?}",
+                shader_data.len(),
+                shader_data.get(..4),
+                strings.into_iter().take(16).collect_vec()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_mask_material_constants() {
+        init_goliath_test_package_manager();
+        for technique in [
+            TagHash(0x80B14088),
+            TagHash(0x80B1248B),
+            TagHash(0x80B124CC),
+            TagHash(0x80B140CC),
+        ] {
+            let entry = package_manager().get_entry(technique).expect("technique");
+            let data = package_manager()
+                .read_tag(technique)
+                .expect("technique data");
+            let preview = crate::material::MaterialTagPreview::load(&entry, &data)
+                .expect("technique preview");
+            let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+            eprintln!("technique {technique}");
+            for stage in preview.stages.iter().filter(|stage| stage.stage == "PS") {
+                eprintln!("  textures={:?}", stage.textures);
+                eprintln!("  constants={:?}", stage.constants);
+                eprintln!("  inline={:?}", stage.inline_constants);
+                eprintln!(
+                    "  cbuffer={:?}",
+                    stage
+                        .constant_buffer_preview
+                        .as_ref()
+                        .map(|preview| &preview.first_values)
+                );
+                eprintln!("  expressions={:?}", stage.bytecode.expressions);
+                eprintln!("  externs={:?}", stage.bytecode.externs);
+                eprintln!("  bindings={:?}", stage.bytecode.bindings);
             }
         }
     }
@@ -3497,6 +7050,82 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_marathon_tfx_unknown_opcodes() {
+        init_goliath_test_package_manager();
+
+        let mut unknown = std::collections::BTreeMap::<
+            u8,
+            (usize, Vec<(TagHash, &'static str, usize, Vec<u8>)>),
+        >::new();
+        let mut stages = 0usize;
+        let mut complete = 0usize;
+
+        for (tag, entry) in package_manager().get_all_by_reference(0x808031D8) {
+            let Ok(data) = package_manager().read_tag(tag) else {
+                continue;
+            };
+            let Some(preview) = crate::material::MaterialTagPreview::load(&entry, &data) else {
+                continue;
+            };
+            let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+            for stage in preview.stages {
+                if stage.bytecode_len == 0 {
+                    continue;
+                }
+                stages += 1;
+                let Some(op) = stage.bytecode.ops.iter().find(|op| op.name == "unknown") else {
+                    complete += 1;
+                    continue;
+                };
+                let stage_index = match stage.stage {
+                    "VS" => 0,
+                    "GS" => 3,
+                    "PS" => 4,
+                    "CS" => 5,
+                    _ => continue,
+                };
+                let Some(bytecode) = read_array(
+                    &data,
+                    0x58 + stage_index * 0x88 + 0x20,
+                    1,
+                    package_manager().version.endian(),
+                ) else {
+                    continue;
+                };
+                let context_start = op.offset.saturating_sub(8);
+                let context_end = op.offset.saturating_add(24).min(bytecode.len());
+                let row = unknown.entry(op.opcode).or_default();
+                row.0 += 1;
+                if row.1.len() < 8 {
+                    row.1.push((
+                        tag,
+                        stage.stage,
+                        op.offset,
+                        bytecode[context_start..context_end].to_vec(),
+                    ));
+                }
+            }
+        }
+
+        eprintln!("marathon_tfx stages={stages} complete={complete}");
+        let rows = unknown
+            .iter()
+            .map(|(opcode, (count, examples))| (*count, *opcode, examples.first()))
+            .sorted_by_key(|(count, opcode, _example)| (Reverse(*count), *opcode))
+            .collect_vec();
+        for (count, opcode, example) in rows.into_iter().take(40) {
+            eprintln!("opcode=0x{opcode:02X} count={count} first={example:02X?}");
+        }
+        assert!(stages > 0);
+        assert_eq!(
+            complete, stages,
+            "some Marathon TFX stages still stop on unknown opcodes"
+        );
+        assert!(unknown.is_empty());
+    }
+
     fn init_goliath_test_package_manager() {
         use std::{path::PathBuf, sync::Arc};
         use tiger_pkg::{GameVersion, MarathonVersion, PackageManager};
@@ -3520,6 +7149,2820 @@ mod tests {
         .expect("package manager");
         tiger_pkg::initialize_package_manager(&Arc::new(pm));
         quicktag_core::classes::initialize_reference_names();
+    }
+
+    fn authored_geometry_dyes(
+        geometry: &[TagHash],
+        palette: &[GearDyeMaterial; 6],
+    ) -> Vec<GearDyeMaterial> {
+        geometry
+            .iter()
+            .flat_map(|geometry| {
+                package_manager()
+                    .read_tag(*geometry)
+                    .into_iter()
+                    .flat_map(|data| {
+                        geometry_primary_index_ranges(&data, package_manager().version.endian())
+                    })
+            })
+            .filter_map(|range| {
+                palette
+                    .get(range.gear_dye_change_color_index as usize)
+                    .copied()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn does_not_inject_legacy_implicit_weapon_mods() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        for (model, expected_geometry, rejected_defaults) in [
+            (
+                TagHash(0x80B6E58A),
+                vec![TagHash(0x80B6E588)],
+                vec![TagHash(0x80A61EE2), TagHash(0x80A61D7E)],
+            ),
+            (
+                TagHash(0x80B6DECC),
+                vec![TagHash(0x80B6DEC9)],
+                vec![TagHash(0x80A61E8C)],
+            ),
+        ] {
+            let entry = package_manager().get_entry(model).expect("model Pattern");
+            assert_eq!(
+                selected_model_geometry_tags(&cache, model, entry.reference),
+                expected_geometry
+            );
+            let preview = GeometryTagPreview::load_model_with_weapon_mods(
+                cache.clone(),
+                model,
+                &entry,
+                model,
+                &[],
+            )
+            .expect("unmodified weapon preview");
+            let GeometryPreviewKind::Model(preview) = preview.kind else {
+                panic!("weapon Pattern must load as a model");
+            };
+            assert_eq!(preview.geometry_parts, expected_geometry);
+            assert!(
+                rejected_defaults
+                    .iter()
+                    .all(|default| !preview.geometry_parts.contains(default)),
+                "{model} still contains implicit default mods: {:?}",
+                preview.geometry_parts
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn resolves_authored_weapon_defaults_and_replaces_only_occupied_family() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let socket_index = WeaponModSocketIndex::new();
+        for (weapon, expected) in [
+            (
+                TagHash(0x80A7AD83),
+                vec![TagHash(0x80A61EE7), TagHash(0x80A61D82)],
+            ),
+            (TagHash(0x80A7ACEC), vec![TagHash(0x80A61E8F)]),
+            (
+                TagHash(0x80A7AD6C),
+                vec![
+                    TagHash(0x80A61D31),
+                    TagHash(0x80A9A431),
+                    TagHash(0x80A61D13),
+                ],
+            ),
+            (
+                TagHash(0x80A7C70D),
+                vec![TagHash(0x80A9A231), TagHash(0x80A9A1DA)],
+            ),
+            (
+                TagHash(0x80A7C86E),
+                vec![
+                    TagHash(0x80A9A0A3),
+                    TagHash(0x80A9A036),
+                    TagHash(0x80A617B7),
+                ],
+            ),
+        ] {
+            let socket = socket_index
+                .owner_for(&cache, weapon, &expected)
+                .unwrap_or_else(|| panic!("no authored socket owner for {weapon}"));
+            assert_eq!(
+                weapon_default_mod_patterns(&cache, weapon, socket)
+                    .into_iter()
+                    .collect::<rustc_hash::FxHashSet<_>>(),
+                expected
+                    .iter()
+                    .copied()
+                    .collect::<rustc_hash::FxHashSet<_>>(),
+                "wrong authored defaults for {weapon}"
+            );
+            assert!(expected.iter().all(|default| {
+                weapon_mod_attachment_pose(&cache, socket, *default).is_some()
+                    && !pattern_nearest_geometry_tags(&cache, *default).is_empty()
+            }));
+        }
+
+        let bully_socket = socket_index
+            .owner_for(&cache, TagHash(0x80A7AD83), &[TagHash(0x80A60874)])
+            .expect("Bully socket owner");
+        let bully_defaults = weapon_unoccupied_default_mod_patterns(
+            &cache,
+            TagHash(0x80A7AD83),
+            bully_socket,
+            &[TagHash(0x80A60874)],
+        );
+        assert!(bully_defaults.contains(&TagHash(0x80A61EE7)));
+        assert!(!bully_defaults.contains(&TagHash(0x80A61D82)));
+
+        let misriah_socket = socket_index
+            .owner_for(&cache, TagHash(0x80A7ACEC), &[TagHash(0x80A601B6)])
+            .expect("Misriah socket owner");
+        assert!(
+            weapon_unoccupied_default_mod_patterns(
+                &cache,
+                TagHash(0x80A7ACEC),
+                misriah_socket,
+                &[TagHash(0x80A601B6)],
+            )
+            .is_empty(),
+            "equipped Misriah grip must replace authored default grip"
+        );
+
+        let attachments = bully_defaults
+            .into_iter()
+            .chain([TagHash(0x80A60874)])
+            .map(|model_tag| WeaponModPreviewAttachment {
+                model_tag,
+                rarity: None,
+                unique_id: 0.5,
+            })
+            .collect_vec();
+        let equipped_geometry = pattern_nearest_geometry_tags(&cache, TagHash(0x80A60874));
+        assert!(!equipped_geometry.is_empty());
+        let weapon = TagHash(0x80A7AD83);
+        let entry = package_manager().get_entry(weapon).expect("Bully Pattern");
+        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache.clone(),
+            weapon,
+            &entry,
+            weapon,
+            bully_socket,
+            &attachments,
+        )
+        .expect("Bully preview");
+        let GeometryPreviewKind::Model(preview) = preview.kind else {
+            panic!("Bully Pattern must load as model");
+        };
+        assert!(preview.geometry_parts.contains(&TagHash(0x80A61EE2)));
+        assert!(!preview.geometry_parts.contains(&TagHash(0x80A61D7E)));
+        assert!(
+            equipped_geometry
+                .iter()
+                .all(|geometry| preview.geometry_parts.contains(geometry))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn resolves_current_brrt_mod_attachment_poses() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let weapon_pattern = TagHash(0x80A7B0B0);
+        let modifications = [TagHash(0x80A61F24), TagHash(0x80A6071A)];
+        let socket = WeaponModSocketIndex::new()
+            .owner_for(&cache, weapon_pattern, &modifications)
+            .expect("BRRT authored socket owner");
+        let poses = modifications.map(|modification| {
+            let pose = weapon_mod_attachment_pose(&cache, socket, modification)
+                .unwrap_or_else(|| panic!("no pose for {modification}"));
+            assert!(weapon_mod_authored_families(&cache, modification).contains(&pose.family_id));
+            assert!(pose.translation.iter().all(|value| value.is_finite()));
+            pose
+        });
+        assert_ne!(poses[0].family_id, poses[1].family_id);
+
+        let base = TagHash(0x80AA0CA3);
+        let attachment_geometry = modifications
+            .iter()
+            .flat_map(|modification| weapon_mod_geometry_tags(&cache, *modification))
+            .collect_vec();
+        let entry = package_manager()
+            .get_entry(base)
+            .expect("BRRT current skin pattern");
+        let attachments = modifications.map(|model_tag| WeaponModPreviewAttachment {
+            model_tag,
+            rarity: None,
+            unique_id: 0.5,
+        });
+        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache.clone(),
+            base,
+            &entry,
+            weapon_pattern,
+            socket,
+            &attachments,
+        )
+        .expect("assembled BRRT preview");
+        let GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("expected model preview");
+        };
+        for expected in attachment_geometry {
+            assert!(
+                model.geometry_parts.contains(&expected),
+                "assembled preview is missing {expected}: {:?}",
+                model.geometry_parts
+            );
+        }
+        let wireframe = model.wireframe.expect("assembled preview has no geometry");
+        assert!(!wireframe.vertices.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn applies_authored_dont_let_up_mod_material_channels() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let skin = TagHash(0x80AA0CA3);
+        let owner = TagHash(0x80A7D43D);
+        let attachments = [TagHash(0x80A61CF0), TagHash(0x80A6071A)];
+        let palette = weapon_skin_gear_dye_palette(&cache, skin).expect("Don't let up dye palette");
+        assert_eq!(palette[1].color, [0.760525, 0.658375, 0.03434, 1.0]);
+        assert_ne!(
+            palette[0], palette[1],
+            "this regression needs distinct fallback and authored channels"
+        );
+
+        // The adjacent Goliath part bytes are independently authored: +0x1c
+        // selects mesh detail while +0x1d selects the change-color channel.
+        // Darksight has three high-detail dyed parts; Precision Barrel has one.
+        for (geometry, expected) in [
+            (TagHash(0x80A61CE0), vec![0, 0, 0]),
+            (TagHash(0x80A60716), vec![0]),
+        ] {
+            let data = package_manager()
+                .read_tag(geometry)
+                .unwrap_or_else(|error| panic!("{geometry}: {error}"));
+            let endian = package_manager().version.endian();
+            let candidates = geometry_index_range_candidates(&data, endian);
+            let selected = geometry_primary_index_ranges(&data, endian);
+            assert!(
+                candidates.iter().any(|range| range.lod_category == 7),
+                "{geometry} regression fixture must contain a lower-detail mesh"
+            );
+            assert!(
+                selected
+                    .iter()
+                    .all(|range| is_highest_detail_lod(range.lod_category)),
+                "{geometry} must not select a lower-detail mesh"
+            );
+            let channels = selected
+                .into_iter()
+                .filter_map(|range| {
+                    (range.gear_dye_change_color_index < 6)
+                        .then_some(range.gear_dye_change_color_index)
+                })
+                .collect_vec();
+            assert_eq!(channels, expected, "{geometry} authored dye channels");
+        }
+
+        let entry = package_manager().get_entry(skin).expect("skin pattern");
+        let GeometryPreviewKind::Model(model) = GeometryTagPreview::load_model_with_weapon_mods(
+            cache.clone(),
+            skin,
+            &entry,
+            owner,
+            &attachments,
+        )
+        .expect("assembled Don't let up preview")
+        .kind
+        else {
+            panic!("expected model preview");
+        };
+        for expected in [TagHash(0x80A61CE0), TagHash(0x80A60716)] {
+            assert!(
+                model.geometry_parts.contains(&expected),
+                "assembled preview is missing {expected}: {:?}",
+                model.geometry_parts
+            );
+        }
+        let ranges = model
+            .wireframe
+            .expect("assembled preview has no geometry")
+            .material_ranges;
+        let dyed = ranges
+            .iter()
+            .filter_map(|range| range.textures.gear_dye)
+            .collect_vec();
+        assert_eq!(
+            dyed,
+            [vec![palette[0]; 3], vec![palette[0]]].concat(),
+            "mods must consume their mesh-authored channel from the selected skin palette"
+        );
+        assert!(
+            ranges
+                .iter()
+                .filter(|range| range.textures.gear_dye.is_some())
+                .all(|range| matches!(
+                    range.textures.gear_dye_palette,
+                    Some(actual) if actual == palette
+                )),
+            "dyed materials need the selected skin's six-color palette for packed material IDs"
+        );
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|range| range.textures.gear_dye.is_some() && range.textures.color.is_some())
+                .count(),
+            2,
+            "both textured mod materials must retain their authored color maps"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn follows_engine_material_region_bindings_for_weapon_mods() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+
+        // The compiled general-purpose gear shader samples its packed material
+        // region IDs from PS t3. These two Atrax fixtures previously regressed
+        // because an unrelated adjacent texture replaced that authored binding.
+        for (geometry, expected_control) in [
+            (TagHash(0x80A60D31), TagHash(0x80A6183A)),
+            (TagHash(0x80A60C4B), TagHash(0x80A61800)),
+        ] {
+            let entry = package_manager()
+                .get_entry(geometry)
+                .unwrap_or_else(|| panic!("missing geometry {geometry}"));
+            let mut wireframe = parse_model_wireframe(geometry, &entry)
+                .unwrap_or_else(|| panic!("failed to parse {geometry}"))
+                .1;
+            let techniques = find_model_technique_entries(&cache, geometry, &entry);
+            let textures = find_model_textures(&cache, geometry, &techniques);
+            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+            let dyed = wireframe
+                .material_ranges
+                .iter()
+                .filter(|range| {
+                    range.gear_dye_change_color_index.is_some() && range.textures.color.is_some()
+                })
+                .collect_vec();
+            assert!(!dyed.is_empty(), "{geometry} has no dyed material range");
+            assert!(
+                dyed.iter()
+                    .all(|range| range.textures.control == Some(expected_control)),
+                "{geometry} did not retain its authored PS t3 material-ID map: {dyed:#?}"
+            );
+        }
+
+        // The same shader's TFX writes six GearDye channels to material IDs
+        // 1..6 in this non-sequential order. This is the engine-authored LUT,
+        // not a display-name, skin, or weapon-family heuristic.
+        let technique = TagHash(0x80A60C3B);
+        let entry = package_manager()
+            .get_entry(technique)
+            .expect("gear technique");
+        let data = package_manager()
+            .read_tag(technique)
+            .expect("gear technique data");
+        let preview = crate::material::MaterialTagPreview::load(&entry, &data)
+            .expect("gear technique preview");
+        let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+        let pixel = preview
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "PS")
+            .expect("pixel stage");
+        let material_id_parameters = [
+            GEAR_DYE_COLOR_PARAMETERS[0],
+            GEAR_DYE_COLOR_PARAMETERS[2],
+            GEAR_DYE_COLOR_PARAMETERS[3],
+            GEAR_DYE_COLOR_PARAMETERS[1],
+            GEAR_DYE_COLOR_PARAMETERS[4],
+            GEAR_DYE_COLOR_PARAMETERS[5],
+        ];
+        for (material_id, parameter) in material_id_parameters.into_iter().enumerate() {
+            let target = format!("output[{}]", material_id + 8);
+            let expression = pixel
+                .bytecode
+                .expressions
+                .iter()
+                .find(|expression| expression.target == target)
+                .unwrap_or_else(|| panic!("missing {target}"));
+            assert!(
+                expression
+                    .expression
+                    .contains(&format!("0x{parameter:08X}")),
+                "material ID {} resolved the wrong GearDye channel: {}",
+                material_id + 1,
+                expression.expression
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn resolves_authored_weapon_skin_dye_palettes() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let cases = [
+            (
+                TagHash(0x80B6CC5D),
+                [
+                    [0.473531, 0.027321, 0.014444],
+                    [0.181164, 0.174647, 0.181164],
+                    [0.473532, 0.027321, 0.014444],
+                    [0.730461, 0.0185, 0.0185],
+                    [0.03434, 0.033105, 0.03434],
+                    [0.723055, 0.693872, 0.708376],
+                ],
+            ),
+            (
+                TagHash(0x80B6E792),
+                [
+                    [0.412543, 0.027321, 0.016807],
+                    [0.046665, 0.046665, 0.046665],
+                    [0.401978, 0.05448, 0.045186],
+                    [0.283149, 0.030713, 0.021219],
+                    [0.401978, 0.082283, 0.074214],
+                    [0.283149, 0.030713, 0.021219],
+                ],
+            ),
+        ];
+        for component in [TagHash(0x80B6CC5C), TagHash(0x80B6E791)] {
+            let data = package_manager()
+                .read_tag(component)
+                .expect("dye component");
+            assert!(
+                decode_weapon_skin_gear_dye_palette(&data).is_some(),
+                "failed to decode {component} directly"
+            );
+        }
+        let expected_roughness = [
+            [-1.4, 1.0, 1.0],
+            [-2.0, 1.2, 1.2],
+            [-1.4, 1.3, 1.3],
+            [-2.0, 1.2, 1.2],
+            [1.4, 0.3, 0.3],
+            [-2.0, 1.2, 1.2],
+        ];
+        for (pattern, expected_colors) in cases {
+            let palette = weapon_skin_gear_dye_palette(&cache, pattern)
+                .unwrap_or_else(|| panic!("no authored palette for {pattern}"));
+            for slot in 0..6 {
+                for channel in 0..3 {
+                    assert!(
+                        (palette[slot].color[channel] - expected_colors[slot][channel]).abs()
+                            < 0.000002,
+                        "{pattern} slot {slot} color: {:?}",
+                        palette[slot].color
+                    );
+                    assert!(
+                        (palette[slot].roughness_remap[channel]
+                            - expected_roughness[slot][channel])
+                            .abs()
+                            < 0.000002,
+                        "{pattern} slot {slot} roughness: {:?}",
+                        palette[slot].roughness_remap
+                    );
+                }
+                assert_eq!(palette[slot].metal_remap, [1.0, 0.0, 0.0, 1.0]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_atrax_pattern_object_channels() {
+        init_goliath_test_package_manager();
+        let wanted = [
+            0x1B3D64F0, 0x1B3D64F1, 0x1B3D64F3, 0x1B3D64F4, 0x1B3D64F6, 0x1B3D64F7, 0xC8939EB8,
+            0xC8939EBA, 0xC8939EBB, 0xC8939EBC, 0xC8939EBD, 0xC8939EBF, 0x3CC0E328, 0x3CC0E32A,
+            0x3CC0E32B, 0x3CC0E32C, 0x3CC0E32D, 0x3CC0E32F, 0x840253AF, 0x840253A1, 0xA500D3AF,
+            0x6F1709EA, 0xDECA4D7E, 0x7B2426A3, 0x040174F7, 0x51E7A18D, 0x89464871,
+        ];
+        quicktag_strings::wordlist::load_wordlist(|word, hash| {
+            if wanted.contains(&hash) {
+                eprintln!("OBJECT_CHANNEL_WORD {hash:08X}={word}");
+            }
+        });
+        let cache = quicktag_scanner::load_tag_cache();
+
+        let dump_component_nodes = |label: &str, component: TagHash| {
+            let data = package_manager()
+                .read_tag(component)
+                .expect("pattern component");
+            let endian = package_manager().version.endian();
+            let mut pointer_offset = 0x10usize;
+            let mut seen = rustc_hash::FxHashSet::default();
+            for index in 0..64 {
+                let Some(relative) = data
+                    .get(pointer_offset..pointer_offset + 8)
+                    .map(|bytes| read_i64(bytes, endian))
+                else {
+                    break;
+                };
+                if relative == 0 || relative == i64::MAX {
+                    break;
+                }
+                let Some(node_offset) = (pointer_offset as i64)
+                    .checked_add(relative)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                else {
+                    break;
+                };
+                if !seen.insert(node_offset) || node_offset < 4 || node_offset + 0x10 > data.len() {
+                    break;
+                }
+                let class = read_u32_at(&data, node_offset - 4, endian).unwrap_or_default();
+                eprintln!(
+                    "COMPONENT_NODE label={label} component={component} index={index} node=0x{node_offset:X} data=0x{:X} class={class:08X}",
+                    node_offset + 0x10
+                );
+                pointer_offset = node_offset;
+            }
+        };
+        for component in [
+            TagHash(0x80A7C7B5),
+            TagHash(0x80A61AE0),
+            TagHash(0x80A60FA2),
+            TagHash(0x80B6D72D),
+        ] {
+            dump_component_nodes("atrax", component);
+            let data = package_manager()
+                .read_tag(component)
+                .expect("pattern component");
+            eprintln!(
+                "COMPONENT_HEADER component={component} words={:?}",
+                data.chunks_exact(4)
+                    .take(40)
+                    .map(|bytes| format!(
+                        "{:08X}",
+                        read_u32(bytes, package_manager().version.endian())
+                    ))
+                    .collect_vec()
+            );
+        }
+
+        for weapon in [
+            TagHash(0x80A7C7B5),
+            TagHash(0x80A7D43D),
+            TagHash(0x80A96FA4),
+        ] {
+            for node in descendant_pattern_nodes(&cache, weapon, 12) {
+                let poses = weapon_attachment_poses(node);
+                if poses.is_empty() {
+                    continue;
+                }
+                let data = package_manager().read_tag(node).expect("socket component");
+                eprintln!(
+                    "SOCKET_TABLE weapon={weapon} node={node} poses={:?} arrays={:?} children={:?} parents={:?}",
+                    poses
+                        .iter()
+                        .map(|pose| (pose.family_id, pose.variant_id, pose.bone_index))
+                        .collect_vec(),
+                    scan_arrays(&data, package_manager().version.endian())
+                        .into_iter()
+                        .map(|array| (array.class, array.count, array.data_offset))
+                        .collect_vec(),
+                    cache
+                        .hashes
+                        .get(&node)
+                        .into_iter()
+                        .flat_map(|scan| scan.file_hashes.iter().map(|child| child.hash))
+                        .collect_vec(),
+                    cache
+                        .hashes
+                        .get(&node)
+                        .into_iter()
+                        .flat_map(|scan| scan.references.iter().copied())
+                        .collect_vec(),
+                );
+                for array in scan_arrays(&data, package_manager().version.endian()) {
+                    if matches!(array.class, CLASS_PATTERN_CHANNEL_BINDINGS | 0x8080B1F3) {
+                        eprintln!(
+                            "  SOCKET_SWITCH class={:08X} count={} words={:?}",
+                            array.class,
+                            array.count,
+                            data[array.data_offset..array.end_offset]
+                                .chunks_exact(4)
+                                .take(if array.class == CLASS_PATTERN_CHANNEL_BINDINGS {
+                                    6
+                                } else {
+                                    16
+                                })
+                                .map(|bytes| format!(
+                                    "{:08X}",
+                                    read_u32(bytes, package_manager().version.endian())
+                                ))
+                                .collect_vec()
+                        );
+                        if array.class == 0x8080B1F3 {
+                            for (index, record) in
+                                array_records(&data, array, 0x10).into_iter().enumerate()
+                            {
+                                let record_offset = array.data_offset + index * 0x10;
+                                let relative =
+                                    read_i64(&record[0..8], package_manager().version.endian());
+                                if let Some(target) = (record_offset as i64)
+                                    .checked_add(relative)
+                                    .and_then(|target| usize::try_from(target).ok())
+                                {
+                                    eprintln!(
+                                        "  SOCKET_RESOURCE weapon={weapon} node={node} index={index} class={:08X} target=0x{target:X} words={:?}",
+                                        read_u32_at(record, 8, package_manager().version.endian())
+                                            .unwrap_or_default(),
+                                        data[target..(target + 0x100).min(data.len())]
+                                            .chunks_exact(4)
+                                            .map(|bytes| format!(
+                                                "{:08X}",
+                                                read_u32(bytes, package_manager().version.endian())
+                                            ))
+                                            .collect_vec()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (geometry, socket_variant) in [
+            (TagHash(0x80A60D31), 0x840253AF_u32),
+            (TagHash(0x80A60C4B), 0x840253A1_u32),
+        ] {
+            let geometry_data = package_manager().read_tag(geometry).expect("mod geometry");
+            eprintln!("MOD_VARIANT geometry={geometry} socket_variant={socket_variant:08X}");
+            for part in
+                geometry_index_range_candidates(&geometry_data, package_manager().version.endian())
+            {
+                eprintln!(
+                    "  part={} base={} variant_shader={} dye={} lod={}",
+                    part.part_index,
+                    part.technique,
+                    part.variant_shader_index,
+                    part.gear_dye_change_color_index,
+                    part.lod_category
+                );
+            }
+            for technique in
+                geometry_index_range_candidates(&geometry_data, package_manager().version.endian())
+                    .into_iter()
+                    .map(|part| part.technique)
+                    .unique()
+            {
+                let entry = package_manager()
+                    .get_entry(technique)
+                    .expect("mod technique");
+                let data = package_manager()
+                    .read_tag(technique)
+                    .expect("mod technique data");
+                let preview = crate::material::MaterialTagPreview::load(&entry, &data)
+                    .expect("mod technique preview");
+                let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+                eprintln!(
+                    "  technique={technique} default7={:?} constants7={:?} inline7={:?} bindings={:?} expressions={:?}",
+                    preview
+                        .stages
+                        .iter()
+                        .find(|stage| stage.stage == "PS")
+                        .and_then(|stage| stage.constant_buffer_preview.as_ref())
+                        .and_then(|buffer| buffer.first_values.get(7)),
+                    preview
+                        .stages
+                        .iter()
+                        .find(|stage| stage.stage == "PS")
+                        .and_then(|stage| stage.constants.get(7)),
+                    preview
+                        .stages
+                        .iter()
+                        .find(|stage| stage.stage == "PS")
+                        .and_then(|stage| stage.inline_constants.get(7)),
+                    preview
+                        .stages
+                        .iter()
+                        .filter(|stage| stage.stage == "PS")
+                        .flat_map(|stage| stage.bytecode.bindings.iter())
+                        .filter(|binding| binding.source.contains("object_channel"))
+                        .map(|binding| (&binding.kind, &binding.source, binding.slot))
+                        .collect_vec(),
+                    preview
+                        .stages
+                        .iter()
+                        .filter(|stage| stage.stage == "PS")
+                        .flat_map(|stage| stage.bytecode.expressions.iter())
+                        .filter(|expression| {
+                            expression.expression.contains("object_channel")
+                                || expression.target.starts_with("output[")
+                        })
+                        .map(|expression| (&expression.target, &expression.expression))
+                        .collect_vec()
+                );
+            }
+            for parent in cache
+                .hashes
+                .get(&geometry)
+                .into_iter()
+                .flat_map(|scan| scan.references.iter().copied())
+            {
+                let Some(parent_entry) = package_manager().get_entry(parent) else {
+                    continue;
+                };
+                eprintln!("  parent={parent} class={:08X}", parent_entry.reference);
+                if !matches!(
+                    parent_entry.reference,
+                    CLASS_ENTITY_RESOURCE | CLASS_PATTERN_COMPONENT
+                ) {
+                    continue;
+                }
+                let data = package_manager().read_tag(parent).expect("model component");
+                let endian = package_manager().version.endian();
+                let resource_offset: usize = data
+                    .get(0x18..0x20)
+                    .map(|bytes| read_i64(bytes, endian))
+                    .and_then(|relative| (0x18_i64 + relative).try_into().ok())
+                    .unwrap_or_default();
+                eprintln!(
+                    "    resource=0x{resource_offset:X} model224={:?} model264={:?} socket_variant_offsets={:?}",
+                    read_tag_at(&data, resource_offset + 0x224, endian),
+                    read_tag_at(&data, resource_offset + 0x264, endian),
+                    data.windows(4)
+                        .enumerate()
+                        .filter_map(|(offset, bytes)| {
+                            (read_u32(bytes, endian) == socket_variant).then_some(offset)
+                        })
+                        .collect_vec()
+                );
+                eprintln!(
+                    "    arrays={:?}",
+                    scan_arrays(&data, endian)
+                        .into_iter()
+                        .map(|array| (array.class, array.count, array.data_offset))
+                        .collect_vec()
+                );
+                for array in scan_arrays(&data, endian) {
+                    if matches!(array.class, CLASS_PATTERN_CHANNEL_BINDINGS | 0x8080BAD0) {
+                        let stride = if array.class == CLASS_PATTERN_CHANNEL_BINDINGS {
+                            0x18
+                        } else {
+                            0x08
+                        };
+                        eprintln!(
+                            "    material switches class={:08X} records={:?}",
+                            array.class,
+                            array_records(&data, array, stride)
+                                .into_iter()
+                                .map(|record| record
+                                    .chunks_exact(4)
+                                    .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
+                                    .collect_vec())
+                                .collect_vec()
+                        );
+                    }
+                }
+                for map_offset in [0x3c0, 0x400] {
+                    let records12 = read_array(&data, resource_offset + map_offset, 12, endian)
+                        .map(|records| {
+                            records
+                                .chunks_exact(12)
+                                .map(|record| {
+                                    (
+                                        read_u32_at(record, 0, endian),
+                                        read_u32_at(record, 4, endian),
+                                        read_u32_at(record, 8, endian),
+                                    )
+                                })
+                                .collect_vec()
+                        });
+                    let tags = read_tag_array(&data, resource_offset + map_offset, endian);
+                    eprintln!("    vec+0x{map_offset:X}: records12={records12:?} tags={tags:?}");
+                }
+                let techniques = read_tag_array(&data, resource_offset + 0x400, endian);
+                for technique in techniques {
+                    let Some(entry) = package_manager().get_entry(technique) else {
+                        continue;
+                    };
+                    let Ok(technique_data) = package_manager().read_tag(technique) else {
+                        continue;
+                    };
+                    eprintln!(
+                        "    variant technique={technique} textures={:?} constants={:?}",
+                        texture_bindings_for_technique(&entry, &technique_data)
+                            .into_iter()
+                            .filter(|binding| binding.stage == "PS")
+                            .map(|binding| (binding.slot, binding.tag))
+                            .collect_vec(),
+                        crate::material::material_constants_for_technique(&entry, &technique_data)
+                    );
+                }
+            }
+        }
+        for mod_root in [TagHash(0x80A60D38), TagHash(0x80A60C4F)] {
+            for node in descendant_pattern_nodes(&cache, mod_root, 8) {
+                let data = package_manager().read_tag(node).expect("mod component");
+                let endian = package_manager().version.endian();
+                for offset in (0..data.len().saturating_sub(4)).step_by(4) {
+                    if read_u32_at(&data, offset, endian) != Some(CLASS_WEAPON_MOD_VISUAL_BINDING) {
+                        continue;
+                    }
+                    eprintln!(
+                        "MOD_VISUAL root={mod_root} node={node} offset=0x{offset:X} words={:?}",
+                        (0..24)
+                            .filter_map(|index| read_u32_at(&data, offset + index * 4, endian))
+                            .map(|value| format!("{value:08X}"))
+                            .collect_vec()
+                    );
+                }
+                for array in scan_arrays(&data, endian)
+                    .into_iter()
+                    .filter(|array| array.class == CLASS_PATTERN_CHANNEL_BINDINGS)
+                {
+                    eprintln!(
+                        "MOD_CHANNELS root={mod_root} node={node} count={} words={:?}",
+                        array.count,
+                        data[array.data_offset..array.end_offset]
+                            .chunks_exact(4)
+                            .take(64)
+                            .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
+                            .collect_vec()
+                    );
+                }
+            }
+        }
+        for root in [
+            TagHash(0x80B6D750),
+            TagHash(0x80A7C7B5),
+            TagHash(0x80A60D38),
+            TagHash(0x80A60C4F),
+        ] {
+            for node in descendant_pattern_nodes(&cache, root, 8) {
+                let Some(entry) = package_manager().get_entry(node) else {
+                    continue;
+                };
+                let Ok(data) = package_manager().read_tag(node) else {
+                    continue;
+                };
+                for parameter in [
+                    0xC8939EBF_u32,
+                    0xC8939EBA,
+                    0xC8939EBC,
+                    0xC8939EBD,
+                    0xC8939EBB,
+                    0xC8939EB8,
+                ] {
+                    for offset in (0..data.len().saturating_sub(3))
+                        .step_by(4)
+                        .filter(|offset| {
+                            read_u32_at(&data, *offset, package_manager().version.endian())
+                                == Some(parameter)
+                        })
+                    {
+                        let arrays = scan_arrays(&data, package_manager().version.endian());
+                        eprintln!(
+                            "VARIANT_RAW root={root} node={node} parameter={parameter:08X} offset=0x{offset:X} arrays={:?}",
+                            arrays
+                                .into_iter()
+                                .filter(|array| offset >= array.data_offset
+                                    && offset < array.end_offset)
+                                .map(|array| (array.class, array.count, array.data_offset))
+                                .collect_vec()
+                        );
+                    }
+                }
+                let arrays = scan_arrays(&data, package_manager().version.endian());
+                for array in arrays
+                    .iter()
+                    .copied()
+                    .filter(|array| array.class == 0x8080AF86)
+                {
+                    for (index, record) in array_records(&data, array, 0x70).into_iter().enumerate()
+                    {
+                        let Some(parameter) =
+                            read_u32_at(record, 0, package_manager().version.endian())
+                        else {
+                            continue;
+                        };
+                        if ![
+                            0xC8939EBF_u32,
+                            0xC8939EBA,
+                            0xC8939EBC,
+                            0xC8939EBD,
+                            0xC8939EBB,
+                            0xC8939EB8,
+                        ]
+                        .contains(&parameter)
+                        {
+                            continue;
+                        }
+                        let record_offset = array.data_offset + index * 0x70;
+                        let bytecode = read_array(
+                            &data,
+                            record_offset + 0x08,
+                            1,
+                            package_manager().version.endian(),
+                        )
+                        .unwrap_or_default();
+                        let constants = read_array(
+                            &data,
+                            record_offset + 0x18,
+                            0x10,
+                            package_manager().version.endian(),
+                        )
+                        .unwrap_or_default();
+                        eprintln!(
+                            "VARIANT_EXPRESSION root={root} node={node} parameter={parameter:08X} bytecode={} constants={:?} words={:?}",
+                            bytecode.iter().map(|byte| format!("{byte:02X}")).join(" "),
+                            constants
+                                .chunks_exact(0x10)
+                                .map(|constant| read_vec4_f32(
+                                    constant,
+                                    0,
+                                    package_manager().version.endian()
+                                )
+                                .unwrap())
+                                .collect_vec(),
+                            record
+                                .chunks_exact(4)
+                                .map(|bytes| format!(
+                                    "{:08X}",
+                                    read_u32(bytes, package_manager().version.endian())
+                                ))
+                                .collect_vec()
+                        );
+                    }
+                }
+                for array in arrays
+                    .iter()
+                    .copied()
+                    .filter(|array| array.class == 0x8080AF14)
+                {
+                    for (index, record) in array_records(&data, array, 0x28).into_iter().enumerate()
+                    {
+                        let Some(parameter) =
+                            read_u32_at(record, 0x20, package_manager().version.endian())
+                        else {
+                            continue;
+                        };
+                        if [
+                            0xC8939EBF_u32,
+                            0xC8939EBA,
+                            0xC8939EBC,
+                            0xC8939EBD,
+                            0xC8939EBB,
+                            0xC8939EB8,
+                        ]
+                        .contains(&parameter)
+                        {
+                            let provider = arrays
+                                .iter()
+                                .copied()
+                                .find(|candidate| candidate.class == 0x8080AF13)
+                                .and_then(|provider_array| {
+                                    array_records(&data, provider_array, 0x30)
+                                        .get(index)
+                                        .copied()
+                                })
+                                .map(|provider| {
+                                    provider
+                                        .chunks_exact(4)
+                                        .map(|bytes| {
+                                            format!(
+                                                "{:08X}",
+                                                read_u32(bytes, package_manager().version.endian())
+                                            )
+                                        })
+                                        .collect_vec()
+                                });
+                            eprintln!(
+                                "VARIANT_SELECTOR root={root} node={node} index={index} parameter={parameter:08X} words={:?} provider={provider:?}",
+                                record
+                                    .chunks_exact(4)
+                                    .map(|bytes| format!(
+                                        "{:08X}",
+                                        read_u32(bytes, package_manager().version.endian())
+                                    ))
+                                    .collect_vec()
+                            );
+                        }
+                    }
+                }
+                let singleton_vectors = arrays
+                    .iter()
+                    .copied()
+                    .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
+                    .collect_vec();
+                let vectors = singleton_vectors
+                    .iter()
+                    .copied()
+                    .map(|array| {
+                        read_serialized_dye_vector(&data, array, package_manager().version.endian())
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let Some(vectors) = vectors else {
+                    continue;
+                };
+                for array in arrays
+                    .iter()
+                    .copied()
+                    .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+                {
+                    for record in array_records(&data, array, 0x0c) {
+                        let Some(scope) =
+                            read_u32_at(record, 0x00, package_manager().version.endian())
+                        else {
+                            continue;
+                        };
+                        let Some(parameter) =
+                            read_u32_at(record, 0x04, package_manager().version.endian())
+                        else {
+                            continue;
+                        };
+                        let Some(index) =
+                            read_u32_at(record, 0x08, package_manager().version.endian())
+                                .map(|value| value as usize)
+                        else {
+                            continue;
+                        };
+                        if let Some(value) = vectors.get(index) {
+                            eprintln!(
+                                "OBJECT_CHANNEL root={root} node={node} class={:08X} scope={scope:08X} parameter={parameter:08X} index={index} value={value:?}",
+                                entry.reference
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let variant_parameters = [
+            0xC8939EBF, 0xC8939EBA, 0xC8939EBC, 0xC8939EBD, 0xC8939EBB, 0xC8939EB8,
+        ];
+        for (component, _entry) in package_manager().get_all_by_reference(CLASS_PATTERN_COMPONENT) {
+            let Ok(data) = package_manager().read_tag(component) else {
+                continue;
+            };
+            let arrays = scan_arrays(&data, package_manager().version.endian());
+            let vectors = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
+                .map(|array| {
+                    read_serialized_dye_vector(&data, array, package_manager().version.endian())
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(vectors) = vectors else {
+                continue;
+            };
+            let values = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+                .flat_map(|array| array_records(&data, array, 0x0c))
+                .filter_map(|record| {
+                    let parameter = read_u32_at(record, 0x04, package_manager().version.endian())?;
+                    variant_parameters.contains(&parameter).then_some(())?;
+                    let index =
+                        read_u32_at(record, 0x08, package_manager().version.endian())? as usize;
+                    Some((parameter, *vectors.get(index)?))
+                })
+                .collect_vec();
+            if values.is_empty() {
+                continue;
+            }
+            eprintln!(
+                "VARIANT_CHANNEL component={component} values={values:?} parents={:?}",
+                cache
+                    .hashes
+                    .get(&component)
+                    .into_iter()
+                    .flat_map(|scan| scan.references.iter().copied())
+                    .map(|parent| {
+                        (
+                            parent,
+                            package_manager()
+                                .get_entry(parent)
+                                .map(|entry| entry.reference),
+                        )
+                    })
+                    .collect_vec()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages and shader decompiler"]
+    #[cfg(feature = "decompile-shaders")]
+    fn probes_goliath_gear_dye_pixel_shader() {
+        init_goliath_test_package_manager();
+        let shader = TagHash(0x80A6007C);
+        let entry = package_manager().get_entry(shader).expect("shader header");
+        let data = package_manager()
+            .read_tag(TagHash(entry.reference))
+            .expect("shader bytecode");
+        let decompiled = hlsldecompiler::decompile(&data).expect("decompile pixel shader");
+        std::fs::create_dir_all("target/quicktag-model-probe").unwrap();
+        std::fs::write(
+            "target/quicktag-model-probe/gear-dye-80A6007C.hlsl",
+            &decompiled,
+        )
+        .unwrap();
+        eprintln!("GEAR_DYE_SHADER_BEGIN\n{decompiled}\nGEAR_DYE_SHADER_END");
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn extracts_goliath_gear_dye_pixel_shader() {
+        init_goliath_test_package_manager();
+        std::fs::create_dir_all("target/quicktag-model-probe").unwrap();
+        for (shader, stage) in [(TagHash(0x80A6007C), "ps"), (TagHash(0x80A60079), "vs")] {
+            let entry = package_manager().get_entry(shader).expect("shader header");
+            let data = package_manager()
+                .read_tag(TagHash(entry.reference))
+                .expect("shader bytecode");
+            std::fs::write(
+                format!("target/quicktag-model-probe/gear-dye-{shader}-{stage}.bin"),
+                data,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn decodes_every_authored_gear_dye_component() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let endian = package_manager().version.endian();
+        let mut same_shape = 0;
+        let mut root_checks = 0;
+        let mut candidates = vec![];
+        let mut failures = vec![];
+        for (tag, _entry) in package_manager().get_all_by_reference(CLASS_PATTERN_COMPONENT) {
+            let Ok(data) = package_manager().read_tag(tag) else {
+                continue;
+            };
+            let arrays = scan_arrays(&data, package_manager().version.endian());
+            let vector_count = arrays
+                .iter()
+                .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
+                .count();
+            if vector_count == 29 {
+                same_shape += 1;
+                let binding_parameters = arrays
+                    .iter()
+                    .copied()
+                    .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+                    .flat_map(|array| array_records(&data, array, 0x0c))
+                    .filter_map(|record| read_u32_at(record, 0x04, endian))
+                    .collect::<rustc_hash::FxHashSet<_>>();
+                if GEAR_DYE_COLOR_PARAMETERS
+                    .iter()
+                    .any(|parameter| binding_parameters.contains(parameter))
+                {
+                    candidates.push(tag);
+                    let Some(expected) = decode_weapon_skin_gear_dye_palette(&data) else {
+                        failures.push(tag);
+                        continue;
+                    };
+                    for (depth, root) in ancestor_pattern_roots(&cache, tag) {
+                        if depth != 1 {
+                            continue;
+                        }
+                        root_checks += 1;
+                        assert_eq!(
+                            weapon_skin_gear_dye_palette(&cache, root),
+                            Some(expected),
+                            "selected pattern {root} resolved the wrong dye component instead of {tag}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(same_shape, 223, "unexpected 29-vector component count");
+        assert_eq!(candidates.len(), 214, "unexpected authored gear-dye count");
+        assert_eq!(
+            root_checks, 247,
+            "unexpected direct skin/default pattern coverage"
+        );
+        assert!(
+            failures.is_empty(),
+            "binding-driven dye decode failed for {failures:?}"
+        );
+
+        for (tag, expected) in [
+            (TagHash(0x80B6C2A0), [0.042311, 0.042311, 0.042311]),
+            (TagHash(0x80B6CA95), [0.152284, 0.496933, 0.015574]),
+        ] {
+            let data = package_manager().read_tag(tag).expect("dye component");
+            let palette = decode_weapon_skin_gear_dye_palette(&data).expect("authored palette");
+            for (actual, expected) in palette[0].color.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 0.000002, "{tag}: {palette:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn applies_authored_basic_weapon_dye_to_mods() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let base = TagHash(0x80AA0E95);
+        let palette = weapon_skin_gear_dye_palette(&cache, base)
+            .expect("basic weapon must resolve its authored default palette");
+        assert_eq!(palette[0].color, [0.042247, 0.042247, 0.042247, 1.0]);
+        let entry = package_manager()
+            .get_entry(base)
+            .expect("basic weapon pattern");
+        let preview = GeometryTagPreview::load_model_with_weapon_mods(
+            cache,
+            base,
+            &entry,
+            TagHash(0x80A96FA4),
+            &[
+                TagHash(0x80A60313),
+                TagHash(0x80A6068A),
+                TagHash(0x80A600AC),
+            ],
+        )
+        .expect("basic weapon with three attached mods");
+        let GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("basic weapon preview must be a model");
+        };
+        for expected in [
+            TagHash(0x80A6030F),
+            TagHash(0x80A60687),
+            TagHash(0x80A60099),
+        ] {
+            assert!(
+                model.geometry_parts.contains(&expected),
+                "missing {expected}"
+            );
+        }
+        let ranges = model
+            .wireframe
+            .expect("basic weapon wireframe")
+            .material_ranges;
+        assert!(ranges.iter().any(|range| range.textures.color.is_some()));
+        let applied = ranges
+            .iter()
+            .filter_map(|range| range.textures.gear_dye)
+            .collect_vec();
+        let attachment_geometry = [
+            TagHash(0x80A6030F),
+            TagHash(0x80A60687),
+            TagHash(0x80A60099),
+        ];
+        assert_eq!(
+            applied,
+            authored_geometry_dyes(&attachment_geometry, &palette),
+            "basic skin attachments must consume their mesh-authored palette channels"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn resolves_current_misriah_mod_attachment_poses() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let weapon_pattern = TagHash(0x80A7ACEC);
+        let modifications = [
+            TagHash(0x80A6032C),
+            TagHash(0x80A60B69),
+            TagHash(0x80A60496),
+        ];
+        let socket = WeaponModSocketIndex::new()
+            .owner_for(&cache, weapon_pattern, &modifications)
+            .expect("Misriah authored socket owner");
+        let poses = modifications.map(|modification| {
+            let pose = weapon_mod_attachment_pose(&cache, socket, modification)
+                .unwrap_or_else(|| panic!("no pose for {modification}"));
+            assert!(weapon_mod_authored_families(&cache, modification).contains(&pose.family_id));
+            assert!(pose.translation.iter().all(|value| value.is_finite()));
+            pose
+        });
+        assert_eq!(
+            poses
+                .iter()
+                .map(|pose| pose.family_id)
+                .collect::<rustc_hash::FxHashSet<_>>()
+                .len(),
+            modifications.len()
+        );
+
+        let base = TagHash(0x80B7D13F);
+        let attachment_geometry = modifications
+            .iter()
+            .flat_map(|modification| weapon_mod_geometry_tags(&cache, *modification))
+            .collect_vec();
+        let entry = package_manager()
+            .get_entry(base)
+            .expect("Misriah base pattern");
+        let attachments = modifications.map(|model_tag| WeaponModPreviewAttachment {
+            model_tag,
+            rarity: None,
+            unique_id: 0.5,
+        });
+        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache.clone(),
+            base,
+            &entry,
+            weapon_pattern,
+            socket,
+            &attachments,
+        )
+        .expect("assembled Misriah preview");
+        let GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("expected model preview");
+        };
+        for expected in attachment_geometry {
+            assert!(
+                model.geometry_parts.contains(&expected),
+                "assembled preview is missing {expected}: {:?}",
+                model.geometry_parts
+            );
+        }
+        let wireframe = model.wireframe.expect("assembled preview has no geometry");
+        assert!(!wireframe.vertices.is_empty());
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_reference_export_attachment_transforms() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let targets = [
+            ("darksight", 0.2069903_f32, 0.1242157_f32),
+            ("flechette", 0.177225_f32, 0.13954_f32),
+        ];
+
+        for tag in cache.hashes.keys().copied().sorted() {
+            if !matches!(tag.0, 0x80A7D43D | 0x80A970D2) {
+                continue;
+            }
+            let Some(entry) = package_manager().get_entry(tag) else {
+                continue;
+            };
+            if entry.file_size > 2 * 1024 * 1024 {
+                continue;
+            }
+            let Ok(data) = package_manager().read_tag(tag) else {
+                continue;
+            };
+            for (name, x, z) in targets {
+                for offset in (0..data.len().saturating_sub(3)).step_by(4) {
+                    let value = read_f32(
+                        &data[offset..offset + 4],
+                        package_manager().version.endian(),
+                    );
+                    if (value - x).abs() > 0.000001 {
+                        continue;
+                    }
+                    let nearby_z = (offset.saturating_sub(0x40)
+                        ..(offset + 0x80).min(data.len().saturating_sub(3)))
+                        .step_by(4)
+                        .find(|candidate| {
+                            let value = read_f32(
+                                &data[*candidate..*candidate + 4],
+                                package_manager().version.endian(),
+                            );
+                            (value - z).abs() < 0.000001
+                        });
+                    let Some(z_offset) = nearby_z else {
+                        continue;
+                    };
+                    let class = get_class_by_id(entry.reference)
+                        .map(|class| class.name.into_owned())
+                        .unwrap_or_else(|| format!("{:08X}", entry.reference));
+                    let parents = cache
+                        .hashes
+                        .get(&tag)
+                        .into_iter()
+                        .flat_map(|scan| scan.references.iter().copied())
+                        .filter_map(|parent| {
+                            let entry = package_manager().get_entry(parent)?;
+                            Some((parent, entry.reference))
+                        })
+                        .sorted()
+                        .collect_vec();
+                    eprintln!(
+                        "ATTACH_TRANSFORM {name} tag={tag} class={:08X}:{class} size={} x@{offset:X} z@{z_offset:X} parents={parents:08X?}",
+                        entry.reference, entry.file_size,
+                    );
+                }
+            }
+        }
+
+        let mut words = rustc_hash::FxHashMap::default();
+        quicktag_strings::wordlist::load_wordlist(|word, hash| {
+            words.entry(hash).or_insert_with(|| word.to_owned());
+        });
+        if let Ok(extra_words) =
+            std::fs::read_to_string("alkahest/crates/alkahest/wordlist_channels.txt")
+        {
+            for word in extra_words.lines() {
+                let hash = quicktag_core::util::fnv1(word.as_bytes());
+                if [
+                    0x138DE801_u32,
+                    0xA9D208CC,
+                    0xA590EEC6,
+                    0xD4FB5E33,
+                    0xEAA8E3CF,
+                ]
+                .contains(&hash)
+                {
+                    eprintln!("QUICKDRAW_CHANNEL_WORD {hash:08X}={word}");
+                }
+            }
+        }
+        for tag in [TagHash(0x80A7D43D), TagHash(0x80A970D2)] {
+            let data = package_manager()
+                .read_tag(tag)
+                .expect("attachment component");
+            let scan = &cache.hashes[&tag];
+            eprintln!(
+                "ATTACH_COMPONENT tag={tag} arrays={:?}",
+                scan_arrays(&data, package_manager().version.endian())
+                    .into_iter()
+                    .map(|array| (
+                        array.class,
+                        array.count,
+                        array.data_offset,
+                        array.end_offset
+                    ))
+                    .collect_vec()
+            );
+            eprintln!(
+                "ATTACH_COMPONENT_REFS tag={tag} refs={:?} refs64={:?} words={:?}",
+                scan.file_hashes
+                    .iter()
+                    .map(|reference| (reference.offset, reference.hash))
+                    .collect_vec(),
+                scan.file_hashes64
+                    .iter()
+                    .map(|reference| (
+                        reference.offset,
+                        reference.hash,
+                        tag64_to_hash32(reference.hash)
+                    ))
+                    .collect_vec(),
+                scan.wordlist_hashes
+                    .iter()
+                    .filter_map(|word| Some((word.offset, word.hash, words.get(&word.hash)?)))
+                    .collect_vec(),
+            );
+            for (index, record) in data[0x300..0x93c].chunks_exact(0x30).enumerate() {
+                let wide = u64::from_le_bytes(record[0x28..0x30].try_into().unwrap());
+                let visual = tag64_to_hash32(tiger_pkg::TagHash64(wide));
+                let rotation = std::array::from_fn::<_, 4, _>(|axis| {
+                    f32::from_bits(u32::from_le_bytes(
+                        record[axis * 4..0x04 + axis * 4].try_into().unwrap(),
+                    ))
+                });
+                let translation = std::array::from_fn::<_, 4, _>(|axis| {
+                    f32::from_bits(u32::from_le_bytes(
+                        record[0x10 + axis * 4..0x14 + axis * 4].try_into().unwrap(),
+                    ))
+                });
+                eprintln!(
+                    "ATTACH_RECORD tag={tag} index={index} wide={wide:016X} visual={visual:?} rotation={rotation:?} translation={translation:?}"
+                );
+            }
+            for (start, end) in [(0x560, 0x610), (0x7A0, 0x850)] {
+                eprintln!(
+                    "ATTACH_COMPONENT_WORDS tag={tag} range={start:X}..{end:X} {:?}",
+                    data[start..end.min(data.len())]
+                        .chunks_exact(4)
+                        .enumerate()
+                        .map(|(index, bytes)| {
+                            let raw = u32::from_le_bytes(bytes.try_into().unwrap());
+                            format!(
+                                "+{:03X}={raw:08X}/{}",
+                                start + index * 4,
+                                f32::from_bits(raw)
+                            )
+                        })
+                        .collect_vec()
+                );
+            }
+        }
+
+        for (name, identifier, expected_visual) in [
+            ("darksight", 0x6F17_09EA_u32, TagHash(0x80A61398)),
+            ("flechette", 0xA500_D3AF_u32, TagHash(0x80A61CF0)),
+        ] {
+            for tag in cache.hashes.keys().copied().sorted() {
+                let Some(entry) = package_manager().get_entry(tag) else {
+                    continue;
+                };
+                if entry.file_size > 128 * 1024
+                    || !matches!(
+                        entry.reference,
+                        CLASS_PATTERN | CLASS_PATTERN_COMPONENT | 0x8080BA53 | 0x8080BEF0
+                    )
+                {
+                    continue;
+                }
+                let Ok(data) = package_manager().read_tag(tag) else {
+                    continue;
+                };
+                for (offset, _bytes) in data.chunks_exact(4).enumerate().filter(|(_, bytes)| {
+                    u32::from_le_bytes((*bytes).try_into().unwrap()) == identifier
+                }) {
+                    eprintln!(
+                        "ATTACH_IDENTIFIER name={name} identifier={identifier:08X} expected={expected_visual} tag={tag} class={:08X} offset={:X}",
+                        entry.reference,
+                        offset * 4,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_mod_anchor_tags() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let anchors = [
+            TagHash(0x80AA0E95),
+            TagHash(0x80AA0ECF),
+            TagHash(0x80A60B32),
+            TagHash(0x80A60B36),
+            TagHash(0x80A9A0C1),
+            TagHash(0x80A9A0C3),
+            TagHash(0x80A61398),
+            TagHash(0x80A61CF0),
+            TagHash(0x80A7EF31),
+            TagHash(0x80B6E792),
+        ];
+
+        for anchor in anchors {
+            let entry = package_manager().get_entry(anchor).expect("anchor entry");
+            let package = package_manager()
+                .package_paths
+                .get(&anchor.pkg_id())
+                .map(|path| path.name.clone())
+                .unwrap_or_else(|| "?".to_owned());
+            let class = get_class_by_id(entry.reference)
+                .map(|class| class.name.into_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let transform = (entry.reference == CLASS_GEOMETRY_RESOURCE)
+                .then(|| package_manager().read_tag(anchor).ok())
+                .flatten()
+                .and_then(|data| {
+                    read_geometry_position_transform(&data, package_manager().version.endian())
+                });
+            eprintln!(
+                "ANCHOR tag={anchor} class={:08X}:{class} size={} package={package} transform={transform:?}",
+                entry.reference, entry.file_size
+            );
+
+            let Some(scan) = cache.hashes.get(&anchor) else {
+                eprintln!("  no scan");
+                continue;
+            };
+            let parents = scan
+                .references
+                .iter()
+                .copied()
+                .filter_map(|tag| {
+                    package_manager().get_entry(tag).map(|entry| {
+                        let name = get_class_by_id(entry.reference)
+                            .map(|class| class.name.into_owned())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        (tag, entry.reference, name)
+                    })
+                })
+                .sorted()
+                .collect_vec();
+            let children = scan
+                .file_hashes
+                .iter()
+                .filter_map(|reference| {
+                    package_manager().get_entry(reference.hash).map(|entry| {
+                        let name = get_class_by_id(entry.reference)
+                            .map(|class| class.name.into_owned())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        (reference.hash, entry.reference, name)
+                    })
+                })
+                .unique()
+                .sorted()
+                .collect_vec();
+            eprintln!("  parents={parents:?}");
+            let pattern_children = children
+                .iter()
+                .filter(|(_tag, class, _name)| *class == CLASS_PATTERN_COMPONENT)
+                .map(|(tag, _class, _name)| tag.to_string())
+                .collect_vec();
+            eprintln!("  pattern_children={pattern_children:?}");
+            let geometry = pattern_geometry_tags(&cache, anchor);
+            eprintln!(
+                "  geometry={} {:?}",
+                geometry.len(),
+                geometry
+                    .iter()
+                    .map(|tag| {
+                        let transform = package_manager().read_tag(*tag).ok().and_then(|data| {
+                            read_geometry_position_transform(
+                                &data,
+                                package_manager().version.endian(),
+                            )
+                        });
+                        format!("{tag}:{transform:?}")
+                    })
+                    .collect_vec()
+            );
+            if matches!(
+                anchor.0,
+                0x80AA0E95
+                    | 0x80AA0ECF
+                    | 0x80A60B32
+                    | 0x80A60B36
+                    | 0x80A9A0C1
+                    | 0x80A9A0C3
+                    | 0x80A61398
+                    | 0x80A61CF0
+                    | 0x80A7EF31
+                    | 0x80B6E792
+            ) {
+                let nearest = pattern_nearest_geometry_tags(&cache, anchor);
+                eprintln!(
+                    "  nearest_geometry={:?}",
+                    nearest.iter().map(|tag| tag.to_string()).collect_vec()
+                );
+                for tag in nearest {
+                    let geometry_entry = package_manager().get_entry(tag).expect("geometry");
+                    let model = load_model_preview_from_tags(
+                        cache.clone(),
+                        tag,
+                        &geometry_entry,
+                        "Geometry",
+                        vec![tag],
+                        &[],
+                    );
+                    let materials = model
+                        .wireframe
+                        .into_iter()
+                        .flat_map(|wireframe| wireframe.material_ranges)
+                        .map(|range| {
+                            (
+                                range.technique.map(|tag| tag.to_string()),
+                                range.textures.color.map(|tag| tag.to_string()),
+                                range.textures.control.map(|tag| tag.to_string()),
+                                range.textures.color_tint,
+                            )
+                        })
+                        .unique()
+                        .collect_vec();
+                    eprintln!("  material geometry={tag} {materials:?}");
+                }
+            }
+
+            let mut frontier = vec![(anchor, 0usize)];
+            let mut seen = rustc_hash::FxHashSet::default();
+            seen.insert(anchor);
+            while let Some((child, depth)) = frontier.pop() {
+                if depth == 2 {
+                    continue;
+                }
+                for parent in cache
+                    .hashes
+                    .get(&child)
+                    .into_iter()
+                    .flat_map(|scan| scan.references.iter().copied())
+                    .sorted()
+                {
+                    if !seen.insert(parent) {
+                        continue;
+                    }
+                    let Some(parent_entry) = package_manager().get_entry(parent) else {
+                        continue;
+                    };
+                    if matches!(
+                        parent_entry.reference,
+                        CLASS_PATTERN | CLASS_PATTERN_COMPONENT | CLASS_GEOMETRY_RESOURCE
+                    ) {
+                        let name = get_class_by_id(parent_entry.reference)
+                            .map(|class| class.name.into_owned())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        eprintln!(
+                            "  up depth={} child={child} parent={parent} class={:08X}:{name}",
+                            depth + 1,
+                            parent_entry.reference
+                        );
+                    }
+                    frontier.push((parent, depth + 1));
+                }
+            }
+        }
+
+        let base = cache.hashes.get(&anchors[0]).expect("base scan");
+        let skin = cache.hashes.get(&anchors[1]).expect("skin scan");
+        let base_refs = base
+            .file_hashes
+            .iter()
+            .map(|reference| (reference.offset, reference.hash))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let skin_refs = skin
+            .file_hashes
+            .iter()
+            .map(|reference| (reference.offset, reference.hash))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut transitions = rustc_hash::FxHashSet::default();
+        for offset in base_refs.keys().chain(skin_refs.keys()).unique().sorted() {
+            let before = base_refs.get(offset);
+            let after = skin_refs.get(offset);
+            if before != after {
+                transitions.insert((before.copied(), after.copied()));
+            }
+        }
+        eprintln!(
+            "SKIN_REF_TRANSITIONS {:?}",
+            transitions
+                .into_iter()
+                .map(|(base, skin)| (
+                    base.map(|tag| tag.to_string()),
+                    skin.map(|tag| tag.to_string())
+                ))
+                .sorted()
+                .collect_vec()
+        );
+        for tag in [
+            TagHash(0x80A60B32),
+            TagHash(0x80A60B36),
+            TagHash(0x80A9A0C1),
+            TagHash(0x80A9A0C3),
+        ] {
+            eprintln!(
+                "REAL_MOD tag={tag} nearest={:?} roots={:?}",
+                pattern_nearest_geometry_tags(&cache, tag),
+                ancestor_pattern_roots(&cache, tag)
+            );
+        }
+        for geometry in [
+            TagHash(0x80A61D7E),
+            TagHash(0x80A9A580),
+            TagHash(0x80A60B32),
+            TagHash(0x80A9A0C1),
+            TagHash(0x80A60B66),
+        ] {
+            for component in cache
+                .hashes
+                .get(&geometry)
+                .into_iter()
+                .flat_map(|scan| scan.references.iter().copied())
+                .filter(|tag| {
+                    package_manager()
+                        .get_entry(*tag)
+                        .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
+                })
+            {
+                let data = package_manager().read_tag(component).expect("component");
+                let offsets = cache.hashes[&component]
+                    .file_hashes
+                    .iter()
+                    .filter(|reference| reference.hash == geometry)
+                    .map(|reference| reference.offset as usize)
+                    .collect_vec();
+                eprintln!(
+                    "SOCKET geometry={geometry} component={component} size={} offsets={offsets:X?}",
+                    data.len()
+                );
+                for child in cache.hashes[&component]
+                    .file_hashes
+                    .iter()
+                    .map(|reference| reference.hash)
+                    .unique()
+                {
+                    let Some(entry) = package_manager().get_entry(child) else {
+                        continue;
+                    };
+                    if !matches!(entry.reference, 0x8080BA53 | 0x8080BAF8) {
+                        continue;
+                    }
+                    let child_data = package_manager().read_tag(child).unwrap_or_default();
+                    eprintln!(
+                        "  VALUE tag={child} class={:08X} len={} words={:?}",
+                        entry.reference,
+                        child_data.len(),
+                        child_data
+                            .chunks_exact(4)
+                            .map(|bytes| {
+                                let raw = u32::from_le_bytes(bytes.try_into().unwrap());
+                                format!("{raw:08X}/{}", f32::from_bits(raw))
+                            })
+                            .collect_vec()
+                    );
+                }
+                for offset in offsets {
+                    let start = offset.saturating_sub(64);
+                    let end = (offset + 80).min(data.len());
+                    let words = data[start..end]
+                        .chunks_exact(4)
+                        .enumerate()
+                        .map(|(word, bytes)| {
+                            let raw = u32::from_le_bytes(bytes.try_into().unwrap());
+                            format!(
+                                "+{:04X}={raw:08X}/{}",
+                                start + word * 4,
+                                f32::from_bits(raw)
+                            )
+                        })
+                        .collect_vec();
+                    eprintln!("  WORDS {words:?}");
+                }
+            }
+        }
+        let technique = TagHash(0x80A60B20);
+        let technique_entry = package_manager().get_entry(technique).unwrap();
+        let technique_data = package_manager().read_tag(technique).unwrap();
+        let preview = crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
+            .expect("magazine technique");
+        let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+        for stage in preview.stages {
+            eprintln!(
+                "MAG_TECH stage={} shader={:?} textures={:?} bindings={:?} constants={:?} externs={:?}",
+                stage.stage,
+                stage.shader,
+                stage.textures,
+                stage.bytecode.bindings,
+                stage.constants,
+                stage.bytecode.externs
+            );
+        }
+        for parent in cache.hashes[&TagHash(0x80A617EC)]
+            .references
+            .iter()
+            .copied()
+        {
+            let Some(entry) = package_manager().get_entry(parent) else {
+                continue;
+            };
+            let name = get_class_by_id(entry.reference)
+                .map(|class| class.name.into_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            eprintln!(
+                "DECAL_PARENT texture=80A617EC parent={parent} class={:08X}:{name}",
+                entry.reference
+            );
+        }
+        let mut frontier = vec![(TagHash(0x80A60B56), 0usize)];
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(TagHash(0x80A60B56));
+        while let Some((child, depth)) = frontier.pop() {
+            if depth >= 5 {
+                continue;
+            }
+            for parent in cache
+                .hashes
+                .get(&child)
+                .into_iter()
+                .flat_map(|scan| scan.references.iter().copied())
+            {
+                if !seen.insert(parent) {
+                    continue;
+                }
+                let Some(entry) = package_manager().get_entry(parent) else {
+                    continue;
+                };
+                let name = get_class_by_id(entry.reference)
+                    .map(|class| class.name.into_owned())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                eprintln!(
+                    "DECAL_UP depth={} child={child} parent={parent} class={:08X}:{name}",
+                    depth + 1,
+                    entry.reference
+                );
+                frontier.push((parent, depth + 1));
+            }
+        }
+        let magazine_entry = package_manager().get_entry(TagHash(0x80A60B32)).unwrap();
+        let mut magazine_wireframe = parse_model_wireframe(TagHash(0x80A60B32), &magazine_entry)
+            .unwrap()
+            .1;
+        let magazine_techniques =
+            find_model_technique_entries(&cache, TagHash(0x80A60B32), &magazine_entry);
+        let magazine_textures =
+            find_model_textures(&cache, TagHash(0x80A60B32), &magazine_techniques);
+        assign_wireframe_material_textures(&mut magazine_wireframe, &cache, &magazine_textures);
+        for range in magazine_wireframe.material_ranges {
+            eprintln!(
+                "MAG_RANGE stage={:?} tech={:?} start={} count={} color={:?} control={:?} aux={:?}",
+                range.render_stage,
+                range.technique,
+                range.index_start,
+                range.index_count,
+                range.textures.color,
+                range.textures.control,
+                range.textures.aux
+            );
+        }
+        let magazine_data = package_manager().read_tag(TagHash(0x80A60B32)).unwrap();
+        for range in
+            geometry_index_range_candidates(&magazine_data, package_manager().version.endian())
+        {
+            eprintln!(
+                "MAG_CAND part={} stage={:?} tech={} variant={} start={} count={} lod={} flags={:08X} dye={}",
+                range.part_index,
+                range.render_stage,
+                range.technique,
+                range.variant_shader_index,
+                range.index_start,
+                range.index_count,
+                range.lod_category,
+                range.flags,
+                range.gear_dye_change_color_index
+            );
+        }
+        let root = TagHash(0x80A97015);
+        let mut frontier = vec![(root, 0usize)];
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(root);
+        while let Some((node, depth)) = frontier.pop() {
+            if depth >= 6 {
+                continue;
+            }
+            for child in cache.hashes.get(&node).into_iter().flat_map(|scan| {
+                scan.file_hashes
+                    .iter()
+                    .map(|reference| reference.hash)
+                    .chain(
+                        scan.file_hashes64
+                            .iter()
+                            .filter_map(|reference| tag64_to_hash32(reference.hash)),
+                    )
+            }) {
+                let Some(entry) = package_manager().get_entry(child) else {
+                    continue;
+                };
+                if !matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                    || !seen.insert(child)
+                {
+                    continue;
+                }
+                if entry.reference == CLASS_PATTERN {
+                    let nearest = pattern_nearest_geometry_tags(&cache, child);
+                    if !nearest.is_empty() {
+                        eprintln!(
+                            "ROOT_BRANCH depth={} pattern={child} geometry={:?}",
+                            depth + 1,
+                            nearest.iter().map(|tag| tag.to_string()).collect_vec()
+                        );
+                    }
+                }
+                frontier.push((child, depth + 1));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_inventory_mod_render_paths() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        for start in [TagHash(0x80A9A582), TagHash(0x80A61D82)] {
+            let mut queue = std::collections::VecDeque::from([(start, vec![start])]);
+            let mut seen = rustc_hash::FxHashSet::default();
+            seen.insert(start);
+            let mut hits = vec![];
+            while let Some((node, path)) = queue.pop_front() {
+                if path.len() > 14 {
+                    continue;
+                }
+                let Some(scan) = cache.hashes.get(&node) else {
+                    continue;
+                };
+                let neighbors = scan
+                    .references
+                    .iter()
+                    .copied()
+                    .chain(scan.file_hashes.iter().map(|reference| reference.hash))
+                    .chain(
+                        scan.file_hashes64
+                            .iter()
+                            .filter_map(|reference| tag64_to_hash32(reference.hash)),
+                    )
+                    .unique()
+                    .collect_vec();
+                for next in neighbors {
+                    if !seen.insert(next) {
+                        continue;
+                    }
+                    let Some(entry) = package_manager().get_entry(next) else {
+                        continue;
+                    };
+                    let mut next_path = path.clone();
+                    next_path.push(next);
+                    if entry.reference == CLASS_GEOMETRY_RESOURCE {
+                        hits.push(next_path.clone());
+                        if hits.len() >= 32 {
+                            break;
+                        }
+                    }
+                    queue.push_back((next, next_path));
+                }
+                if hits.len() >= 32 {
+                    break;
+                }
+            }
+            for path in hits {
+                let annotated = path
+                    .into_iter()
+                    .map(|tag| {
+                        let class = package_manager()
+                            .get_entry(tag)
+                            .map(|entry| entry.reference)
+                            .unwrap_or_default();
+                        format!("{tag}:{class:08X}")
+                    })
+                    .join(" -> ");
+                eprintln!("MOD_PATH {start}: {annotated}");
+            }
+        }
+
+        for tag in [TagHash(0x80AA0E95), TagHash(0x80A9A582)] {
+            let scan = cache.hashes.get(&tag).expect("tag scan");
+            for reference in &scan.file_hashes {
+                let class = package_manager()
+                    .get_entry(reference.hash)
+                    .map(|entry| entry.reference)
+                    .unwrap_or_default();
+                eprintln!(
+                    "MOD_DIRECT {tag} +{:X} -> {}:{class:08X}",
+                    reference.offset, reference.hash
+                );
+            }
+            let data = package_manager().read_tag(tag).expect("tag payload");
+            for array in scan_arrays(&data, package_manager().version.endian()) {
+                eprintln!(
+                    "MOD_ARRAY {tag} class={:08X} count={} data={:X} end={:X}",
+                    array.class, array.count, array.data_offset, array.end_offset
+                );
+                if array.class == 0x8080BAC2 {
+                    for (index, record) in array_records(&data, array, 0x28)
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_index, record)| {
+                            read_u32_at(record, 0x20, package_manager().version.endian())
+                                == Some(0x80A60015)
+                        })
+                    {
+                        let words = record
+                            .chunks_exact(4)
+                            .map(|bytes| read_u32(bytes, package_manager().version.endian()))
+                            .map(|raw| format!("{raw:08X}"))
+                            .collect_vec();
+                        eprintln!("MOD_ROOT_DESCRIPTOR {tag} index={index} words={words:?}");
+                    }
+                }
+            }
+        }
+        for tag in [TagHash(0x80A9BC45), TagHash(0x80A9BC46)] {
+            eprintln!(
+                "MOD_COMPONENT {tag} nearest={:?}",
+                pattern_nearest_geometry_tags(&cache, tag)
+            );
+            let scan = cache.hashes.get(&tag).expect("component scan");
+            for reference in &scan.file_hashes {
+                let class = package_manager()
+                    .get_entry(reference.hash)
+                    .map(|entry| entry.reference)
+                    .unwrap_or_default();
+                eprintln!(
+                    "MOD_COMPONENT_REF {tag} +{:X} -> {}:{class:08X}",
+                    reference.offset, reference.hash
+                );
+            }
+        }
+        for owner in cache.hashes[&TagHash(0x80A60015)]
+            .references
+            .iter()
+            .copied()
+            .filter(|tag| {
+                package_manager()
+                    .get_entry(*tag)
+                    .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
+            })
+        {
+            let data = package_manager().read_tag(owner).expect("descriptor owner");
+            for reference in cache.hashes[&owner]
+                .file_hashes
+                .iter()
+                .filter(|reference| reference.hash == TagHash(0x80A60015))
+            {
+                let end = reference.offset as usize + 4;
+                let start = end.saturating_sub(0x28);
+                let words = data[start..end]
+                    .chunks_exact(4)
+                    .map(|bytes| read_u32(bytes, package_manager().version.endian()))
+                    .map(|raw| format!("{raw:08X}"))
+                    .collect_vec();
+                eprintln!(
+                    "MOD_DESCRIPTOR_RECORD owner={owner} offset={:X} words={words:?}",
+                    reference.offset
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_magazine_component_pose() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        for (component, geometry) in [
+            (TagHash(0x80A9BC45), TagHash(0x80AA0E92)),
+            (TagHash(0x80A9A357), TagHash(0x80A61D7E)),
+            (TagHash(0x80A9B013), TagHash(0x80A9A580)),
+            (TagHash(0x80A6076C), TagHash(0x80A60B32)),
+        ] {
+            let data = package_manager().read_tag(component).expect("component");
+            let geometry_offsets = cache.hashes[&component]
+                .file_hashes
+                .iter()
+                .filter(|reference| reference.hash == geometry)
+                .map(|reference| reference.offset as usize)
+                .collect_vec();
+            let entry = package_manager()
+                .get_entry(geometry)
+                .expect("geometry entry");
+            let wireframe = parse_model_wireframe(geometry, &entry)
+                .expect("wireframe")
+                .1;
+            eprintln!(
+                "POSE component={component} geometry={geometry} offsets={geometry_offsets:X?} bounds={:?}..{:?}",
+                wireframe.min, wireframe.max
+            );
+            for array in scan_arrays(&data, package_manager().version.endian()) {
+                if geometry_offsets
+                    .iter()
+                    .any(|offset| *offset >= array.data_offset && *offset < array.end_offset)
+                {
+                    let start = array.data_offset;
+                    let end = array.end_offset.min(data.len());
+                    eprintln!(
+                        "POSE_ARRAY class={:08X} count={} data={start:X} end={end:X} bytes={}",
+                        array.class,
+                        array.count,
+                        data[start..end]
+                            .iter()
+                            .map(|byte| format!("{byte:02X}"))
+                            .join(" ")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_updated_weapon_pattern_words() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let mut wordlist = rustc_hash::FxHashMap::default();
+        quicktag_strings::wordlist::load_wordlist(|word, hash| {
+            wordlist.entry(hash).or_insert_with(|| word.to_owned());
+        });
+        for (name, model) in [
+            ("BRRT SMG", TagHash(0x80A7B0B0)),
+            ("Bully SMG", TagHash(0x80A7AD83)),
+            ("Longshot", TagHash(0x80A7AD6C)),
+            ("Misriah 2442", TagHash(0x80A7ACEC)),
+            ("V11 Punch", TagHash(0x80A7AEC7)),
+            ("V22 Volt Thrower", TagHash(0x80A7ADA4)),
+        ] {
+            let words = descendant_pattern_nodes(&cache, model, 8)
+                .into_iter()
+                .filter_map(|node| cache.hashes.get(&node))
+                .flat_map(|scan| scan.wordlist_hashes.iter().map(|word| word.hash))
+                .unique()
+                .filter_map(|hash| Some((hash, wordlist.get(&hash)?.clone())))
+                .sorted_by_key(|(_hash, word)| word.clone())
+                .collect_vec();
+            eprintln!("WEAPON_PATTERN_WORDS name={name} model={model} words={words:X?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_updated_weapon_socket_ancestry() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        for (name, model) in [
+            ("Bully SMG", TagHash(0x80A7AD83)),
+            ("Misriah 2442", TagHash(0x80A7ACEC)),
+            ("V99 Channel Rifle", TagHash(0x80A7C86E)),
+            ("Biotoxic Disinjector", TagHash(0x80A7E10C)),
+            ("BR33 Volley Rifle", TagHash(0x80A7AA89)),
+            ("BRRT SMG", TagHash(0x80A7B0B0)),
+            ("Copperhead RF", TagHash(0x80A7ADC2)),
+            ("Demolition HMG", TagHash(0x80A7B89F)),
+            ("Longshot", TagHash(0x80A7AD6C)),
+            ("M77 Assault Rifle", TagHash(0x80A7C262)),
+            ("Outland", TagHash(0x80A7C70D)),
+            ("Stryder M1T", TagHash(0x80A7B354)),
+            ("Twin Tap HBR", TagHash(0x80A7B336)),
+            ("V00 ZEUS RG", TagHash(0x80A7AD4A)),
+            ("WSTR Combat Shotgun", TagHash(0x80A7AC1F)),
+        ] {
+            let rooted = rooted_pattern_equivalent(&cache, model);
+            let ancestors = std::iter::once((0usize, model))
+                .chain(rooted.map(|root| (0, root)))
+                .chain(ancestor_pattern_roots(&cache, model))
+                .chain(
+                    rooted
+                        .into_iter()
+                        .flat_map(|root| ancestor_pattern_roots(&cache, root)),
+                )
+                .unique_by(|(_depth, candidate)| *candidate)
+                .map(|(depth, candidate)| {
+                    let tables = descendant_pattern_nodes_with_depth(&cache, candidate, 12)
+                        .into_iter()
+                        .filter_map(|(node, node_depth)| {
+                            let poses = weapon_attachment_poses(node);
+                            (!poses.is_empty()).then_some((
+                                node_depth,
+                                node,
+                                poses.iter().filter(|pose| pose.bone_index != 0).count(),
+                                poses.len(),
+                            ))
+                        })
+                        .collect_vec();
+                    (depth, candidate, tables)
+                })
+                .filter(|(_depth, _candidate, tables)| !tables.is_empty())
+                .collect_vec();
+            eprintln!(
+                "UPDATED_SOCKET_ANCESTRY name={name} model={model} rooted={rooted:?} candidates={ancestors:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_weapon_socket_resources() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let start = TagHash(0x80AA0E95);
+        let targets = [0x80809779, 0x808081DD, 0x80808B66, 0x80806D8A];
+        let mut queue = std::collections::VecDeque::from([(start, vec![start])]);
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(start);
+        while let Some((node, path)) = queue.pop_front() {
+            if path.len() > 12 || seen.len() > 50_000 {
+                continue;
+            }
+            let Some(scan) = cache.hashes.get(&node) else {
+                continue;
+            };
+            for child in scan
+                .file_hashes
+                .iter()
+                .map(|reference| reference.hash)
+                .chain(
+                    scan.file_hashes64
+                        .iter()
+                        .filter_map(|reference| tag64_to_hash32(reference.hash)),
+                )
+                .chain(scan.references.iter().copied())
+                .unique()
+            {
+                if !seen.insert(child) {
+                    continue;
+                }
+                let Some(entry) = package_manager().get_entry(child) else {
+                    continue;
+                };
+                let mut child_path = path.clone();
+                child_path.push(child);
+                if targets.contains(&entry.reference) {
+                    eprintln!(
+                        "SOCKET_RESOURCE class={:08X} path={}",
+                        entry.reference,
+                        child_path.iter().format(" -> ")
+                    );
+                }
+                queue.push_back((child, child_path));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_magazine_vertex_streams() {
+        init_goliath_test_package_manager();
+        for geometry in [TagHash(0x80A60B32), TagHash(0x80A61D7E)] {
+            let data = package_manager().read_tag(geometry).expect("geometry");
+            for array in scan_arrays(&data, package_manager().version.endian())
+                .into_iter()
+                .filter(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
+            {
+                for record in array_records(&data, array, 0x80) {
+                    let refs = (0..0x20)
+                        .step_by(4)
+                        .map(|offset| {
+                            read_u32_at(record, offset, package_manager().version.endian())
+                        })
+                        .collect_vec();
+                    eprintln!(
+                        "STREAMS geometry={geometry} layout={:?} refs={refs:08X?}",
+                        geometry_buffer_set_input_layout_id(record)
+                    );
+                    for tag in refs
+                        .into_iter()
+                        .flatten()
+                        .map(TagHash)
+                        .filter(|tag| package_manager().get_entry(*tag).is_some())
+                    {
+                        let entry = package_manager().get_entry(tag).unwrap();
+                        let payload = package_manager().read_tag(tag).unwrap_or_default();
+                        eprintln!(
+                            "STREAM tag={tag} class={:08X} len={} head={}",
+                            entry.reference,
+                            payload.len(),
+                            payload
+                                .iter()
+                                .take(32)
+                                .map(|byte| format!("{byte:02X}"))
+                                .join(" ")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_weapon_pattern_owners() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let weapon = TagHash(0x80AA0E95);
+        for owner in cache.hashes[&weapon].references.iter().copied() {
+            let entry = package_manager().get_entry(owner).expect("owner");
+            let data = package_manager().read_tag(owner).unwrap_or_default();
+            eprintln!(
+                "WEAPON_OWNER tag={owner} class={:08X} len={} refs={:?} arrays={:?}",
+                entry.reference,
+                data.len(),
+                cache
+                    .hashes
+                    .get(&owner)
+                    .into_iter()
+                    .flat_map(|scan| scan.file_hashes.iter())
+                    .map(|reference| (
+                        reference.offset,
+                        reference.hash,
+                        package_manager()
+                            .get_entry(reference.hash)
+                            .map(|entry| entry.reference)
+                    ))
+                    .collect_vec(),
+                scan_arrays(&data, package_manager().version.endian())
+                    .into_iter()
+                    .map(|array| (
+                        array.class,
+                        array.count,
+                        array.data_offset,
+                        array.end_offset
+                    ))
+                    .collect_vec()
+            );
+            eprintln!(
+                "WEAPON_OWNER_BYTES {owner} {}",
+                data.iter().map(|byte| format!("{byte:02X}")).join(" ")
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_root_hierarchy_records() {
+        init_goliath_test_package_manager();
+        let data = package_manager()
+            .read_tag(TagHash(0x80A9700D))
+            .expect("root component");
+        for offset in (0x4B0..data.len()).step_by(8) {
+            let bytes = &data[offset..(offset + 8).min(data.len())];
+            eprintln!(
+                "ROOT_WORD {offset:04X} {}",
+                bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
+            );
+        }
+        for offset in [0x188usize, 0x1B8, 0x1E8, 0x218, 0x248, 0x480] {
+            let record = &data[offset..offset + 0x30];
+            eprintln!(
+                "ROOT_RECORD {offset:04X} {:?}",
+                record
+                    .chunks_exact(4)
+                    .map(|bytes| {
+                        let raw = u32::from_le_bytes(bytes.try_into().unwrap());
+                        format!("{raw:08X}/{}", f32::from_bits(raw))
+                    })
+                    .collect_vec()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_weapon_translation_candidates() {
+        init_goliath_test_package_manager();
+        for tag in [
+            TagHash(0x80AA0E95),
+            TagHash(0x80A9BC45),
+            TagHash(0x80A9700D),
+            TagHash(0x80A97015),
+            TagHash(0x80AA30DD),
+        ] {
+            let data = package_manager().read_tag(tag).unwrap_or_default();
+            for offset in (0..data.len().saturating_sub(4)).step_by(4) {
+                let raw = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                let value = f32::from_bits(raw);
+                if value.is_finite() && (0.08..0.18).contains(&value.abs()) {
+                    eprintln!("TRANSLATION_CANDIDATE tag={tag} offset={offset:X} value={value}");
+                    if tag == TagHash(0x80A97015) {
+                        let start = offset.saturating_sub(0x40);
+                        let end = (offset + 0x44).min(data.len());
+                        eprintln!(
+                            "TRANSLATION_CONTEXT {}",
+                            data[start..end]
+                                .chunks_exact(4)
+                                .enumerate()
+                                .map(|(index, bytes)| {
+                                    let raw = u32::from_le_bytes(bytes.try_into().unwrap());
+                                    format!(
+                                        "+{:X}={raw:08X}/{}",
+                                        start + index * 4,
+                                        f32::from_bits(raw)
+                                    )
+                                })
+                                .join(" ")
+                        );
+                        for array in scan_arrays(&data, package_manager().version.endian())
+                            .into_iter()
+                            .filter(|array| {
+                                offset >= array.data_offset && offset < array.end_offset
+                            })
+                        {
+                            eprintln!(
+                                "TRANSLATION_ARRAY class={:08X} count={} data={:X} end={:X}",
+                                array.class, array.count, array.data_offset, array.end_offset
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_weapon_pattern_mod_nodes() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let mut words = rustc_hash::FxHashMap::default();
+        quicktag_strings::wordlist::load_wordlist(|word, hash| {
+            words.entry(hash).or_insert_with(|| word.to_owned());
+        });
+        if let Ok(extra_words) =
+            std::fs::read_to_string("alkahest/crates/alkahest/wordlist_channels.txt")
+        {
+            for word in extra_words.lines() {
+                words
+                    .entry(quicktag_core::util::fnv1(word.as_bytes()))
+                    .or_insert_with(|| word.to_owned());
+            }
+        }
+        for word in words.values().unique() {
+            for candidate in [
+                format!("{word}0"),
+                format!("{word}_0"),
+                format!("{word}.0"),
+                format!("parent.{word}0"),
+                format!("parent.{word}_0"),
+            ] {
+                if quicktag_core::util::fnv1(candidate.as_bytes()) == 0xD5754C50 {
+                    eprintln!("resolved D5754C50 channel prefix: {candidate}");
+                }
+            }
+        }
+
+        for selected in [
+            TagHash(0x80B6CD7A),
+            TagHash(0x80AA03CA),
+            TagHash(0x80AA0E95),
+            TagHash(0x80AA0ECF),
+            TagHash(0x80A9A582),
+            TagHash(0x80A61D82),
+        ] {
+            let mut ancestors = vec![selected];
+            let mut seen = rustc_hash::FxHashSet::default();
+            let mut roots = vec![];
+            seen.insert(selected);
+            while let Some(child) = ancestors.pop() {
+                for parent in cache
+                    .hashes
+                    .get(&child)
+                    .into_iter()
+                    .flat_map(|scan| scan.references.iter().copied())
+                {
+                    let class = package_manager()
+                        .get_entry(parent)
+                        .map(|entry| entry.reference)
+                        .unwrap_or_default();
+                    if matches!(class, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                        && seen.insert(parent)
+                    {
+                        if class == CLASS_PATTERN {
+                            roots.push(parent);
+                        }
+                        ancestors.push(parent);
+                    }
+                }
+            }
+            roots.sort();
+            roots.dedup();
+            eprintln!("selected={selected} roots={roots:?}");
+
+            for root in roots {
+                let mut frontier = vec![root];
+                let mut visited = rustc_hash::FxHashSet::default();
+                while let Some(node) = frontier.pop() {
+                    if !visited.insert(node) {
+                        continue;
+                    }
+                    let Some(entry) = package_manager().get_entry(node) else {
+                        continue;
+                    };
+                    let scan = cache.hashes.get(&node);
+                    let child_classes = scan
+                        .into_iter()
+                        .flat_map(|scan| {
+                            scan.file_hashes
+                                .iter()
+                                .map(|reference| reference.hash)
+                                .chain(
+                                    scan.file_hashes64
+                                        .iter()
+                                        .filter_map(|reference| tag64_to_hash32(reference.hash)),
+                                )
+                        })
+                        .filter_map(|child| {
+                            package_manager()
+                                .get_entry(child)
+                                .map(|entry| (entry.reference, child))
+                        })
+                        .fold(
+                            rustc_hash::FxHashMap::<u32, rustc_hash::FxHashSet<TagHash>>::default(),
+                            |mut classes, (class, child)| {
+                                classes.entry(class).or_default().insert(child);
+                                classes
+                            },
+                        );
+                    for config in child_classes
+                        .get(&0x8080BA53)
+                        .into_iter()
+                        .flat_map(|tags| tags.iter().copied())
+                    {
+                        let data = package_manager().read_tag(config).unwrap_or_default();
+                        let config_scan = cache.hashes.get(&config);
+                        let config_words = config_scan
+                            .into_iter()
+                            .flat_map(|scan| scan.wordlist_hashes.iter())
+                            .filter_map(|hash| {
+                                words
+                                    .get(&hash.hash)
+                                    .map(|word| (hash.offset, word.clone()))
+                            })
+                            .collect_vec();
+                        let refs = config_scan
+                            .into_iter()
+                            .flat_map(|scan| scan.file_hashes.iter())
+                            .map(|reference| {
+                                let class = package_manager()
+                                    .get_entry(reference.hash)
+                                    .map(|entry| entry.reference)
+                                    .unwrap_or_default();
+                                (reference.offset, reference.hash, class)
+                            })
+                            .collect_vec();
+                        eprintln!(
+                            "    config={config} len={} words={config_words:?} refs={refs:?} arrays={:?}",
+                            data.len(),
+                            scan_arrays(&data, package_manager().version.endian())
+                                .into_iter()
+                                .map(|array| (
+                                    array.class,
+                                    array.count,
+                                    array.data_offset,
+                                    array.end_offset
+                                ))
+                                .collect_vec(),
+                        );
+                        if matches!(config.0, 0x80A9BDA3 | 0x80A9BB64) {
+                            for (line, bytes) in data.chunks(16).enumerate() {
+                                eprintln!(
+                                    "      {config} {:04X}: {}",
+                                    line * 16,
+                                    bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
+                                );
+                            }
+                        }
+                    }
+                    let names = scan
+                        .into_iter()
+                        .flat_map(|scan| scan.wordlist_hashes.iter())
+                        .filter_map(|hash| words.get(&hash.hash).map(|word| (hash.offset, word)))
+                        .filter(|(_offset, word)| {
+                            let word = word.to_ascii_lowercase();
+                            word.contains("mod")
+                                || word.contains("optic")
+                                || word.contains("muzzle")
+                                || word.contains("magazine")
+                                || word.contains("grip")
+                                || word.contains("socket")
+                                || word.contains("attach")
+                                || word.contains("variant")
+                        })
+                        .collect_vec();
+                    let children = scan
+                        .into_iter()
+                        .flat_map(|scan| scan.file_hashes.iter().map(|reference| reference.hash))
+                        .filter(|child| {
+                            package_manager().get_entry(*child).is_some_and(|entry| {
+                                matches!(
+                                    entry.reference,
+                                    CLASS_PATTERN
+                                        | CLASS_PATTERN_COMPONENT
+                                        | CLASS_GEOMETRY_RESOURCE
+                                )
+                            })
+                        })
+                        .unique()
+                        .collect_vec();
+                    let arrays = package_manager()
+                        .read_tag(node)
+                        .ok()
+                        .map(|data| {
+                            scan_arrays(&data, package_manager().version.endian())
+                                .into_iter()
+                                .map(|array| {
+                                    (
+                                        array.class,
+                                        array.count,
+                                        array.data_offset,
+                                        array.end_offset,
+                                    )
+                                })
+                                .collect_vec()
+                        })
+                        .unwrap_or_default();
+                    if matches!(node.0, 0x80B6CD7B | 0x80B6D76B) {
+                        let data = package_manager().read_tag(node).unwrap_or_default();
+                        for array in scan_arrays(&data, package_manager().version.endian())
+                            .into_iter()
+                            .filter(|array| {
+                                matches!(
+                                    array.class,
+                                    0x8080AF13 | 0x8080AF14 | 0x8080BF07 | 0x8080AF7B
+                                )
+                            })
+                        {
+                            let stride = match array.class {
+                                0x8080AF13 => 0x30,
+                                0x8080AF14 => 0x28,
+                                0x8080BF07 => 0x10,
+                                0x8080AF7B => 0x4,
+                                _ => unreachable!(),
+                            };
+                            for (index, record) in
+                                array_records(&data, array, stride).into_iter().enumerate()
+                            {
+                                let fields = record
+                                    .chunks_exact(4)
+                                    .enumerate()
+                                    .map(|(field, bytes)| {
+                                        let value =
+                                            read_u32(bytes, package_manager().version.endian());
+                                        let meaning =
+                                            words.get(&value).cloned().unwrap_or_default();
+                                        format!("+{:02X}={value:08X}:{meaning}", field * 4)
+                                    })
+                                    .collect_vec();
+                                eprintln!(
+                                    "    selector node={node} class={:08X} index={index}: {fields:?}",
+                                    array.class
+                                );
+                            }
+                        }
+                    }
+                    if node == root {
+                        let data = package_manager().read_tag(node).unwrap_or_default();
+                        let mut descriptors = rustc_hash::FxHashSet::default();
+                        for array in scan_arrays(&data, package_manager().version.endian())
+                            .into_iter()
+                            .filter(|array| {
+                                matches!(array.class, 0x8080BA61 | 0x8080BAC2 | 0x8080BAC0)
+                            })
+                        {
+                            let stride = match array.class {
+                                0x8080BA61 => 0x38,
+                                0x8080BAC2 => 0x28,
+                                0x8080BAC0 => 0x18,
+                                _ => unreachable!(),
+                            };
+                            for (index, record) in
+                                array_records(&data, array, stride).into_iter().enumerate()
+                            {
+                                if array.class == 0x8080BAC2 {
+                                    if let Some(tag) = read_u32_at(
+                                        record,
+                                        0x20,
+                                        package_manager().version.endian(),
+                                    )
+                                    .map(TagHash)
+                                    .filter(|tag| {
+                                        package_manager()
+                                            .get_entry(*tag)
+                                            .is_some_and(|entry| entry.reference == 0x8080BAF8)
+                                    }) {
+                                        descriptors.insert(tag);
+                                    }
+                                }
+                                let fields = record
+                                    .chunks_exact(4)
+                                    .enumerate()
+                                    .map(|(field, bytes)| {
+                                        let value =
+                                            read_u32(bytes, package_manager().version.endian());
+                                        let meaning = words
+                                            .get(&value)
+                                            .cloned()
+                                            .or_else(|| {
+                                                package_manager().get_entry(TagHash(value)).map(
+                                                    |entry| format!("tag:{:08X}", entry.reference),
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        format!("+{:02X}={value:08X}:{meaning}", field * 4)
+                                    })
+                                    .collect_vec();
+                                eprintln!(
+                                    "    root_record root={root} class={:08X} index={index}: {fields:?}",
+                                    array.class
+                                );
+                            }
+                        }
+                        for descriptor in descriptors.into_iter().sorted() {
+                            let payload =
+                                package_manager().read_tag(descriptor).unwrap_or_default();
+                            let names = cache
+                                .hashes
+                                .get(&descriptor)
+                                .into_iter()
+                                .flat_map(|scan| scan.wordlist_hashes.iter())
+                                .filter_map(|hash| {
+                                    words
+                                        .get(&hash.hash)
+                                        .map(|word| (hash.offset, word.clone()))
+                                })
+                                .collect_vec();
+                            eprintln!(
+                                "    descriptor root={root} tag={descriptor} names={names:?} bytes={}",
+                                payload.iter().map(|byte| format!("{byte:02X}")).join(" ")
+                            );
+                        }
+                    }
+                    eprintln!(
+                        "  node={node} class={:08X} len={} names={names:?} children={children:?} child_classes={child_classes:?} arrays={arrays:?}",
+                        entry.reference, entry.file_size,
+                    );
+                    frontier.extend(children.iter().copied().filter(|child| {
+                        package_manager().get_entry(*child).is_some_and(|entry| {
+                            matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+                        })
+                    }));
+                }
+                let geometry = pattern_geometry_tags(&cache, root);
+                eprintln!("  root={root} geometry_count={}", geometry.len());
+                for tag in geometry {
+                    let transform = package_manager().read_tag(tag).ok().and_then(|data| {
+                        read_geometry_position_transform(&data, package_manager().version.endian())
+                    });
+                    eprintln!("    geometry={tag} transform={transform:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -3555,6 +9998,145 @@ mod tests {
         assert_eq!(header.unk1, 0x1234);
         assert_eq!(header.data_size, 0x40);
         assert_eq!(header.deadbeef, 0xDEADBEEF);
+    }
+
+    #[test]
+    fn expands_triangle_strips_across_restart_indices() {
+        assert_eq!(
+            preview_triangles_from_indices(&[0, 1, 2, 3, 0xFFFF, 4, 5, 6], 5),
+            vec![0, 1, 2, 2, 1, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn recognizes_all_alkahest_high_detail_lods() {
+        for lod in [0, 1, 2, 3, 10] {
+            assert!(is_highest_detail_lod(lod));
+        }
+        for lod in [4, 7, 8, 9] {
+            assert!(!is_highest_detail_lod(lod));
+        }
+    }
+
+    #[test]
+    fn selects_visible_marathon_render_stages() {
+        let boundaries = [0, 6, 6, 9, 9, 12, 12, 15, 18, 18];
+        assert_eq!(
+            preview_part_indices_from_boundaries(&boundaries, 18),
+            Some((0..9).chain(12..18).collect())
+        );
+        assert!(preview_part_indices_from_boundaries(&[0, 3, 2], 3).is_none());
+
+        let stages = preview_part_stages_from_boundaries(&boundaries, 18).expect("stage map");
+        assert_eq!(stages[0], Some(0));
+        assert_eq!(stages[4], Some(0));
+        assert_eq!(stages[8], Some(2));
+        assert_eq!(stages[12], Some(6));
+        assert_eq!(stages[14], Some(6));
+        assert_eq!(stages[15], Some(7));
+        assert_eq!(stages[10], None);
+    }
+
+    #[test]
+    fn applies_geometry_position_dequantization() {
+        let mut wireframe = WireframePreview {
+            source: "test".into(),
+            position_format: "i16x4.xyz @ +0",
+            uv_format: None,
+            vertices: vec![[-32767.0, 0.0, 32767.0]],
+            normals: None,
+            procedural_positions: Some(vec![[-32767.0, 0.0, 32767.0]]),
+            procedural_normals: None,
+            tangents: None,
+            uvs: None,
+            normal_format: None,
+            tangent_format: None,
+            indices: vec![],
+            material_ranges: vec![],
+            min: [-32767.0, 0.0, 32767.0],
+            max: [-32767.0, 0.0, 32767.0],
+            vertex_count_total: 1,
+            index_count_total: 0,
+        };
+        apply_geometry_position_transform(
+            &mut wireframe,
+            GeometryPositionTransform {
+                scale: [2.0, 4.0, 8.0],
+                offset: [10.0, 20.0, 30.0],
+            },
+        );
+        assert_eq!(wireframe.vertices, vec![[8.0, 20.0, 38.0]]);
+        assert_eq!(
+            wireframe.procedural_positions,
+            Some(vec![[8.0, 20.0, 38.0]])
+        );
+        assert_eq!(wireframe.min, [8.0, 20.0, 38.0]);
+    }
+
+    #[test]
+    fn socket_pose_preserves_gear_dye_procedural_coordinates() {
+        let geometry = TagHash(1);
+        let source = MeshSourcePreview {
+            kind: "test",
+            buffer_index: 0,
+            technique: None,
+            index_start: 0,
+            index_count: 0,
+            primitive_type: 0,
+            lod_category: 0,
+            input_layout_index: None,
+            index_buffer: TagHash(0),
+            vertex0_buffer: TagHash(0),
+            vertex1_buffer: TagHash(0),
+            color_buffer: TagHash(0),
+            uv_transform: None,
+            shader_constants: vec![],
+        };
+        let wireframe = WireframePreview {
+            source: "test".into(),
+            position_format: "f32x3",
+            uv_format: None,
+            vertices: vec![[1.0, 0.0, 0.0]],
+            normals: Some(vec![[1.0, 0.0, 0.0]]),
+            procedural_positions: None,
+            procedural_normals: None,
+            tangents: None,
+            uvs: None,
+            normal_format: None,
+            tangent_format: None,
+            indices: vec![],
+            material_ranges: vec![],
+            min: [1.0, 0.0, 0.0],
+            max: [1.0, 0.0, 0.0],
+            vertex_count_total: 1,
+            index_count_total: 0,
+        };
+        let half_sqrt = std::f32::consts::FRAC_1_SQRT_2;
+        let attachment = ResolvedWeaponModAttachment {
+            geometry,
+            pose: WeaponModAttachmentPose {
+                family_id: 0,
+                variant_id: 0,
+                bone_index: 0,
+                rotation: [0.0, 0.0, half_sqrt, half_sqrt],
+                translation: [5.0, 6.0, 7.0],
+            },
+            rarity: Some(WeaponModRarity::Enhanced),
+            unique_id: 0.25,
+        };
+        let mut parts = vec![(geometry, source, wireframe)];
+
+        apply_weapon_mod_attachment_poses(&mut parts, &[attachment]);
+
+        let transformed = &parts[0].2;
+        for (actual, expected) in transformed.vertices[0].into_iter().zip([5.0, 7.0, 7.0]) {
+            assert!((actual - expected).abs() < 0.000_01);
+        }
+        assert_eq!(
+            transformed.procedural_positions,
+            Some(vec![[1.0, 0.0, 0.0]])
+        );
+        assert_eq!(transformed.procedural_normals, Some(vec![[1.0, 0.0, 0.0]]));
     }
 
     #[test]
@@ -3677,6 +10259,34 @@ mod tests {
     }
 
     #[test]
+    fn decodes_and_normalizes_packed_snorm_tangent() {
+        let mut data = vec![0u8; 0x10];
+        data[0x04..0x06].copy_from_slice(&0x4000i16.to_le_bytes());
+        data[0x06..0x08].copy_from_slice(&0i16.to_le_bytes());
+        data[0x08..0x0a].copy_from_slice(&0x4000i16.to_le_bytes());
+        data[0x0a..0x0c].copy_from_slice(&(-1i16).to_le_bytes());
+
+        let vectors = decode_input_layout_vectors(
+            &data,
+            0x10,
+            Endian::Little,
+            InputLayoutVector {
+                buffer_index: 0,
+                offset: 4,
+                format: InputLayoutFormat::R16G16B16A16Snorm,
+            },
+            1,
+        )
+        .expect("packed tangent");
+        let tangent = normalize_input_layout_vector(vectors[0], true).expect("unit tangent");
+
+        assert!((tangent[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+        assert_eq!(tangent[1], 0.0);
+        assert!((tangent[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+        assert_eq!(tangent[3], -1.0);
+    }
+
+    #[test]
     fn propagates_uv_transform_to_shader_constant() {
         let constants = shader_constants_from_uv_transform(Some(UvTransformPreview {
             scale: [2.0, 3.0],
@@ -3696,5 +10306,630 @@ mod tests {
         mesh[0x64] = 0x07;
 
         assert_eq!(geometry_buffer_set_input_layout_id(&mesh), Some(7));
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_weapon_attachment_channel_sources() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let endian = package_manager().version.endian();
+        let needles = [
+            0xA500D3AF_u32,
+            0x6F1709EA,
+            0x840253AF,
+            0x840253A1,
+            0x840254D0,
+            0xDECA4D7E,
+            0x7B2426A3,
+            0x040174F7,
+            0xC8939EBF,
+            0xC8939EBA,
+            0xC8939EBC,
+            0xC8939EBD,
+            0xC8939EBB,
+            0xC8939EB8,
+        ];
+        for root in [
+            TagHash(0x80A7C7B5),
+            TagHash(0x80A7D43D),
+            TagHash(0x80A60D38),
+            TagHash(0x80A61CF0),
+        ] {
+            for node in descendant_pattern_nodes(&cache, root, 12) {
+                let Ok(data) = package_manager().read_tag(node) else {
+                    continue;
+                };
+                for offset in (0..data.len().saturating_sub(4)).step_by(4) {
+                    let Some(value) = read_u32_at(&data, offset, endian) else {
+                        continue;
+                    };
+                    if needles.contains(&value) {
+                        eprintln!(
+                            "ATTACHMENT_CHANNEL_HIT root={root} node={node} class={:08X} offset=0x{offset:X} value={value:08X} words={:?}",
+                            package_manager()
+                                .get_entry(node)
+                                .map(|entry| entry.reference)
+                                .unwrap_or_default(),
+                            (offset.saturating_sub(0x20)..(offset + 0x40).min(data.len()))
+                                .step_by(4)
+                                .filter_map(|field| read_u32_at(&data, field, endian))
+                                .map(|word| format!("{word:08X}"))
+                                .collect_vec()
+                        );
+                    }
+                }
+            }
+        }
+        for root in [
+            TagHash(0x80A60D38),
+            TagHash(0x80A60C4F),
+            TagHash(0x80A61CF0),
+            TagHash(0x80A6071A),
+        ] {
+            let root_data = package_manager().read_tag(root).expect("mod pattern root");
+            for array in scan_arrays(&root_data, endian)
+                .into_iter()
+                .filter(|array| array.class == 0x8080BA61)
+            {
+                for (index, record) in array_records(&root_data, array, 0x38)
+                    .into_iter()
+                    .enumerate()
+                {
+                    eprintln!(
+                        "MOD_ROOT_BINDING root={root} index={index} words={:?}",
+                        record
+                            .chunks_exact(4)
+                            .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
+                            .collect_vec()
+                    );
+                }
+            }
+            for node in descendant_pattern_nodes(&cache, root, 8) {
+                let Ok(data) = package_manager().read_tag(node) else {
+                    continue;
+                };
+                for array in scan_arrays(&data, endian)
+                    .into_iter()
+                    .filter(|array| array.class == 0x8080AF86)
+                {
+                    for (channel_index, record) in
+                        array_records(&data, array, 0x70).into_iter().enumerate()
+                    {
+                        let Some(parameter) = read_u32_at(record, 0, endian) else {
+                            continue;
+                        };
+                        if [
+                            0x5A116CBA_u32,
+                            0xF714F29F,
+                            0x3AF60B50,
+                            0xC17A8BB6,
+                            0xC8939EBF,
+                            0xC8939EBA,
+                            0xC8939EBC,
+                            0xC8939EBD,
+                            0xC8939EBB,
+                            0xC8939EB8,
+                        ]
+                        .contains(&parameter)
+                        {
+                            eprintln!(
+                                "MOD_CHANNEL_RECORD root={root} node={node} index={channel_index} parameter={parameter:08X} words={:?}",
+                                record
+                                    .chunks_exact(4)
+                                    .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
+                                    .collect_vec()
+                            );
+                        }
+                    }
+                }
+                let arrays = scan_arrays(&data, endian);
+                let vectors = arrays
+                    .iter()
+                    .copied()
+                    .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
+                    .map(|array| read_serialized_dye_vector(&data, array, endian))
+                    .collect::<Option<Vec<_>>>();
+                if let Some(vectors) = vectors {
+                    for array in arrays
+                        .into_iter()
+                        .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+                    {
+                        for record in array_records(&data, array, 0x0c) {
+                            let Some(parameter) = read_u32_at(record, 4, endian) else {
+                                continue;
+                            };
+                            let Some(index) = read_u32_at(record, 8, endian)
+                                .and_then(|index| usize::try_from(index).ok())
+                            else {
+                                continue;
+                            };
+                            if let Some(value) = vectors.get(index) {
+                                eprintln!(
+                                    "MOD_LOCAL_VECTOR root={root} node={node} parameter={parameter:08X} value={value:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_quickdraw_grip_age_material() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let root = TagHash(0x80A601B6);
+        let endian = package_manager().version.endian();
+        let mut words = rustc_hash::FxHashMap::default();
+        quicktag_strings::wordlist::load_wordlist(|word, hash| {
+            words.entry(hash).or_insert_with(|| word.to_owned());
+        });
+
+        eprintln!("QUICKDRAW root={root}");
+        for node in descendant_pattern_nodes(&cache, root, 10) {
+            let entry = package_manager().get_entry(node).expect("pattern node");
+            let data = package_manager().read_tag(node).expect("pattern node data");
+            let arrays = scan_arrays(&data, endian);
+            eprintln!(
+                "  NODE tag={node} class={:08X} len=0x{:X} arrays={:?}",
+                entry.reference,
+                data.len(),
+                arrays
+                    .iter()
+                    .map(|array| (array.class, array.count, array.data_offset))
+                    .collect_vec()
+            );
+
+            for array in arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == 0x8080AF86)
+            {
+                for (index, record) in array_records(&data, array, 0x70).into_iter().enumerate() {
+                    let parameter = read_u32_at(record, 0, endian).unwrap_or_default();
+                    let record_offset = array.data_offset + index * 0x70;
+                    let bytecode =
+                        read_array(&data, record_offset + 0x08, 1, endian).unwrap_or_default();
+                    let constants = read_array(&data, record_offset + 0x18, 0x10, endian)
+                        .unwrap_or_default()
+                        .chunks_exact(0x10)
+                        .filter_map(|constant| read_vec4_f32(constant, 0, endian))
+                        .collect_vec();
+                    eprintln!(
+                        "    OBJECT_CHANNEL index={index} parameter={parameter:08X} name={:?} bytecode={} constants={constants:?}",
+                        words.get(&parameter),
+                        bytecode.iter().map(|byte| format!("{byte:02X}")).join(" ")
+                    );
+                }
+            }
+
+            let vectors = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
+                .map(|array| read_serialized_dye_vector(&data, array, endian))
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default();
+            for array in arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+            {
+                for record in array_records(&data, array, 0x0c) {
+                    let parameter = read_u32_at(record, 4, endian).unwrap_or_default();
+                    let value = read_u32_at(record, 8, endian)
+                        .and_then(|index| vectors.get(index as usize))
+                        .copied();
+                    eprintln!(
+                        "    LOCAL_VECTOR parameter={parameter:08X} name={:?} value={value:?}",
+                        words.get(&parameter),
+                    );
+                }
+            }
+        }
+
+        let geometries = pattern_nearest_geometry_tags(&cache, root);
+        eprintln!("  GEOMETRIES {geometries:?}");
+        for geometry in geometries {
+            let entry = package_manager().get_entry(geometry).expect("mod geometry");
+            let techniques = find_model_technique_entries(&cache, geometry, &entry);
+            let textures = find_model_textures(&cache, geometry, &techniques);
+            let (_source, mut wireframe) =
+                parse_model_wireframe(geometry, &entry).expect("mod wireframe");
+            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+            eprintln!(
+                "  GEOMETRY {geometry} techniques={:?} textures={:?}",
+                techniques.iter().map(|(tag, _)| *tag).collect_vec(),
+                textures.iter().map(|(tag, _)| *tag).collect_vec(),
+            );
+            for range in &wireframe.material_ranges {
+                let Some(technique) = range.technique else {
+                    continue;
+                };
+                eprintln!(
+                    "    RANGE indices={}+{} dye={:?} technique={technique} material={:?}",
+                    range.index_start,
+                    range.index_count,
+                    range.gear_dye_change_color_index,
+                    range.textures,
+                );
+                let technique_entry = package_manager().get_entry(technique).expect("technique");
+                let technique_data = package_manager()
+                    .read_tag(technique)
+                    .expect("technique data");
+                for binding in texture_bindings_for_technique(&technique_entry, &technique_data)
+                    .into_iter()
+                    .filter(|binding| binding.stage == "PS")
+                {
+                    let descriptor = Texture::load_data_d2(binding.tag, false)
+                        .map(|(desc, _, _)| {
+                            format!("{}x{} {:?}", desc.width, desc.height, desc.format)
+                        })
+                        .unwrap_or_else(|_| "non-texture".to_owned());
+                    eprintln!("      PS t{}={} {descriptor}", binding.slot, binding.tag);
+                }
+                let preview =
+                    crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
+                        .expect("technique preview");
+                let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+                if let Some(pixel) = preview.stages.iter().find(|stage| stage.stage == "PS") {
+                    eprintln!(
+                        "      SHADER {:?} bindings={:?} expressions={:?} inline={:?}",
+                        pixel.shader,
+                        pixel
+                            .bytecode
+                            .bindings
+                            .iter()
+                            .map(|binding| (&binding.kind, binding.slot, &binding.source))
+                            .collect_vec(),
+                        pixel
+                            .bytecode
+                            .expressions
+                            .iter()
+                            .map(|expression| (&expression.target, &expression.expression))
+                            .collect_vec(),
+                        pixel.constants,
+                    );
+                    for age in -2..=6 {
+                        let channels = std::collections::HashMap::from([
+                            (0x138D_E801, [age as f32; 4]),
+                            (0xD358_3E54, [0.0; 4]),
+                        ]);
+                        let (_bindings, expressions) =
+                            crate::material::interpret_tfx_stack_with_object_channels(
+                                &pixel.bytecode.ops,
+                                &pixel.constants,
+                                &channels,
+                            );
+                        eprintln!(
+                            "      AGE {age}: {:?}",
+                            expressions
+                                .iter()
+                                .filter(|expression| {
+                                    matches!(
+                                        expression.target.as_str(),
+                                        "output[24]" | "output[42]" | "output[49]"
+                                    )
+                                })
+                                .map(|expression| (&expression.target, expression.value))
+                                .collect_vec()
+                        );
+                    }
+                    for expression in pixel.bytecode.expressions.iter().filter(|expression| {
+                        matches!(
+                            expression.target.as_str(),
+                            "output[24]" | "output[42]" | "output[49]"
+                        )
+                    }) {
+                        let Some(index) = pixel
+                            .bytecode
+                            .ops
+                            .iter()
+                            .position(|op| op.offset == expression.op_offset)
+                        else {
+                            continue;
+                        };
+                        eprintln!("      AGE_OUTPUT_OPS target={}:", expression.target);
+                        for source in &pixel.bytecode.ops[index.saturating_sub(12)..=index] {
+                            eprintln!(
+                                "        {:04X} {:02X} {} {}",
+                                source.offset, source.opcode, source.name, source.detail
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn resolves_authored_three_tier_weapon_mod_condition() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+
+        for (root, expected_technique) in [
+            (TagHash(0x80A601B6), TagHash(0x80A601A2)),
+            (TagHash(0x80A60313), TagHash(0x80A602FF)),
+        ] {
+            let mut wear_materials = Vec::new();
+            let mut resolved_techniques = Vec::new();
+            for geometry in pattern_nearest_geometry_tags(&cache, root) {
+                let entry = package_manager().get_entry(geometry).expect("mod geometry");
+                let technique_entries = find_model_technique_entries(&cache, geometry, &entry);
+                let textures = find_model_textures(&cache, geometry, &technique_entries);
+                let (_source, mut wireframe) =
+                    parse_model_wireframe(geometry, &entry).expect("mod wireframe");
+                assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+                resolved_techniques.extend(
+                    wireframe
+                        .material_ranges
+                        .iter()
+                        .filter_map(|range| range.technique),
+                );
+                wear_materials.extend(
+                    wireframe
+                        .material_ranges
+                        .into_iter()
+                        .filter_map(|range| range.textures.mod_wear),
+                );
+            }
+
+            assert!(
+                resolved_techniques.contains(&expected_technique),
+                "{root} resolved {resolved_techniques:?}, expected own material {expected_technique}"
+            );
+            assert!(!wear_materials.is_empty(), "{root} has no wear material");
+            for wear in wear_materials {
+                assert_eq!(wear.scratches_projection, [4.0, -4.0, 0.0, 0.0]);
+                assert_eq!(wear.scratches_remap_base, [0.0, 0.0, 0.0, 1.0]);
+                assert_eq!(
+                    wear.scratches_remap_scale,
+                    [0.21404114, 0.21404114, 0.21404114, 0.0]
+                );
+                assert_eq!(wear.condition_blend, 0.5);
+                assert_eq!(wear.grime_projection_unique_delta, [0.0, 0.0, 1.0, 1.0]);
+                assert_eq!(wear.damage_projection_unique_delta, [0.0, 0.0, 1.0, 1.0]);
+                assert_eq!(
+                    wear.condition_controls,
+                    [[1.0, 1.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],
+                    "{root} must use authored Enhanced/Deluxe/Superior TFX outputs"
+                );
+                for projection in [
+                    wear.scratches_projection,
+                    wear.grime_projection,
+                    wear.damage_projection,
+                ] {
+                    assert!(projection.iter().all(|value| value.is_finite()));
+                    assert!(projection[0].abs() > 0.05 && projection[1].abs() > 0.05);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_weapon_mod_unique_id_projection() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+
+        for (root, expected_technique) in [
+            (TagHash(0x80A601B6), TagHash(0x80A601A2)),
+            (TagHash(0x80A60313), TagHash(0x80A602FF)),
+        ] {
+            let geometry = pattern_nearest_geometry_tags(&cache, root)
+                .into_iter()
+                .next()
+                .expect("mod geometry");
+            let geometry_entry = package_manager()
+                .get_entry(geometry)
+                .expect("geometry entry");
+            let techniques = find_model_technique_entries(&cache, geometry, &geometry_entry);
+            assert!(techniques.iter().any(|(tag, _)| *tag == expected_technique));
+            let technique_entry = package_manager()
+                .get_entry(expected_technique)
+                .expect("technique entry");
+            let technique_data = package_manager()
+                .read_tag(expected_technique)
+                .expect("technique data");
+            let preview = MaterialTagPreview::load(&technique_entry, &technique_data)
+                .expect("technique preview");
+            let MaterialPreviewKind::Technique(preview) = preview.kind;
+            let pixel = preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .expect("pixel stage");
+
+            eprintln!("UNIQUE_ID root={root} technique={expected_technique}");
+            for seed in [0.0_f32, 0.125, 0.25, 0.5, 0.75, 1.0] {
+                let channels = std::collections::HashMap::from([
+                    (WEAPON_MOD_AGE_CHANNEL, [1.0; 4]),
+                    (UNIQUE_ID_CHANNEL, [seed; 4]),
+                ]);
+                let (_bindings, expressions) = interpret_tfx_stack_with_object_channels(
+                    &pixel.bytecode.ops,
+                    &pixel.constants,
+                    &channels,
+                );
+                let values = expressions
+                    .iter()
+                    .filter(|expression| {
+                        matches!(
+                            expression.target.as_str(),
+                            "output[39]"
+                                | "output[40]"
+                                | "output[24]"
+                                | "output[42]"
+                                | "output[49]"
+                        )
+                    })
+                    .map(|expression| (&expression.target, expression.value))
+                    .collect_vec();
+                eprintln!("  seed={seed:.3} {values:?}");
+            }
+        }
+
+        for technique in [
+            TagHash::new(0x130, 7672),
+            TagHash::new(0x130, 3910),
+            TagHash::new(0x130, 3194),
+            TagHash::new(0x130, 4713),
+            TagHash::new(0x130, 954),
+        ] {
+            let entry = package_manager()
+                .get_entry(technique)
+                .expect("technique entry");
+            let data = package_manager()
+                .read_tag(technique)
+                .expect("technique data");
+            let bindings = texture_bindings_for_technique(&entry, &data);
+            let preview = MaterialTagPreview::load(&entry, &data).expect("technique preview");
+            let MaterialPreviewKind::Technique(preview) = preview.kind;
+            let pixel = preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .expect("pixel stage");
+            eprintln!(
+                "ALT_WEAR technique={technique} shader={:?} bindings={bindings:?} inline_len={} c14={:?} c15={:?} c16={:?} c50={:?}",
+                pixel.shader,
+                pixel.inline_constants.len(),
+                pixel.inline_constants.get(14),
+                pixel.inline_constants.get(15),
+                pixel.inline_constants.get(16),
+                pixel.inline_constants.get(50),
+            );
+            let age_targets = pixel
+                .bytecode
+                .expressions
+                .iter()
+                .filter(|expression| expression.expression.contains("object_channel(0x138DE801)"))
+                .filter_map(|expression| {
+                    expression
+                        .target
+                        .strip_prefix("output[")?
+                        .strip_suffix(']')?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .collect_vec();
+            if let [first, _, third] = age_targets.as_slice() {
+                eprintln!(
+                    "  dynamic_inline scratch={:?} remap_base={:?} remap_scale={:?} blend={:?}",
+                    pixel.inline_constants.get(first.saturating_sub(10)),
+                    pixel.inline_constants.get(first.saturating_sub(9)),
+                    pixel.inline_constants.get(first.saturating_sub(8)),
+                    pixel.inline_constants.get(third + 1),
+                );
+            }
+            eprintln!(
+                "  age_expressions={:?}",
+                pixel
+                    .bytecode
+                    .expressions
+                    .iter()
+                    .filter(|expression| {
+                        expression.expression.contains("object_channel(0x138DE801)")
+                            || expression.expression.contains("object_channel(0xD3583E54)")
+                    })
+                    .collect_vec()
+            );
+            for tier in [1.0_f32, 2.0, 3.0] {
+                let channels = std::collections::HashMap::from([
+                    (WEAPON_MOD_AGE_CHANNEL, [tier; 4]),
+                    (UNIQUE_ID_CHANNEL, [0.25; 4]),
+                ]);
+                let (_bindings, expressions) = interpret_tfx_stack_with_object_channels(
+                    &pixel.bytecode.ops,
+                    &pixel.constants,
+                    &channels,
+                );
+                let values = expressions
+                    .iter()
+                    .filter(|expression| {
+                        matches!(
+                            expression.target.as_str(),
+                            "output[24]"
+                                | "output[39]"
+                                | "output[40]"
+                                | "output[42]"
+                                | "output[49]"
+                        )
+                    })
+                    .map(|expression| (&expression.target, expression.value))
+                    .collect_vec();
+                eprintln!("  tier={tier} {values:?}");
+            }
+            eprintln!(
+                "  wear={:?}",
+                weapon_mod_wear_material(technique, &bindings)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages and GPU"]
+    fn exports_quickdraw_grip_age_textures() {
+        init_goliath_test_package_manager();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("GPU adapter");
+        let required_features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features,
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let target_format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let renderer = eframe::egui_wgpu::Renderer::new(
+            &device,
+            target_format,
+            eframe::egui_wgpu::RendererOptions::default(),
+        );
+        let render_state = eframe::egui_wgpu::RenderState {
+            adapter,
+            available_adapters: vec![],
+            device,
+            queue,
+            target_format,
+            renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
+        };
+
+        let textures = [
+            TagHash(0x80A61633),
+            TagHash(0x80A615D5),
+            TagHash(0x80A4050F),
+            TagHash(0x80A61670),
+            TagHash(0x80A60055),
+            TagHash(0x80A6149D),
+            TagHash(0x80A61508),
+            TagHash(0x80A6149F),
+            TagHash(0x80A46D44),
+        ];
+        let tile = 256_u32;
+        let columns = 3_u32;
+        let rows = textures.len().div_ceil(columns as usize) as u32;
+        let mut sheet = image::RgbaImage::new(columns * tile, rows * tile);
+        let output = std::path::Path::new("target/quicktag-mod-age-probe");
+        std::fs::create_dir_all(output).expect("probe directory");
+        for (index, texture) in textures.into_iter().enumerate() {
+            let loaded = Texture::load(&render_state, texture, false).expect("texture upload");
+            let image = loaded.to_image(&render_state, 0).expect("texture capture");
+            image
+                .save(output.join(format!("{index}-t{index}-{texture}.png")))
+                .expect("texture export");
+            let thumbnail = image.thumbnail(tile, tile).to_rgba8();
+            let x = index as u32 % columns * tile + (tile - thumbnail.width()) / 2;
+            let y = index as u32 / columns * tile + (tile - thumbnail.height()) / 2;
+            image::imageops::overlay(&mut sheet, &thumbnail, x.into(), y.into());
+        }
+        sheet
+            .save(output.join("quickdraw-material-sheet.png"))
+            .expect("contact sheet");
     }
 }

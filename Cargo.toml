@@ -88,7 +88,7 @@ downmixer = "0.0.5"
 #dawn-data = { git = "https://github.com/cohaereo/dawn.git" }
 
 [features]
-default = ["wordlist", "decompile-shaders", "xbox-one-deswizzler"]
+default = ["wordlist", "xbox-one-deswizzler"]
 # Embeds `wordlist.txt` into the executable and adds it's contents to the raw string list
 wordlist = []
 decompile-shaders = ["hlsldecompiler"]
@@ -98,6 +98,10 @@ xbox-one-deswizzler = ["xg"]
 opt-level = 3
 # cohae: Overflow checks are nice for some, but not for us
 overflow-checks = false
+
+[dev-dependencies]
+naga = { version = "27.0.3", features = ["wgsl-in"] }
+pollster = "0.4.0"
 
 [profile.release]
 debug = "limited"
