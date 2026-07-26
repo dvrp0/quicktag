@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 use crate::material::{
     MaterialPreviewKind, MaterialTagPreview, TechniqueMaterialConstants, TechniqueTextureBinding,
     interpret_tfx_stack_with_object_channels, is_technique_entry, material_constants_for_technique,
-    primary_sampler_for_technique, texture_bindings_for_technique,
+    primary_sampler_for_technique, render_state_for_technique, texture_bindings_for_technique,
 };
 use crate::texture::Texture;
 
@@ -292,6 +292,12 @@ pub struct WireframeMaterialTextures {
     pub gear_dye_palette: Option<[GearDyeMaterial; 6]>,
     pub mod_wear: Option<WeaponModWearMaterial>,
     pub emissive_strength: u8,
+    /// Textureless Tiger material base colour decoded from the pixel shader's
+    /// authored constant-buffer defaults. `frame_color == -1` is an engine
+    /// sentinel selecting this value; it is not transparency.
+    pub solid_color: Option<[f32; 4]>,
+    /// Authored `(roughness, metalness)` for a decoded textureless material.
+    pub solid_surface: Option<[f32; 2]>,
 }
 
 /// The three condition tiers authored for Marathon weapon mods. The game uses
@@ -382,6 +388,8 @@ impl Default for WireframeMaterialTextures {
             gear_dye_palette: None,
             mod_wear: None,
             emissive_strength: 0,
+            solid_color: None,
+            solid_surface: None,
         }
     }
 }
@@ -922,12 +930,109 @@ impl WeaponModSocketIndex {
     ) -> Option<TagHash> {
         weapon_mod_socket_owner_from_index(cache, model, modifications, &self.candidates)
     }
+
+    /// Returns the authored socket-family/variant identity carried by a weapon
+    /// or cosmetic Pattern, without needing an already-classified mod list.
+    /// This is the engine join used to classify updated hash-only weapon skins:
+    /// cosmetic group ordinals can move, while socket identities must remain
+    /// stable for attachments to render at the correct weapon-specific pose.
+    pub fn signature_for_model(&self, cache: &TagCache, model: TagHash) -> Option<Vec<(u32, u32)>> {
+        if let Some(signature) = weapon_mod_socket_signature_from_ancestry(cache, model) {
+            return Some(signature);
+        }
+        let owner = weapon_mod_socket_owner_for_model(cache, model, &self.candidates)?;
+        let poses = self
+            .candidates
+            .iter()
+            .find_map(|(candidate, poses)| (*candidate == owner).then_some(poses))?;
+        let mut signature = poses
+            .iter()
+            .map(|pose| (pose.family_id, pose.variant_id))
+            .collect_vec();
+        signature.sort_unstable();
+        signature.dedup();
+        (!signature.is_empty()).then_some(signature)
+    }
+}
+
+fn weapon_mod_socket_signature_from_ancestry(
+    cache: &TagCache,
+    model: TagHash,
+) -> Option<Vec<(u32, u32)>> {
+    let tables = descendant_pattern_nodes_with_depth(cache, model, 12)
+        .into_iter()
+        .filter_map(|(node, depth)| {
+            let poses = weapon_attachment_poses(node);
+            (!poses.is_empty()).then_some((depth, poses))
+        })
+        .collect_vec();
+    // Runtime feasibility is the union of authored socket tables. Depth-1
+    // carries visual-mod families; deeper tables carry defaults/variants.
+    // Compatibility is subsequently intersected with investment archetypes,
+    // so shared visual families do not make unrelated guns compatible.
+    let mut signature = tables
+        .into_iter()
+        .flat_map(|(_, poses)| {
+            poses
+                .into_iter()
+                .map(|pose| (pose.family_id, pose.variant_id))
+        })
+        .collect_vec();
+    signature.sort_unstable();
+    signature.dedup();
+    (!signature.is_empty()).then_some(signature)
 }
 
 impl Default for WeaponModSocketIndex {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn weapon_mod_socket_owner_for_model(
+    cache: &TagCache,
+    model: TagHash,
+    socket_candidates: &[(TagHash, Vec<WeaponModAttachmentPose>)],
+) -> Option<TagHash> {
+    let authored = model_authored_socket_pairs(cache, model);
+    if authored.is_empty() {
+        return None;
+    }
+
+    // Several compiled components may duplicate one table. Group by the
+    // semantic pair set, then require one best signature instead of choosing a
+    // tag by iteration order when two weapons merely share one broad family.
+    let mut signatures = rustc_hash::FxHashMap::<Vec<(u32, u32)>, (usize, TagHash)>::default();
+    for (candidate, poses) in socket_candidates {
+        let mut signature = poses
+            .iter()
+            .map(|pose| (pose.family_id, pose.variant_id))
+            .collect_vec();
+        signature.sort_unstable();
+        signature.dedup();
+        let overlap = signature
+            .iter()
+            .filter(|pair| authored.contains(pair))
+            .count();
+        if overlap == 0 {
+            continue;
+        }
+        signatures
+            .entry(signature)
+            .and_modify(|entry| {
+                if overlap > entry.0 || (overlap == entry.0 && *candidate < entry.1) {
+                    *entry = (overlap, *candidate);
+                }
+            })
+            .or_insert((overlap, *candidate));
+    }
+    let best = signatures.values().map(|(score, _)| *score).max()?;
+    let mut winners = signatures
+        .values()
+        .filter(|(score, _)| *score == best)
+        .map(|(_, candidate)| *candidate);
+    let winner = winners.next()?;
+    winners.next().is_none().then_some(winner)
 }
 
 fn weapon_mod_socket_owner_from_index(
@@ -2822,7 +2927,141 @@ fn material_textures_for_technique(
 
     promote_auxiliary_preview_color(&mut material, technique);
 
+    if material.color.is_none()
+        && let Some(flat) = textureless_flat_material_for_technique(technique)
+    {
+        material.solid_color = Some(flat.color);
+        material.solid_surface = Some([flat.roughness, flat.metalness]);
+    } else if material.color.is_none()
+        && let Some(surface) = procedural_surface_material_for_technique(technique)
+    {
+        material.solid_color = Some(surface.color);
+        material.solid_surface = Some([surface.roughness, surface.metalness]);
+    }
+
     material
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TexturelessFlatMaterial {
+    color: [f32; 4],
+    roughness: f32,
+    metalness: f32,
+}
+
+/// Decode Marathon's textureless weapon-panel shader family.
+///
+/// The TFX program sends `frame_color` to PS output 2 and its component sum to
+/// output 3. The compiled pixel shader compares that sum with cbuffer[4].x;
+/// negative `frame_color` (the Pattern's `-1` sentinel) selects cbuffer[1] as
+/// the authored base colour. G-buffer target 2 stores roughness 0.5 and the
+/// authored metal value from cbuffer[36].x. This is the same branch the game
+/// executes, rather than a weapon/skin-specific colour substitution.
+fn textureless_flat_material_for_technique(technique: TagHash) -> Option<TexturelessFlatMaterial> {
+    let Some(entry) = package_manager().get_entry(technique) else {
+        return None;
+    };
+    let Ok(data) = package_manager().read_tag(technique) else {
+        return None;
+    };
+    if texture_bindings_for_technique(&entry, &data)
+        .into_iter()
+        .any(|binding| binding.stage == "PS")
+    {
+        return None;
+    }
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    let sends_frame_color = pixel.bytecode.expressions.iter().any(|expression| {
+        expression.target == "output[2]"
+            && expression.expression.contains("object_channel(0xC9A5E5AC)")
+    });
+    let sends_selector = pixel.bytecode.expressions.iter().any(|expression| {
+        expression.target == "output[3]"
+            && expression.expression.contains("object_channel(0xC9A5E5AC)")
+    });
+    if !sends_frame_color || !sends_selector {
+        return None;
+    }
+
+    let color = *pixel.inline_constants.get(1)?;
+    let epsilon = pixel.inline_constants.get(4)?.first().copied()?;
+    if !color.iter().all(|value| value.is_finite())
+        || !color[..3].iter().all(|value| (0.0..=1.0).contains(value))
+        || !(0.0..=0.001).contains(&epsilon)
+    {
+        return None;
+    }
+    let metalness = pixel
+        .inline_constants
+        .get(36)
+        .map(|value| value[0].clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    Some(TexturelessFlatMaterial {
+        color,
+        roughness: 0.5,
+        metalness,
+    })
+}
+
+/// Decode Marathon's textureless procedural-surface pass.
+///
+/// Updated Goliath geometry may place these parts outside the ordinary G-buffer
+/// stage. The compiled shader's material block is stable relative to its base
+/// colour: metalness is +17 vectors and roughness is +21 vectors. The preceding
+/// epsilon vector identifies the block without relying on a weapon, skin, tag,
+/// or absolute constant index.
+fn procedural_surface_material_for_technique(
+    technique: TagHash,
+) -> Option<TexturelessFlatMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    if render_state_for_technique(technique).blend != Some(8) {
+        return None;
+    }
+
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    let (color_index, color) =
+        pixel
+            .inline_constants
+            .windows(2)
+            .enumerate()
+            .find_map(|(index, pair)| {
+                let epsilon = pair[0];
+                let color = pair[1];
+                let epsilon_marker = (0.0001..=0.01).contains(&epsilon[0])
+                    && epsilon[1..].iter().all(|value| value.abs() < 0.0001);
+                let valid_color = color[..3]
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                    && color[3].abs() < 0.0001;
+                let (min, max) = color[..3]
+                    .iter()
+                    .copied()
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), value| {
+                        (min.min(value), max.max(value))
+                    });
+                (epsilon_marker && valid_color && max - min > 0.1 && max > 0.08)
+                    .then_some((index + 1, [color[0], color[1], color[2], 1.0]))
+            })?;
+    let metalness = pixel.inline_constants.get(color_index + 17)?[0];
+    let roughness = pixel.inline_constants.get(color_index + 21)?[0];
+    if !metalness.is_finite()
+        || !roughness.is_finite()
+        || !(0.0..=1.0).contains(&metalness)
+        || !(0.02..=1.0).contains(&roughness)
+    {
+        return None;
+    }
+
+    Some(TexturelessFlatMaterial {
+        color,
+        roughness,
+        metalness,
+    })
 }
 
 const WEAPON_MOD_AGE_CHANNEL: u32 = 0x138D_E801;
@@ -4491,8 +4730,10 @@ fn geometry_buffer_set_input_layout_id(mesh: &[u8]) -> Option<u8> {
 
 fn geometry_primary_index_ranges(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
     let selected_parts = geometry_preview_part_indices(data, endian);
-    let candidates = geometry_index_range_candidates(data, endian)
-        .into_iter()
+    let all_candidates = geometry_index_range_candidates(data, endian);
+    let candidates = all_candidates
+        .iter()
+        .cloned()
         .filter(|range| {
             selected_parts
                 .as_ref()
@@ -4518,6 +4759,32 @@ fn geometry_primary_index_ranges(data: &[u8], endian: Endian) -> Vec<GeometryInd
                 .into_iter()
                 .filter(|range| range.lod_category == fallback_lod),
         );
+    }
+
+    // Goliath's updated geometry can author opaque procedural-surface pieces in
+    // a later render pass rather than GenerateGbuffer. Keep one such pass when
+    // it fills source-index coverage absent from ordinary preview stages. This
+    // recovers real authored panels/decals without drawing shadow/depth copies
+    // or making sentinel-coloured geometry transparent.
+    let mut covered = ranges
+        .iter()
+        .map(|range| range.index_start..range.index_start.saturating_add(range.index_count))
+        .collect_vec();
+    for supplemental in all_candidates.into_iter().filter(|range| {
+        is_highest_detail_lod(range.lod_category)
+            && procedural_surface_material_for_technique(range.technique).is_some()
+    }) {
+        let interval = supplemental.index_start
+            ..supplemental
+                .index_start
+                .saturating_add(supplemental.index_count);
+        let overlaps = covered
+            .iter()
+            .any(|existing| interval.start < existing.end && existing.start < interval.end);
+        if !overlaps {
+            covered.push(interval);
+            ranges.push(supplemental);
+        }
     }
     ranges.sort_by_key(|range| (lod_selection_rank(range.lod_category), range.index_start));
     ranges
@@ -6414,6 +6681,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires current installed Marathon packages"]
+    fn decodes_updated_weapon_flat_materials_without_gear_dye() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let skin = TagHash(0x80A9F63F);
+        let techniques = find_model_technique_entries(
+            &cache,
+            skin,
+            &package_manager().get_entry(skin).expect("V85 Vox Nocturna"),
+        );
+        let textures = find_model_textures(&cache, skin, &techniques);
+        let geometry = TagHash(0x80A9F63A);
+        let geometry_data = package_manager()
+            .read_tag(geometry)
+            .expect("V85 Vox Nocturna geometry");
+        let selected =
+            geometry_primary_index_ranges(&geometry_data, package_manager().version.endian());
+        assert!(selected.iter().any(|range| {
+            range.technique == TagHash(0x80A9FBB1)
+                && range.index_start == 0
+                && range.index_count == 2996
+        }));
+        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache.clone(),
+            skin,
+            &package_manager().get_entry(skin).expect("V85 Vox Nocturna"),
+            skin,
+            skin,
+            &[],
+        )
+        .expect("V85 model preview");
+        let GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("V85 must load as model")
+        };
+        let wireframe = model.wireframe.expect("V85 wireframe");
+        let supplemental = wireframe
+            .material_ranges
+            .iter()
+            .find(|range| range.technique == Some(TagHash(0x80A9FBB1)))
+            .expect("procedural surface must be rendered");
+        assert_eq!(
+            supplemental.textures.solid_color,
+            Some([0.44368514, 0.18800727, 0.035853356, 1.0])
+        );
+        assert_eq!(supplemental.textures.solid_surface, Some([0.54, 0.08]));
+        assert_eq!(supplemental.textures.gear_dye, None);
+        let dark = material_textures_for_technique(TagHash(0x80A9F5CD), &cache, &textures);
+        assert_eq!(dark.color, None);
+        assert_eq!(dark.solid_surface, Some([0.5, 0.0]));
+        assert!(dark.solid_color.is_some_and(|color| {
+            color[..3]
+                .iter()
+                .all(|value| (*value - 0.09845916).abs() < 0.000001)
+        }));
+        assert_eq!(dark.gear_dye, None);
+
+        let light = material_textures_for_technique(TagHash(0x80A9FBE0), &cache, &textures);
+        assert_eq!(light.color, None);
+        assert_eq!(light.solid_surface, Some([0.5, 0.25]));
+        assert!(light.solid_color.is_some_and(|color| {
+            color[..3]
+                .iter()
+                .all(|value| (*value - 0.89789754).abs() < 0.000001)
+        }));
+        assert_eq!(light.gear_dye, None);
+
+        let base = material_textures_for_technique(TagHash(0x80A9F5D8), &cache, &textures);
+        assert!(base.color.is_some());
+        assert_eq!(base.solid_color, None);
+        assert_eq!(base.solid_surface, None);
+        assert_eq!(base.gear_dye, None);
     }
 
     #[test]

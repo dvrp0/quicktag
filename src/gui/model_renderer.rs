@@ -46,6 +46,8 @@ struct ModelVertex {
 struct ModelDraw {
     indices: Range<u32>,
     material: Option<MaterialTextureKey>,
+    solid_color: Option<[f32; 4]>,
+    solid_surface: Option<[f32; 2]>,
     control: Option<TagHash>,
     roughness_channel: u8,
     mask_palette: Option<[[f32; 4]; 2]>,
@@ -216,6 +218,8 @@ fn model_draws(
                     color_tint: range.textures.color_tint,
                     emissive_strength: range.textures.emissive_strength,
                 }),
+                solid_color: range.textures.solid_color,
+                solid_surface: range.textures.solid_surface,
                 control: range.textures.control,
                 roughness_channel: range.textures.roughness_channel,
                 mask_palette: range.textures.mask_palette,
@@ -240,6 +244,8 @@ fn model_draws(
         draws.push(ModelDraw {
             indices: 0..index_len as u32,
             material: fallback_color.map(default_material),
+            solid_color: None,
+            solid_surface: None,
             control: None,
             roughness_channel: 0,
             mask_palette: None,
@@ -430,6 +436,8 @@ pub(crate) struct ModelEnvironment {
     pub light_size: f32,
     pub light_gizmo: bool,
     pub shadow_strength: f32,
+    /// Normalized PCF radius: 0.0 is hard, 1.0 is the widest penumbra.
+    pub shadow_softness: f32,
     pub brightness: f32,
     pub contrast: f32,
     pub saturation: f32,
@@ -443,7 +451,7 @@ impl Default for ModelEnvironment {
     fn default() -> Self {
         Self {
             time_of_day: 0.35,
-            sun_intensity: 0.2,
+            sun_intensity: 0.35,
             fog_density: 0.0,
             bloom_strength: 0.0,
             exposure: 1.0,
@@ -461,15 +469,16 @@ impl Default for ModelEnvironment {
             ssao_strength: 10.0,
             tone_mapping: true,
             ambient_intensity: 0.2,
-            specular_ibl_intensity: 0.155,
+            specular_ibl_intensity: 0.3,
             light_position: [0.061, 0.711, 0.701],
             light_orbit_radius: -1.0,
             light_size: 5.0,
             light_gizmo: false,
             shadow_strength: 1.0,
+            shadow_softness: 0.5,
             brightness: 1.1,
-            contrast: 1.012,
-            saturation: 1.5,
+            contrast: 1.02,
+            saturation: 1.6,
             gamma: 1.0,
             diagnostic_pass: 0,
         }
@@ -510,6 +519,7 @@ struct MaterialUniform {
     tint: [f32; 4],
     params: [f32; 4],
     blend: [f32; 4],
+    solid_surface: [f32; 4],
     palette_base: [f32; 4],
     palette_delta: [f32; 4],
     palette_tertiary: [f32; 4],
@@ -539,6 +549,8 @@ struct ModelSamplerDesc {
 
 struct LoadedMaterial {
     key: Option<MaterialTextureKey>,
+    solid_color: Option<[f32; 4]>,
+    solid_surface: Option<[f32; 2]>,
     blend: u8,
     control_tag: Option<TagHash>,
     roughness_channel: u8,
@@ -673,6 +685,8 @@ impl ModelPaintCallback {
                 .iter()
                 .position(|material| {
                     material.key == draw.material
+                        && material.solid_color == draw.solid_color
+                        && material.solid_surface == draw.solid_surface
                         && material.blend == draw.pipeline.blend
                         && material.control_tag == draw.control
                         && material.roughness_channel == draw.roughness_channel
@@ -718,6 +732,8 @@ impl ModelPaintCallback {
                     let dye_palette = draw_dye_palette(draw);
                     materials.push(LoadedMaterial {
                         key: draw.material,
+                        solid_color: draw.solid_color,
+                        solid_surface: draw.solid_surface,
                         blend: draw.pipeline.blend,
                         control_tag: draw.control,
                         roughness_channel: draw.roughness_channel,
@@ -812,7 +828,7 @@ impl ModelPaintCallback {
                     aspect,
                     pan.x * 2.0 / rect.width().max(1.0),
                     -pan.y * 2.0 / rect.height().max(1.0),
-                    environment.light_size,
+                    environment.shadow_softness.clamp(0.0, 1.0),
                 ],
                 uv_transform: [
                     transform.scale[0],
@@ -917,6 +933,12 @@ impl ModelPaintCallback {
                             .chain(wear.condition_controls.into_iter().flatten())
                             .map(|value| u64::from(value.to_bits())),
                     );
+                }
+                if let Some(color) = material.solid_color {
+                    values.extend(color.map(|value| u64::from(value.to_bits())));
+                }
+                if let Some(surface) = material.solid_surface {
+                    values.extend(surface.map(|value| u64::from(value.to_bits())));
                 }
                 if let Some(palette) = material.mask_palette {
                     values.extend(
@@ -1648,6 +1670,7 @@ impl CallbackTrait for ModelPaintCallback {
                 let tint = material
                     .key
                     .map(|key| key.color_tint.map(|value| value as f32 / 255.0))
+                    .or(material.solid_color)
                     .unwrap_or([0.72, 0.75, 0.8, 1.0]);
                 let uniform = MaterialUniform {
                     tint,
@@ -1670,6 +1693,10 @@ impl CallbackTrait for ModelPaintCallback {
                         material.control.is_some() as u8 as f32,
                         material.mask_palette.is_some() as u8 as f32,
                     ],
+                    solid_surface: material
+                        .solid_surface
+                        .map(|surface| [surface[0], surface[1], 1.0, 0.0])
+                        .unwrap_or_default(),
                     palette_base: material
                         .dye_palette
                         .map(|palette| palette[0])
@@ -3019,6 +3046,7 @@ struct SceneUniform {
 
 struct MaterialUniform {
     tint: vec4<f32>, params: vec4<f32>, blend: vec4<f32>,
+    solid_surface: vec4<f32>,
     palette_base: vec4<f32>, palette_delta: vec4<f32>, palette_tertiary: vec4<f32>,
     roughness_remap: vec4<f32>,
     metal_remap: vec4<f32>,
@@ -3116,6 +3144,7 @@ struct MaterialUniform {
     tint: vec4<f32>,
     params: vec4<f32>,
     blend: vec4<f32>,
+    solid_surface: vec4<f32>,
     palette_base: vec4<f32>,
     palette_delta: vec4<f32>,
     palette_tertiary: vec4<f32>,
@@ -3395,6 +3424,9 @@ fn fallback_surface(albedo: vec3<f32>) -> vec2<f32> {
 }
 
 fn material_surface(uv: vec2<f32>, albedo: vec3<f32>) -> vec2<f32> {
+    if material.solid_surface.z > 0.5 {
+        return material.solid_surface.xy;
+    }
     if material.blend.z < 0.5 {
         return fallback_surface(albedo);
     }
@@ -3414,16 +3446,22 @@ fn material_surface(uv: vec2<f32>, albedo: vec3<f32>) -> vec2<f32> {
     // large painted surfaces are rough dielectrics, not coated show-car metal.
     let authored_roughness = authored * material.roughness_remap.x + material.roughness_remap.y;
     let class_surface = fallback_surface(albedo);
-    let roughness = max(mix(class_surface.x, authored_roughness, 0.35), 0.58);
+    let roughness = max(mix(class_surface.x, authored_roughness, 0.45), 0.42);
     let authored_metalness = authored * material.metal_remap.x + material.metal_remap.y;
     let luma = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
     let painted_limit = select(0.15, 0.80, luma > 0.32 && class_surface.y > 0.2);
     let metalness = min(clamp(authored_metalness * 0.70, 0.0, 0.80), painted_limit);
-    return vec2<f32>(clamp(roughness, 0.58, 0.96), metalness);
+    return vec2<f32>(clamp(roughness, 0.42, 0.92), metalness);
 }
 
 fn fresnel_schlick(cosine: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - cosine, 5.0);
+}
+
+fn grazing_boost(n_dot_v: f32, roughness: f32) -> f32 {
+    let edge = pow(1.0 - clamp(n_dot_v, 0.0, 1.0), 4.0);
+    // Stronger on smoother surfaces, weaker on rough plastic.
+    return 1.0 + edge * mix(2.2, 0.8, roughness);
 }
 
 fn ggx_specular(
@@ -3453,15 +3491,23 @@ fn clamp_specular_luminance(value: vec3<f32>, maximum: f32) -> vec3<f32> {
     return value * min(1.0, maximum / max(luminance, 0.000001));
 }
 
-// Stable Poisson disk. Hardware comparison filtering turns each tap into a
-// bilinear 2x2 PCF sample, avoiding the square bands of the old 5x5 grid.
-const SHADOW_DISK = array<vec2<f32>, 12>(
-    vec2<f32>(-0.326, -0.406), vec2<f32>(-0.840, -0.074),
-    vec2<f32>(-0.696,  0.457), vec2<f32>(-0.203,  0.621),
-    vec2<f32>( 0.962, -0.195), vec2<f32>( 0.473, -0.480),
-    vec2<f32>( 0.519,  0.767), vec2<f32>( 0.185, -0.893),
-    vec2<f32>( 0.507,  0.064), vec2<f32>( 0.896,  0.412),
-    vec2<f32>(-0.322, -0.933), vec2<f32>(-0.792, -0.598),
+// Stable Vogel disk. Hardware comparison filtering turns each tap into a
+// bilinear 2x2 PCF sample. More taps keep wide softness settings smooth while
+// remaining deterministic, so the preview does not shimmer while orbiting.
+const SHADOW_SAMPLE_COUNT = 24u;
+const SHADOW_DISK = array<vec2<f32>, 24>(
+    vec2<f32>( 0.1443,  0.0000), vec2<f32>(-0.1843,  0.1689),
+    vec2<f32>( 0.0282, -0.3215), vec2<f32>( 0.2324,  0.3031),
+    vec2<f32>(-0.4264, -0.0754), vec2<f32>( 0.4039, -0.2569),
+    vec2<f32>(-0.1351,  0.5026), vec2<f32>(-0.2577, -0.4961),
+    vec2<f32>( 0.5590,  0.2041), vec2<f32>(-0.5816,  0.2401),
+    vec2<f32>( 0.2803, -0.5991), vec2<f32>( 0.2072,  0.6605),
+    vec2<f32>(-0.6244, -0.3619), vec2<f32>( 0.7325, -0.1610),
+    vec2<f32>(-0.4470,  0.6359), vec2<f32>(-0.1033, -0.7970),
+    vec2<f32>( 0.6340,  0.5343), vec2<f32>(-0.8532,  0.0353),
+    vec2<f32>( 0.6223, -0.6193), vec2<f32>(-0.0416,  0.9004),
+    vec2<f32>(-0.5922, -0.7096), vec2<f32>( 0.9380,  0.1262),
+    vec2<f32>(-0.7948,  0.5530), vec2<f32>( 0.2172, -0.9654),
 );
 
 fn directional_shadow(input: VertexOutput) -> f32 {
@@ -3480,9 +3526,23 @@ fn directional_shadow(input: VertexOutput) -> f32 {
     // in shadow texels keeps it stable for every weapon size and suppresses
     // triangle/segment acne without detaching genuine contact shadows.
     let receiver_bias = shadow_texel.x * (0.75 + (1.0 - n_dot_light) * 2.0);
-    let filter_radius = 0.75 + max(scene.params1.w, 0.0) * 1.25;
+    let softness = clamp(scene.params1.w, 0.0, 1.0);
+
+    // A true hard-shadow endpoint is useful for inspection and cheaper than
+    // running the full PCF kernel. The squared response gives finer control
+    // near the sharp end while still allowing a broad penumbra at 1.0.
+    if softness <= 0.001 {
+        return textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            input.shadow_position.xy,
+            input.shadow_position.z - receiver_bias,
+        );
+    }
+
+    let filter_radius = 0.75 + softness * softness * 48.0;
     var visibility = 0.0;
-    for (var sample = 0u; sample < 12u; sample++) {
+    for (var sample = 0u; sample < SHADOW_SAMPLE_COUNT; sample++) {
         let sample_uv = input.shadow_position.xy
             + SHADOW_DISK[sample] * shadow_texel * filter_radius;
         // Out-of-frustum space contains no caster. Check every tap instead of
@@ -3499,7 +3559,7 @@ fn directional_shadow(input: VertexOutput) -> f32 {
             );
         }
     }
-    return visibility / 12.0;
+    return visibility / f32(SHADOW_SAMPLE_COUNT);
 }
 
 @fragment
@@ -3594,19 +3654,33 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         * diffuse_working_scale;
     let indirect_diffuse = unoccluded_indirect_diffuse * vertex_ao;
 
+    let grazing = grazing_boost(n_dot_v, roughness);
+
     let direct_specular = clamp_specular_luminance(
-        key_specular * key_color * scene.postprocess0.w * n_dot_l * sun_visibility * 0.12,
-        0.10,
+        key_specular
+            * key_color
+            * scene.postprocess0.w
+            * n_dot_l
+            * sun_visibility
+            * 0.24
+            * grazing,
+        0.22,
     );
+
     let specular_occlusion = clamp(
         pow(n_dot_v + vertex_ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + vertex_ao,
         0.0,
         1.0,
     );
+
     let indirect_specular = clamp_specular_luminance(
-        environment * environment_fresnel * (1.0 - roughness * 0.85)
-            * scene.postprocess4.w * specular_occlusion,
-        0.06,
+        environment
+            * environment_fresnel
+            * (1.0 - roughness * 0.72)
+            * scene.postprocess4.w
+            * specular_occlusion
+            * grazing,
+        0.14,
     );
 
     let diagnostic_mode = u32(scene.postprocess2.x + 0.5);
@@ -4030,6 +4104,7 @@ mod tests {
         assert_eq!(environment.light_size, 5.0);
         assert!(!environment.light_gizmo);
         assert_eq!(environment.shadow_strength, 1.0);
+        assert_eq!(environment.shadow_softness, 0.35);
         assert_eq!(environment.brightness, 2.0);
         assert_eq!(environment.contrast, 1.05);
         assert_eq!(environment.saturation, 1.0);
@@ -4067,6 +4142,8 @@ mod tests {
         }
         assert!(MODEL_SHADER.contains("let receiver_bias = shadow_texel.x"));
         assert!(MODEL_SHADER.contains("const SHADOW_DISK"));
+        assert!(MODEL_SHADER.contains("let softness = clamp(scene.params1.w"));
+        assert!(MODEL_SHADER.contains("softness * softness * 48.0"));
         assert!(!MODEL_SHADER.contains("shadow_texel * 5.0"));
         assert!(!MODEL_SHADER.contains("mix(0.30, 1.0"));
     }
@@ -4118,6 +4195,56 @@ mod tests {
         };
         assert!(!model_draws(&preview(2), None)[0].sticker_proxy);
         assert!(!model_draws(&preview(1), None)[0].sticker_proxy);
+    }
+
+    #[test]
+    fn renders_decoded_textureless_material_instead_of_hiding_it() {
+        let mut runtime = WireframeMaterialTextures::default();
+        runtime.solid_color = Some([0.7, 0.3, 0.1, 1.0]);
+        runtime.solid_surface = Some([0.5, 0.25]);
+        let wireframe = WireframePreview {
+            source: "runtime surface".into(),
+            position_format: "f32x3 @ +0",
+            uv_format: None,
+            vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: None,
+            procedural_positions: None,
+            procedural_normals: None,
+            tangents: None,
+            uvs: None,
+            normal_format: None,
+            tangent_format: None,
+            indices: vec![0, 1, 2, 0, 2, 1],
+            material_ranges: vec![
+                WireframeMaterialRange {
+                    index_start: 0,
+                    index_count: 3,
+                    render_stage: Some(0),
+                    technique: None,
+                    gear_dye_change_color_index: None,
+                    texture: None,
+                    textures: runtime,
+                },
+                WireframeMaterialRange {
+                    index_start: 3,
+                    index_count: 3,
+                    render_stage: Some(0),
+                    technique: None,
+                    gear_dye_change_color_index: None,
+                    texture: None,
+                    textures: WireframeMaterialTextures::default(),
+                },
+            ],
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 1.0, 0.0],
+            vertex_count_total: 3,
+            index_count_total: 6,
+        };
+        let draws = model_draws(&wireframe, None);
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].indices, 0..3);
+        assert_eq!(draws[0].solid_color, Some([0.7, 0.3, 0.1, 1.0]));
+        assert_eq!(draws[0].solid_surface, Some([0.5, 0.25]));
     }
 
     #[test]
@@ -4441,6 +4568,34 @@ mod tests {
             .map(|(left, right)| (left - right).powi(2))
             .sum::<f32>()
             .sqrt()
+    }
+
+    fn dominant_orange_rgb(
+        image: &image::RgbaImage,
+        x: std::ops::Range<u32>,
+        y: std::ops::Range<u32>,
+    ) -> ([f32; 3], usize) {
+        let mut bins = std::collections::BTreeMap::<[u8; 3], (usize, [u64; 3])>::new();
+        for row in y {
+            for column in x.clone() {
+                let [red, green, blue, _alpha] = image.get_pixel(column, row).0;
+                if red < 70 || red < green.saturating_add(30) || green < blue.saturating_add(15) {
+                    continue;
+                }
+                let entry = bins
+                    .entry([red / 8, green / 8, blue / 8])
+                    .or_insert((0, [0; 3]));
+                entry.0 += 1;
+                for (sum, value) in entry.1.iter_mut().zip([red, green, blue]) {
+                    *sum += u64::from(value);
+                }
+            }
+        }
+        let (_bin, (count, sum)) = bins
+            .into_iter()
+            .max_by_key(|(_bin, (count, _sum))| *count)
+            .expect("orange color sample");
+        (sum.map(|channel| channel as f32 / count as f32), count)
     }
 
     #[derive(Debug)]
@@ -4869,6 +5024,14 @@ mod tests {
                 vec![],
                 -22.6_f32.to_radians(),
             ),
+            (
+                "vox-nocturna-v85-flat-panel",
+                TagHash(0x80A9F63F),
+                TagHash(0x80A9F63F),
+                vec![],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
         ] {
             if requested_case
                 .as_deref()
@@ -4877,6 +5040,7 @@ mod tests {
                 continue;
             }
             let lighting_reference_case = name == "vox-nocturna-misriah-ingame-lighting";
+            let flat_panel_reference_case = name == "vox-nocturna-v85-flat-panel";
             let probe_f32 = |key: &str, fallback: f32| {
                 std::env::var(key)
                     .ok()
@@ -4888,7 +5052,10 @@ mod tests {
             } else {
                 yaw
             };
-            let entry = package_manager().get_entry(weapon).expect("weapon pattern");
+            let Some(entry) = package_manager().get_entry(weapon) else {
+                eprintln!("skipping stale visual fixture {name}: missing {weapon}");
+                continue;
+            };
             let rarity = if name.ends_with("-enhanced") {
                 Some(WeaponModRarity::Enhanced)
             } else if name.ends_with("-deluxe") {
@@ -5046,6 +5213,8 @@ mod tests {
                     diagnostic_pass,
                     ..defaults
                 }
+            } else if flat_panel_reference_case {
+                ModelEnvironment::default()
             } else {
                 ModelEnvironment {
                     sun_intensity: 0.0,
@@ -5070,6 +5239,8 @@ mod tests {
                 yaw,
                 if lighting_reference_case {
                     probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 16.2).to_radians()
+                } else if flat_panel_reference_case {
+                    14.8_f32.to_radians()
                 } else {
                     0.05
                 },
@@ -5133,16 +5304,18 @@ mod tests {
                 .iter()
                 .filter_map(|material| material.dye_palette)
                 .collect_vec();
-            assert!(!dye_palettes.is_empty(), "attached mods need skin dyes");
             let gear_dye_palettes = callback
                 .materials
                 .iter()
                 .filter_map(|material| material.gear_dye_palette)
                 .collect_vec();
-            assert!(
-                !gear_dye_palettes.is_empty(),
-                "attached mods need the full skin palette"
-            );
+            if !mods.is_empty() {
+                assert!(!dye_palettes.is_empty(), "attached mods need skin dyes");
+                assert!(
+                    !gear_dye_palettes.is_empty(),
+                    "attached mods need the full skin palette"
+                );
+            }
             assert!(gear_dye_palettes.iter().all(|palette| {
                 palette.iter().all(|dye| {
                     dye.color[..3]
@@ -5456,6 +5629,33 @@ mod tests {
                         "Midnight Decay mod colors diverge from the reference relationship: body={body:?}, front choke={front_choke:?} (RGB distance {front_distance:.2}, luma delta {front_luma_delta:.2}), rear choke={rear_choke:?} (luma delta {rear_luma_delta:.2})"
                     ));
                 }
+            }
+            if flat_panel_reference_case {
+                let crop_x = 260..510;
+                let crop_y = 205..380;
+                let (orange, orange_count) =
+                    dominant_orange_rgb(&image, crop_x.clone(), crop_y.clone());
+                let target = [177.0, 87.0, 36.0];
+                let distance = rgb_distance(orange, target);
+                let white_count = crop_y
+                    .flat_map(|row| crop_x.clone().map(move |column| (column, row)))
+                    .filter(|(column, row)| {
+                        let [red, green, blue, _alpha] = image.get_pixel(*column, *row).0;
+                        red.min(green).min(blue) > 210
+                            && red.max(green).max(blue) - red.min(green).min(blue) < 24
+                    })
+                    .count();
+                eprintln!(
+                    "V85 Vox Nocturna panel: rendered={orange:.1?}, target=#B15724, distance={distance:.1}, orange={orange_count}, white={white_count}"
+                );
+                assert!(
+                    orange_count > 1_000 && distance < 80.0,
+                    "procedural panel must render near annotated orange #B15724"
+                );
+                assert!(
+                    white_count < orange_count / 3,
+                    "procedural panel regressed to broad white fallback"
+                );
             }
             let output_stem = if lighting_reference_case && diagnostic_pass != 0 {
                 format!("{name}-{diagnostic_name}")

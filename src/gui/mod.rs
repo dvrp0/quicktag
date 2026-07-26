@@ -815,6 +815,10 @@ impl eframe::App for QuickTagApp {
                             self.textures_view.show_texture(t);
                             self.open_panel = Panel::Textures;
                         }
+                        ViewAction::ShowModel(t) => {
+                            self.models_view.show_model(t);
+                            self.open_panel = Panel::Models;
+                        }
                     }
                 }
             });
@@ -957,6 +961,7 @@ impl QuickTagApp {
 pub enum ViewAction {
     OpenTag(TagHash),
     ShowTexture(TagHash),
+    ShowModel(TagHash),
 }
 
 pub trait View {

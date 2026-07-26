@@ -164,6 +164,17 @@ impl ModelsView {
         }
     }
 
+    pub fn show_model(&mut self, tag: TagHash) {
+        self.package_filter.clear();
+        self.model_filter.clear();
+        self.packages_with_models = Self::search_models(None);
+        self.selected_package = tag.pkg_id();
+        self.load_package_models(self.selected_package);
+        if self.models.iter().any(|entry| entry.tag == tag) {
+            self.load_model(tag);
+        }
+    }
+
     fn resolve_weapon_socket_owners(&mut self) {
         if self.cache.hashes.is_empty()
             || !self
@@ -1141,6 +1152,13 @@ pub(super) fn model_wireframe_ui(
                     MODEL_PARAMETER_RANGE.clone(),
                 )
                 .text("Shadows"),
+            );
+            ui.add(
+                egui::Slider::new(
+                    &mut environment.shadow_softness,
+                    MODEL_PARAMETER_RANGE.clone(),
+                )
+                .text("Shadow softness"),
             );
             ui.add(
                 egui::Slider::new(

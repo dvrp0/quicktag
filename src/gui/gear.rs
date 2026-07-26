@@ -19,12 +19,16 @@ const INTERNAL_CATEGORY_REGISTRY_REFERENCE: u32 = 0x808095d6;
 const INTERNAL_CATEGORY_NAMESPACE_TABLE_OFFSET: usize = 0x8;
 const INTERNAL_CATEGORY_INDEX_TABLE_OFFSET: usize = 0x8;
 const INTERNAL_CATEGORY_LOOKUP_TABLE_OFFSET: usize = 0x18;
-const INTERNAL_CATEGORY_LIST_OFFSET: usize = 0x168;
+// Goliath's July investment-definition layout inserted one pointer-sized field
+// before the authored category table.  Reading the former 0x168 header yields
+// an empty range for every item even though the live table begins at 0x170.
+const INTERNAL_CATEGORY_LIST_OFFSET: usize = 0x170;
 const PATTERN_GLOBAL_TABLE_REFERENCE: u32 = 0x80806cac;
 const PATTERN_ASSIGNMENT_TABLE_REFERENCE: u32 = 0x8080b61c;
 const INVESTMENT_COSMETIC_MAP_REFERENCE: u32 = 0x80803081;
 const PATTERN_TRANSLATION_BLOCK_MARKER: u32 = 0x808091d3;
 const MODEL_PATTERN_REFERENCE: u32 = 0x8080baad;
+const MODEL_PATTERN_COMPONENT_REFERENCE: u32 = 0x8080badb;
 const EMPTY_HASH: u32 = 0x811c9dc5;
 const RARITY_MARKER: u32 = 0x808092a2;
 const RARITY_STANDARD_HASH: u32 = 0xb45bd4fa;
@@ -336,7 +340,9 @@ impl GearView {
                     .items
                     .iter()
                     .filter(|item| item.item_type.as_deref() == Some("Weapon") && item.name == name)
-                    .min_by_key(|item| (item.rarity.is_some(), item.display_tag))?;
+                    .min_by_key(|item| {
+                        (item.rarity != Some(GearRarity::Standard), item.display_tag)
+                    })?;
                 let mut model_tags = self
                     .items
                     .iter()
@@ -456,6 +462,7 @@ impl GearView {
                 ))
             })
             .collect::<Vec<_>>();
+
         let weapon_names_by_model = base_weapons
             .iter()
             .map(|(model, name, _, _)| (*model, name.as_str()))
@@ -547,16 +554,69 @@ impl GearView {
         }
         loop {
             let mut changed = 0;
-            while reconcile_skin_reference_neighborhoods(&mut self.items, cache) > 0 {
-                changed += 1;
-            }
+            changed += reconcile_skin_shared_pattern_components(&mut self.items, cache);
             changed += propagate_current_skin_groups(&mut self.items);
             if changed == 0 {
                 break;
             }
         }
         assign_legacy_unresolved_skin_owners(&mut self.items);
+        self.reconcile_weapon_mod_models(cache);
         self.update_filter();
+    }
+
+    fn reconcile_weapon_mod_models(&mut self, cache: &quicktag_scanner::TagCache) {
+        let weapons = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.item_type.as_deref() == Some("Weapon")
+                    && item.rarity == Some(GearRarity::Standard)
+                    && (is_canonical_weapon_skin_owner(item)
+                        || item.internal_hash == Some(KKV_9SD_HASH))
+            })
+            .filter_map(|item| Some((item.name.clone(), item.model_tag?)))
+            .unique()
+            .collect::<Vec<_>>();
+        let socket_index = crate::geometry::WeaponModSocketIndex::new();
+        let weapon_families = weapons
+            .into_iter()
+            .filter_map(|(name, model)| {
+                let families = socket_index
+                    .signature_for_model(cache, model)?
+                    .into_iter()
+                    .map(|(family, _variant)| family)
+                    .collect::<FxHashSet<_>>();
+                (!families.is_empty()).then_some((name, families))
+            })
+            .collect::<Vec<_>>();
+        let mut mod_families = FxHashMap::default();
+
+        for modification in self.items.iter_mut().filter(|item| {
+            item.item_type.as_deref() == Some("Weapon Mod")
+                && !item.mod_is_universal
+                && item.mod_category.as_deref() != Some("Unique")
+        }) {
+            let Some(model) = modification.model_tag else {
+                continue;
+            };
+            let families = mod_families
+                .entry(model)
+                .or_insert_with(|| crate::geometry::weapon_mod_authored_families(cache, model));
+            if families.is_empty() {
+                continue;
+            }
+            // Investment paths/categories author gameplay compatibility;
+            // Pattern families author whether that mod can actually spawn on
+            // the selected render rig. Both branches must agree. Never expand
+            // compatibility from a shared visual family alone.
+            modification.compatible_weapons.retain(|compatible| {
+                weapon_families
+                    .iter()
+                    .find(|(name, _)| name == compatible)
+                    .is_some_and(|(_, weapon)| !weapon.is_disjoint(families))
+            });
+        }
     }
 
     /// Carries filters and selection across a localized data rebuild.
@@ -958,6 +1018,12 @@ impl View for GearView {
                 );
                 if ui.small_button(format!("{}", item.display_tag)).clicked() {
                     action = Some(ViewAction::OpenTag(item.display_tag));
+                }
+                if item.item_type.as_deref() == Some("Weapon Skin")
+                    && let Some(model) = item.model_tag
+                    && ui.button("Go to Models").clicked()
+                {
+                    action = Some(ViewAction::ShowModel(model));
                 }
             });
             ui.separator();
@@ -1511,6 +1577,8 @@ fn load_gear_resolved(
         ) = definition_tag
             .and_then(|definition_tag| package_manager().read_tag(definition_tag).ok())
             .map(|definition| {
+                let internal_categories =
+                    extract_internal_categories(&definition, &internal_category_registry);
                 let definition_internal_name = wordlist_name_at(&definition, 0xf0, &wordlist);
                 let pattern_internal_name = pattern_resolver
                     .definition_internal_path_hash(&definition)
@@ -1519,19 +1587,30 @@ fn load_gear_resolved(
                         name.starts_with("weapon_mods.")
                             || (structurally_weapon && name.starts_with("weapons."))
                     });
-                let internal_name = definition_internal_name
-                    .as_ref()
+                // The API hash is the stable investment identity. The July
+                // layout moved the old 0xf0 string field; prefer its direct
+                // wordlist/generated-path resolution whenever available.
+                let api_internal_name = internal_hash
+                    .and_then(|hash| wordlist.get(&hash))
                     .filter(|name| !name.starts_with('#'))
-                    .cloned()
+                    .cloned();
+                let internal_name = api_internal_name
+                    .or_else(|| {
+                        definition_internal_name
+                            .as_ref()
+                            .filter(|name| !name.starts_with('#'))
+                            .cloned()
+                    })
                     .or(pattern_internal_name)
                     .or(definition_internal_name);
                 (
                     internal_name,
                     definition_group_key(&definition),
                     definition_type_code(&definition),
-                    parse_rarity(&definition),
+                    parse_rarity_from_categories(&internal_categories)
+                        .or_else(|| parse_rarity(&definition)),
                     parse_price(&definition),
-                    extract_internal_categories(&definition, &internal_category_registry),
+                    internal_categories,
                 )
             })
             .unwrap_or_default();
@@ -1613,6 +1692,7 @@ fn load_gear_resolved(
     }
     classify_unseeded_weapon_skins(&mut items);
     correct_special_cosmetic_taxonomy(&mut items);
+    resolve_internal_item_type_taxonomy(&mut items);
     assign_weapon_mod_metadata(&mut items);
     let shell_taxonomy = runner_shell_taxonomy(&items);
     for (item, facets) in items.iter_mut().zip(&mut facets) {
@@ -1630,7 +1710,7 @@ fn load_gear_resolved(
         if item.item_type.as_deref() == Some("Weapon") && item.subcategory.is_none() {
             item.subcategory = weapon_subcategory(item);
         }
-        if item.definition_type_code == Some(0x19c) {
+        if matches!(item.definition_type_code, Some(0x19c | 0x1a9)) {
             item.types.retain(|kind| {
                 !matches!(kind.as_str(), "item_type_trinket" | "category_#A34DFEFD")
             });
@@ -1643,6 +1723,7 @@ fn load_gear_resolved(
             );
         }
     }
+    propagate_runner_skin_taxonomy(&mut items);
     assign_runner_owners(&mut items);
     assign_skin_weapons(&mut items);
     items.sort_by(|a, b| {
@@ -1652,6 +1733,47 @@ fn load_gear_resolved(
             .then(a.display_tag.cmp(&b.display_tag))
     });
     Ok(items)
+}
+
+/// The July display record no longer carries a structural UI type for every
+/// inventory row. Its compact internal `item_type.*` category remains intact.
+/// Learn each category's presentation label from independently typed rows and
+/// apply it only when that authored category has one unambiguous meaning.
+fn resolve_internal_item_type_taxonomy(items: &mut [GearItem]) {
+    let mut labels = FxHashMap::<String, FxHashSet<String>>::default();
+    for item in items.iter().filter(|item| item.item_type.is_some()) {
+        let label = item.item_type.as_ref().expect("filtered");
+        for category in item
+            .internal_categories
+            .iter()
+            .filter(|category| category.starts_with("item_type."))
+        {
+            labels
+                .entry(category.clone())
+                .or_default()
+                .insert(label.clone());
+        }
+    }
+    let labels = labels
+        .into_iter()
+        .filter_map(|(category, labels)| {
+            let mut labels = labels.into_iter();
+            let label = labels.next()?;
+            labels.next().is_none().then_some((category, label))
+        })
+        .collect::<FxHashMap<_, _>>();
+
+    for item in items.iter_mut().filter(|item| item.item_type.is_none()) {
+        let candidates = item
+            .internal_categories
+            .iter()
+            .filter_map(|category| labels.get(category))
+            .unique()
+            .collect::<Vec<_>>();
+        if let [category] = candidates.as_slice() {
+            item.item_type = Some((*category).clone());
+        }
+    }
 }
 
 fn localize_gear_display(
@@ -1821,6 +1943,24 @@ struct TaxonomyInference {
 fn infer_taxonomy(item: &GearItem) -> TaxonomyInference {
     let mut result = TaxonomyInference::default();
 
+    // Stable internal item-type categories survive localization and layout
+    // changes. These two opaque registry names are decoded by their unanimous
+    // live record sets: weapon cosmetics and profile titles respectively.
+    if item
+        .internal_categories
+        .iter()
+        .any(|category| category == "item_type.#A4200795")
+    {
+        result.category = Some("Weapon Skin".to_owned());
+    } else if item
+        .internal_categories
+        .iter()
+        .any(|category| category == "item_type.#A8805E93")
+    {
+        result.category = Some("Profile".to_owned());
+        result.subcategory = Some("Title".to_owned());
+    }
+
     match item.classification.as_deref() {
         Some("weapon") => result.category = Some("Weapon".to_owned()),
         Some("ranked") => result.category = Some("Ranked Reward".to_owned()),
@@ -1916,15 +2056,26 @@ fn infer_taxonomy(item: &GearItem) -> TaxonomyInference {
                 result.subcategory = Some("Title".to_owned());
             }
             Some(0x128) => {
+                result.category = Some("Profile".to_owned());
+                result.subcategory = Some("Title".to_owned());
+            }
+            Some(0x12c) => {
                 result.category = Some("Runner Skin".to_owned());
                 result.subcategory = Some("Rook".to_owned());
                 result.facets.push("runner_rook".to_owned());
             }
             Some(0x132) => result.category = Some("Charm".to_owned()),
             Some(0x134) => result.category = Some("Sticker".to_owned()),
+            Some(0x117) => {
+                result.category = Some("Progression Reward".to_owned());
+                result.subcategory = Some("Cosmetics".to_owned());
+            }
             Some(0x153) => result.category = Some("Challenge".to_owned()),
-            Some(0x186..=0x190) => result.category = Some("Sponsored Kit".to_owned()),
-            Some(0x19c) => {
+            Some(0x158) => result.category = Some("Trinket".to_owned()),
+            Some(0x186..=0x190 | 0x197..=0x19b) => {
+                result.category = Some("Sponsored Kit".to_owned())
+            }
+            Some(0x19c | 0x1a9) => {
                 result.category = Some("Implant".to_owned());
                 result.subcategory = Some("Implant".to_owned());
             }
@@ -1938,16 +2089,13 @@ fn infer_taxonomy(item: &GearItem) -> TaxonomyInference {
         result.category = Some("Item Modifier".to_owned());
     }
     if result.category.is_none() && item.definition_type_code == Some(0x030) {
-        let is_key_template = item.name.contains("Key Template")
-            || item.name.ends_with("Door Key")
-            || item
-                .description
-                .as_deref()
-                .is_some_and(|description| description.contains("key template"));
-        if is_key_template {
-            result.category = Some("Key".to_owned());
-            result.subcategory = Some("Template".to_owned());
-        }
+        // Authored loot-type/display-item rows. The contained `item_type.*`
+        // category describes what the table yields, not the row's UI class.
+        result.category = Some("Loot Type".to_owned());
+    }
+    if result.category.is_none() && item.definition_type_code == Some(0x031) {
+        result.category = Some("Key".to_owned());
+        result.subcategory = Some("Template".to_owned());
     }
     if result.category.is_none() && item.definition_type_code == Some(0x156) {
         result.category = Some("Trinket".to_owned());
@@ -2050,6 +2198,27 @@ impl GearItem {
 fn classify_unseeded_weapon_skins(items: &mut [GearItem]) {
     let generated_weapon_owners = generated_skin_path_owners();
     let generated_melee_hashes = generated_skin_hashes(MELEE_SKIN_OWNER_PATHS);
+    // The compact `item_type` category is shared by weapon and melee
+    // cosmetics. A concrete investment path/hash is therefore authoritative
+    // before group propagation; group ordinals are reused across these two
+    // cosmetic domains in the updated tables.
+    for item in items.iter_mut().filter(|item| {
+        item.definition_type_code
+            .is_some_and(is_weapon_or_melee_skin_type)
+    }) {
+        if direct_melee_skin(item, &generated_melee_hashes) {
+            item.item_type = Some("Melee".to_owned());
+            item.subcategory = item
+                .internal_name
+                .as_deref()
+                .and_then(|name| name.strip_prefix("melees."))
+                .and_then(|path| path.split('.').next())
+                .map(humanize_identifier)
+                .or_else(|| Some("Knives".to_owned()));
+        } else if direct_skin_weapon_hash(item, &generated_weapon_owners).is_some() {
+            item.item_type = Some("Weapon Skin".to_owned());
+        }
+    }
     let seeded_groups = items
         .iter()
         .filter(|item| {
@@ -2202,6 +2371,22 @@ fn weapon_mod_category_from_definition(definition: &[u8]) -> Option<&'static str
     .find_map(|(marker, category)| values.contains(&marker).then_some(category))
 }
 
+fn weapon_mod_category_from_internal_categories(item: &GearItem) -> Option<&'static str> {
+    if item
+        .internal_categories
+        .iter()
+        .any(|category| category == "item_type.#F97B117F")
+    {
+        // Current universal behaviour-chip rows no longer expose their old
+        // `weapon_mods.chips.*` wordlist path, but retain this authored type.
+        return Some("Chip");
+    }
+    item.internal_categories
+        .iter()
+        .any(|category| category == "item_type.weapon_mod.unique")
+        .then_some("Unique")
+}
+
 fn weapon_mod_path_family(internal_name: &str) -> Option<(&str, &str)> {
     let mut parts = internal_name.strip_prefix("weapon_mods.")?.split('.');
     Some((parts.next()?, parts.next()?))
@@ -2269,14 +2454,13 @@ fn base_weapon_matches_mod_family(
     match (category, compatibility) {
         ("Barrel", "precision") => {
             (weapon.is_subcategory("Marksman Rifle") || weapon.is_subcategory("Sniper Rifle"))
-                // V66's authored front family is `battery_front`, confirmed
-                // by its exact `gold_battery_dmr` Prestige mod. It must not
-                // also inherit the ballistic precision-barrel family.
-                && !weapon.is_archetype("dmr_battery_01")
+                && weapon.is_ballistic()
         }
         ("Foregrip", "rifle") => weapon.is_subcategory("Assault Rifle") && weapon.is_ballistic(),
         ("Foregrip", "shotgun") => weapon.is_subcategory("Shotgun"),
-        ("Generator", _) => weapon.is_subcategory("Railgun") && weapon.is_fusion(),
+        // The July investment update exposes the generator family on both
+        // railgun feeds. Ammo type is not the slot discriminator.
+        ("Generator", _) => weapon.is_subcategory("Railgun"),
         ("Magazine", "battery") => weapon.is_battery() && weapon.supports_magazine_mods(),
         ("Magazine", "heavy_battery") => weapon.is_fusion() && weapon.supports_magazine_mods(),
         ("Magazine", "lmg") => {
@@ -2317,11 +2501,13 @@ fn base_weapon_matches_mod_family(
         // while `gold_btsmg` targets V22 within the broader Dampener family.
         // V11 and V75 share that same Dampener family; display subtypes alone
         // are not sufficient to make this distinction.
-        ("Muzzle", "battery_front") => weapon.is_archetype("dmr_battery_01"),
+        ("Muzzle", "battery_front") => {
+            weapon.is_archetype("dmr_battery_01") || weapon.is_archetype("sniper_fusion_01")
+        }
         ("Muzzle", "dampener") => ["pistol_battery_01", "smg_battery_01", "auto_battery_01"]
             .into_iter()
             .any(|archetype| weapon.is_archetype(archetype)),
-        ("Muzzle", "underbarrel") => weapon.is_subcategory("Shotgun"),
+        ("Muzzle", "underbarrel") => weapon.is_subcategory("Shotgun") && weapon.is_ballistic(),
         ("Optic", "lmg") => weapon.is_subcategory("Machine Gun"),
         ("Optic", "marksman") => weapon.is_subcategory("Marksman Rifle"),
         // The D54 ships with an integrated sight and uses its fourth authored
@@ -2496,6 +2682,7 @@ fn assign_weapon_mod_metadata(items: &mut [GearItem]) {
             .internal_name
             .as_deref()
             .and_then(weapon_mod_category_from_path)
+            .or_else(|| weapon_mod_category_from_internal_categories(item))
             .or_else(|| {
                 item.definition_tag
                     .and_then(|tag| package_manager().read_tag(tag).ok())
@@ -2835,16 +3022,14 @@ fn assign_skin_weapons(items: &mut [GearItem]) {
     }
 }
 
-/// Updated opaque skin rows still retain two independently-authored reference
-/// tables whose entries are contiguous within a weapon family. Use a neighbor
-/// only when both tables identify the same canonical owner, avoiding package or
-/// model-hash proximity guesses.
-fn reconcile_skin_reference_neighborhoods(
+/// Resolve opaque updated cosmetics through exact Pattern-component reuse.
+/// A cosmetic may have a new wrapper and no usable investment path/group, but
+/// it still instantiates the same weapon-authored component as a proven skin.
+/// Shared/global components naturally map to several owners and are ignored.
+fn reconcile_skin_shared_pattern_components(
     items: &mut [GearItem],
     cache: &quicktag_scanner::TagCache,
 ) -> usize {
-    const MAX_REFERENCE_GAP: u16 = 64;
-
     let canonical_names = items
         .iter()
         .filter(|item| {
@@ -2857,7 +3042,7 @@ fn reconcile_skin_reference_neighborhoods(
         .filter(|item| item.item_type.as_deref() == Some("Weapon"))
         .filter_map(|item| Some((item.name.clone(), item.subcategory.clone()?)))
         .collect::<FxHashMap<_, _>>();
-    let mut anchors_by_package: FxHashMap<u16, Vec<(u16, String)>> = FxHashMap::default();
+    let mut component_owners = FxHashMap::<TagHash, FxHashSet<String>>::default();
     for skin in items.iter().filter(|item| {
         item.item_type.as_deref() == Some("Weapon Skin")
             && item
@@ -2868,14 +3053,11 @@ fn reconcile_skin_reference_neighborhoods(
         let Some((model, owner)) = skin.model_tag.zip(skin.applies_to.as_ref()) else {
             continue;
         };
-        let Some(scan) = cache.hashes.get(&model) else {
-            continue;
-        };
-        for reference in &scan.references {
-            anchors_by_package
-                .entry(reference.pkg_id())
+        for component in model_pattern_components(cache, model) {
+            component_owners
+                .entry(component)
                 .or_default()
-                .push((reference.entry_index(), owner.clone()));
+                .insert(owner.clone());
         }
     }
 
@@ -2883,54 +3065,58 @@ fn reconcile_skin_reference_neighborhoods(
     for skin in items.iter_mut().filter(|item| {
         item.item_type.as_deref() == Some("Weapon Skin") && item.applies_to.is_none()
     }) {
-        let Some(scan) = skin.model_tag.and_then(|model| cache.hashes.get(&model)) else {
+        let Some(model) = skin.model_tag else {
             continue;
         };
-        let mut votes = Vec::new();
-        for reference in &scan.references {
-            let Some(anchors) = anchors_by_package.get(&reference.pkg_id()) else {
-                continue;
-            };
-            // Standard/default rows are authored first in each family block.
-            // Their equally-close predecessor is therefore the prior weapon;
-            // prefer the next entry before applying the symmetric rule.
-            let forward_only = skin.rarity == Some(GearRarity::Standard);
-            let gap = |entry: u16| {
-                if forward_only {
-                    entry.checked_sub(reference.entry_index())
-                } else {
-                    Some(entry.abs_diff(reference.entry_index()))
-                }
-            };
-            let closest_gap = anchors
-                .iter()
-                .filter_map(|(entry, _)| gap(*entry))
-                .filter(|gap| *gap > 0 && *gap <= MAX_REFERENCE_GAP)
-                .min();
-            let Some(closest_gap) = closest_gap else {
-                continue;
-            };
-            let mut closest_owners = anchors
-                .iter()
-                .filter(|(entry, _)| gap(*entry) == Some(closest_gap))
-                .map(|(_, owner)| owner.as_str())
-                .unique();
-            let Some(owner) = closest_owners.next() else {
-                continue;
-            };
-            if closest_owners.next().is_none() {
-                votes.push(owner);
-            }
-        }
-        if votes.len() < 2 || votes.iter().unique().count() != 1 {
+        let owners = model_pattern_components(cache, model)
+            .into_iter()
+            .filter_map(|component| component_owners.get(&component))
+            .filter(|owners| owners.len() == 1)
+            .flatten()
+            .unique()
+            .collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
             continue;
-        }
-        let owner = votes[0];
-        skin.applies_to = Some(owner.to_owned());
-        skin.subcategory = subcategories.get(owner).cloned();
+        };
+        skin.applies_to = Some((*owner).clone());
+        skin.subcategory = subcategories.get(*owner).cloned();
         resolved += 1;
     }
     resolved
+}
+
+fn model_pattern_components(
+    cache: &quicktag_scanner::TagCache,
+    model: TagHash,
+) -> FxHashSet<TagHash> {
+    let mut components = FxHashSet::default();
+    let mut seen = FxHashSet::default();
+    let mut queue = std::collections::VecDeque::from([(model, 0usize)]);
+    seen.insert(model);
+    while let Some((node, depth)) = queue.pop_front() {
+        if depth >= 12 {
+            continue;
+        }
+        let Some(scan) = cache.hashes.get(&node) else {
+            continue;
+        };
+        for child in scan.file_hashes.iter().map(|reference| reference.hash) {
+            let Some(entry) = package_manager().get_entry(child) else {
+                continue;
+            };
+            if entry.reference == MODEL_PATTERN_COMPONENT_REFERENCE {
+                components.insert(child);
+            }
+            if matches!(
+                entry.reference,
+                MODEL_PATTERN_REFERENCE | MODEL_PATTERN_COMPONENT_REFERENCE
+            ) && seen.insert(child)
+            {
+                queue.push_back((child, depth + 1));
+            }
+        }
+    }
+    components
 }
 
 /// Some current rows omit a usable path and have no resolvable Pattern frame.
@@ -2938,6 +3124,66 @@ fn reconcile_skin_reference_neighborhoods(
 /// path/geometry/reference passes prove either one owner or a 2x-supported
 /// dominant owner. This preserves explicit special-family collisions.
 fn propagate_current_skin_groups(items: &mut [GearItem]) -> usize {
+    let weapon_names = items
+        .iter()
+        .filter(|item| item.item_type.as_deref() == Some("Weapon"))
+        .filter_map(|item| Some((item.internal_hash?, item.name.clone())))
+        .collect::<FxHashMap<_, _>>();
+    let generated_owners = generated_skin_path_owners();
+    let exact_candidates = items
+        .iter()
+        .filter(|item| {
+            item.item_type.as_deref() == Some("Weapon Skin")
+                && item.definition_type_code == Some(0x137)
+                // 0x811c is the high half of the FNV empty sentinel, used by
+                // ungrouped/special cosmetics rather than a real group row.
+                && item
+                    .definition_group_key
+                    .is_some_and(|key| key as u16 != 0x811c)
+        })
+        .filter_map(|item| {
+            Some((
+                item.cosmetic_group_key()?,
+                direct_skin_weapon_hash(item, &generated_owners)
+                    .and_then(|hash| weapon_names.get(&hash))?
+                    .clone(),
+            ))
+        })
+        .into_group_map();
+    let exact_owners = exact_candidates
+        .into_iter()
+        .filter_map(|(group, owners)| {
+            let owners = owners.into_iter().unique().collect::<Vec<_>>();
+            (owners.len() == 1).then(|| (group, owners.into_iter().next().unwrap()))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let subcategories = items
+        .iter()
+        .filter(|item| item.item_type.as_deref() == Some("Weapon"))
+        .filter_map(|item| Some((item.name.clone(), item.subcategory.clone()?)))
+        .collect::<FxHashMap<_, _>>();
+    let mut resolved = 0;
+    for skin in items.iter_mut().filter(|item| {
+        item.item_type.as_deref() == Some("Weapon Skin")
+            && item.definition_type_code == Some(0x137)
+            && item
+                .definition_group_key
+                .is_some_and(|key| key as u16 != 0x811c)
+    }) {
+        let Some(owner) = skin
+            .cosmetic_group_key()
+            .and_then(|group| exact_owners.get(&group))
+        else {
+            continue;
+        };
+        if skin.applies_to.as_ref() == Some(owner) {
+            continue;
+        }
+        skin.applies_to = Some(owner.clone());
+        skin.subcategory = subcategories.get(owner).cloned();
+        resolved += 1;
+    }
+
     let candidates = items
         .iter()
         .filter(|item| {
@@ -2963,13 +3209,6 @@ fn propagate_current_skin_groups(items: &mut [GearItem]) -> usize {
                 .then(|| (group, owner.clone()))
         })
         .collect::<FxHashMap<_, _>>();
-    let subcategories = items
-        .iter()
-        .filter(|item| item.item_type.as_deref() == Some("Weapon"))
-        .filter_map(|item| Some((item.name.clone(), item.subcategory.clone()?)))
-        .collect::<FxHashMap<_, _>>();
-
-    let mut resolved = 0;
     for skin in items.iter_mut().filter(|item| {
         item.item_type.as_deref() == Some("Weapon Skin")
             && item.definition_type_code == Some(0x137)
@@ -3018,10 +3257,10 @@ fn assign_legacy_unresolved_skin_owners(items: &mut [GearItem]) {
 }
 
 fn runner_shell_model(description: &str) -> Option<&str> {
-    description
-        .lines()
-        .next()?
+    let header = description.lines().next()?;
+    header
         .strip_prefix("SHELL MODEL:")
+        .or_else(|| header.strip_prefix("FRAME MODEL:"))
         .map(str::trim)
         .filter(|model| !model.is_empty())
 }
@@ -3047,7 +3286,45 @@ fn runner_core_archetype(
 }
 
 fn canonical_runner_shell_model(model: &str) -> &str {
-    model.strip_suffix(" [basic]").unwrap_or(model)
+    let model = model.strip_suffix(" [basic]").unwrap_or(model);
+    if model.eq_ignore_ascii_case("rook") {
+        "Rook"
+    } else {
+        model
+    }
+}
+
+/// Current runner cosmetics retain their authored definition group even when
+/// their wordlist path and `SHELL/FRAME MODEL` debug header are absent. Learn a
+/// group only from path/header-backed runner rows and reject conflicting groups.
+fn propagate_runner_skin_taxonomy(items: &mut [GearItem]) {
+    let groups = items
+        .iter()
+        .filter(|item| item.item_type.as_deref() == Some("Runner Skin"))
+        .filter_map(|item| Some((item.cosmetic_group_key()?, item.subcategory.clone()?)))
+        .into_group_map();
+    let groups = groups
+        .into_iter()
+        .filter_map(|(group, subcategories)| {
+            let mut subcategories = subcategories.into_iter().unique();
+            let subcategory = subcategories.next()?;
+            subcategories
+                .next()
+                .is_none()
+                .then_some((group, subcategory))
+        })
+        .collect::<FxHashMap<_, _>>();
+
+    for item in items.iter_mut().filter(|item| {
+        item.item_type.as_deref() == Some("Runner Skin") && item.subcategory.is_none()
+    }) {
+        if let Some(subcategory) = item
+            .cosmetic_group_key()
+            .and_then(|group| groups.get(&group))
+        {
+            item.subcategory = Some(subcategory.clone());
+        }
+    }
 }
 
 fn runner_shell_names(items: &[GearItem]) -> FxHashMap<String, String> {
@@ -3780,21 +4057,6 @@ fn parse_rarity(data: &[u8]) -> Option<GearRarity> {
         return tier;
     }
 
-    // Unique weapons use a packed rarity/category value rather than the normal
-    // fixed-tier marker. This value is shared by named and hash-only definitions.
-    if data
-        .chunks_exact(4)
-        .any(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == RARITY_UNIQUE_VALUE)
-    {
-        return Some(GearRarity::Unique);
-    }
-    if data
-        .chunks_exact(4)
-        .any(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == RARITY_CONTRABAND_VALUE)
-    {
-        return Some(GearRarity::Contraband);
-    }
-
     // Special tiers may be stored directly as raw hashes.
     data.chunks_exact(4)
         .find_map(|bytes| GearRarity::from_raw_hash(u32::from_le_bytes(bytes.try_into().unwrap())))
@@ -3802,6 +4064,26 @@ fn parse_rarity(data: &[u8]) -> Option<GearRarity> {
             read_u32(data, data.len().checked_sub(4)?)
                 .and_then(|footer| GearRarity::from_footer_code((footer >> 16) as u16))
         })
+}
+
+/// The updated investment definition explicitly authors rarity as an internal
+/// category.  It is more specific than incidental packed words elsewhere in
+/// the (now much larger) definition. `dynamic` is the ordinary baseline weapon
+/// tier shown as gray by the game; runtime rolls live in separate display rows.
+fn parse_rarity_from_categories(categories: &[String]) -> Option<GearRarity> {
+    categories.iter().find_map(|category| {
+        Some(match category.as_str() {
+            "rarity_tier.grey" | "rarity_tier.dynamic" => GearRarity::Standard,
+            "rarity_tier.green" => GearRarity::Enhanced,
+            "rarity_tier.blue" => GearRarity::Deluxe,
+            "rarity_tier.purple" => GearRarity::Superior,
+            "rarity_tier.gold" => GearRarity::Prestige,
+            "rarity_tier.contraband" => GearRarity::Contraband,
+            "rarity_tier.quest" => GearRarity::Quest,
+            "rarity_tier.unique" => GearRarity::Unique,
+            _ => return None,
+        })
+    })
 }
 
 fn parse_price(data: &[u8]) -> Option<u32> {
@@ -4232,7 +4514,7 @@ mod tests {
         for (target, expected_slots) in [
             ("V99 Channel Rifle", &["Optic", "Barrel", "Magazine"][..]),
             ("V00 ZEUS RG", &["Generator", "Magazine"]),
-            ("V85 Circuit Breaker", &["Barrel", "Grip", "Magazine"]),
+            ("V85 Circuit Breaker", &["Grip", "Magazine"]),
         ] {
             let weapon = catalog
                 .weapons
@@ -4555,7 +4837,7 @@ mod tests {
         let strings =
             Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
         let view = GearView::new(strings);
-        let cache = quicktag_scanner::load_tag_cache();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
         for item in view.items.iter().filter(|item| {
             item.item_type.as_deref() == Some("Weapon Mod")
                 && [
@@ -5086,14 +5368,24 @@ mod tests {
             parse_rarity(&RARITY_UNIQUE_HASH.to_le_bytes()),
             Some(GearRarity::Unique)
         );
-        assert_eq!(
-            parse_rarity(&RARITY_UNIQUE_VALUE.to_le_bytes()),
-            Some(GearRarity::Unique)
-        );
-        assert_eq!(
-            parse_rarity(&RARITY_CONTRABAND_VALUE.to_le_bytes()),
-            Some(GearRarity::Contraband)
-        );
+        assert_eq!(parse_rarity(&RARITY_UNIQUE_VALUE.to_le_bytes()), None);
+        assert_eq!(parse_rarity(&RARITY_CONTRABAND_VALUE.to_le_bytes()), None);
+        for (category, rarity) in [
+            ("rarity_tier.dynamic", GearRarity::Standard),
+            ("rarity_tier.grey", GearRarity::Standard),
+            ("rarity_tier.green", GearRarity::Enhanced),
+            ("rarity_tier.blue", GearRarity::Deluxe),
+            ("rarity_tier.purple", GearRarity::Superior),
+            ("rarity_tier.gold", GearRarity::Prestige),
+            ("rarity_tier.contraband", GearRarity::Contraband),
+            ("rarity_tier.quest", GearRarity::Quest),
+            ("rarity_tier.unique", GearRarity::Unique),
+        ] {
+            assert_eq!(
+                parse_rarity_from_categories(&[category.to_owned()]),
+                Some(rarity)
+            );
+        }
     }
 
     #[test]
@@ -5256,7 +5548,7 @@ mod tests {
             assert!(!fixed_feed.supports_magazine_mods());
         }
         assert!(bully.supports_magazine_mods());
-        assert!(!base_weapon_matches_mod_family(
+        assert!(base_weapon_matches_mod_family(
             &ares,
             "Generator",
             "payload"
@@ -5283,7 +5575,7 @@ mod tests {
             "Foregrip",
             "shotgun"
         ));
-        assert!(base_weapon_matches_mod_family(
+        assert!(!base_weapon_matches_mod_family(
             &circuit_breaker,
             "Muzzle",
             "underbarrel"
@@ -5293,10 +5585,15 @@ mod tests {
             "Generator",
             "heavy_battery"
         ));
-        assert!(base_weapon_matches_mod_family(
+        assert!(!base_weapon_matches_mod_family(
             &channel_rifle,
             "Barrel",
             "precision"
+        ));
+        assert!(base_weapon_matches_mod_family(
+            &channel_rifle,
+            "Muzzle",
+            "battery_front"
         ));
         assert!(base_weapon_matches_mod_family(
             &channel_rifle,
@@ -6086,6 +6383,278 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the current local Marathon package installation"]
+    fn audits_current_marathon_gear_contract() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let items = &view.items;
+
+        assert_eq!(items.len(), 2_415, "current investment row count changed");
+        assert!(
+            items.iter().all(|item| item.item_type.is_some()),
+            "unresolved Gear UI taxonomy: {:#?}",
+            items
+                .iter()
+                .filter(|item| item.item_type.is_none())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.internal_categories.is_empty()),
+            "some Gear definitions lost their authored internal-category table"
+        );
+        let internal_categories = items
+            .iter()
+            .flat_map(|item| item.internal_categories.iter().map(String::as_str))
+            .collect::<FxHashSet<_>>();
+        for category in [
+            "ammo_compatibility.ammo_heavy_battery",
+            "behaviors.durable_item",
+            "loot_table_behaviors.always_excluded",
+        ] {
+            assert!(internal_categories.contains(category), "missing {category}");
+        }
+
+        let weapons = items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Weapon"))
+            .collect::<Vec<_>>();
+        assert_eq!(weapons.len(), 83);
+        for name in [
+            "Demolition HMG",
+            "M77 Assault Rifle",
+            "Overrun AR",
+            "Stryder M1T",
+            "Twin Tap HBR",
+        ] {
+            let matching = weapons
+                .iter()
+                .filter(|weapon| weapon.name == name)
+                .copied()
+                .collect::<Vec<_>>();
+            assert!(
+                matching
+                    .iter()
+                    .any(|weapon| weapon.rarity == Some(GearRarity::Standard)),
+                "missing baseline weapon {name}"
+            );
+            assert!(
+                matching.iter().all(|weapon| !matches!(
+                    weapon.rarity,
+                    Some(GearRarity::Contraband | GearRarity::Unique)
+                )),
+                "baseline weapon {name} has false special rarity: {matching:#?}"
+            );
+        }
+
+        for (model, expected) in [
+            (TagHash(0x80B7C92A), "Hardline PR"),
+            (TagHash(0x80B7B8D9), "Overrun AR"),
+        ] {
+            let owners = catalog
+                .weapons
+                .iter()
+                .filter(|weapon| weapon.model_tags.contains(&model))
+                .map(|weapon| weapon.name.as_str())
+                .unique()
+                .collect::<Vec<_>>();
+            assert_eq!(owners, [expected], "wrong Models owner for {model}");
+        }
+
+        let runner_cores = items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Runner Core"))
+            .collect::<Vec<_>>();
+        assert_eq!(runner_cores.len(), 80);
+        let mut core_owner_counts = runner_cores
+            .iter()
+            .map(|core| core.applies_to.as_deref().unwrap_or("<missing>"))
+            .counts()
+            .into_iter()
+            .collect::<Vec<_>>();
+        core_owner_counts.sort_unstable();
+        assert_eq!(
+            core_owner_counts,
+            vec![
+                ("All Shells", 10),
+                ("Assassin", 10),
+                ("Destroyer", 10),
+                ("Recon", 10),
+                ("Sentinel", 10),
+                ("Thief", 10),
+                ("Triage", 10),
+                ("Vandal", 10),
+            ]
+        );
+        assert_eq!(
+            runner_cores
+                .iter()
+                .map(|core| core.name.as_str())
+                .unique()
+                .count(),
+            runner_cores.len(),
+            "Runner Core localization collapsed"
+        );
+
+        let runner_skins = items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Runner Skin"))
+            .collect::<Vec<_>>();
+        let runner_owner_counts = runner_skins
+            .iter()
+            .map(|skin| skin.applies_to.as_deref().unwrap_or("<missing>"))
+            .counts();
+        assert!(
+            runner_skins
+                .iter()
+                .any(|skin| skin.applies_to.as_deref() == Some("Recon")),
+            "runner owners: {runner_owner_counts:?}"
+        );
+        assert!(
+            runner_skins
+                .iter()
+                .any(|skin| skin.applies_to.as_deref() == Some("Rook")),
+            "runner owners: {runner_owner_counts:?}"
+        );
+        assert!(
+            runner_skins
+                .iter()
+                .all(|skin| skin.subcategory.is_some() && skin.applies_to.is_some()),
+            "unowned runner skins: {:#?}",
+            runner_skins
+                .iter()
+                .filter(|skin| skin.subcategory.is_none() || skin.applies_to.is_none())
+                .collect::<Vec<_>>()
+        );
+        assert!(items.iter().all(|item| {
+            item.definition_type_code != Some(0x128)
+                || (item.item_type.as_deref() == Some("Profile")
+                    && item.subcategory.as_deref() == Some("Title"))
+        }));
+
+        assert!(items.iter().all(|item| {
+            !matches!(item.definition_type_code, Some(0x19c | 0x1a9))
+                || (item.item_type.as_deref() == Some("Implant")
+                    && !item.types.iter().any(|kind| kind.contains("trinket")))
+        }));
+        assert!(items.iter().all(|item| {
+            item.item_type.as_deref() != Some("Trinket")
+                || !matches!(item.definition_type_code, Some(0x19c | 0x1a9))
+        }));
+
+        let mods = items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Weapon Mod"))
+            .collect::<Vec<_>>();
+        assert_eq!(mods.len(), 512);
+        assert!(mods.iter().all(|item| item.rarity.is_some()));
+        let unmatched_mods = mods
+            .iter()
+            .filter(|item| {
+                item.mod_category.as_deref() != Some("Chip")
+                    && (item.compatible_weapons.is_empty() || item.mod_is_universal)
+            })
+            .collect::<Vec<_>>();
+        // Firestorm's three Contraband affixes are private quest-weapon
+        // behavior rows, not selectable attachment-pool mods. Their authored
+        // definitions intentionally omit public compatibility. Every ordinary
+        // attachment must still resolve to a concrete, non-universal pool.
+        assert_eq!(unmatched_mods.len(), 3);
+        assert!(
+            unmatched_mods.iter().all(|item| {
+                item.rarity == Some(GearRarity::Contraband)
+                    && item
+                        .internal_categories
+                        .iter()
+                        .any(|category| category == "loot_table_behaviors.always_excluded")
+            }),
+            "ordinary weapon mods lost compatibility: {:#?}",
+            unmatched_mods
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            mods.iter()
+                .filter(|item| item.mod_category.as_deref() == Some("Chip"))
+                .all(|item| item.mod_is_universal && item.compatible_weapons.is_empty())
+        );
+
+        let compatible = |name: &str, weapon: &str| {
+            mods.iter().any(|item| {
+                item.name == name
+                    && item
+                        .compatible_weapons
+                        .iter()
+                        .any(|candidate| candidate == weapon)
+            })
+        };
+        assert!(compatible("Daredevil Stock", "KKV-9SD"));
+        assert!(compatible("Daredevil Stock", "D54 Battle Pistol"));
+        assert!(compatible("Null-Grav Generator", "ARES RG"));
+        assert!(compatible("Null-Grav Generator", "V00 ZEUS RG"));
+        assert!(!mods.iter().any(|item| {
+            item.mod_category.as_deref() == Some("Muzzle")
+                && item
+                    .compatible_weapons
+                    .iter()
+                    .any(|weapon| weapon == "V85 Circuit Breaker")
+        }));
+        assert!(compatible("Accu-Point Barrel", "V66 Lookout"));
+        assert!(compatible("Accu-Point Barrel", "V99 Channel Rifle"));
+        assert!(!compatible("Precision Barrel", "V99 Channel Rifle"));
+
+        let slots = |weapon_name: &str| {
+            let weapon = items
+                .iter()
+                .find(|item| {
+                    item.item_type.as_deref() == Some("Weapon") && item.name == weapon_name
+                })
+                .unwrap_or_else(|| panic!("missing weapon {weapon_name}"));
+            compatible_mod_sections(items, weapon)
+                .into_iter()
+                .map(|(slot, _)| slot)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slots("ARES RG"), ["Generator", "Magazine"]);
+        assert_eq!(slots("V85 Circuit Breaker"), ["Grip", "Magazine"]);
+        assert_eq!(slots("V99 Channel Rifle"), ["Optic", "Barrel", "Magazine"]);
+
+        let weapon_skins = items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Weapon Skin"))
+            .collect::<Vec<_>>();
+        assert_eq!(weapon_skins.len(), 225);
+        assert!(
+            weapon_skins.iter().all(|skin| skin.applies_to.is_some()),
+            "unowned weapon skins: {:#?}",
+            weapon_skins
+                .iter()
+                .filter(|skin| skin.applies_to.is_none())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     #[ignore = "requires a local Marathon package installation"]
     fn audits_marathon_localization_collisions() {
         let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
@@ -6119,7 +6688,7 @@ mod tests {
             "gear records: {}; categories: {category_counts:?}",
             items.len()
         );
-        assert_eq!(items.len(), 2_357);
+        assert_eq!(items.len(), 2_415);
         let runner_cores = items
             .iter()
             .filter(|item| item.item_type.as_deref() == Some("Runner Core"))
@@ -6494,7 +7063,7 @@ mod tests {
             ("ARES RG", &["Magazine"]),
             ("V00 ZEUS RG", &["Generator", "Magazine"]),
             ("Misriah 2442", &["Barrel", "Grip", "Magazine"]),
-            ("V85 Circuit Breaker", &["Barrel", "Grip", "Magazine"]),
+            ("V85 Circuit Breaker", &["Grip", "Magazine"]),
             ("WSTR Combat Shotgun", &["Barrel", "Grip"]),
             ("Longshot", &["Optic", "Barrel", "Magazine"]),
             ("Outland", &["Optic", "Barrel"]),
