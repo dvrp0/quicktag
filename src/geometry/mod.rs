@@ -11,13 +11,14 @@ use wgpu::util::DeviceExt;
 
 use crate::material::{
     MaterialPreviewKind, MaterialTagPreview, TechniqueMaterialConstants, TechniqueTextureBinding,
-    interpret_tfx_stack_with_object_channels, is_technique_entry, material_constants_for_technique,
-    primary_sampler_for_technique, render_state_for_technique, texture_bindings_for_technique,
+    interpret_tfx_stack_with_object_channels, interpret_tfx_stack_with_runtime_inputs,
+    is_technique_entry, material_constants_for_technique, primary_sampler_for_technique,
+    render_state_for_technique, texture_bindings_for_technique,
 };
 use crate::texture::Texture;
 
 #[cfg(test)]
-use crate::material::{render_state_for_technique, tfx_texture_bindings_for_technique};
+use crate::material::tfx_texture_bindings_for_technique;
 
 const MAX_PREVIEW_VERTICES: usize = 200_000;
 const MAX_PREVIEW_INDICES: usize = 900_000;
@@ -240,8 +241,9 @@ pub struct WireframePreview {
     pub uv_format: Option<String>,
     pub vertices: Vec<[f32; 3]>,
     pub normals: Option<Vec<[f32; 3]>>,
-    /// Dequantized model-local POSITION consumed by GearDye TEXCOORD5.
-    /// Attachment transforms must not alter this stream.
+    /// Raw shader-input POSITION consumed by common-surface procedural passes.
+    /// For `R16G16B16A16_SNORM` geometry this is the hardware-decoded
+    /// `[-1, 1]` value, before geometry scale/offset and attachment transforms.
     pub procedural_positions: Option<Vec<[f32; 3]>>,
     /// Model-local NORMAL consumed by GearDye TEXCOORD6.
     pub procedural_normals: Option<Vec<[f32; 3]>>,
@@ -264,6 +266,9 @@ pub struct WireframeMaterialRange {
     pub render_stage: Option<u8>,
     pub technique: Option<TagHash>,
     pub gear_dye_change_color_index: Option<u8>,
+    /// Rigid-model `position_offset.w` / skinning `offset_scale.w` consumed
+    /// by common-surface procedural branches through `scope_skinning[5].w`.
+    pub procedural_scale: f32,
     pub texture: Option<TagHash>,
     pub textures: WireframeMaterialTextures,
 }
@@ -291,6 +296,22 @@ pub struct WireframeMaterialTextures {
     pub gear_dye_default: Option<[f32; 4]>,
     pub gear_dye_palette: Option<[GearDyeMaterial; 6]>,
     pub mod_wear: Option<WeaponModWearMaterial>,
+    /// Time-driven common-surface overlay used by animated inventory skins.
+    /// Detection comes from the compiled PS/TFX ABI: a slot-7 field atlas,
+    /// frame-driven outputs 66/67/71, and the authored response constants.
+    pub animated_dither: Option<AnimatedDitherMaterial>,
+    /// Object-space contour/detail layer decoded from the common gear surface
+    /// shader. The control map selects which material IDs receive the layer;
+    /// the bound field texture perturbs the authored tri-planar line function.
+    pub gear_pattern: Option<GearPatternMaterial>,
+    /// The technique directly owns a shared colour/decal atlas. Shared atlases
+    /// often resemble engine debug sheets globally, but must not be removed
+    /// when shader bindings prove this material consumes one as visible data.
+    pub authored_shared_atlas: bool,
+    /// Authored investment-decal shader inputs. Runner decals encode a source
+    /// selector in UV.x and keep opacity in a separate BC4 atlas; treating the
+    /// colour atlas as an ordinary material produces the large white quads.
+    pub investment_decal: Option<InvestmentDecalMaterial>,
     pub emissive_strength: u8,
     /// Textureless Tiger material base colour decoded from the pixel shader's
     /// authored constant-buffer defaults. `frame_color == -1` is an engine
@@ -298,6 +319,41 @@ pub struct WireframeMaterialTextures {
     pub solid_color: Option<[f32; 4]>,
     /// Authored `(roughness, metalness)` for a decoded textureless material.
     pub solid_surface: Option<[f32; 2]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvestmentDecalMode {
+    SelectorMask,
+    DetailSelectorMask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvestmentDecalMaskMode {
+    Threshold,
+    UvSplit,
+    Binary,
+}
+
+/// Decoded constants and resources from Marathon's investment-decal pixel
+/// shader ABI. This is shared by weapon and runner geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InvestmentDecalMaterial {
+    pub mode: InvestmentDecalMode,
+    pub color: TagHash,
+    pub mask: TagHash,
+    pub detail: Option<TagHash>,
+    pub selector_colors: [[f32; 4]; 5],
+    pub selector_color_count: u8,
+    pub atlas_selector_max: u8,
+    pub mask_mode: InvestmentDecalMaskMode,
+    pub mask_threshold: f32,
+    pub detail_transform: [f32; 4],
+    pub detail_base: [f32; 4],
+    pub detail_scale: [f32; 4],
+    pub grayscale_remap: [f32; 4],
+    pub positive_mask_remap: [f32; 4],
+    pub negative_mask_remap: [f32; 4],
+    pub output_gate: f32,
 }
 
 /// The three condition tiers authored for Marathon weapon mods. The game uses
@@ -387,11 +443,78 @@ impl Default for WireframeMaterialTextures {
             gear_dye_default: None,
             gear_dye_palette: None,
             mod_wear: None,
+            animated_dither: None,
+            gear_pattern: None,
+            authored_shared_atlas: false,
+            investment_decal: None,
             emissive_strength: 0,
             solid_color: None,
             solid_surface: None,
         }
     }
+}
+
+/// Decoded constants/resources for Tiger's procedural gear-pattern branch.
+///
+/// This is deliberately data-driven. Weapon/skin tags do not identify the
+/// effect: the compiled pixel-shader ABI (control t3, field t6, material IDs
+/// 2/4, and its constant block) does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GearPatternMaterial {
+    pub field: TagHash,
+    pub projection: [f32; 4],
+    pub normal_power: f32,
+    pub field_midpoint: f32,
+    pub warp: [f32; 2],
+    pub stripe: [f32; 4],
+    pub contour: [f32; 4],
+    pub contour_remap: [f32; 4],
+    pub colors: [[f32; 4]; 2],
+}
+
+/// Decoded parameters for Tiger's animated circular/dither surface branch.
+///
+/// The game scrolls two scales of the shared slot-7 atlas in object space,
+/// converts its blue/alpha pair into a triangular time mask, gates it by the
+/// authored object-space face normal, then reshapes the material colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnimatedDitherMaterial {
+    pub field: TagHash,
+    /// Slot-6 technical LUT sampled with mesh UVs before the animated response.
+    pub technical_mask: TagHash,
+    /// Per control-material affine remaps (PS constants 82..88).
+    pub technical_mask_remap: [[f32; 2]; 7],
+    /// Common-surface detail branch (PS t5). Engine projects this field in
+    /// object space and routes it into roughness, not base colour.
+    pub dot_detail: Option<AnimatedDotDetailMaterial>,
+    pub phase_speed: f32,
+    /// xy = object-space scale, zw = scroll rate.
+    pub primary_transform: [f32; 4],
+    /// xy = object-space scale, zw = scroll rate.
+    pub secondary_transform: [f32; 4],
+    /// x = waveform numerator, y = divisor, z/w = affine remap.
+    pub waveform: [f32; 4],
+    /// xy = normal-facing affine gate, z = response scale (c75*c76*c77 default),
+    /// w = authored wave strength (c74 default).
+    pub facing_response: [f32; 4],
+    /// x = colour exponent, y = colour scale, z = normal response, w = mask exponent.
+    pub surface_response: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnimatedDotDetailMaterial {
+    pub texture: TagHash,
+    pub position_scale: [f32; 3],
+    pub position_offset: [f32; 3],
+    /// PS c4: coarse triplanar projection used by control material IDs 0, 1, 3, and 4.
+    pub projection: [f32; 4],
+    /// PS c5: fine triplanar projection used only by control material ID 2.
+    pub fine_projection: [f32; 4],
+    pub normal_power: f32,
+    /// PS c89.x: roughness selected by the projected field.
+    pub roughness_target: f32,
+    /// PS c90.xy: affine remap applied to the projected field.
+    pub roughness_remap: [f32; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -1949,6 +2072,26 @@ fn load_model_preview_from_tags(
                 }
             }
         }
+        if wireframe
+            .material_ranges
+            .iter()
+            .any(|range| range.textures.animated_dither.is_some())
+            && let Some(palette) =
+                gear_dye_palette.or_else(|| weapon_skin_gear_dye_palette(&cache, tag))
+        {
+            for range in &mut wireframe.material_ranges {
+                if range.textures.animated_dither.is_some()
+                    && let Some(dye) = range
+                        .gear_dye_change_color_index
+                        .and_then(|index| palette.get(index as usize).copied())
+                {
+                    range.textures.gear_dye = Some(dye);
+                    range.textures.gear_dye_default =
+                        range.technique.and_then(technique_default_gear_dye_color);
+                    range.textures.gear_dye_palette = Some(palette);
+                }
+            }
+        }
     }
     let wireframe = merge_model_wireframes(parsed)
         .or_else(|| build_model_wireframe(&vertex_buffers, &index_buffers));
@@ -2122,8 +2265,8 @@ fn apply_weapon_mod_attachment_poses(
         let Some(pose) = attachment_poses.get(tag) else {
             continue;
         };
-        // GearDye VS forwards dequantized, model-local POSITION/NORMAL directly
-        // to PS TEXCOORD5/6. Preserve those before baking socket transforms.
+        // Common-surface VS forwards raw shader-input POSITION/NORMAL directly
+        // to PS procedural varyings. Preserve those before socket transforms.
         wireframe
             .procedural_positions
             .get_or_insert_with(|| wireframe.vertices.clone());
@@ -2587,6 +2730,7 @@ fn merge_model_wireframes(
                 render_stage: None,
                 technique: None,
                 gear_dye_change_color_index: None,
+                procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
             }]
@@ -2623,6 +2767,7 @@ fn merge_model_wireframes(
                     render_stage: range.render_stage,
                     technique: range.technique,
                     gear_dye_change_color_index: range.gear_dye_change_color_index,
+                    procedural_scale: range.procedural_scale,
                     texture: range.texture,
                     textures: range.textures,
                 });
@@ -2896,14 +3041,50 @@ fn material_textures_for_technique(
         .collect_vec();
     let normal_slot = material_normal_texture_slot(&candidates);
     let control_slot = material_control_texture_slot(&candidates, normal_slot);
+    let investment_decal = investment_decal_for_technique(technique, &candidates);
+    let direct_shared_color_atlas = direct_shared_color_atlas_for_technique(technique, &candidates);
     material.mod_wear = weapon_mod_wear_material(technique, &candidates);
+    material.animated_dither = animated_dither_material(technique, &candidates);
+    // Both families can expose eight PS textures, but slots 5..7 mean physical
+    // age/wear when the TFX wear ABI is present. Never reinterpret those wear
+    // resources as decorative contour inputs.
+    material.gear_pattern = (material.mod_wear.is_none() && material.animated_dither.is_none())
+        .then(|| gear_pattern_material(technique, &candidates))
+        .flatten();
 
-    for binding in candidates {
+    for binding in &candidates {
+        let binding = *binding;
         let mut role = material_texture_role(binding, normal_slot, control_slot);
-        if fallback_aux_texture(binding.tag) {
+        if investment_decal
+            .as_ref()
+            .is_some_and(|decal| decal.color() == binding.tag)
+        {
+            role = MaterialTextureRole::Color;
+        } else if direct_shared_color_atlas == Some(binding.tag) {
+            role = MaterialTextureRole::Color;
+        } else if fallback_aux_texture(binding.tag) {
             role = MaterialTextureRole::Aux;
         }
         assign_material_texture(&mut material, binding.tag, role);
+    }
+
+    if let Some(investment_decal) = investment_decal {
+        material.color = Some(investment_decal.color());
+        material.authored_shared_atlas =
+            matches!(investment_decal, InvestmentDecalResolution::Atlas(_));
+        if let InvestmentDecalResolution::Shader(shader) = investment_decal {
+            // Reuse the renderer's linear data-texture bindings. Investment
+            // decal shaders do not have a material normal map: PS t3/t4/t5 are
+            // detail, colour, and opacity respectively.
+            material.normal = shader.detail;
+            material.control = Some(shader.mask);
+            material.investment_decal = Some(shader);
+        }
+    }
+    if let Some(atlas) = direct_shared_color_atlas {
+        material.color = Some(atlas);
+        material.authored_shared_atlas = true;
+        material.aux.retain(|texture| *texture != atlas);
     }
 
     for texture in textures
@@ -2937,9 +3118,445 @@ fn material_textures_for_technique(
     {
         material.solid_color = Some(surface.color);
         material.solid_surface = Some([surface.roughness, surface.metalness]);
+    } else if material.color.is_none()
+        && let Some(surface) = animated_flat_material_for_technique(technique)
+    {
+        material.solid_color = Some(surface.color);
+        material.solid_surface = Some([surface.roughness, surface.metalness]);
     }
 
     material
+}
+
+/// Resolve an opaque material whose authored colour is a shared atlas.
+///
+/// Shared atlases are normally technical resources and must not win generic
+/// albedo guessing. An opaque decal technique, however, can bind that same
+/// atlas as its sole PS t0 colour source. Direct-slot ownership makes that use
+/// unambiguous without naming a weapon or technique tag.
+fn direct_shared_color_atlas_for_technique(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<TagHash> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    if pixel
+        .bytecode
+        .expressions
+        .iter()
+        .any(|expression| expression.expression.contains("DecalSetTransform"))
+    {
+        return None;
+    }
+    let pixel_textures = bindings
+        .iter()
+        .filter(|binding| binding.stage == "PS")
+        .copied()
+        .unique_by(|binding| binding.slot)
+        .collect_vec();
+    let [atlas] = pixel_textures.as_slice() else {
+        return None;
+    };
+    (atlas.slot == 0
+        && texture_is_srgb(atlas.tag)
+        && !matches!(render_state_for_technique(technique).blend, Some(26 | 27)))
+    .then_some(atlas.tag)
+}
+
+/// Resolve Tiger's investment-decal pass.
+///
+/// Weapon and runner geometry carries decal quads with selector UVs already
+/// baked into the mesh. Their pixel techniques read `DecalSetTransform` and
+/// use either a sole colour atlas or a colour + opacity + detail texture ABI.
+/// Treating these bindings as an ordinary material drops the authored stencil
+/// and renders Quicktag's white fallback. Decode the pass from its blend state,
+/// TFX extern, texture formats, and constant layout; no asset/tag rule is used.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InvestmentDecalResolution {
+    Atlas(TagHash),
+    Shader(InvestmentDecalMaterial),
+}
+
+impl InvestmentDecalResolution {
+    fn color(self) -> TagHash {
+        match self {
+            Self::Atlas(color) => color,
+            Self::Shader(material) => material.color,
+        }
+    }
+}
+
+fn investment_decal_for_technique(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<InvestmentDecalResolution> {
+    if !matches!(render_state_for_technique(technique).blend, Some(26 | 27)) {
+        return None;
+    }
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    let reads_decal_transform = pixel
+        .bytecode
+        .expressions
+        .iter()
+        .any(|expression| expression.expression.contains("DecalSetTransform"));
+    if !reads_decal_transform {
+        return None;
+    }
+
+    let pixel_textures = bindings
+        .iter()
+        .filter(|binding| binding.stage == "PS")
+        .copied()
+        .sorted_by_key(|binding| binding.slot)
+        .unique_by(|binding| binding.slot)
+        .collect_vec();
+
+    match pixel_textures.as_slice() {
+        [atlas] => Some(InvestmentDecalResolution::Atlas(atlas.tag)),
+        [color, mask]
+            if texture_is_srgb(color.tag)
+                && texture_is_single_channel(mask.tag)
+                && pixel.inline_constants.len() > 10 =>
+        {
+            let mut selector_colors = [[0.0; 4]; 5];
+            selector_colors[0] = pixel.inline_constants[1];
+            selector_colors[1] = pixel.inline_constants[2];
+            Some(InvestmentDecalResolution::Shader(InvestmentDecalMaterial {
+                mode: InvestmentDecalMode::SelectorMask,
+                color: color.tag,
+                mask: mask.tag,
+                detail: None,
+                selector_colors,
+                selector_color_count: 2,
+                atlas_selector_max: 0,
+                mask_mode: InvestmentDecalMaskMode::Threshold,
+                mask_threshold: pixel.inline_constants[3][0],
+                detail_transform: [1.0, 1.0, 0.0, 0.0],
+                detail_base: [1.0; 4],
+                detail_scale: [0.0; 4],
+                grayscale_remap: [0.0, 1.0, 0.0, 0.0],
+                positive_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                negative_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                output_gate: pixel.inline_constants[10][1].clamp(0.0, 1.0),
+            }))
+        }
+        [detail, color, mask]
+            if texture_is_single_channel(detail.tag)
+                && texture_is_srgb(color.tag)
+                && texture_is_single_channel(mask.tag)
+                && pixel.inline_constants.len() > 15 =>
+        {
+            let constants = &pixel.inline_constants;
+            let selector_color_count = constants[4..]
+                .iter()
+                .take(5)
+                .take_while(|color| color[3] > 0.5)
+                .count();
+            if selector_color_count == 0 {
+                return None;
+            }
+            let mut selector_colors = [[0.0; 4]; 5];
+            selector_colors[..selector_color_count]
+                .copy_from_slice(&constants[4..4 + selector_color_count]);
+            let remap = 4 + selector_color_count;
+            let uv_split = selector_color_count == 1;
+            Some(InvestmentDecalResolution::Shader(InvestmentDecalMaterial {
+                mode: InvestmentDecalMode::DetailSelectorMask,
+                color: color.tag,
+                mask: mask.tag,
+                detail: Some(detail.tag),
+                selector_colors,
+                selector_color_count: selector_color_count as u8,
+                atlas_selector_max: u8::from(uv_split),
+                mask_mode: if uv_split {
+                    InvestmentDecalMaskMode::UvSplit
+                } else {
+                    InvestmentDecalMaskMode::Binary
+                },
+                mask_threshold: 0.0,
+                detail_transform: constants[1],
+                detail_base: constants[2],
+                detail_scale: constants[3],
+                grayscale_remap: constants[remap],
+                positive_mask_remap: constants
+                    .get(remap + 1)
+                    .copied()
+                    .unwrap_or([0.0, 1.0, 0.0, 0.0]),
+                negative_mask_remap: constants
+                    .get(remap + 2)
+                    .copied()
+                    .unwrap_or([0.0, 1.0, 0.0, 0.0]),
+                output_gate: constants[15][1].clamp(0.0, 1.0),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Decode common gear shader's procedural contour branch.
+///
+/// DXIL samples PS t6 in three object-space planes, perturbs a periodic line
+/// function, then uses the t3 RGB bit selector to blend authored constants over
+/// t0 for material IDs 2 and 4. Missing t6 therefore removes only the marble /
+/// topographic strokes while leaving every ordinary decal intact.
+fn gear_pattern_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<GearPatternMaterial> {
+    let pixel_bindings = bindings
+        .iter()
+        .filter(|binding| binding.stage == "PS")
+        .copied()
+        .sorted_by_key(|binding| binding.slot)
+        .unique_by(|binding| binding.slot)
+        .collect_vec();
+    // Distinguish this family from seven-slot environment surface shaders and
+    // eight-slot mod-wear shaders using authored layout plus constant ABI.
+    if pixel_bindings.last()?.slot != 7
+        || !pixel_bindings.iter().any(|binding| binding.slot == 3)
+        || !pixel_bindings.iter().any(|binding| binding.slot == 7)
+    {
+        return None;
+    }
+    let field = pixel_bindings.iter().find(|binding| binding.slot == 6)?.tag;
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let constants = &preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .inline_constants;
+
+    let projection = *constants.get(43)?;
+    let normal_power = constants.get(42)?[0];
+    let base_warp = constants.get(44)?[0];
+    let field_midpoint = constants.get(52)?[0];
+    let stripe_source = *constants.get(53)?;
+    let triangle = *constants.get(54)?;
+    let line_strength = constants.get(59)?[0];
+    let contour_phase = constants.get(61)?[0];
+    let contour_source = *constants.get(38)?;
+    let colors = [*constants.get(33)?, *constants.get(35)?];
+    let warp = [
+        base_warp * constants.get(47)?[0],
+        base_warp * constants.get(49)?[0],
+    ];
+    let decoded = GearPatternMaterial {
+        field,
+        projection,
+        normal_power,
+        field_midpoint,
+        warp,
+        stripe: [stripe_source[0], stripe_source[2], triangle[0], triangle[1]],
+        contour: [triangle[2], line_strength, contour_phase, 0.0],
+        contour_remap: contour_source,
+        colors,
+    };
+
+    let values = decoded
+        .projection
+        .into_iter()
+        .chain([decoded.normal_power, decoded.field_midpoint])
+        .chain(decoded.warp)
+        .chain(decoded.stripe)
+        .chain(decoded.contour)
+        .chain(decoded.contour_remap)
+        .chain(decoded.colors.into_iter().flatten());
+    (values.clone().all(f32::is_finite)
+        && (1.0..=32.0).contains(&normal_power)
+        && projection[0].abs() > 0.0001
+        && projection[1].abs() > 0.0001
+        && (0.0..=1.0).contains(&field_midpoint)
+        && warp.into_iter().all(|value| value.abs() <= 8.0)
+        && decoded.stripe[0].abs() > 0.0001
+        && decoded.stripe[3] < 0.0
+        && line_strength > 0.0
+        && contour_source[1] < 0.0
+        && colors
+            .iter()
+            .flatten()
+            .all(|value| (0.0..=4.0).contains(value)))
+    .then_some(decoded)
+}
+
+/// Decode animated inventory-surface branch from shader resources + TFX.
+/// No weapon, skin, package, shader, or texture hash participates in matching.
+fn animated_dither_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<AnimatedDitherMaterial> {
+    let pixel_bindings = bindings
+        .iter()
+        .filter(|binding| binding.stage == "PS")
+        .copied()
+        .sorted_by_key(|binding| binding.slot)
+        .unique_by(|binding| binding.slot)
+        .collect_vec();
+    let field = pixel_bindings.iter().find(|binding| binding.slot == 7)?.tag;
+    let technical_mask = pixel_bindings.iter().find(|binding| binding.slot == 6)?.tag;
+    if pixel_bindings.first()?.slot != 0
+        || pixel_bindings.last()?.slot != 7
+        || pixel_bindings.len() != 8
+    {
+        return None;
+    }
+
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    let expression = |target: &str| {
+        pixel
+            .bytecode
+            .expressions
+            .iter()
+            .find(|expression| expression.target == target)
+            .map(|expression| expression.expression.as_str())
+    };
+    if !expression("output[67]")?.contains("Frame+0x0")
+        || !expression("output[66]")?.contains("Frame+0x0")
+        || !expression("output[71]")?.contains("Frame+0x0")
+    {
+        return None;
+    }
+
+    let tfx = &pixel.constants;
+    let inline = &pixel.inline_constants;
+    let phase_speed = tfx.get(0)?[0];
+    let secondary_scale = *tfx.get(10)?;
+    let secondary_scroll = [tfx.get(11)?[0], tfx.get(12)?[0]];
+    let primary_scale = *tfx.get(14)?;
+    let primary_scroll = [tfx.get(15)?[0], tfx.get(16)?[0]];
+    let waveform = [
+        inline.get(68)?[0],
+        inline.get(69)?[0],
+        inline.get(70)?[0],
+        inline.get(70)?[1],
+    ];
+    // With preview object channels at zero, TFX output c74 evaluates to this
+    // product. Outputs c75 and c77 evaluate to one; c76 is the inline master
+    // response. Keep c74 inside `(1 - wave*c74)`, exactly as the compiled PS.
+    let authored_strength = tfx.get(2)?[0] * tfx.get(4)?[0] * tfx.get(5)?[0] * tfx.get(6)?[0];
+    let response_scale = inline.get(76)?[0];
+    let dot_detail = pixel_bindings
+        .iter()
+        .find(|binding| binding.slot == 5)
+        .map(|binding| AnimatedDotDetailMaterial {
+            texture: binding.tag,
+            position_scale: inline[1][..3].try_into().expect("three-vector"),
+            position_offset: inline[2][..3].try_into().expect("three-vector"),
+            projection: inline[4],
+            fine_projection: inline[5],
+            normal_power: inline[3][0],
+            roughness_target: inline[89][0],
+            roughness_remap: inline[90][..2].try_into().expect("two-vector"),
+        })
+        .filter(|detail| {
+            (1.0..=128.0).contains(&detail.normal_power)
+                && detail.projection[0].abs() > 0.0001
+                && detail.projection[1].abs() > 0.0001
+                && detail.fine_projection[0].abs() > 0.0001
+                && detail.fine_projection[1].abs() > 0.0001
+                && (0.0..=1.0).contains(&detail.roughness_target)
+                && detail.roughness_remap[1] > 0.0
+        });
+    let decoded = AnimatedDitherMaterial {
+        field,
+        technical_mask,
+        technical_mask_remap: std::array::from_fn(|index| {
+            let constant = inline[82 + index];
+            [constant[0], constant[1]]
+        }),
+        dot_detail,
+        phase_speed,
+        primary_transform: [
+            primary_scale[0],
+            primary_scale[1],
+            primary_scroll[0],
+            primary_scroll[1],
+        ],
+        secondary_transform: [
+            secondary_scale[0],
+            secondary_scale[1],
+            secondary_scroll[0],
+            secondary_scroll[1],
+        ],
+        waveform,
+        facing_response: [
+            inline.get(73)?[0],
+            inline.get(73)?[1],
+            response_scale,
+            authored_strength,
+        ],
+        surface_response: [
+            inline.get(78)?[0],
+            inline.get(79)?[0],
+            inline.get(80)?[0],
+            inline.get(81)?[0],
+        ],
+    };
+    let values = [decoded.phase_speed]
+        .into_iter()
+        .chain(decoded.technical_mask_remap.into_iter().flatten())
+        .chain(decoded.dot_detail.into_iter().flat_map(|detail| {
+            detail
+                .position_scale
+                .into_iter()
+                .chain(detail.position_offset)
+                .chain(detail.projection)
+                .chain(detail.fine_projection)
+                .chain([detail.normal_power, detail.roughness_target])
+                .chain(detail.roughness_remap)
+        }))
+        .chain(decoded.primary_transform)
+        .chain(decoded.secondary_transform)
+        .chain(decoded.waveform)
+        .chain(decoded.facing_response)
+        .chain(decoded.surface_response);
+    (values.clone().all(f32::is_finite)
+        && (0.01..=20.0).contains(&decoded.phase_speed)
+        && decoded.primary_transform[..2]
+            .iter()
+            .all(|value| (0.1..=100.0).contains(&value.abs()))
+        && decoded.secondary_transform[..2]
+            .iter()
+            .all(|value| (0.1..=100.0).contains(&value.abs()))
+        && decoded.primary_transform[2..]
+            .iter()
+            .chain(&decoded.secondary_transform[2..])
+            .all(|value| value.abs() <= 2.0)
+        && decoded.waveform[0] > 0.0
+        && decoded.waveform[1] > 0.0
+        && decoded.facing_response[1] > 0.0
+        && decoded.facing_response[2] > 0.0
+        && decoded.surface_response[0] > 0.0
+        && decoded.surface_response[1] > 0.0)
+        .then_some(decoded)
+}
+
+fn texture_is_srgb(texture: TagHash) -> bool {
+    Texture::load_data_d2(texture, false)
+        .map(|(desc, _data, _comment)| format!("{:?}", desc.format).contains("Srgb"))
+        .unwrap_or(false)
+}
+
+fn texture_is_single_channel(texture: TagHash) -> bool {
+    Texture::load_data_d2(texture, false)
+        .map(|(desc, _data, _comment)| {
+            let format = format!("{:?}", desc.format);
+            format.contains("Bc4") || format.contains("R8Unorm")
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3061,6 +3678,73 @@ fn procedural_surface_material_for_technique(
         color,
         roughness,
         metalness,
+    })
+}
+
+/// Decode Tiger's textureless, TFX-driven G-buffer material family.
+///
+/// These techniques author their visible base colour in TFX output 1 rather
+/// than in a texture. The pixel shader consumes that output as cbuffer[1].rgb;
+/// falling back to Quicktag's white texture therefore produces solid white
+/// panels over otherwise-correct investment decals. Evaluate the same TFX
+/// program at the preview clock origin and use its authored linear colour.
+/// Animated materials still receive a deterministic, valid frame instead of
+/// an invented white albedo.
+fn animated_flat_material_for_technique(technique: TagHash) -> Option<TexturelessFlatMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    if texture_bindings_for_technique(&entry, &data)
+        .into_iter()
+        .any(|binding| binding.stage == "PS")
+    {
+        return None;
+    }
+
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    if !pixel
+        .bytecode
+        .expressions
+        .iter()
+        .any(|expression| expression.target == "output[1]")
+    {
+        return None;
+    }
+
+    let object_channels = pixel
+        .bytecode
+        .ops
+        .iter()
+        .filter(|op| op.name == "push_object_channel")
+        .filter_map(|op| {
+            Some((
+                u32::from_str_radix(op.detail.strip_prefix("0x")?, 16).ok()?,
+                [0.0; 4],
+            ))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let extern_values = std::collections::HashMap::from([("Frame+0x0".to_string(), [0.0; 4])]);
+    let (_bindings, expressions) = interpret_tfx_stack_with_runtime_inputs(
+        &pixel.bytecode.ops,
+        &pixel.constants,
+        &object_channels,
+        &extern_values,
+    );
+    let color = expressions
+        .iter()
+        .find(|expression| expression.target == "output[1]")?
+        .value?;
+    if !color.iter().all(|value| value.is_finite())
+        || !color[..3].iter().all(|value| (0.0..=1.0).contains(value))
+    {
+        return None;
+    }
+
+    Some(TexturelessFlatMaterial {
+        color: [color[0], color[1], color[2], color[3].clamp(0.0, 1.0)],
+        roughness: 0.5,
+        metalness: 0.0,
     })
 }
 
@@ -4050,7 +4734,7 @@ fn build_wireframe_from_refs(
         wireframe.uvs = Some(uvs);
     }
 
-    if let Some((normal_tag, normal_format, normals)) = input_layout_vectors(
+    if let Some((normal_tag, normal_format, raw_normals)) = input_layout_vectors(
         &vertex_previews,
         input_layout_index,
         SEMANTIC_NORMAL,
@@ -4059,15 +4743,26 @@ fn build_wireframe_from_refs(
         wireframe.normal_format = Some(format!(
             "{normal_format} from {normal_tag} layout {input_layout_index:?}"
         ));
-        wireframe.normals = Some(
-            normals
-                .into_iter()
+        // The compiled common-surface VS forwards input NORMAL to TEXCOORD7
+        // without normalization. That raw SNORM vector is also authored data
+        // for procedural facing masks (animated inventory skins). Keep it
+        // byte-faithful there, while normalizing the separate lighting copy.
+        wireframe.procedural_normals = Some(
+            raw_normals
+                .iter()
                 .map(|normal| [normal[0], normal[1], normal[2]])
                 .collect(),
         );
-        wireframe.procedural_normals = wireframe.normals.clone();
+        wireframe.normals = Some(
+            raw_normals
+                .into_iter()
+                .filter_map(|normal| normalize_input_layout_vector(normal, false))
+                .map(|normal| [normal[0], normal[1], normal[2]])
+                .collect::<Vec<[f32; 3]>>(),
+        )
+        .filter(|normals| normals.len() == wireframe.vertices.len());
     }
-    if let Some((tangent_tag, tangent_format, tangents)) = input_layout_vectors(
+    if let Some((tangent_tag, tangent_format, raw_tangents)) = input_layout_vectors(
         &vertex_previews,
         input_layout_index,
         SEMANTIC_TANGENT,
@@ -4076,7 +4771,10 @@ fn build_wireframe_from_refs(
         wireframe.tangent_format = Some(format!(
             "{tangent_format} from {tangent_tag} layout {input_layout_index:?}"
         ));
-        wireframe.tangents = Some(tangents);
+        wireframe.tangents = raw_tangents
+            .into_iter()
+            .map(|tangent| normalize_input_layout_vector(tangent, true))
+            .collect::<Option<Vec<_>>>();
     }
 
     let index_entry = package_manager().get_entry(index_tag)?;
@@ -4126,6 +4824,7 @@ fn build_wireframe_from_refs(
                 render_stage: range.render_stage,
                 technique: range.technique,
                 gear_dye_change_color_index: range.gear_dye_change_color_index,
+                procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
             });
@@ -4254,10 +4953,7 @@ fn input_layout_vectors(
         endian,
         layout,
         vertex_count,
-    )?
-    .into_iter()
-    .map(|vector| normalize_input_layout_vector(vector, semantic == SEMANTIC_TANGENT))
-    .collect::<Option<Vec<_>>>()?;
+    )?;
 
     (vectors.len() == vertex_count).then_some((*tag, layout.format, vectors))
 }
@@ -5084,6 +5780,7 @@ fn read_geometry_uv_transform(data: &[u8], endian: Endian) -> Option<UvTransform
 struct GeometryPositionTransform {
     scale: [f32; 3],
     offset: [f32; 3],
+    procedural_scale: f32,
 }
 
 fn read_geometry_position_transform(
@@ -5100,12 +5797,19 @@ fn read_geometry_position_transform(
         read_f32(data.get(0xb4..0xb8)?, endian),
         read_f32(data.get(0xb8..0xbc)?, endian),
     ];
+    let procedural_scale = read_f32(data.get(0xbc..0xc0)?, endian);
     (scale
         .into_iter()
         .chain(offset)
         .all(|value| value.is_finite())
+        && procedural_scale.is_finite()
+        && procedural_scale.abs() > 0.000001
         && scale.iter().all(|value| value.abs() > 0.000001))
-    .then_some(GeometryPositionTransform { scale, offset })
+    .then_some(GeometryPositionTransform {
+        scale,
+        offset,
+        procedural_scale,
+    })
 }
 
 fn apply_geometry_position_transform(
@@ -5121,6 +5825,10 @@ fn apply_geometry_position_transform(
                 + transform.offset[axis];
         }
     }
+    // Compiled common-surface VS writes input POSITION straight to its
+    // procedural varying, while rendered position follows geometry
+    // dequantization. Vertex fetch supplies R16G16B16A16_SNORM, so preserve
+    // exactly that normalized pre-transform value for pattern/wear/animation.
     if let Some(positions) = &mut wireframe.procedural_positions {
         for position in positions {
             for axis in 0..3 {
@@ -6758,6 +7466,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires current installed Marathon packages"]
+    fn decodes_textureless_tfx_companion_materials() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+
+        let animated = material_textures_for_technique(TagHash(0x80A9B87F), &cache, &[]);
+        assert_eq!(animated.color, None);
+        assert_eq!(animated.solid_color, Some([1.0, 0.617207, 0.040915, 1.0]));
+        assert_eq!(animated.solid_surface, Some([0.5, 0.0]));
+
+        let channel_driven = material_textures_for_technique(TagHash(0x80A9B889), &cache, &[]);
+        assert_eq!(channel_driven.color, None);
+        assert_eq!(channel_driven.solid_color, Some([0.0, 0.4, 1.0, 1.0]));
+        assert_eq!(channel_driven.solid_surface, Some([0.5, 0.0]));
+
+        let shared_atlas = material_textures_for_technique(TagHash(0x80A60033), &cache, &[]);
+        assert_eq!(shared_atlas.color, Some(TagHash(0x80A60058)));
+        assert_eq!(shared_atlas.solid_color, None);
+        assert!(shared_atlas.authored_shared_atlas);
+
+        let blended_atlas = material_textures_for_technique(TagHash(0x80A9B0ED), &cache, &[]);
+        assert_eq!(blended_atlas.color, Some(TagHash(0x80A60058)));
+        assert!(blended_atlas.authored_shared_atlas);
+    }
+
+    #[test]
     #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
     fn probes_goliath_visible_render_states() {
         init_goliath_test_package_manager();
@@ -7490,6 +8224,123 @@ mod tests {
         .expect("package manager");
         tiger_pkg::initialize_package_manager(&Arc::new(pm));
         quicktag_core::classes::initialize_reference_names();
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn loads_investment_decal_atlases_for_weapon_and_runner_geometry() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+
+        for (root, expected_technique, expected_atlas) in [
+            (
+                TagHash(0x80B7B91F),
+                TagHash(0x80A9A2E0),
+                TagHash(0x80A60058),
+            ),
+            (
+                TagHash(0x80B7B9C6),
+                TagHash(0x80A9A2E0),
+                TagHash(0x80A60058),
+            ),
+            (
+                TagHash(0x80A9F88F),
+                TagHash(0x80A9A2E0),
+                TagHash(0x80A60058),
+            ),
+            (
+                TagHash(0x80A9E83E),
+                TagHash(0x80A9E7C9),
+                TagHash(0x80A9BD8A),
+            ),
+        ] {
+            let entry = package_manager().get_entry(root).expect("model root");
+            let model_tags = selected_model_geometry_tags(&cache, root, entry.reference);
+            let model_entries = model_tags
+                .iter()
+                .filter_map(|model_tag| {
+                    package_manager()
+                        .get_entry(*model_tag)
+                        .map(|entry| (*model_tag, entry))
+                })
+                .collect_vec();
+            let techniques = model_entries
+                .iter()
+                .flat_map(|(model_tag, model_entry)| {
+                    find_model_technique_entries(&cache, *model_tag, model_entry)
+                })
+                .unique_by(|(technique, _entry)| *technique)
+                .collect_vec();
+            let textures = model_tags
+                .iter()
+                .flat_map(|model_tag| find_model_textures(&cache, *model_tag, &techniques))
+                .unique_by(|(texture, _entry)| *texture)
+                .collect_vec();
+            let mut matching_ranges = 0;
+
+            for (model_tag, model_entry) in model_entries {
+                let Some((_source, mut wireframe)) = parse_model_wireframe(model_tag, &model_entry)
+                else {
+                    continue;
+                };
+                assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+                for range in wireframe
+                    .material_ranges
+                    .iter()
+                    .filter(|range| range.technique == Some(expected_technique))
+                {
+                    matching_ranges += 1;
+                    assert_eq!(
+                        range.textures.color,
+                        Some(expected_atlas),
+                        "{root}: investment decal atlas was not promoted"
+                    );
+                    assert!(
+                        !range.textures.aux.contains(&expected_atlas),
+                        "{root}: investment decal atlas remained technical aux data"
+                    );
+                }
+            }
+
+            assert!(
+                matching_ranges > 0,
+                "{root}: expected investment decal technique {expected_technique}"
+            );
+        }
+
+        let resolve = |technique| {
+            let entry = package_manager().get_entry(technique).expect("technique");
+            let data = package_manager()
+                .read_tag(technique)
+                .expect("technique data");
+            let bindings = texture_bindings_for_technique(&entry, &data);
+            investment_decal_for_technique(technique, &bindings).expect("investment decal")
+        };
+
+        let InvestmentDecalResolution::Shader(selector) = resolve(TagHash(0x80B140A0)) else {
+            panic!("runner selector/mask technique was not decoded")
+        };
+        assert_eq!(selector.mode, InvestmentDecalMode::SelectorMask);
+        assert_eq!(selector.color, TagHash(0x80B14333));
+        assert_eq!(selector.mask, TagHash(0x80B14331));
+        assert_eq!(selector.selector_color_count, 2);
+
+        let InvestmentDecalResolution::Shader(detail) = resolve(TagHash(0x80B1443E)) else {
+            panic!("runner detail-selector technique was not decoded")
+        };
+        assert_eq!(detail.mode, InvestmentDecalMode::DetailSelectorMask);
+        assert_eq!(detail.detail, Some(TagHash(0x80A60000)));
+        assert_eq!(detail.color, TagHash(0x80B14474));
+        assert_eq!(detail.mask, TagHash(0x80B14471));
+        assert_eq!(detail.mask_mode, InvestmentDecalMaskMode::UvSplit);
+        assert_eq!(detail.atlas_selector_max, 1);
+
+        let InvestmentDecalResolution::Shader(multi_color) = resolve(TagHash(0x80B7A1DF)) else {
+            panic!("runner multi-colour selector technique was not decoded")
+        };
+        assert_eq!(multi_color.selector_color_count, 5);
+        assert_eq!(multi_color.mask_mode, InvestmentDecalMaskMode::Binary);
+        assert_eq!(multi_color.atlas_selector_max, 0);
     }
 
     fn authored_geometry_dyes(
@@ -10404,13 +11255,11 @@ mod tests {
             GeometryPositionTransform {
                 scale: [2.0, 4.0, 8.0],
                 offset: [10.0, 20.0, 30.0],
+                procedural_scale: 0.25,
             },
         );
         assert_eq!(wireframe.vertices, vec![[8.0, 20.0, 38.0]]);
-        assert_eq!(
-            wireframe.procedural_positions,
-            Some(vec![[8.0, 20.0, 38.0]])
-        );
+        assert_eq!(wireframe.procedural_positions, Some(vec![[-1.0, 0.0, 1.0]]));
         assert_eq!(wireframe.min, [8.0, 20.0, 38.0]);
     }
 
