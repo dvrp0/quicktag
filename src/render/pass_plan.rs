@@ -1,6 +1,7 @@
 use crate::{
     material::TechniqueRenderState,
     render::{
+        adapter::GoliathAdapter,
         evidence::EvidenceLevel,
         material::{MaterialFamily, MaterialIR},
     },
@@ -14,6 +15,8 @@ pub enum RenderPassKind {
     InvestmentDecalCompatibility,
     ForwardTransparent,
     UnknownCompatibility,
+    MaterialEmissive,
+    MaterialFlags,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,9 +69,15 @@ impl DrawPassPlan {
                 warnings: vec!["missing raw render stage".into()],
             };
         }
+        let shadow_evidence = GoliathAdapter::shadow_participation(raw_stage, state);
+        let mut passes = vec![];
+        if shadow_evidence != EvidenceLevel::Unknown {
+            passes.push(RenderPassKind::Shadow);
+        }
+        passes.push(RenderPassKind::OpaqueCompatibility);
         Self {
-            evidence: EvidenceLevel::Probable,
-            passes: vec![RenderPassKind::Shadow, RenderPassKind::OpaqueCompatibility],
+            evidence: shadow_evidence,
+            passes,
             warnings: vec![],
         }
     }

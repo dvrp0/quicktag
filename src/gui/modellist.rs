@@ -24,7 +24,7 @@ use crate::util::{format_file_size, ui_image_rotated};
 
 use super::gear::{ModelModEntry, ModelWeaponCatalog, ModelWeaponEntry, ModelWeaponSkinEntry};
 use super::model_renderer::{
-    GpuModelPreview, ModelCameraFrame, ModelEnvironment, ModelPaintCallback,
+    GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelPaintCallback,
 };
 use super::{View, ViewAction};
 
@@ -1102,10 +1102,79 @@ pub(super) fn model_wireframe_ui(
             "Pretty Preview",
         );
     });
+    if let Some(gpu_preview) = gpu_preview {
+        egui::CollapsingHeader::new("Render evidence")
+            .default_open(false)
+            .show(ui, |ui| {
+                for line in gpu_preview.inspection_lines() {
+                    ui.monospace(line);
+                }
+            });
+    }
+    egui::CollapsingHeader::new("TFX runtime")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut environment.tfx_paused, "Paused");
+                if ui.button("Reset time").clicked() {
+                    environment.tfx_time_seconds = 0.0;
+                }
+            });
+            ui.add(
+                egui::Slider::new(&mut environment.tfx_time_seconds, 0.0..=120.0).text("Time (s)"),
+            );
+            ui.add(egui::Slider::new(&mut environment.tfx_speed, 0.0..=4.0).text("Speed"));
+        });
+    if !environment.tfx_paused {
+        environment.tfx_time_seconds += ui.input(|input| input.stable_dt) * environment.tfx_speed;
+        ui.ctx().request_repaint();
+    }
     egui::CollapsingHeader::new("Lighting")
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.label("Model");
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::TigerGgxApproximation,
+                    "Tiger GGX",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::TigerGgxCompatibility,
+                    "Compatibility",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::DebugLambert,
+                    "Debug Lambert",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceNormals,
+                    "Normals",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceProperties,
+                    "M/R/AO",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceEmissive,
+                    "Emissive",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceFlags,
+                    "Flags",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceAlbedo,
+                    "Albedo MRT",
+                );
+                ui.separator();
                 ui.checkbox(&mut environment.light_gizmo, "Orbit gizmo");
                 if ui.button("Reset lighting").clicked() {
                     let defaults = ModelEnvironment::default();

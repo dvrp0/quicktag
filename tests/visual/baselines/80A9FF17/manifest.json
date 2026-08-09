@@ -1,5 +1,7 @@
 {
-  "schema": 1,
+  "schema": 2,
+  "renderer_schema_version": 2,
+  "adapter_version": "goliath-render-v1",
   "asset": "80A9FF17",
   "case": "revamp-br33-vibrant-sport-deluxe",
   "owner": "80A7AA89",
@@ -31,15 +33,37 @@
     "ao",
     "specular",
     "hdr",
-    "normal"
+    "normal",
+    "mrt-albedo",
+    "mrt-normal",
+    "mrt-properties",
+    "mrt-emissive",
+    "mrt-flags"
   ],
-  "quicktag_parent_commit": "289e37a782f1db98d34da7d897b87169400eec92",
+  "quicktag_parent_commit": "b29d30f2972ef5a7da4d2a102311c7f3c30301fd",
   "quicktag_worktree_dirty": true,
-  "captured_utc": "2026-08-09T06:36:22.9381596Z",
+  "captured_utc": "2026-08-09T08:09:03.6835936Z",
   "package_path": "D:\\SteamLibrary\\steamapps\\common\\Marathon\\packages",
-  "build_note": "Record exact package build manually when available.",
+  "package_file_count": 579,
+  "package_latest_file": "w64_sr_audio_015b_ko_6.pkg",
+  "package_latest_write_utc": "2026-08-04T16:06:44.9084228Z",
   "cargo_features": [
     "wordlist"
   ],
-  "xg_enabled": false
+  "xg_enabled": false,
+  "fidelity_mode": "StrictTiger",
+  "capture_metadata": [
+    "revamp-br33-vibrant-sport-deluxe-final.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-base-color.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-diffuse.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-ao.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-specular.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-hdr.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-normal.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-mrt-albedo.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-mrt-normal.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-mrt-properties.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-mrt-emissive.capture.json",
+    "revamp-br33-vibrant-sport-deluxe-mrt-flags.capture.json"
+  ]
 }

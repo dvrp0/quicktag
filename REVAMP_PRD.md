@@ -2,9 +2,30 @@
 
 ## Product Requirements Document v2.1 — Evidence-Gated Revision
 
-Status: implementation candidate after codebase audit  
+Status: implemented for the supported Marathon weapon/mod preview corpus
 Primary target: Marathon / Goliath asset preview  
 Secondary reference: Destiny-era Tiger behavior, never assumed equivalent
+
+## Implementation status — revamp branch
+
+The architecture and required preview graph are operational. The canonical regression fixture is BR33 Volley Rifle: Vibrant Sport (`80A9FF17`) with Deluxe Cold Vigilance Scope (`80A60FED`) and Deluxe Impulse Brake (`80A60608`), captured at yaw -24°, pitch +14°, 1024×640 in Strict Tiger mode.
+
+Completed gates:
+
+- raw LOD/stage/technique/source provenance survives through GPU scheduling and capture metadata
+- versioned `GoliathAdapter`, per-stage technique/resource ABI, explicit unsupported vertex ABI
+- Strict/Pretty evidence split, typed MaterialIR, deterministic family reports, dependency graph
+- typed/partial TFX runtime with trace, dependencies, raw scopes, and undecoded-tail preservation
+- validated shadow/opaque/alpha/decal/lighting/transparent pass plan and expanded pipeline keys
+- logical albedo, normal/roughness, metal/AO, emissive, `R32Uint` flags, depth, and debug captures
+- replaceable deferred Tiger GGX approximation with reconstructed-position shadow resolve; compatibility-forward remains selectable
+- separate Investment Decal, emissive, integer-flags, and sorted forward-transparent passes
+- confirmed six-slot Goliath Gear baseline, Gear Pattern, Weapon Mod Condition, compact-hair classification
+- deterministic schema-2 capture manifest with package inventory, adapter/schema, GPU/backend/driver, scene, fidelity, channel, draw plans, and unknown TFX counts
+
+Current canonical capture quantifies 14 draws: 10 classified, 4 intentionally `Unknown`, and 0 partial/unknown TFX stages. Unknown families remain visible rather than guessed.
+
+Evidence-gated exclusions remain exclusions by design, not unfinished acceptance items: unsupported Runner/skinned ABI, unobserved dynamic effect families, anisotropic hair, speculative decal writes, distortion/energy/hologram behavior, and unconfirmed Destiny-style Gear fields.
 
 ---
 

@@ -7,7 +7,10 @@ param(
 
     [string] $BaselineRoot = "",
 
-    [string[]] $Passes = @("final", "base-color", "diffuse", "ao", "specular", "hdr", "normal")
+    [string[]] $Passes = @(
+        "final", "base-color", "diffuse", "ao", "specular", "hdr", "normal",
+        "mrt-albedo", "mrt-normal", "mrt-properties", "mrt-emissive", "mrt-flags"
+    )
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,16 +72,26 @@ try {
         }
 
         $outputPath = Join-Path $outputRoot $fileName
+        $captureName = "$case-$pass.capture.json"
+        $capturePath = Join-Path $outputRoot $captureName
+        if (-not (Test-Path -LiteralPath $capturePath -PathType Leaf)) {
+            throw "Missing capture metadata: $capturePath"
+        }
         if ($Mode -eq "Capture") {
             Copy-Item -LiteralPath $outputPath -Destination $baselinePath -Force
+            Copy-Item -LiteralPath $capturePath -Destination (Join-Path $baselineRoot $captureName) -Force
         }
     }
 
     if ($Mode -eq "Capture") {
         $parentCommit = (git rev-parse HEAD).Trim()
         $worktreeDirty = [bool](git status --porcelain)
+        $packageFiles = Get-ChildItem -LiteralPath $Packages -File
+        $latestPackage = $packageFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
         $manifest = [ordered]@{
-            schema = 1
+            schema = 2
+            renderer_schema_version = 2
+            adapter_version = "goliath-render-v1"
             asset = "80A9FF17"
             case = $case
             owner = "80A7AA89"
@@ -97,10 +110,13 @@ try {
             quicktag_worktree_dirty = $worktreeDirty
             captured_utc = [DateTime]::UtcNow.ToString("o")
             package_path = (Resolve-Path -LiteralPath $Packages).Path
-            build_note = "Record exact package build manually when available."
+            package_file_count = $packageFiles.Count
+            package_latest_file = if ($null -ne $latestPackage) { $latestPackage.Name } else { $null }
+            package_latest_write_utc = if ($null -ne $latestPackage) { $latestPackage.LastWriteTimeUtc.ToString("o") } else { $null }
             cargo_features = @("wordlist")
             xg_enabled = $false
             fidelity_mode = "StrictTiger"
+            capture_metadata = @($Passes | ForEach-Object { "$case-$_.capture.json" })
         }
         $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $baselineRoot "manifest.json") -Encoding utf8
     }

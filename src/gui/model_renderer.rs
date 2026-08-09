@@ -19,8 +19,8 @@ use tiger_pkg::{TagHash, package_manager};
 use crate::{
     geometry::{
         GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaskMode, InvestmentDecalMaterial,
-        InvestmentDecalMode, UvTransformPreview, WeaponModWearMaterial, WireframeMaterialTextures,
-        WireframePreview,
+        InvestmentDecalMode, UvTransformPreview, WeaponModConditionMaterial,
+        WireframeMaterialTextures, WireframePreview,
     },
     material::{TechniqueRenderState, is_sticker_proxy_technique, render_state_for_technique},
     render::{
@@ -45,6 +45,7 @@ const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 // These are research/debug contracts; compatibility HDR remains RGBA16F.
 const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SURFACE_PROPERTIES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+const SURFACE_EMISSIVE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SURFACE_FLAGS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SHADOW_MAP_SIZE: u32 = 4096;
@@ -74,7 +75,7 @@ struct ModelDraw {
     gear_dye: Option<GearDyeMaterial>,
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
-    mod_wear: Option<WeaponModWearMaterial>,
+    mod_wear: Option<WeaponModConditionMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
     investment_decal: Option<InvestmentDecalMaterial>,
     authored_shared_atlas: bool,
@@ -92,6 +93,11 @@ struct ModelPipelineKey {
     depth_stencil: u8,
     rasterizer: u8,
     depth_bias: u8,
+    family: crate::render::material::MaterialFamily,
+    pass: RenderPassKind,
+    technique: Option<TagHash>,
+    vertex_layout_bytes: u16,
+    target_signature: u16,
 }
 
 impl Default for ModelPipelineKey {
@@ -101,6 +107,11 @@ impl Default for ModelPipelineKey {
             depth_stencil: 2,
             rasterizer: 2,
             depth_bias: 0,
+            family: crate::render::material::MaterialFamily::Unknown,
+            pass: RenderPassKind::UnknownCompatibility,
+            technique: None,
+            vertex_layout_bytes: std::mem::size_of::<ModelVertex>() as u16,
+            target_signature: 0x501,
         }
     }
 }
@@ -113,6 +124,7 @@ impl ModelPipelineKey {
                 depth_stencil: 15,
                 rasterizer: 2,
                 depth_bias: 1,
+                ..Self::default()
             }
         } else {
             Self::default()
@@ -122,7 +134,56 @@ impl ModelPipelineKey {
             depth_stencil: selection.depth_stencil.unwrap_or(defaults.depth_stencil),
             rasterizer: selection.rasterizer.unwrap_or(defaults.rasterizer),
             depth_bias: selection.depth_bias.unwrap_or(defaults.depth_bias),
+            ..defaults
         }
+    }
+
+    fn select_for_draw(
+        selection: TechniqueRenderState,
+        family: crate::render::material::MaterialFamily,
+        plan: &DrawPassPlan,
+        technique: Option<TagHash>,
+    ) -> Self {
+        let mut key = Self::select(selection);
+        key.family = family;
+        key.pass = plan
+            .passes
+            .iter()
+            .copied()
+            .find(|pass| *pass != RenderPassKind::Shadow)
+            .unwrap_or(RenderPassKind::UnknownCompatibility);
+        key.technique = technique;
+        key
+    }
+
+    fn material_flags(self) -> Self {
+        Self {
+            pass: RenderPassKind::MaterialFlags,
+            blend: 0,
+            family: crate::render::material::MaterialFamily::Unknown,
+            technique: None,
+            ..self
+        }
+    }
+
+    fn material_emissive(self) -> Self {
+        Self {
+            pass: RenderPassKind::MaterialEmissive,
+            blend: 0,
+            family: crate::render::material::MaterialFamily::Unknown,
+            technique: None,
+            ..self
+        }
+    }
+
+    fn gpu_equivalent(self, other: Self) -> bool {
+        self.blend == other.blend
+            && self.depth_stencil == other.depth_stencil
+            && self.rasterizer == other.rasterizer
+            && self.depth_bias == other.depth_bias
+            && self.pass == other.pass
+            && self.vertex_layout_bytes == other.vertex_layout_bytes
+            && self.target_signature == other.target_signature
     }
 }
 
@@ -137,6 +198,43 @@ pub(crate) struct GpuModelPreview {
 }
 
 impl GpuModelPreview {
+    pub(crate) fn inspection_lines(&self) -> Vec<String> {
+        self.draws
+            .iter()
+            .enumerate()
+            .map(|(index, draw)| {
+                let tfx = draw
+                    .packet
+                    .technique
+                    .as_ref()
+                    .map(|technique| {
+                        technique
+                            .stages
+                            .iter()
+                            .map(|stage| format!("{}:{:?}", stage.raw_stage_label, stage.tfx_execution.status))
+                            .join(",")
+                    })
+                    .unwrap_or_else(|| "missing".into());
+                let source = self
+                    .provenance
+                    .get(draw.packet.source)
+                    .map(|record| format!("{:?}", record.evidence))
+                    .unwrap_or_else(|| "missing".into());
+                format!(
+                    "#{index} lod={:?} stage={:?} tech={:?} family={:?} passes={:?} source={} tfx=[{}] warnings={:?}",
+                    draw.packet.raw_lod_category,
+                    draw.packet.raw_render_stage,
+                    draw.packet.technique_hash,
+                    draw.packet.material.family(),
+                    draw.packet.pass_plan.passes,
+                    source,
+                    tfx,
+                    draw.packet.pass_plan.warnings,
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn create(
         device: &wgpu::Device,
         wireframe: &WireframePreview,
@@ -274,6 +372,12 @@ fn model_draws(
                 });
             let material_ir = MaterialIR::classify(&range.textures);
             let pass_plan = DrawPassPlan::derive(range.render_stage, render_state, &material_ir);
+            let pipeline = ModelPipelineKey::select_for_draw(
+                render_state,
+                material_ir.family(),
+                &pass_plan,
+                range.technique,
+            );
             draws.push(ModelDraw {
                 indices: start as u32..end as u32,
                 packet: TigerDrawPacket {
@@ -307,7 +411,7 @@ fn model_draws(
                 authored_shared_atlas: range.textures.authored_shared_atlas,
                 sampler: range.textures.sampler,
                 sticker_proxy: range.technique.is_some_and(is_sticker_proxy_technique),
-                pipeline: ModelPipelineKey::select(render_state),
+                pipeline,
                 center: draw_range_center(wireframe, start, end),
                 procedural_scale: range.procedural_scale,
             });
@@ -554,6 +658,10 @@ struct SceneUniform {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ModelEnvironment {
     pub fidelity_mode: FidelityMode,
+    pub lighting_model: LightingModel,
+    pub tfx_time_seconds: f32,
+    pub tfx_paused: bool,
+    pub tfx_speed: f32,
     pub time_of_day: f32,
     pub sun_intensity: f32,
     pub fog_density: f32,
@@ -590,10 +698,27 @@ pub(crate) struct ModelEnvironment {
     pub diagnostic_pass: u8,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LightingModel {
+    TigerGgxCompatibility,
+    #[default]
+    TigerGgxApproximation,
+    DebugLambert,
+    SurfaceNormals,
+    SurfaceProperties,
+    SurfaceEmissive,
+    SurfaceFlags,
+    SurfaceAlbedo,
+}
+
 impl Default for ModelEnvironment {
     fn default() -> Self {
         Self {
             fidelity_mode: FidelityMode::PrettyPreview,
+            lighting_model: LightingModel::TigerGgxApproximation,
+            tfx_time_seconds: 0.0,
+            tfx_paused: true,
+            tfx_speed: 1.0,
             time_of_day: 0.35,
             sun_intensity: 0.35,
             fog_density: 0.0,
@@ -718,7 +843,7 @@ struct LoadedMaterial {
     gear_dye: Option<GearDyeMaterial>,
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
-    mod_wear: Option<WeaponModWearMaterial>,
+    mod_wear: Option<WeaponModConditionMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
     investment_decal: Option<InvestmentDecalMaterial>,
     sampler_tag: Option<TagHash>,
@@ -1054,9 +1179,18 @@ impl ModelPaintCallback {
                 ],
                 fidelity: [
                     (environment.fidelity_mode == FidelityMode::PrettyPreview) as u8 as f32,
-                    0.0,
-                    0.0,
-                    0.0,
+                    match environment.lighting_model {
+                        LightingModel::TigerGgxCompatibility => 0.0,
+                        LightingModel::TigerGgxApproximation => 1.0,
+                        LightingModel::DebugLambert => 2.0,
+                        LightingModel::SurfaceNormals => 3.0,
+                        LightingModel::SurfaceProperties => 4.0,
+                        LightingModel::SurfaceEmissive => 5.0,
+                        LightingModel::SurfaceFlags => 6.0,
+                        LightingModel::SurfaceAlbedo => 7.0,
+                    },
+                    environment.tfx_time_seconds,
+                    environment.tfx_speed,
                 ],
             },
             materials,
@@ -1668,6 +1802,7 @@ struct ModelPipelineResources {
     material_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
     bloom_layout: wgpu::BindGroupLayout,
+    lighting_layout: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
     present_sampler: wgpu::Sampler,
     _fallback_color: wgpu::Texture,
@@ -1676,6 +1811,7 @@ struct ModelPipelineResources {
     model_pipeline_layout: wgpu::PipelineLayout,
     model_pipelines: Vec<(ModelPipelineKey, wgpu::RenderPipeline)>,
     present_pipeline: wgpu::RenderPipeline,
+    lighting_pipeline: wgpu::RenderPipeline,
     bloom_bright_pipeline: wgpu::RenderPipeline,
     bloom_downsample_pipeline: wgpu::RenderPipeline,
     bloom_blur_horizontal_pipeline: wgpu::RenderPipeline,
@@ -1693,12 +1829,16 @@ struct ModelTargetResources {
     size: [u32; 2],
     _color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    _lit_color: wgpu::Texture,
+    lit_color_view: wgpu::TextureView,
     _surface_normal: wgpu::Texture,
     surface_normal_view: wgpu::TextureView,
     _surface_properties: wgpu::Texture,
     surface_properties_view: wgpu::TextureView,
     _surface_emissive: wgpu::Texture,
     surface_emissive_view: wgpu::TextureView,
+    _surface_albedo: wgpu::Texture,
+    surface_albedo_view: wgpu::TextureView,
     _surface_flags: wgpu::Texture,
     surface_flags_view: wgpu::TextureView,
     _depth: wgpu::Texture,
@@ -1717,6 +1857,7 @@ struct ModelFrameResources {
     key: FrameResourceKey,
     scene_buffer: wgpu::Buffer,
     shadow_scene_bind_group: wgpu::BindGroup,
+    scene_bind_group: wgpu::BindGroup,
     _material_buffers: Vec<wgpu::Buffer>,
     material_bind_groups: Vec<wgpu::BindGroup>,
     bloom_half_bind_group: wgpu::BindGroup,
@@ -1724,6 +1865,7 @@ struct ModelFrameResources {
     bloom_blur_horizontal_bind_group: wgpu::BindGroup,
     bloom_blur_vertical_bind_group: wgpu::BindGroup,
     present_bind_group: wgpu::BindGroup,
+    lighting_bind_group: wgpu::BindGroup,
     opaque_bundles: Vec<wgpu::RenderBundle>,
     decal_bundles: Vec<wgpu::RenderBundle>,
     transparent_bundles: Vec<wgpu::RenderBundle>,
@@ -1760,16 +1902,21 @@ fn create_model_render_bundles(
                 .iter()
                 .find(|(key, _)| *key == draw.pipeline)?;
             let material = material_bind_groups.get(draw.material_index)?;
+            let transparent = accepted_passes == [RenderPassKind::ForwardTransparent];
+            let color_formats = if transparent {
+                vec![Some(OFFSCREEN_FORMAT)]
+            } else {
+                vec![
+                    Some(OFFSCREEN_FORMAT),
+                    Some(SURFACE_FORMAT),
+                    Some(SURFACE_PROPERTIES_FORMAT),
+                    Some(SURFACE_FORMAT),
+                ]
+            };
             let mut bundle =
                 device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
                     label: Some("quicktag_model_parallel_draw"),
-                    color_formats: &[
-                        Some(OFFSCREEN_FORMAT),
-                        Some(SURFACE_FORMAT),
-                        Some(SURFACE_PROPERTIES_FORMAT),
-                        Some(SURFACE_FORMAT),
-                        Some(SURFACE_FLAGS_FORMAT),
-                    ],
+                    color_formats: &color_formats,
                     depth_stencil: Some(wgpu::RenderBundleDepthStencil {
                         format: DEPTH_FORMAT,
                         depth_read_only: false,
@@ -1812,12 +1959,37 @@ impl CallbackTrait for ModelPaintCallback {
         }
 
         if let Some(resources) = callback_resources.get_mut::<ModelPipelineResources>() {
-            for key in self.draws.iter().map(|draw| draw.pipeline).unique() {
+            let keys = self
+                .draws
+                .iter()
+                .flat_map(|draw| {
+                    [
+                        Some(draw.pipeline),
+                        (!draw.passes.contains(&RenderPassKind::ForwardTransparent))
+                            .then_some(draw.pipeline.material_flags()),
+                        (!draw.passes.contains(&RenderPassKind::ForwardTransparent))
+                            .then_some(draw.pipeline.material_emissive()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
+                .unique()
+                .collect_vec();
+            for key in keys {
                 if resources
                     .model_pipelines
                     .iter()
                     .any(|(existing, _pipeline)| *existing == key)
                 {
+                    continue;
+                }
+                let shared_pipeline = resources
+                    .model_pipelines
+                    .iter()
+                    .find(|(existing, _)| existing.gpu_equivalent(key))
+                    .map(|(_, pipeline)| pipeline.clone());
+                if let Some(pipeline) = shared_pipeline {
+                    resources.model_pipelines.push((key, pipeline));
                     continue;
                 }
                 let pipeline = create_model_pipeline(
@@ -1836,6 +2008,7 @@ impl CallbackTrait for ModelPaintCallback {
             material_layout,
             present_layout,
             bloom_layout,
+            lighting_layout,
             material_sampler,
             present_sampler,
             fallback_color_view,
@@ -1851,6 +2024,7 @@ impl CallbackTrait for ModelPaintCallback {
                     resources.material_layout.clone(),
                     resources.present_layout.clone(),
                     resources.bloom_layout.clone(),
+                    resources.lighting_layout.clone(),
                     resources.material_sampler.clone(),
                     resources.present_sampler.clone(),
                     resources.fallback_color_view.clone(),
@@ -2263,7 +2437,14 @@ impl CallbackTrait for ModelPaintCallback {
 
             let Some((
                 color_view,
+                lit_color_view,
+                surface_normal_view,
+                surface_properties_view,
+                surface_emissive_view,
+                surface_flags_view,
+                surface_albedo_view,
                 depth_view,
+                shadow_depth_view,
                 bloom_half_view,
                 bloom_quarter_view,
                 bloom_blur_view,
@@ -2272,7 +2453,14 @@ impl CallbackTrait for ModelPaintCallback {
                 .map(|target| {
                     (
                         target.color_view.clone(),
+                        target.lit_color_view.clone(),
+                        target.surface_normal_view.clone(),
+                        target.surface_properties_view.clone(),
+                        target.surface_emissive_view.clone(),
+                        target.surface_flags_view.clone(),
+                        target.surface_albedo_view.clone(),
                         target.depth_view.clone(),
+                        target.shadow_depth_view.clone(),
                         target.bloom_half_view.clone(),
                         target.bloom_quarter_view.clone(),
                         target.bloom_blur_view.clone(),
@@ -2292,7 +2480,7 @@ impl CallbackTrait for ModelPaintCallback {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color_view),
+                        resource: wgpu::BindingResource::TextureView(&lit_color_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -2350,7 +2538,7 @@ impl CallbackTrait for ModelPaintCallback {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color_view),
+                        resource: wgpu::BindingResource::TextureView(&lit_color_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -2375,6 +2563,56 @@ impl CallbackTrait for ModelPaintCallback {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(&bloom_quarter_view),
+                    },
+                ],
+            });
+            let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("quicktag_model_lighting_bind_group"),
+                layout: &lighting_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&color_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&surface_normal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&surface_properties_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&surface_emissive_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&present_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: scene_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&surface_flags_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&surface_albedo_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(&depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: wgpu::BindingResource::Sampler(&shadow_sampler),
                     },
                 ],
             });
@@ -2405,6 +2643,7 @@ impl CallbackTrait for ModelPaintCallback {
                 key: frame_key,
                 scene_buffer,
                 shadow_scene_bind_group,
+                scene_bind_group,
                 _material_buffers: material_buffers,
                 material_bind_groups,
                 bloom_half_bind_group,
@@ -2412,6 +2651,7 @@ impl CallbackTrait for ModelPaintCallback {
                 bloom_blur_horizontal_bind_group,
                 bloom_blur_vertical_bind_group,
                 present_bind_group,
+                lighting_bind_group,
                 opaque_bundles,
                 decal_bundles,
                 transparent_bundles,
@@ -2485,8 +2725,7 @@ impl CallbackTrait for ModelPaintCallback {
                 }),
                 Some(clear_surface_attachment(&target.surface_normal_view)),
                 Some(clear_surface_attachment(&target.surface_properties_view)),
-                Some(clear_surface_attachment(&target.surface_emissive_view)),
-                Some(clear_surface_attachment(&target.surface_flags_view)),
+                Some(clear_surface_attachment(&target.surface_albedo_view)),
             ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &target.depth_view,
@@ -2502,16 +2741,10 @@ impl CallbackTrait for ModelPaintCallback {
         pass.execute_bundles(frame.opaque_bundles.iter());
         drop(pass);
 
-        for (label, bundles) in [
-            (
-                "quicktag_model_investment_decal_pass",
-                frame.decal_bundles.as_slice(),
-            ),
-            (
-                "quicktag_model_forward_transparent_pass",
-                frame.transparent_bundles.as_slice(),
-            ),
-        ] {
+        for (label, bundles) in [(
+            "quicktag_model_investment_decal_pass",
+            frame.decal_bundles.as_slice(),
+        )] {
             if bundles.is_empty() {
                 continue;
             }
@@ -2521,8 +2754,7 @@ impl CallbackTrait for ModelPaintCallback {
                     Some(load_surface_attachment(&target.color_view)),
                     Some(load_surface_attachment(&target.surface_normal_view)),
                     Some(load_surface_attachment(&target.surface_properties_view)),
-                    Some(load_surface_attachment(&target.surface_emissive_view)),
-                    Some(load_surface_attachment(&target.surface_flags_view)),
+                    Some(load_surface_attachment(&target.surface_albedo_view)),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &target.depth_view,
@@ -2536,6 +2768,132 @@ impl CallbackTrait for ModelPaintCallback {
                 occlusion_query_set: None,
             });
             special_pass.execute_bundles(bundles.iter());
+        }
+
+        {
+            let mut emissive_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quicktag_model_material_emissive_pass"),
+                color_attachments: &[Some(clear_surface_attachment(
+                    &target.surface_emissive_view,
+                ))],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            emissive_pass.set_vertex_buffer(0, self.preview.vertex_buffer.slice(..));
+            emissive_pass.set_index_buffer(
+                self.preview.index_buffer.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            for draw in self
+                .draws
+                .iter()
+                .filter(|draw| !draw.passes.contains(&RenderPassKind::ForwardTransparent))
+            {
+                let emissive_key = draw.pipeline.material_emissive();
+                let Some((_, pipeline)) = pipelines
+                    .model_pipelines
+                    .iter()
+                    .find(|(key, _)| *key == emissive_key)
+                else {
+                    continue;
+                };
+                emissive_pass.set_pipeline(pipeline);
+                emissive_pass.set_bind_group(0, &frame.scene_bind_group, &[]);
+                emissive_pass.set_bind_group(
+                    1,
+                    &frame.material_bind_groups[draw.material_index],
+                    &[],
+                );
+                emissive_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
+            }
+        }
+
+        {
+            let mut flags_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quicktag_model_material_flags_pass"),
+                color_attachments: &[Some(clear_surface_attachment(&target.surface_flags_view))],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            flags_pass.set_vertex_buffer(0, self.preview.vertex_buffer.slice(..));
+            flags_pass.set_index_buffer(
+                self.preview.index_buffer.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            for draw in self
+                .draws
+                .iter()
+                .filter(|draw| !draw.passes.contains(&RenderPassKind::ForwardTransparent))
+            {
+                let flag_key = draw.pipeline.material_flags();
+                let Some((_, pipeline)) = pipelines
+                    .model_pipelines
+                    .iter()
+                    .find(|(key, _)| *key == flag_key)
+                else {
+                    continue;
+                };
+                flags_pass.set_pipeline(pipeline);
+                flags_pass.set_bind_group(0, &frame.scene_bind_group, &[]);
+                flags_pass.set_bind_group(1, &frame.material_bind_groups[draw.material_index], &[]);
+                flags_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
+            }
+        }
+
+        {
+            let mut lighting_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quicktag_model_deferred_lighting_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.lit_color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            lighting_pass.set_pipeline(&pipelines.lighting_pipeline);
+            lighting_pass.set_bind_group(0, &frame.lighting_bind_group, &[]);
+            lighting_pass.draw(0..3, 0..1);
+        }
+
+        if !frame.transparent_bundles.is_empty() {
+            let mut transparent_pass =
+                egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("quicktag_model_forward_transparent_pass"),
+                    color_attachments: &[Some(load_surface_attachment(&target.lit_color_view))],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &target.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+            transparent_pass.execute_bundles(frame.transparent_bundles.iter());
         }
 
         for (label, pipeline, bind_group, view) in [
@@ -2848,6 +3206,68 @@ fn create_pipeline_resources(
             },
         ],
     });
+    let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("quicktag_model_lighting_layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(1),
+            texture_entry(2),
+            texture_entry(3),
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            texture_entry(7),
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                count: None,
+            },
+        ],
+    });
     let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("quicktag_model_material_sampler"),
         address_mode_u: wgpu::AddressMode::Repeat,
@@ -3019,6 +3439,21 @@ fn create_pipeline_resources(
         label: Some("quicktag_model_bloom_shader"),
         source: wgpu::ShaderSource::Wgsl(BLOOM_SHADER.into()),
     });
+    let lighting_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quicktag_model_lighting_shader"),
+        source: wgpu::ShaderSource::Wgsl(LIGHTING_SHADER.into()),
+    });
+    let lighting_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("quicktag_model_lighting_pipeline_layout"),
+        bind_group_layouts: &[&lighting_layout],
+        push_constant_ranges: &[],
+    });
+    let lighting_pipeline = create_bloom_pipeline(
+        device,
+        &lighting_shader,
+        &lighting_pipeline_layout,
+        "fs_main",
+    );
     let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("quicktag_model_bloom_pipeline_layout"),
         bind_group_layouts: &[&bloom_layout],
@@ -3082,6 +3517,7 @@ fn create_pipeline_resources(
         material_layout,
         present_layout,
         bloom_layout,
+        lighting_layout,
         material_sampler,
         present_sampler,
         _fallback_color: fallback_color,
@@ -3090,6 +3526,7 @@ fn create_pipeline_resources(
         model_pipeline_layout,
         model_pipelines: Vec::new(),
         present_pipeline,
+        lighting_pipeline,
         bloom_bright_pipeline,
         bloom_downsample_pipeline,
         bloom_blur_horizontal_pipeline,
@@ -3141,6 +3578,31 @@ fn create_model_pipeline(
     layout: &wgpu::PipelineLayout,
     key: ModelPipelineKey,
 ) -> wgpu::RenderPipeline {
+    let transparent = key.pass == RenderPassKind::ForwardTransparent;
+    let emissive_only = key.pass == RenderPassKind::MaterialEmissive;
+    let flags_only = key.pass == RenderPassKind::MaterialFlags;
+    let targets = if transparent {
+        vec![Some(wgpu::ColorTargetState {
+            format: OFFSCREEN_FORMAT,
+            blend: blend_state(key.blend),
+            write_mask: wgpu::ColorWrites::ALL,
+        })]
+    } else if emissive_only {
+        vec![Some(surface_target(SURFACE_EMISSIVE_FORMAT))]
+    } else if flags_only {
+        vec![Some(surface_target(SURFACE_FLAGS_FORMAT))]
+    } else {
+        vec![
+            Some(wgpu::ColorTargetState {
+                format: OFFSCREEN_FORMAT,
+                blend: blend_state(key.blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+            Some(surface_target(SURFACE_FORMAT)),
+            Some(surface_target(SURFACE_PROPERTIES_FORMAT)),
+            Some(surface_target(SURFACE_FORMAT)),
+        ]
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("quicktag_model_pipeline"),
         layout: Some(layout),
@@ -3199,23 +3661,29 @@ fn create_model_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: depth_stencil_state(key.depth_stencil, key.depth_bias),
+        depth_stencil: if flags_only {
+            Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            })
+        } else {
+            depth_stencil_state(key.depth_stencil, key.depth_bias)
+        },
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(match key.pass {
+                RenderPassKind::InvestmentDecalCompatibility => "fs_investment_decal",
+                RenderPassKind::ForwardTransparent => "fs_forward_transparent",
+                RenderPassKind::MaterialEmissive => "fs_material_emissive",
+                RenderPassKind::MaterialFlags => "fs_material_flags",
+                _ => "fs_main",
+            }),
             compilation_options: Default::default(),
-            targets: &[
-                Some(wgpu::ColorTargetState {
-                    format: OFFSCREEN_FORMAT,
-                    blend: blend_state(key.blend),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(surface_target(SURFACE_FORMAT)),
-                Some(surface_target(SURFACE_PROPERTIES_FORMAT)),
-                Some(surface_target(SURFACE_FORMAT)),
-                Some(surface_target(SURFACE_FLAGS_FORMAT)),
-            ],
+            targets: &targets,
         }),
         multiview: None,
         cache: None,
@@ -3348,6 +3816,19 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         view_formats: &[],
     });
     let color_view = color.create_view(&Default::default());
+    let lit_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quicktag_model_lit_color_target"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let lit_color_view = lit_color.create_view(&Default::default());
     let surface_texture = |label, format| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -3369,8 +3850,10 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         SURFACE_PROPERTIES_FORMAT,
     );
     let surface_properties_view = surface_properties.create_view(&Default::default());
-    let surface_emissive = surface_texture("quicktag_surface_emissive", SURFACE_FORMAT);
+    let surface_emissive = surface_texture("quicktag_surface_emissive", SURFACE_EMISSIVE_FORMAT);
     let surface_emissive_view = surface_emissive.create_view(&Default::default());
+    let surface_albedo = surface_texture("quicktag_surface_albedo_opacity", SURFACE_FORMAT);
+    let surface_albedo_view = surface_albedo.create_view(&Default::default());
     let surface_flags = surface_texture("quicktag_surface_flags", SURFACE_FLAGS_FORMAT);
     let surface_flags_view = surface_flags.create_view(&Default::default());
     let depth = device.create_texture(&wgpu::TextureDescriptor {
@@ -3439,12 +3922,16 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         size,
         _color: color,
         color_view,
+        _lit_color: lit_color,
+        lit_color_view,
         _surface_normal: surface_normal,
         surface_normal_view,
         _surface_properties: surface_properties,
         surface_properties_view,
         _surface_emissive: surface_emissive,
         surface_emissive_view,
+        _surface_albedo: surface_albedo,
+        surface_albedo_view,
         _surface_flags: surface_flags,
         surface_flags_view,
         _depth: depth,
@@ -3483,6 +3970,183 @@ fn load_surface_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColorAtt
         },
     }
 }
+
+const LIGHTING_SHADER: &str = r#"
+@group(0) @binding(0) var compatibility_hdr: texture_2d<f32>;
+@group(0) @binding(1) var normal_roughness: texture_2d<f32>;
+@group(0) @binding(2) var material_properties: texture_2d<f32>;
+@group(0) @binding(3) var surface_emissive: texture_2d<f32>;
+@group(0) @binding(4) var surface_sampler: sampler;
+@group(0) @binding(5) var<uniform> scene: SceneUniform;
+@group(0) @binding(6) var surface_flags: texture_2d<u32>;
+@group(0) @binding(7) var surface_albedo: texture_2d<f32>;
+@group(0) @binding(8) var scene_depth: texture_depth_2d;
+@group(0) @binding(9) var sun_shadow: texture_depth_2d;
+@group(0) @binding(10) var sun_shadow_sampler: sampler_comparison;
+
+struct SceneUniform {
+    center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
+    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let position = positions[vertex_index];
+    var output: VertexOutput;
+    output.position = vec4<f32>(position, 0.0, 1.0);
+    output.uv = position * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    return output;
+}
+
+fn view_direction_to_world(value: vec3<f32>) -> vec3<f32> {
+    let cy = cos(scene.params0.y);
+    let sy = sin(scene.params0.y);
+    let cp = cos(scene.params0.z);
+    let sp = sin(scene.params0.z);
+    let yawed = vec3<f32>(
+        value.x,
+        value.y * cp + value.z * sp,
+        -value.y * sp + value.z * cp,
+    );
+    let z_up = vec3<f32>(
+        yawed.x * cy - yawed.z * sy,
+        yawed.y,
+        yawed.x * sy + yawed.z * cy,
+    );
+    return vec3<f32>(z_up.x, z_up.z, z_up.y);
+}
+
+fn reconstruct_object_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let clip = uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    let scale = 0.84 * scene.params0.w / max(scene.params0.x, 0.0001);
+    let view_position = vec3<f32>(
+        -(clip.x - scene.params1.y) / max(scale * scene.params1.x, 0.0001),
+        (clip.y - scene.params1.z) / max(scale, 0.0001),
+        (0.5 - depth) / max(scale * 0.25, 0.0001),
+    );
+    return scene.center.xyz + view_direction_to_world(view_position);
+}
+
+fn deferred_shadow(uv: vec2<f32>, normal: vec3<f32>) -> f32 {
+    let dimensions = vec2<i32>(textureDimensions(scene_depth));
+    let pixel = clamp(vec2<i32>(uv * vec2<f32>(dimensions)), vec2<i32>(0), dimensions - vec2<i32>(1));
+    let depth = textureLoad(scene_depth, pixel, 0);
+    let position = reconstruct_object_position(uv, depth);
+    let light_world = normalize(view_direction_to_world(scene.light_direction.xyz));
+    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_world.z) > 0.95);
+    let right = normalize(cross(up, light_world));
+    let vertical = cross(light_world, right);
+    let relative = (position - scene.center.xyz) / max(scene.center.w, 0.0001);
+    let shadow_position = vec3<f32>(
+        vec2<f32>(dot(relative, right), dot(relative, vertical)) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5),
+        0.5 - dot(relative, light_world) * 0.5,
+    );
+    if any(shadow_position.xy < vec2<f32>(0.0)) || any(shadow_position.xy > vec2<f32>(1.0)) {
+        return 1.0;
+    }
+    let texel = 1.0 / vec2<f32>(textureDimensions(sun_shadow));
+    let receiver_bias = texel.x * (0.75 + (1.0 - max(dot(view_direction_to_world(normal), light_world), 0.0)) * 2.0);
+    return textureSampleCompareLevel(
+        sun_shadow,
+        sun_shadow_sampler,
+        shadow_position.xy,
+        shadow_position.z - receiver_bias,
+    );
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let compatibility = textureSample(compatibility_hdr, surface_sampler, input.uv);
+    let packed_normal = textureSample(normal_roughness, surface_sampler, input.uv);
+    let normal = normalize(packed_normal.rgb * 2.0 - vec3<f32>(1.0));
+    let properties = textureSample(material_properties, surface_sampler, input.uv);
+    let emissive_dimensions = vec2<i32>(textureDimensions(surface_emissive));
+    let emissive_pixel = clamp(
+        vec2<i32>(input.uv * vec2<f32>(emissive_dimensions)),
+        vec2<i32>(0),
+        emissive_dimensions - vec2<i32>(1),
+    );
+    let emissive = textureLoad(surface_emissive, emissive_pixel, 0).rgb;
+    let surface = textureSample(surface_albedo, surface_sampler, input.uv);
+    let model = u32(scene.fidelity.y + 0.5);
+    if model == 1u {
+        if surface.a <= 0.0 {
+            return compatibility;
+        }
+        let albedo = surface.rgb;
+        let roughness = clamp(packed_normal.a, 0.045, 1.0);
+        let metalness = clamp(properties.r, 0.0, 1.0);
+        let ao = clamp(properties.g, 0.0, 1.0);
+        let light = normalize(scene.light_direction.xyz);
+        let view = vec3<f32>(0.0, 0.0, 1.0);
+        let halfway = normalize(light + view);
+        let n_dot_l = max(dot(normal, light), 0.0);
+        let n_dot_v = max(dot(normal, view), 0.001);
+        let n_dot_h = max(dot(normal, halfway), 0.0);
+        let v_dot_h = max(dot(view, halfway), 0.0);
+        let alpha = roughness * roughness;
+        let alpha2 = alpha * alpha;
+        let denominator = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0;
+        let distribution = alpha2 / max(3.14159265 * denominator * denominator, 0.0001);
+        let k = (roughness + 1.0) * (roughness + 1.0) * 0.125;
+        let visibility_l = n_dot_l / max(n_dot_l * (1.0 - k) + k, 0.0001);
+        let visibility_v = n_dot_v / max(n_dot_v * (1.0 - k) + k, 0.0001);
+        let f0 = mix(vec3<f32>(0.04), albedo, metalness);
+        let fresnel = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - v_dot_h, 5.0);
+        let specular = distribution * visibility_l * visibility_v * fresnel * 0.25;
+        let diffuse = (vec3<f32>(1.0) - fresnel) * (1.0 - metalness) * albedo / 3.14159265;
+        let shadow = mix(1.0, deferred_shadow(input.uv, normal), scene.light_direction.w);
+        let direct = (diffuse + specular) * n_dot_l * scene.postprocess0.w * shadow;
+        let ibl_diffuse = albedo * (1.0 - metalness) * scene.postprocess4.z * ao;
+        let ibl_specular = f0 * mix(0.08, 1.0, 1.0 - roughness)
+            * scene.postprocess4.w * ao;
+        let color = (direct + ibl_diffuse + ibl_specular + emissive) * scene.postprocess0.x;
+        return vec4<f32>(color, surface.a);
+    }
+    if model == 2u {
+        let light = normalize(scene.light_direction.xyz);
+        let lambert = max(dot(normal, light), 0.0);
+        let ao = properties.g;
+        return vec4<f32>(surface.rgb * (0.18 * ao + 0.82 * lambert) + emissive, compatibility.a);
+    }
+    if model == 3u {
+        return vec4<f32>(normal * 0.5 + vec3<f32>(0.5), compatibility.a);
+    }
+    if model == 4u {
+        return vec4<f32>(properties.r, properties.g, packed_normal.a, 1.0);
+    }
+    if model == 5u {
+        return vec4<f32>(emissive, 1.0);
+    }
+    if model == 6u {
+        let dimensions = vec2<i32>(textureDimensions(surface_flags));
+        let pixel = clamp(vec2<i32>(input.uv * vec2<f32>(dimensions)), vec2<i32>(0), dimensions - vec2<i32>(1));
+        let flags = textureLoad(surface_flags, pixel, 0).r;
+        return vec4<f32>(
+            select(0.0, 1.0, (flags & 1u) != 0u),
+            select(0.0, 1.0, (flags & 2u) != 0u),
+            select(0.0, 1.0, (flags & 8u) != 0u),
+            1.0,
+        );
+    }
+    if model == 7u {
+        return surface;
+    }
+    // Compatibility is an explicit migration path. Surface buffers remain
+    // inspectable while family lighting moves here incrementally.
+    return compatibility;
+}
+"#;
 
 const BLOOM_SHADER: &str = r#"
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
@@ -4315,12 +4979,10 @@ struct FragmentOutput {
     @location(0) compatibility_hdr: vec4<f32>,
     @location(1) normal_roughness: vec4<f32>,
     @location(2) material_properties: vec4<f32>,
-    @location(3) emissive: vec4<f32>,
-    @location(4) flags: u32,
+    @location(3) albedo: vec4<f32>,
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> FragmentOutput {
+fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     let base_color = textureSampleBias(
         color_texture,
         material_sampler,
@@ -4329,7 +4991,6 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     );
     let mask_material = material.params.w < -0.5;
     var material_alpha = select(base_color.a, base_color.r, mask_material);
-    let investment_decal = material.decal_params.x > 0.5;
     if !investment_decal && ((!mask_material && base_color.a < material.params.w)
         || (mask_material && material_alpha < 0.02)) {
         discard;
@@ -4526,6 +5187,17 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     {
         color *= scene.postprocess0.x;
     }
+    if diagnostic_mode == 7u {
+        color = emissive_output;
+    } else if diagnostic_mode == 8u {
+        let investment_decal = material.decal_params.x > 0.5;
+        let mask_material = material.params.w < -0.5;
+        color = vec3<f32>(
+            select(0.0, 1.0, !investment_decal),
+            select(0.0, 1.0, investment_decal),
+            select(0.0, 1.0, mask_material),
+        );
+    }
     let output_alpha = material_alpha * material.tint.a;
     var compatibility_hdr = vec4<f32>(color, output_alpha);
     if decal_blend {
@@ -4544,13 +5216,49 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     output.compatibility_hdr = compatibility_hdr;
     output.normal_roughness = vec4<f32>(normal * 0.5 + vec3<f32>(0.5), roughness);
     output.material_properties = vec4<f32>(metalness, vertex_ao, 0.0, output_alpha);
-    output.emissive = vec4<f32>(emissive_output, 1.0);
-    let transparent = material.blend.x != 0.0
-        && material.blend.x != 1.0
-        && material.blend.x != 57.0;
+    output.albedo = vec4<f32>(albedo, output_alpha);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> FragmentOutput {
+    return shade_model(input, false);
+}
+
+@fragment
+fn fs_investment_decal(input: VertexOutput) -> FragmentOutput {
+    return shade_model(input, true);
+}
+
+@fragment
+fn fs_forward_transparent(input: VertexOutput) -> @location(0) vec4<f32> {
+    return shade_model(input, false).compatibility_hdr;
+}
+
+@fragment
+fn fs_material_emissive(input: VertexOutput) -> @location(0) vec4<f32> {
+    if material.params.y > 0.5 {
+        return vec4<f32>(textureSampleBias(
+            emissive_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        ).rgb * min(material.params.z, 0.01), 1.0);
+    }
+    return vec4<f32>(0.0);
+}
+
+struct AuxiliaryOutput {
+    @location(0) flags: u32,
+}
+
+@fragment
+fn fs_material_flags(input: VertexOutput) -> AuxiliaryOutput {
+    let investment_decal = material.decal_params.x > 0.5;
+    let mask_material = material.params.w < -0.5;
+    var output: AuxiliaryOutput;
     output.flags = select(1u, 2u, investment_decal)
-        | select(0u, 4u, mask_material)
-        | select(0u, 8u, transparent);
+        | select(0u, 4u, mask_material);
     return output;
 }
 "#;
@@ -4800,10 +5508,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOOM_SHADER, GpuModelPreview, MAX_MODEL_TARGET_PIXELS, MODEL_SHADER, MaterialLuminance,
-        ModelEnvironment, ModelFrameResources, ModelPaintCallback, ModelPipelineKey,
-        ModelPipelineResources, PRESENT_SHADER, SHADOW_SHADER, adapt_exposure, alpha_mode,
-        blend_enabled, blend_state, bounded_target_size, create_model_pipeline,
+        BLOOM_SHADER, GpuModelPreview, LIGHTING_SHADER, LightingModel, MAX_MODEL_TARGET_PIXELS,
+        MODEL_SHADER, MaterialLuminance, ModelEnvironment, ModelFrameResources, ModelPaintCallback,
+        ModelPipelineKey, ModelPipelineResources, PRESENT_SHADER, SHADOW_SHADER, adapt_exposure,
+        alpha_mode, blend_enabled, blend_state, bounded_target_size, create_model_pipeline,
         create_model_sampler, create_pipeline_resources, decode_model_sampler_desc,
         exposure_target, first_person_key_light, hiz_draw_visible, model_draws, model_view_depth,
         rasterizer_cull_mode, shadow_pipeline_index, smooth_normals, vertex_ambient_occlusion,
@@ -4813,7 +5521,7 @@ mod tests {
             GeometryPreviewKind, GeometryTagPreview, WeaponModPreviewAttachment, WeaponModRarity,
             WireframeMaterialRange, WireframeMaterialTextures, WireframePreview,
         },
-        render::evidence::FidelityMode,
+        render::{evidence::FidelityMode, pass_plan::RenderPassKind},
         texture::{Texture, cache::TextureCache},
     };
     use eframe::{
@@ -4839,6 +5547,43 @@ mod tests {
         max_channel_delta: u8,
         changed_pixel_fraction: f64,
         changed_pixel_threshold: u8,
+    }
+
+    #[derive(Serialize)]
+    struct VisualCaptureDraw {
+        draw_index: usize,
+        raw_lod: Option<u8>,
+        raw_stage: Option<u8>,
+        technique: Option<String>,
+        family: String,
+        passes: Vec<String>,
+        provenance: String,
+        tfx_states: Vec<String>,
+        unknown_tfx_stages: usize,
+        warnings: Vec<String>,
+    }
+
+    #[derive(Serialize)]
+    struct VisualCaptureMetadata {
+        schema: u32,
+        adapter_version: &'static str,
+        renderer_schema_version: u32,
+        asset: &'static str,
+        owner: &'static str,
+        attachments: [&'static str; 2],
+        gpu_name: String,
+        gpu_backend: String,
+        gpu_driver: String,
+        gpu_driver_info: String,
+        output_size: [u32; 2],
+        yaw_degrees: f32,
+        pitch_degrees: f32,
+        scale: f32,
+        fidelity: String,
+        lighting_model: String,
+        debug_channel: String,
+        draws: Vec<VisualCaptureDraw>,
+        unknown_tfx_stages: usize,
     }
 
     fn verify_visual_baseline(image: &image::RgbaImage, baseline_path: &Path, report_path: &Path) {
@@ -4955,7 +5700,13 @@ mod tests {
 
     #[test]
     fn validates_model_preview_shaders() {
-        for source in [MODEL_SHADER, PRESENT_SHADER, SHADOW_SHADER, BLOOM_SHADER] {
+        for source in [
+            MODEL_SHADER,
+            PRESENT_SHADER,
+            SHADOW_SHADER,
+            BLOOM_SHADER,
+            LIGHTING_SHADER,
+        ] {
             let module = naga::front::wgsl::parse_str(source).expect("WGSL should parse");
             naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
@@ -4985,7 +5736,7 @@ mod tests {
             environment.light_position,
             environment.shadow_strength,
         );
-        assert!(light[0] < 0.0, "configured orbit X remains negative");
+        assert!(light[0] > 0.0, "configured orbit X remains positive");
         assert!(light[1] > 0.0, "configured orbit Y remains positive");
         let length = environment
             .light_position
@@ -5005,23 +5756,23 @@ mod tests {
     fn uses_requested_inventory_environment_defaults() {
         let environment = ModelEnvironment::default();
         assert_eq!(environment.fog_density, 0.0);
-        assert_eq!(environment.bloom_strength, 0.2);
-        assert_eq!(environment.sun_intensity, 0.15);
+        assert_eq!(environment.bloom_strength, 0.0);
+        assert_eq!(environment.sun_intensity, 0.35);
         assert_eq!(environment.exposure, 1.0);
         assert!(!environment.auto_exposure);
-        assert_eq!(environment.ambient_intensity, 0.5);
-        assert_eq!(environment.specular_ibl_intensity, 0.155);
+        assert_eq!(environment.ambient_intensity, 0.2);
+        assert_eq!(environment.specular_ibl_intensity, 0.3);
         assert_eq!(environment.vertex_ao_strength, 0.5);
-        assert_eq!(environment.light_position, [-0.382, 0.8, 0.5]);
+        assert_eq!(environment.light_position, [0.061, 0.711, 0.701]);
         assert_eq!(environment.light_orbit_radius, -1.0);
         assert_eq!(environment.light_size, 5.0);
         assert!(!environment.light_gizmo);
         assert_eq!(environment.shadow_strength, 1.0);
-        assert_eq!(environment.shadow_softness, 0.35);
-        assert_eq!(environment.brightness, 2.0);
-        assert_eq!(environment.contrast, 1.05);
-        assert_eq!(environment.saturation, 1.0);
-        assert_eq!(environment.gamma, 0.95);
+        assert_eq!(environment.shadow_softness, 0.5);
+        assert_eq!(environment.brightness, 1.0);
+        assert_eq!(environment.contrast, 1.01);
+        assert_eq!(environment.saturation, 1.4);
+        assert_eq!(environment.gamma, 1.0);
         assert_eq!(environment.ssao_strength, 10.0);
         assert_eq!(environment.distortion, 0.0);
         assert_eq!(environment.water_strength, 0.0);
@@ -5030,7 +5781,7 @@ mod tests {
         assert_eq!(environment.decal, None);
         assert_eq!(environment.cubemap, None);
         assert_eq!(environment.diagnostic_pass, 0);
-        assert!(!environment.tone_mapping);
+        assert!(environment.tone_mapping);
     }
 
     #[test]
@@ -5039,9 +5790,8 @@ mod tests {
         assert!(MODEL_SHADER.contains("material.metal_remap.x"));
         assert!(MODEL_SHADER.contains("let f0 = mix(vec3<f32>(0.03), albedo, metalness)"));
         assert!(MODEL_SHADER.contains("let direct_diffuse"));
-        assert!(MODEL_SHADER.contains(
-            "key_specular * key_color * scene.postprocess0.w * n_dot_l * sun_visibility * 0.12"
-        ));
+        assert!(MODEL_SHADER.contains("key_specular"));
+        assert!(MODEL_SHADER.contains("* 0.24"));
         assert!(MODEL_SHADER.contains("let specular_occlusion"));
         assert!(MODEL_SHADER.contains("directional_shadow(input)"));
         assert!(!MODEL_SHADER.contains("rim_"));
@@ -5248,6 +5998,24 @@ mod tests {
             },
             ModelPipelineKey {
                 blend: 26,
+                ..Default::default()
+            },
+            ModelPipelineKey {
+                pass: RenderPassKind::InvestmentDecalCompatibility,
+                blend: 26,
+                ..Default::default()
+            },
+            ModelPipelineKey {
+                pass: RenderPassKind::ForwardTransparent,
+                blend: 8,
+                ..Default::default()
+            },
+            ModelPipelineKey {
+                pass: RenderPassKind::MaterialEmissive,
+                ..Default::default()
+            },
+            ModelPipelineKey {
+                pass: RenderPassKind::MaterialFlags,
                 ..Default::default()
             },
         ] {
@@ -5790,6 +6558,7 @@ mod tests {
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .expect("GPU adapter");
+        let adapter_info = adapter.get_info();
         let required_features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features,
@@ -5822,14 +6591,21 @@ mod tests {
         let diagnostic_name = std::env::var("QUICKTAG_PROBE_PASS")
             .unwrap_or_else(|_| "final".into())
             .to_ascii_lowercase();
-        let diagnostic_pass = match diagnostic_name.as_str() {
-            "final" => 0,
-            "base-color" | "base_colour" | "base-colour" => 1,
-            "diffuse" | "diffuse-only" => 2,
-            "ao" | "ao-only" => 3,
-            "specular" | "specular-only" => 4,
-            "pre-tone" | "pre_tone" | "hdr" => 5,
-            "normal" | "normals" => 6,
+        let (diagnostic_pass, probe_lighting_model) = match diagnostic_name.as_str() {
+            "final" => (0, LightingModel::TigerGgxApproximation),
+            "base-color" | "base_colour" | "base-colour" => {
+                (1, LightingModel::TigerGgxCompatibility)
+            }
+            "diffuse" | "diffuse-only" => (2, LightingModel::TigerGgxCompatibility),
+            "ao" | "ao-only" => (3, LightingModel::TigerGgxCompatibility),
+            "specular" | "specular-only" => (4, LightingModel::TigerGgxCompatibility),
+            "pre-tone" | "pre_tone" | "hdr" => (5, LightingModel::TigerGgxCompatibility),
+            "normal" | "normals" => (6, LightingModel::TigerGgxCompatibility),
+            "mrt-albedo" => (0, LightingModel::SurfaceAlbedo),
+            "mrt-normal" => (0, LightingModel::SurfaceNormals),
+            "mrt-properties" => (0, LightingModel::SurfaceProperties),
+            "mrt-emissive" => (7, LightingModel::TigerGgxCompatibility),
+            "mrt-flags" => (8, LightingModel::TigerGgxCompatibility),
             value => panic!("unknown QUICKTAG_PROBE_PASS {value}"),
         };
         let tuning_probe = std::env::var("QUICKTAG_PROBE_TUNE")
@@ -6530,6 +7306,7 @@ mod tests {
                 "pretty" | "pretty-preview" => FidelityMode::PrettyPreview,
                 value => panic!("unknown QUICKTAG_PROBE_FIDELITY {value}"),
             };
+            verification_environment.lighting_model = probe_lighting_model;
             let callback = ModelPaintCallback::new(
                 gpu,
                 &texture_cache,
@@ -6557,6 +7334,96 @@ mod tests {
                 1.0,
                 verification_environment,
             );
+            if revamp_baseline_case {
+                let draws = callback
+                    .preview
+                    .draws
+                    .iter()
+                    .enumerate()
+                    .map(|(draw_index, draw)| {
+                        let tfx_states = draw
+                            .packet
+                            .technique
+                            .as_ref()
+                            .map(|technique| {
+                                technique
+                                    .stages
+                                    .iter()
+                                    .map(|stage| {
+                                        format!(
+                                            "{}:{:?}",
+                                            stage.raw_stage_label, stage.tfx_execution.status
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let unknown_tfx_stages = tfx_states
+                            .iter()
+                            .filter(|state| {
+                                state.contains("Partial")
+                                    || state.contains("StoppedAtUnknown")
+                                    || state.contains("Invalid")
+                            })
+                            .count();
+                        VisualCaptureDraw {
+                            draw_index,
+                            raw_lod: draw.packet.raw_lod_category,
+                            raw_stage: draw.packet.raw_render_stage,
+                            technique: draw.packet.technique_hash.map(|tag| tag.to_string()),
+                            family: format!("{:?}", draw.packet.material.family()),
+                            passes: draw
+                                .packet
+                                .pass_plan
+                                .passes
+                                .iter()
+                                .map(|pass| format!("{pass:?}"))
+                                .collect(),
+                            provenance: callback
+                                .preview
+                                .provenance
+                                .get(draw.packet.source)
+                                .map(|record| format!("{:?}", record.evidence))
+                                .unwrap_or_else(|| "Missing".into()),
+                            tfx_states,
+                            unknown_tfx_stages,
+                            warnings: draw
+                                .packet
+                                .pass_plan
+                                .warnings
+                                .iter()
+                                .map(|warning| format!("{warning:?}"))
+                                .collect(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let capture = VisualCaptureMetadata {
+                    schema: 2,
+                    adapter_version: crate::render::adapter::GoliathAdapter::ADAPTER_VERSION,
+                    renderer_schema_version: 2,
+                    asset: "80A9FF17",
+                    owner: "80A7AA89",
+                    attachments: ["80A60FED", "80A60608"],
+                    gpu_name: adapter_info.name.clone(),
+                    gpu_backend: format!("{:?}", adapter_info.backend),
+                    gpu_driver: adapter_info.driver.clone(),
+                    gpu_driver_info: adapter_info.driver_info.clone(),
+                    output_size: [1024, 640],
+                    yaw_degrees: yaw.to_degrees(),
+                    pitch_degrees: callback.scene.params0[2].to_degrees(),
+                    scale: 3.1,
+                    fidelity: format!("{:?}", verification_environment.fidelity_mode),
+                    lighting_model: format!("{:?}", verification_environment.lighting_model),
+                    debug_channel: diagnostic_name.clone(),
+                    unknown_tfx_stages: draws.iter().map(|draw| draw.unknown_tfx_stages).sum(),
+                    draws,
+                };
+                std::fs::write(
+                    output.join(format!("{name}-{diagnostic_name}.capture.json")),
+                    serde_json::to_vec_pretty(&capture).expect("serialize capture metadata"),
+                )
+                .expect("write capture metadata");
+            }
             if lighting_reference_case {
                 eprintln!(
                     "Vox Nocturna lighting probe: pass={diagnostic_name} yaw={:.2} pitch={:.2} exposure={:.4} environment={verification_environment:?}",
@@ -7115,7 +7982,7 @@ mod tests {
                 .filter(|value| !value.is_empty())
                 .map(|value| format!("-{value}"))
                 .unwrap_or_default();
-            let output_stem = if diagnostic_pass != 0 {
+            let output_stem = if diagnostic_name != "final" {
                 format!("{name}-{diagnostic_name}")
             } else {
                 name.to_string()

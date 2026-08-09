@@ -296,7 +296,7 @@ pub struct WireframeMaterialTextures {
     pub gear_dye: Option<GearDyeMaterial>,
     pub gear_dye_default: Option<[f32; 4]>,
     pub gear_dye_palette: Option<[GearDyeMaterial; 6]>,
-    pub mod_wear: Option<WeaponModWearMaterial>,
+    pub mod_wear: Option<WeaponModConditionMaterial>,
     /// Object-space contour/detail layer decoded from the common gear surface
     /// shader. The control map selects which material IDs receive the layer;
     /// the bound field texture perturbs the authored tri-planar line function.
@@ -383,7 +383,7 @@ pub struct WeaponModPreviewAttachment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WeaponModWearMaterial {
+pub struct WeaponModConditionMaterial {
     /// Additional common-surface texture authored at PS t5.
     pub scratches: TagHash,
     /// Additional common-surface texture authored at PS t6.
@@ -3469,7 +3469,7 @@ const WEAPON_MOD_SCRATCHES_REMAP_SCALE_AGE_DELTA: usize = 8;
 fn weapon_mod_wear_material(
     technique: TagHash,
     bindings: &[TechniqueTextureBinding],
-) -> Option<WeaponModWearMaterial> {
+) -> Option<WeaponModConditionMaterial> {
     let entry = package_manager().get_entry(technique)?;
     let data = package_manager().read_tag(technique).ok()?;
     let preview = MaterialTagPreview::load(&entry, &data)?;
@@ -3618,7 +3618,7 @@ fn weapon_mod_wear_material(
             .map(|binding| binding.tag)
             .filter(|texture| local_surface_texture_candidate(*texture, technique))
     };
-    Some(WeaponModWearMaterial {
+    Some(WeaponModConditionMaterial {
         scratches: texture_at(5)?,
         grime: texture_at(6)?,
         damage: texture_at(7)?,
@@ -5547,8 +5547,7 @@ fn apply_geometry_position_transform(
     if let Some(positions) = &mut wireframe.procedural_positions {
         for position in positions {
             for axis in 0..3 {
-                position[axis] = read_snorm_position(position[axis]) * transform.scale[axis]
-                    + transform.offset[axis];
+                position[axis] = read_snorm_position(position[axis]);
             }
         }
     }

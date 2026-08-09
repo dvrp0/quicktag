@@ -1,5 +1,5 @@
 use crate::geometry::{
-    GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaterial, WeaponModWearMaterial,
+    GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaterial, WeaponModConditionMaterial,
     WireframeMaterialTextures,
 };
 use crate::render::evidence::EvidenceLevel;
@@ -36,18 +36,41 @@ pub struct MaterialDependencyGraph {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfirmedGearSlot {
+    pub color: [f32; 4],
+    pub roughness_remap: [f32; 4],
+    pub metalness_remap: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoliathGearDyeIR {
+    pub slots: [ConfirmedGearSlot; 6],
+    pub raw_parameters: Vec<[f32; 4]>,
+    pub evidence: EvidenceLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlChannelExpression {
+    pub raw_channel: char,
+    pub expression: &'static str,
+    pub evidence: EvidenceLevel,
+}
+
 #[derive(Debug, Clone)]
 pub struct SurfaceIR {
     pub family: MaterialFamily,
     pub evidence: EvidenceLevel,
     pub dependencies: MaterialDependencyGraph,
+    pub control_expressions: Vec<ControlChannelExpression>,
     pub color_texture: Option<tiger_pkg::TagHash>,
     pub normal_texture: Option<tiger_pkg::TagHash>,
     pub emissive_texture: Option<tiger_pkg::TagHash>,
     pub control_texture: Option<tiger_pkg::TagHash>,
     pub gear_dye: Option<GearDyeMaterial>,
+    pub goliath_gear: Option<GoliathGearDyeIR>,
     pub pattern: Option<GearPatternMaterial>,
-    pub condition: Option<WeaponModWearMaterial>,
+    pub condition: Option<WeaponModConditionMaterial>,
     pub solid_color: Option<[f32; 4]>,
     pub solid_surface: Option<[f32; 2]>,
 }
@@ -260,17 +283,52 @@ impl MaterialIR {
             family,
             evidence,
             dependencies: dependency_graph(textures),
+            control_expressions: control_expressions(textures),
             color_texture: textures.color,
             normal_texture: textures.normal,
             emissive_texture: textures.emissive,
             control_texture: textures.control,
             gear_dye: textures.gear_dye,
+            goliath_gear: textures.gear_dye_palette.map(|palette| GoliathGearDyeIR {
+                slots: palette.map(|slot| ConfirmedGearSlot {
+                    color: slot.color,
+                    roughness_remap: slot.roughness_remap,
+                    metalness_remap: slot.metal_remap,
+                }),
+                raw_parameters: palette
+                    .into_iter()
+                    .flat_map(|slot| [slot.color, slot.roughness_remap, slot.metal_remap])
+                    .collect(),
+                evidence: EvidenceLevel::Confirmed,
+            }),
             pattern: textures.gear_pattern,
             condition: textures.mod_wear,
             solid_color: textures.solid_color,
             solid_surface: textures.solid_surface,
         })
     }
+}
+
+fn control_expressions(textures: &WireframeMaterialTextures) -> Vec<ControlChannelExpression> {
+    if textures.gear_dye_palette.is_some() {
+        return ['R', 'G', 'B']
+            .map(|raw_channel| ControlChannelExpression {
+                raw_channel,
+                expression: "raw <= 0.5 selects Goliath Gear palette bit",
+                evidence: EvidenceLevel::Confirmed,
+            })
+            .into();
+    }
+    if textures.control.is_some() {
+        return ['R', 'G', 'B', 'A']
+            .map(|raw_channel| ControlChannelExpression {
+                raw_channel,
+                expression: "raw channel preserved; semantic unknown",
+                evidence: EvidenceLevel::Unknown,
+            })
+            .into();
+    }
+    vec![]
 }
 
 fn dependency_graph(textures: &WireframeMaterialTextures) -> MaterialDependencyGraph {

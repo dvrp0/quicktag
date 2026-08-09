@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod evidence;
 pub mod material;
 pub mod pass_plan;
