@@ -1089,6 +1089,18 @@ pub(super) fn model_wireframe_ui(
             *zoom = 1.0;
             *pan = vec2(0.0, 0.0);
         }
+        ui.separator();
+        ui.label("Fidelity");
+        ui.selectable_value(
+            &mut environment.fidelity_mode,
+            crate::render::evidence::FidelityMode::StrictTiger,
+            "Strict Tiger",
+        );
+        ui.selectable_value(
+            &mut environment.fidelity_mode,
+            crate::render::evidence::FidelityMode::PrettyPreview,
+            "Pretty Preview",
+        );
     });
     egui::CollapsingHeader::new("Lighting")
         .default_open(true)

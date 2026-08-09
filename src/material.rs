@@ -120,7 +120,19 @@ pub struct TfxBytecodePreview {
     pub constant_refs: Vec<TfxConstantRefPreview>,
     pub decoded_ops: usize,
     pub unknown_ops: usize,
+    pub status: TfxDecodeStatus,
+    pub undecoded_offset: Option<usize>,
+    pub undecoded_bytes: Vec<u8>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TfxDecodeStatus {
+    #[default]
+    Complete,
+    Partial,
+    StoppedAtUnknown,
+    Invalid,
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +684,8 @@ fn parse_tfx_bytecode_with_constants_dialect(
     let mut all_ops = Vec::with_capacity(data.len());
     let mut decoded_ops = 0usize;
     let mut unknown_ops = 0usize;
+    let mut undecoded_offset = None;
+    let mut undecoded_bytes = vec![];
 
     while cursor < data.len() {
         let offset = cursor;
@@ -685,6 +699,8 @@ fn parse_tfx_bytecode_with_constants_dialect(
         };
         let Some(mut op) = parsed else {
             unknown_ops += 1;
+            undecoded_offset = Some(offset);
+            undecoded_bytes.extend_from_slice(&data[offset..]);
             all_ops.push(TfxBytecodeOpPreview {
                 offset,
                 opcode,
@@ -694,6 +710,9 @@ fn parse_tfx_bytecode_with_constants_dialect(
             });
             break;
         };
+        if op.name.contains("unknown") {
+            unknown_ops += 1;
+        }
         op.opcode = opcode;
         if op.name.starts_with("push_extern_") {
             op.extern_scope_id = data.get(offset + 1).copied();
@@ -707,6 +726,13 @@ fn parse_tfx_bytecode_with_constants_dialect(
     let externs = summarize_tfx_externs(&all_ops);
     let constant_refs = summarize_tfx_constant_refs(&all_ops, constants);
     let truncated = all_ops.len() > MAX_UI_OPS;
+    let status = if undecoded_offset.is_some() {
+        TfxDecodeStatus::StoppedAtUnknown
+    } else if unknown_ops > 0 {
+        TfxDecodeStatus::Partial
+    } else {
+        TfxDecodeStatus::Complete
+    };
     TfxBytecodePreview {
         total_bytes: data.len(),
         bindings,
@@ -715,6 +741,9 @@ fn parse_tfx_bytecode_with_constants_dialect(
         constant_refs,
         decoded_ops,
         unknown_ops,
+        status,
+        undecoded_offset,
+        undecoded_bytes,
         truncated,
         // Keep the complete program for render-time interpretation. The tag
         // inspector applies its own display cap; truncating here silently
@@ -2256,6 +2285,20 @@ mod tests {
         assert_eq!(decoded.bindings[0].stage, "PS");
         assert_eq!(decoded.bindings[0].slot, 1);
         assert_eq!(decoded.expressions.len(), 3);
+    }
+
+    #[test]
+    fn preserves_unknown_tfx_tail_and_reports_status() {
+        let stopped = parse_tfx_bytecode(&[0xff, 0x12, 0x34]);
+        assert_eq!(stopped.status, TfxDecodeStatus::StoppedAtUnknown);
+        assert_eq!(stopped.undecoded_offset, Some(0));
+        assert_eq!(stopped.undecoded_bytes, [0xff, 0x12, 0x34]);
+
+        let partial = parse_tfx_bytecode_with_constants_dialect(&[0x6d, 0x53, 0x00], &[], true);
+        assert_eq!(partial.status, TfxDecodeStatus::Partial);
+        assert_eq!(partial.unknown_ops, 1);
+        assert_eq!(partial.decoded_ops, 2);
+        assert!(partial.undecoded_bytes.is_empty());
     }
 
     #[test]

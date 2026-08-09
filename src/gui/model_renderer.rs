@@ -19,9 +19,20 @@ use tiger_pkg::{TagHash, package_manager};
 use crate::{
     geometry::{
         GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaskMode, InvestmentDecalMaterial,
-        InvestmentDecalMode, UvTransformPreview, WeaponModWearMaterial, WireframePreview,
+        InvestmentDecalMode, UvTransformPreview, WeaponModWearMaterial, WireframeMaterialTextures,
+        WireframePreview,
     },
     material::{TechniqueRenderState, is_sticker_proxy_technique, render_state_for_technique},
+    render::{
+        TigerDrawPacket,
+        evidence::{
+            EvidenceLevel, FidelityMode, ProvenanceId, ProvenanceRecord, ProvenanceStore,
+            SourceSpan,
+        },
+        material::MaterialIR,
+        pass_plan::{DrawPassPlan, RenderPassKind},
+        technique::{TechniqueDescriptor, VertexAbiDescriptor},
+    },
     texture::{
         Texture, TextureType,
         cache::{MaterialTextureKey, TextureCache},
@@ -30,6 +41,11 @@ use crate::{
 };
 
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+// RGBA8 keeps five logical targets under WebGPU's portable 32-byte/sample cap.
+// These are research/debug contracts; compatibility HDR remains RGBA16F.
+const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const SURFACE_PROPERTIES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+const SURFACE_FLAGS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SHADOW_MAP_SIZE: u32 = 4096;
 
@@ -48,11 +64,7 @@ struct ModelVertex {
 #[derive(Clone)]
 struct ModelDraw {
     indices: Range<u32>,
-    /// Raw Tiger metadata retained through GPU submission. Semantic routing
-    /// will be derived later by a game/build-specific pass planner.
-    raw_lod_category: Option<u8>,
-    raw_render_stage: Option<u8>,
-    technique: Option<TagHash>,
+    packet: TigerDrawPacket,
     material: Option<MaterialTextureKey>,
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
@@ -120,6 +132,8 @@ pub(crate) struct GpuModelPreview {
     draws: Vec<ModelDraw>,
     vertices: Vec<ModelVertex>,
     indices: Vec<u32>,
+    vertex_abi: VertexAbiDescriptor,
+    provenance: ProvenanceStore,
 }
 
 impl GpuModelPreview {
@@ -178,9 +192,27 @@ impl GpuModelPreview {
                     .unwrap_or(normals[index]),
             })
             .collect::<Vec<_>>();
-        let draws = model_draws(wireframe, fallback_color);
+        let mut draws = model_draws(wireframe, fallback_color);
         if draws.is_empty() {
             return None;
+        }
+        let mut provenance = ProvenanceStore::default();
+        for draw in &mut draws {
+            let source_tag = draw.packet.technique_hash.unwrap_or(TagHash(0));
+            draw.packet.source = provenance.insert(ProvenanceRecord {
+                evidence: draw
+                    .packet
+                    .technique_hash
+                    .map_or(EvidenceLevel::Probable, |_| EvidenceLevel::Confirmed),
+                source_spans: vec![SourceSpan {
+                    tag: source_tag,
+                    offset: u64::from(draw.indices.start) * 4,
+                    size: Some((draw.indices.end - draw.indices.start) * 4),
+                }],
+                technique: draw.packet.technique_hash,
+                shader_stage: None,
+                notes: vec![format!("wireframe source {}", wireframe.source)],
+            });
         }
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -200,6 +232,8 @@ impl GpuModelPreview {
             draws,
             vertices,
             indices: wireframe.indices.clone(),
+            vertex_abi: VertexAbiDescriptor::from_wireframe(wireframe),
+            provenance,
         })
     }
 }
@@ -212,6 +246,7 @@ fn model_draws(
     let mut ranges = wireframe.material_ranges.iter().collect_vec();
     ranges.sort_by_key(|range| range.index_start);
     let mut draws = Vec::new();
+    let mut technique_descriptors = HashMap::<TagHash, Option<TechniqueDescriptor>>::new();
 
     for range in ranges {
         let start = range.index_start.min(index_len);
@@ -222,11 +257,35 @@ fn model_draws(
         let color = range.textures.color.or(range.texture);
 
         if start < end {
+            let technique = range.technique.and_then(|tag| {
+                technique_descriptors
+                    .entry(tag)
+                    .or_insert_with(|| TechniqueDescriptor::load(tag))
+                    .clone()
+            });
+            let render_state = technique
+                .as_ref()
+                .map(|technique| technique.render_state)
+                .unwrap_or_else(|| {
+                    range
+                        .technique
+                        .map(render_state_for_technique)
+                        .unwrap_or_default()
+                });
+            let material_ir = MaterialIR::classify(&range.textures);
+            let pass_plan = DrawPassPlan::derive(range.render_stage, render_state, &material_ir);
             draws.push(ModelDraw {
                 indices: start as u32..end as u32,
-                raw_lod_category: range.raw_lod_category,
-                raw_render_stage: range.render_stage,
-                technique: range.technique,
+                packet: TigerDrawPacket {
+                    indices: start as u32..end as u32,
+                    raw_lod_category: range.raw_lod_category,
+                    raw_render_stage: range.render_stage,
+                    technique_hash: range.technique,
+                    technique,
+                    material: material_ir,
+                    pass_plan,
+                    source: ProvenanceId(u32::MAX),
+                },
                 material: color.map(|color| MaterialTextureKey {
                     color,
                     normal: range.textures.normal,
@@ -248,12 +307,7 @@ fn model_draws(
                 authored_shared_atlas: range.textures.authored_shared_atlas,
                 sampler: range.textures.sampler,
                 sticker_proxy: range.technique.is_some_and(is_sticker_proxy_technique),
-                pipeline: ModelPipelineKey::select(
-                    range
-                        .technique
-                        .map(render_state_for_technique)
-                        .unwrap_or_default(),
-                ),
+                pipeline: ModelPipelineKey::select(render_state),
                 center: draw_range_center(wireframe, start, end),
                 procedural_scale: range.procedural_scale,
             });
@@ -261,11 +315,23 @@ fn model_draws(
     }
 
     if draws.is_empty() && wireframe.material_ranges.is_empty() {
+        let material_ir = MaterialIR::classify(&WireframeMaterialTextures::default());
         draws.push(ModelDraw {
             indices: 0..index_len as u32,
-            raw_lod_category: None,
-            raw_render_stage: None,
-            technique: None,
+            packet: TigerDrawPacket {
+                indices: 0..index_len as u32,
+                raw_lod_category: None,
+                raw_render_stage: None,
+                technique_hash: None,
+                technique: None,
+                pass_plan: DrawPassPlan::derive(
+                    None,
+                    TechniqueRenderState::default(),
+                    &material_ir,
+                ),
+                material: material_ir,
+                source: ProvenanceId(u32::MAX),
+            },
             material: fallback_color.map(default_material),
             solid_color: None,
             solid_surface: None,
@@ -482,10 +548,12 @@ struct SceneUniform {
     postprocess3: [f32; 4],
     postprocess4: [f32; 4],
     postprocess5: [f32; 4],
+    fidelity: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ModelEnvironment {
+    pub fidelity_mode: FidelityMode,
     pub time_of_day: f32,
     pub sun_intensity: f32,
     pub fog_density: f32,
@@ -525,6 +593,7 @@ pub(crate) struct ModelEnvironment {
 impl Default for ModelEnvironment {
     fn default() -> Self {
         Self {
+            fidelity_mode: FidelityMode::PrettyPreview,
             time_of_day: 0.35,
             sun_intensity: 0.35,
             fog_density: 0.0,
@@ -670,6 +739,8 @@ struct PreparedDraw {
     material_index: usize,
     pipeline: ModelPipelineKey,
     view_depth: f32,
+    stable_index: usize,
+    passes: Vec<RenderPassKind>,
 }
 
 pub(crate) struct ModelPaintCallback {
@@ -765,7 +836,7 @@ impl ModelPaintCallback {
 
         let mut materials = Vec::<LoadedMaterial>::new();
         let mut draws = Vec::with_capacity(preview.draws.len());
-        for draw in &preview.draws {
+        for (stable_index, draw) in preview.draws.iter().enumerate() {
             if draw.sticker_proxy && !show_stickers {
                 continue;
             }
@@ -864,6 +935,8 @@ impl ModelPaintCallback {
                 material_index,
                 pipeline: draw.pipeline,
                 view_depth: model_view_depth(draw.center, center, yaw, pitch),
+                stable_index,
+                passes: draw.packet.pass_plan.passes.clone(),
             });
         }
         draws.sort_by(|left, right| {
@@ -871,7 +944,9 @@ impl ModelPaintCallback {
             let right_blended = blend_enabled(right.pipeline.blend);
             left_blended.cmp(&right_blended).then_with(|| {
                 if left_blended && right_blended {
-                    left.view_depth.total_cmp(&right.view_depth)
+                    left.view_depth
+                        .total_cmp(&right.view_depth)
+                        .then_with(|| left.stable_index.cmp(&right.stable_index))
                 } else {
                     std::cmp::Ordering::Equal
                 }
@@ -976,6 +1051,12 @@ impl ModelPaintCallback {
                     environment.contrast,
                     environment.saturation,
                     environment.gamma,
+                ],
+                fidelity: [
+                    (environment.fidelity_mode == FidelityMode::PrettyPreview) as u8 as f32,
+                    0.0,
+                    0.0,
+                    0.0,
                 ],
             },
             materials,
@@ -1612,6 +1693,14 @@ struct ModelTargetResources {
     size: [u32; 2],
     _color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    _surface_normal: wgpu::Texture,
+    surface_normal_view: wgpu::TextureView,
+    _surface_properties: wgpu::Texture,
+    surface_properties_view: wgpu::TextureView,
+    _surface_emissive: wgpu::Texture,
+    surface_emissive_view: wgpu::TextureView,
+    _surface_flags: wgpu::Texture,
+    surface_flags_view: wgpu::TextureView,
     _depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     _shadow_depth: wgpu::Texture,
@@ -1635,7 +1724,9 @@ struct ModelFrameResources {
     bloom_blur_horizontal_bind_group: wgpu::BindGroup,
     bloom_blur_vertical_bind_group: wgpu::BindGroup,
     present_bind_group: wgpu::BindGroup,
-    render_bundles: Vec<wgpu::RenderBundle>,
+    opaque_bundles: Vec<wgpu::RenderBundle>,
+    decal_bundles: Vec<wgpu::RenderBundle>,
+    transparent_bundles: Vec<wgpu::RenderBundle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1654,9 +1745,15 @@ fn create_model_render_bundles(
     material_bind_groups: &[wgpu::BindGroup],
     preview: &GpuModelPreview,
     draws: &[PreparedDraw],
+    accepted_passes: &[RenderPassKind],
 ) -> Vec<wgpu::RenderBundle> {
     draws
         .par_iter()
+        .filter(|draw| {
+            draw.passes
+                .iter()
+                .any(|pass| accepted_passes.contains(pass))
+        })
         .filter_map(|draw| {
             let (_, pipeline) = pipelines
                 .model_pipelines
@@ -1666,7 +1763,13 @@ fn create_model_render_bundles(
             let mut bundle =
                 device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
                     label: Some("quicktag_model_parallel_draw"),
-                    color_formats: &[Some(OFFSCREEN_FORMAT)],
+                    color_formats: &[
+                        Some(OFFSCREEN_FORMAT),
+                        Some(SURFACE_FORMAT),
+                        Some(SURFACE_PROPERTIES_FORMAT),
+                        Some(SURFACE_FORMAT),
+                        Some(SURFACE_FLAGS_FORMAT),
+                    ],
                     depth_stencil: Some(wgpu::RenderBundleDepthStencil {
                         format: DEPTH_FORMAT,
                         depth_read_only: false,
@@ -2275,19 +2378,29 @@ impl CallbackTrait for ModelPaintCallback {
                     },
                 ],
             });
-            let render_bundles = callback_resources
-                .get::<ModelPipelineResources>()
-                .map(|pipelines| {
-                    create_model_render_bundles(
-                        device,
-                        pipelines,
-                        &scene_bind_group,
-                        &material_bind_groups,
-                        &self.preview,
-                        &self.draws,
-                    )
-                })
-                .unwrap_or_default();
+            let make_bundles = |passes: &[RenderPassKind]| {
+                callback_resources
+                    .get::<ModelPipelineResources>()
+                    .map(|pipelines| {
+                        create_model_render_bundles(
+                            device,
+                            pipelines,
+                            &scene_bind_group,
+                            &material_bind_groups,
+                            &self.preview,
+                            &self.draws,
+                            passes,
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+            let opaque_bundles = make_bundles(&[
+                RenderPassKind::OpaqueCompatibility,
+                RenderPassKind::AlphaTestedCompatibility,
+                RenderPassKind::UnknownCompatibility,
+            ]);
+            let decal_bundles = make_bundles(&[RenderPassKind::InvestmentDecalCompatibility]);
+            let transparent_bundles = make_bundles(&[RenderPassKind::ForwardTransparent]);
             callback_resources.insert(ModelFrameResources {
                 key: frame_key,
                 scene_buffer,
@@ -2299,7 +2412,9 @@ impl CallbackTrait for ModelPaintCallback {
                 bloom_blur_horizontal_bind_group,
                 bloom_blur_vertical_bind_group,
                 present_bind_group,
-                render_bundles,
+                opaque_bundles,
+                decal_bundles,
+                transparent_bundles,
             });
         }
 
@@ -2337,7 +2452,7 @@ impl CallbackTrait for ModelPaintCallback {
             for draw in self
                 .draws
                 .iter()
-                .filter(|draw| !blend_enabled(draw.pipeline.blend))
+                .filter(|draw| draw.passes.contains(&RenderPassKind::Shadow))
             {
                 shadow_pass.set_pipeline(
                     &pipelines.shadow_pipelines[shadow_pipeline_index(draw.pipeline.rasterizer)],
@@ -2353,23 +2468,26 @@ impl CallbackTrait for ModelPaintCallback {
 
         let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("quicktag_model_offscreen_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.color_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        // Linear form of the viewer's #121929 background.
-                        // Present pass applies the final display transfer to
-                        // every pixel, including antialiased model edges.
-                        r: 0.006_049,
-                        g: 0.009_721,
-                        b: 0.022_174,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.006_049,
+                            g: 0.009_721,
+                            b: 0.022_174,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(clear_surface_attachment(&target.surface_normal_view)),
+                Some(clear_surface_attachment(&target.surface_properties_view)),
+                Some(clear_surface_attachment(&target.surface_emissive_view)),
+                Some(clear_surface_attachment(&target.surface_flags_view)),
+            ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &target.depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -2381,8 +2499,44 @@ impl CallbackTrait for ModelPaintCallback {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.execute_bundles(frame.render_bundles.iter());
+        pass.execute_bundles(frame.opaque_bundles.iter());
         drop(pass);
+
+        for (label, bundles) in [
+            (
+                "quicktag_model_investment_decal_pass",
+                frame.decal_bundles.as_slice(),
+            ),
+            (
+                "quicktag_model_forward_transparent_pass",
+                frame.transparent_bundles.as_slice(),
+            ),
+        ] {
+            if bundles.is_empty() {
+                continue;
+            }
+            let mut special_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[
+                    Some(load_surface_attachment(&target.color_view)),
+                    Some(load_surface_attachment(&target.surface_normal_view)),
+                    Some(load_surface_attachment(&target.surface_properties_view)),
+                    Some(load_surface_attachment(&target.surface_emissive_view)),
+                    Some(load_surface_attachment(&target.surface_flags_view)),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            special_pass.execute_bundles(bundles.iter());
+        }
 
         for (label, pipeline, bind_group, view) in [
             (
@@ -3051,15 +3205,29 @@ fn create_model_pipeline(
             module: shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: OFFSCREEN_FORMAT,
-                blend: blend_state(key.blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: OFFSCREEN_FORMAT,
+                    blend: blend_state(key.blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(surface_target(SURFACE_FORMAT)),
+                Some(surface_target(SURFACE_PROPERTIES_FORMAT)),
+                Some(surface_target(SURFACE_FORMAT)),
+                Some(surface_target(SURFACE_FLAGS_FORMAT)),
+            ],
         }),
         multiview: None,
         cache: None,
     })
+}
+
+fn surface_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
+    wgpu::ColorTargetState {
+        format,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    }
 }
 
 fn rasterizer_cull_mode(index: u8) -> Option<wgpu::Face> {
@@ -3180,6 +3348,31 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         view_formats: &[],
     });
     let color_view = color.create_view(&Default::default());
+    let surface_texture = |label, format| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    };
+    let surface_normal = surface_texture("quicktag_surface_normal_roughness", SURFACE_FORMAT);
+    let surface_normal_view = surface_normal.create_view(&Default::default());
+    let surface_properties = surface_texture(
+        "quicktag_surface_material_properties",
+        SURFACE_PROPERTIES_FORMAT,
+    );
+    let surface_properties_view = surface_properties.create_view(&Default::default());
+    let surface_emissive = surface_texture("quicktag_surface_emissive", SURFACE_FORMAT);
+    let surface_emissive_view = surface_emissive.create_view(&Default::default());
+    let surface_flags = surface_texture("quicktag_surface_flags", SURFACE_FLAGS_FORMAT);
+    let surface_flags_view = surface_flags.create_view(&Default::default());
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_depth_target"),
         size: extent,
@@ -3246,6 +3439,14 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         size,
         _color: color,
         color_view,
+        _surface_normal: surface_normal,
+        surface_normal_view,
+        _surface_properties: surface_properties,
+        surface_properties_view,
+        _surface_emissive: surface_emissive,
+        surface_emissive_view,
+        _surface_flags: surface_flags,
+        surface_flags_view,
         _depth: depth,
         depth_view,
         _shadow_depth: shadow_depth,
@@ -3256,6 +3457,30 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         bloom_quarter_view,
         _bloom_blur: bloom_blur,
         bloom_blur_view,
+    }
+}
+
+fn clear_surface_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        resolve_target: None,
+        depth_slice: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            store: wgpu::StoreOp::Store,
+        },
+    }
+}
+
+fn load_surface_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        resolve_target: None,
+        depth_slice: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        },
     }
 }
 
@@ -3335,7 +3560,7 @@ fn fs_blur_vertical(input: VertexOutput) -> @location(0) vec4<f32> {
 const SHADOW_SHADER: &str = r#"
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>,
+    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
 
@@ -3481,6 +3706,7 @@ struct SceneUniform {
     postprocess3: vec4<f32>,
     postprocess4: vec4<f32>,
     postprocess5: vec4<f32>,
+    fidelity: vec4<f32>,
 }
 
 struct MaterialUniform {
@@ -3859,6 +4085,11 @@ fn mapped_normal(input: VertexOutput) -> vec3<f32> {
 }
 
 fn fallback_surface(albedo: vec3<f32>) -> vec2<f32> {
+    // Strict Tiger uses a neutral dielectric fallback. Pretty Preview retains
+    // legacy luma/chroma guesses, but never presents them as authored values.
+    if scene.fidelity.x < 0.5 {
+        return vec2<f32>(0.82, 0.0);
+    }
     let luma = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
     let chroma = max(albedo.r, max(albedo.g, albedo.b))
         - min(albedo.r, min(albedo.g, albedo.b));
@@ -4080,8 +4311,16 @@ fn investment_decal_source(uv: vec2<f32>, atlas: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(grayscale);
 }
 
+struct FragmentOutput {
+    @location(0) compatibility_hdr: vec4<f32>,
+    @location(1) normal_roughness: vec4<f32>,
+    @location(2) material_properties: vec4<f32>,
+    @location(3) emissive: vec4<f32>,
+    @location(4) flags: u32,
+}
+
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input: VertexOutput) -> FragmentOutput {
     let base_color = textureSampleBias(
         color_texture,
         material_sampler,
@@ -4248,14 +4487,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     } else if diagnostic_mode == 6u {
         color = normal * 0.5 + vec3<f32>(0.5);
     }
-    if material.params.y > 0.5 && (diagnostic_mode == 0u || diagnostic_mode == 5u) {
-        color += textureSampleBias(
+    var emissive_output = vec3<f32>(0.0);
+    if material.params.y > 0.5 {
+        emissive_output = textureSampleBias(
             emissive_texture,
             material_sampler,
             input.uv,
             material.sampler_params.x,
         ).rgb
             * min(material.params.z, 0.01);
+        if diagnostic_mode == 0u || diagnostic_mode == 5u {
+            color += emissive_output;
+        }
     }
     // 0.6-style environment approximation for the asset viewer. Keep it in
     // linear space so translucent/decal state remains authored.
@@ -4284,18 +4527,31 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color *= scene.postprocess0.x;
     }
     let output_alpha = material_alpha * material.tint.a;
+    var compatibility_hdr = vec4<f32>(color, output_alpha);
     if decal_blend {
         // Tiger decal blend is One + Dst*SrcAlpha. Invert alpha and premultiply
         // final-color output to reproduce standard source-over compositing.
-        return vec4<f32>(color * output_alpha, 1.0 - output_alpha);
+        compatibility_hdr = vec4<f32>(color * output_alpha, 1.0 - output_alpha);
+    } else if material.blend.x == 8.0 {
+        compatibility_hdr = vec4<f32>(color * output_alpha, output_alpha);
+    } else {
+        let opaque = material.blend.x == 0.0
+            || material.blend.x == 1.0
+            || material.blend.x == 57.0;
+        compatibility_hdr = vec4<f32>(color, select(output_alpha, 1.0, opaque));
     }
-    if material.blend.x == 8.0 {
-        return vec4<f32>(color * output_alpha, output_alpha);
-    }
-    let opaque = material.blend.x == 0.0
-        || material.blend.x == 1.0
-        || material.blend.x == 57.0;
-    return vec4<f32>(color, select(output_alpha, 1.0, opaque));
+    var output: FragmentOutput;
+    output.compatibility_hdr = compatibility_hdr;
+    output.normal_roughness = vec4<f32>(normal * 0.5 + vec3<f32>(0.5), roughness);
+    output.material_properties = vec4<f32>(metalness, vertex_ao, 0.0, output_alpha);
+    output.emissive = vec4<f32>(emissive_output, 1.0);
+    let transparent = material.blend.x != 0.0
+        && material.blend.x != 1.0
+        && material.blend.x != 57.0;
+    output.flags = select(1u, 2u, investment_decal)
+        | select(0u, 4u, mask_material)
+        | select(0u, 8u, transparent);
+    return output;
 }
 "#;
 
@@ -4310,7 +4566,7 @@ const PRESENT_SHADER: &str = r#"
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>,
+    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 
 fn reconstruct_view_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -4557,6 +4813,7 @@ mod tests {
             GeometryPreviewKind, GeometryTagPreview, WeaponModPreviewAttachment, WeaponModRarity,
             WireframeMaterialRange, WireframeMaterialTextures, WireframePreview,
         },
+        render::evidence::FidelityMode,
         texture::{Texture, cache::TextureCache},
     };
     use eframe::{
@@ -4853,9 +5110,9 @@ mod tests {
         };
         let decal = model_draws(&preview(2), None);
         assert!(!decal[0].sticker_proxy);
-        assert_eq!(decal[0].raw_lod_category, Some(2));
-        assert_eq!(decal[0].raw_render_stage, Some(2));
-        assert_eq!(decal[0].technique, None);
+        assert_eq!(decal[0].packet.raw_lod_category, Some(2));
+        assert_eq!(decal[0].packet.raw_render_stage, Some(2));
+        assert_eq!(decal[0].packet.technique_hash, None);
         assert!(!model_draws(&preview(1), None)[0].sticker_proxy);
     }
 
@@ -6147,14 +6404,21 @@ mod tests {
                 "excluded stage/LOD gaps must not become fallback draws"
             );
             if revamp_baseline_case {
+                assert!(
+                    gpu.vertex_abi
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.semantic == "POSITION0" && attribute.decoded),
+                    "80A9FF17 vertex ABI lost POSITION0"
+                );
                 let metadata = gpu
                     .draws
                     .iter()
                     .map(|draw| {
                         (
-                            draw.raw_lod_category,
-                            draw.raw_render_stage,
-                            draw.technique,
+                            draw.packet.raw_lod_category,
+                            draw.packet.raw_render_stage,
+                            draw.packet.technique_hash,
                             draw.indices.clone(),
                         )
                     })
@@ -6168,6 +6432,32 @@ mod tests {
                             && technique.is_some()),
                     "80A9FF17 must retain raw LOD, stage, and technique on every GPU draw: {metadata:?}"
                 );
+                assert!(
+                    gpu.draws.iter().all(|draw| {
+                        draw.packet
+                            .technique
+                            .as_ref()
+                            .is_some_and(|technique| !technique.stages.is_empty())
+                            && !draw.packet.pass_plan.passes.is_empty()
+                            && draw.packet.indices == draw.indices
+                            && gpu.provenance.get(draw.packet.source).is_some()
+                    }),
+                    "80A9FF17 draw packets require per-stage technique ABI and validated pass plans"
+                );
+                eprintln!(
+                    "80A9FF17 families/plans: {:?}",
+                    gpu.draws
+                        .iter()
+                        .map(|draw| (
+                            draw.packet.material.family(),
+                            &draw.packet.pass_plan.passes,
+                            draw.packet
+                                .technique
+                                .as_ref()
+                                .map(|technique| technique.stages.len())
+                        ))
+                        .collect_vec()
+                );
             }
             let size = if lighting_reference_case {
                 [997_u32, 326_u32]
@@ -6178,7 +6468,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(size[0] as f32, size[1] as f32),
             );
-            let verification_environment = if lighting_reference_case {
+            let mut verification_environment = if lighting_reference_case {
                 let defaults = ModelEnvironment::default();
                 ModelEnvironment {
                     time_of_day: probe_f32("QUICKTAG_PROBE_TIME", defaults.time_of_day),
@@ -6230,6 +6520,15 @@ mod tests {
                     diagnostic_pass,
                     ..ModelEnvironment::default()
                 }
+            };
+            verification_environment.fidelity_mode = match std::env::var("QUICKTAG_PROBE_FIDELITY")
+                .unwrap_or_else(|_| "strict".into())
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "strict" | "strict-tiger" => FidelityMode::StrictTiger,
+                "pretty" | "pretty-preview" => FidelityMode::PrettyPreview,
+                value => panic!("unknown QUICKTAG_PROBE_FIDELITY {value}"),
             };
             let callback = ModelPaintCallback::new(
                 gpu,

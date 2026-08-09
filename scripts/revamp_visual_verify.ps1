@@ -5,13 +5,16 @@ param(
 
     [string] $Packages = "D:\SteamLibrary\steamapps\common\Marathon\packages",
 
-    [string] $BaselineRoot = (Join-Path $PSScriptRoot "..\tests\visual\baselines\80A9FF17"),
+    [string] $BaselineRoot = "",
 
     [string[]] $Passes = @("final", "base-color", "diffuse", "ao", "specular", "hdr", "normal")
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+if ([string]::IsNullOrWhiteSpace($BaselineRoot)) {
+    $BaselineRoot = Join-Path $repoRoot "tests\visual\baselines\80A9FF17"
+}
 $baselineRoot = [System.IO.Path]::GetFullPath($BaselineRoot)
 $outputRoot = Join-Path $repoRoot "target\quicktag-model-probe"
 $case = "revamp-br33-vibrant-sport-deluxe"
@@ -31,6 +34,7 @@ Push-Location $repoRoot
 try {
     $env:QUICKTAG_MARATHON_PACKAGES = $Packages
     $env:QUICKTAG_MODEL_PROBE_CASE = $case
+    $env:QUICKTAG_PROBE_FIDELITY = "strict"
     $env:RUST_TEST_THREADS = "1"
 
     cargo test --no-default-features --features wordlist $test --no-run
@@ -96,6 +100,7 @@ try {
             build_note = "Record exact package build manually when available."
             cargo_features = @("wordlist")
             xg_enabled = $false
+            fidelity_mode = "StrictTiger"
         }
         $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $baselineRoot "manifest.json") -Encoding utf8
     }
@@ -104,6 +109,7 @@ try {
     Remove-Item Env:\QUICKTAG_PROBE_PASS -ErrorAction SilentlyContinue
     Remove-Item Env:\QUICKTAG_MODEL_PROBE_CASE -ErrorAction SilentlyContinue
     Remove-Item Env:\QUICKTAG_MARATHON_PACKAGES -ErrorAction SilentlyContinue
+    Remove-Item Env:\QUICKTAG_PROBE_FIDELITY -ErrorAction SilentlyContinue
     Pop-Location
 }
 

@@ -2,6 +2,7 @@ mod geometry;
 mod gui;
 mod material;
 mod panic_handler;
+mod render;
 mod texture;
 mod util;
 

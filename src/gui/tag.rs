@@ -2413,6 +2413,16 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
         "TFX bytecode: {} bytes, {} decoded ops, {} unknown",
         bytecode.total_bytes, bytecode.decoded_ops, bytecode.unknown_ops
     ));
+    ui.label(format!("Execution status: {:?}", bytecode.status));
+    if let Some(offset) = bytecode.undecoded_offset {
+        ui.label(
+            RichText::new(format!(
+                "Stopped at byte 0x{offset:X}; {} raw bytes preserved",
+                bytecode.undecoded_bytes.len()
+            ))
+            .color(Color32::YELLOW),
+        );
+    }
     if bytecode.truncated {
         ui.label(RichText::new("Opcode list truncated for UI").color(Color32::YELLOW));
     }
