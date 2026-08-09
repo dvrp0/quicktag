@@ -48,6 +48,11 @@ struct ModelVertex {
 #[derive(Clone)]
 struct ModelDraw {
     indices: Range<u32>,
+    /// Raw Tiger metadata retained through GPU submission. Semantic routing
+    /// will be derived later by a game/build-specific pass planner.
+    raw_lod_category: Option<u8>,
+    raw_render_stage: Option<u8>,
+    technique: Option<TagHash>,
     material: Option<MaterialTextureKey>,
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
@@ -219,6 +224,9 @@ fn model_draws(
         if start < end {
             draws.push(ModelDraw {
                 indices: start as u32..end as u32,
+                raw_lod_category: range.raw_lod_category,
+                raw_render_stage: range.render_stage,
+                technique: range.technique,
                 material: color.map(|color| MaterialTextureKey {
                     color,
                     normal: range.textures.normal,
@@ -255,6 +263,9 @@ fn model_draws(
     if draws.is_empty() && wireframe.material_ranges.is_empty() {
         draws.push(ModelDraw {
             indices: 0..index_len as u32,
+            raw_lod_category: None,
+            raw_render_stage: None,
+            technique: None,
             material: fallback_color.map(default_material),
             solid_color: None,
             solid_surface: None,
@@ -4554,8 +4565,104 @@ mod tests {
     };
     use either::Either::Left;
     use itertools::Itertools;
-    use std::{path::PathBuf, sync::Arc};
+    use serde::Serialize;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
     use tiger_pkg::{GameVersion, MarathonVersion, PackageManager, TagHash, package_manager};
+
+    #[derive(Serialize)]
+    struct VisualBaselineMetrics {
+        baseline: String,
+        width: u32,
+        height: u32,
+        mean_absolute_error: f64,
+        p99_channel_delta: u8,
+        max_channel_delta: u8,
+        changed_pixel_fraction: f64,
+        changed_pixel_threshold: u8,
+    }
+
+    fn verify_visual_baseline(image: &image::RgbaImage, baseline_path: &Path, report_path: &Path) {
+        let baseline = image::open(baseline_path)
+            .unwrap_or_else(|error| panic!("baseline {}: {error}", baseline_path.display()))
+            .to_rgba8();
+        assert_eq!(
+            image.dimensions(),
+            baseline.dimensions(),
+            "visual baseline dimensions changed for {}",
+            baseline_path.display()
+        );
+
+        let changed_pixel_threshold = std::env::var("QUICKTAG_PROBE_CHANGED_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8_u8);
+        let max_mae = std::env::var("QUICKTAG_PROBE_MAX_MAE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1.5_f64);
+        let max_p99 = std::env::var("QUICKTAG_PROBE_MAX_P99")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8_u8);
+        let max_changed_fraction = std::env::var("QUICKTAG_PROBE_MAX_CHANGED_FRACTION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.02_f64);
+
+        let mut channel_deltas = Vec::with_capacity((image.width() * image.height() * 3) as usize);
+        let mut changed_pixels = 0_u64;
+        for (actual, expected) in image.pixels().zip(baseline.pixels()) {
+            let mut changed = false;
+            for channel in 0..3 {
+                let delta = actual[channel].abs_diff(expected[channel]);
+                channel_deltas.push(delta);
+                changed |= delta > changed_pixel_threshold;
+            }
+            changed_pixels += u64::from(changed);
+        }
+        channel_deltas.sort_unstable();
+        let sum = channel_deltas
+            .iter()
+            .map(|delta| u64::from(*delta))
+            .sum::<u64>();
+        let mean_absolute_error = sum as f64 / channel_deltas.len().max(1) as f64;
+        let p99_index = (channel_deltas.len().saturating_sub(1) * 99) / 100;
+        let p99_channel_delta = channel_deltas.get(p99_index).copied().unwrap_or(0);
+        let max_channel_delta = channel_deltas.last().copied().unwrap_or(0);
+        let changed_pixel_fraction =
+            changed_pixels as f64 / u64::from(image.width() * image.height()).max(1) as f64;
+        let metrics = VisualBaselineMetrics {
+            baseline: baseline_path.display().to_string(),
+            width: image.width(),
+            height: image.height(),
+            mean_absolute_error,
+            p99_channel_delta,
+            max_channel_delta,
+            changed_pixel_fraction,
+            changed_pixel_threshold,
+        };
+        std::fs::write(
+            report_path,
+            serde_json::to_vec_pretty(&metrics).expect("serialize visual baseline metrics"),
+        )
+        .unwrap_or_else(|error| panic!("write {}: {error}", report_path.display()));
+        eprintln!(
+            "visual baseline {}: MAE={mean_absolute_error:.4}, p99={p99_channel_delta}, max={max_channel_delta}, changed>{changed_pixel_threshold}={:.3}%",
+            baseline_path.display(),
+            changed_pixel_fraction * 100.0,
+        );
+        assert!(
+            mean_absolute_error <= max_mae
+                && p99_channel_delta <= max_p99
+                && changed_pixel_fraction <= max_changed_fraction,
+            "visual regression against {}: MAE {mean_absolute_error:.4}/{max_mae:.4}, p99 {p99_channel_delta}/{max_p99}, changed fraction {changed_pixel_fraction:.5}/{max_changed_fraction:.5}; report {}",
+            baseline_path.display(),
+            report_path.display(),
+        );
+    }
 
     #[test]
     fn computes_triangle_normals() {
@@ -4731,6 +4838,7 @@ mod tests {
             material_ranges: vec![WireframeMaterialRange {
                 index_start: 0,
                 index_count: 3,
+                raw_lod_category: Some(2),
                 render_stage: Some(stage),
                 technique: None,
                 gear_dye_change_color_index: None,
@@ -4743,7 +4851,11 @@ mod tests {
             vertex_count_total: 3,
             index_count_total: 3,
         };
-        assert!(!model_draws(&preview(2), None)[0].sticker_proxy);
+        let decal = model_draws(&preview(2), None);
+        assert!(!decal[0].sticker_proxy);
+        assert_eq!(decal[0].raw_lod_category, Some(2));
+        assert_eq!(decal[0].raw_render_stage, Some(2));
+        assert_eq!(decal[0].technique, None);
         assert!(!model_draws(&preview(1), None)[0].sticker_proxy);
     }
 
@@ -4769,6 +4881,7 @@ mod tests {
                 WireframeMaterialRange {
                     index_start: 0,
                     index_count: 3,
+                    raw_lod_category: Some(0),
                     render_stage: Some(0),
                     technique: None,
                     gear_dye_change_color_index: None,
@@ -4779,6 +4892,7 @@ mod tests {
                 WireframeMaterialRange {
                     index_start: 3,
                     index_count: 3,
+                    raw_lod_category: Some(0),
                     render_stage: Some(0),
                     technique: None,
                     gear_dye_change_color_index: None,
@@ -4817,6 +4931,7 @@ mod tests {
             material_ranges: vec![WireframeMaterialRange {
                 index_start: 3,
                 index_count: 3,
+                raw_lod_category: Some(0),
                 render_stage: Some(0),
                 technique: None,
                 gear_dye_change_color_index: None,
@@ -5494,6 +5609,14 @@ mod tests {
                 0.0,
             ),
             (
+                "revamp-br33-vibrant-sport-deluxe",
+                TagHash(0x80A9FF17),
+                TagHash(0x80A7AA89),
+                vec![TagHash(0x80A60FED), TagHash(0x80A60608)],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
+            (
                 "dont-let-up-brrt-darksight-precision-yaw-left",
                 TagHash(0x80AA0CA3),
                 TagHash(0x80A7D43D),
@@ -5685,6 +5808,7 @@ mod tests {
             let lighting_reference_case = name == "vox-nocturna-misriah-ingame-lighting";
             let flat_panel_reference_case = name == "vox-nocturna-v85-flat-panel";
             let investment_decal_reference_case = name == "m77-investment-decal";
+            let revamp_baseline_case = name == "revamp-br33-vibrant-sport-deluxe";
             let probe_f32 = |key: &str, fallback: f32| {
                 std::env::var(key)
                     .ok()
@@ -5705,6 +5829,7 @@ mod tests {
             } else {
                 None
             };
+            let expects_attached_dyes = !expected_dye_colors.is_empty();
             let attachments = mods
                 .iter()
                 .copied()
@@ -6021,6 +6146,29 @@ mod tests {
                 drawn_index_count, explicit_index_count,
                 "excluded stage/LOD gaps must not become fallback draws"
             );
+            if revamp_baseline_case {
+                let metadata = gpu
+                    .draws
+                    .iter()
+                    .map(|draw| {
+                        (
+                            draw.raw_lod_category,
+                            draw.raw_render_stage,
+                            draw.technique,
+                            draw.indices.clone(),
+                        )
+                    })
+                    .collect_vec();
+                eprintln!("80A9FF17 raw draw metadata: {metadata:?}");
+                assert!(
+                    metadata
+                        .iter()
+                        .all(|(lod, stage, technique, _)| lod.is_some()
+                            && stage.is_some()
+                            && technique.is_some()),
+                    "80A9FF17 must retain raw LOD, stage, and technique on every GPU draw: {metadata:?}"
+                );
+            }
             let size = if lighting_reference_case {
                 [997_u32, 326_u32]
             } else {
@@ -6092,6 +6240,8 @@ mod tests {
                 yaw,
                 if lighting_reference_case {
                     probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 16.2).to_radians()
+                } else if revamp_baseline_case {
+                    probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 14.0).to_radians()
                 } else if flat_panel_reference_case || investment_decal_reference_case {
                     if investment_decal_reference_case {
                         15.2_f32.to_radians()
@@ -6176,7 +6326,7 @@ mod tests {
                 .iter()
                 .filter_map(|material| material.gear_dye_palette)
                 .collect_vec();
-            if !mods.is_empty() {
+            if expects_attached_dyes {
                 assert!(
                     !dye_palettes.is_empty(),
                     "{name}: attached mods need skin dyes"
@@ -6409,7 +6559,7 @@ mod tests {
                     );
                 }
             }
-            if name == "dont-let-up-brrt-darksight-precision" {
+            if name == "dont-let-up-brrt-darksight-precision" && diagnostic_pass == 0 {
                 let (mut dark, mut yellow) = (0usize, 0usize);
                 for y in 130..230 {
                     for x in 120..270 {
@@ -6671,9 +6821,12 @@ mod tests {
             } else {
                 name.to_string()
             };
-            image
-                .save(output.join(format!("{output_stem}{suffix}.png")))
-                .expect("save render");
+            let output_path = output.join(format!("{output_stem}{suffix}.png"));
+            image.save(&output_path).expect("save render");
+            if let Some(baseline_path) = std::env::var_os("QUICKTAG_PROBE_BASELINE") {
+                let report_path = output.join(format!("{output_stem}{suffix}.metrics.json"));
+                verify_visual_baseline(&image, Path::new(&baseline_path), &report_path);
+            }
             renders.push((name, image));
         }
         let rarity_render = |rarity: &str| {

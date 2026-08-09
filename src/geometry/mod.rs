@@ -262,6 +262,8 @@ pub struct WireframePreview {
 pub struct WireframeMaterialRange {
     pub index_start: usize,
     pub index_count: usize,
+    /// Raw game/build-specific LOD membership byte. Never normalized here.
+    pub raw_lod_category: Option<u8>,
     pub render_stage: Option<u8>,
     pub technique: Option<TagHash>,
     pub gear_dye_change_color_index: Option<u8>,
@@ -474,6 +476,8 @@ pub struct MeshSourcePreview {
     pub index_start: u32,
     pub index_count: u32,
     pub primitive_type: u8,
+    pub raw_lod_category: u8,
+    /// Viewer-friendly LOD level derived from `raw_lod_category`.
     pub lod_category: u8,
     pub input_layout_index: Option<u8>,
     pub index_buffer: TagHash,
@@ -2656,6 +2660,7 @@ fn merge_model_wireframes(
             vec![WireframeMaterialRange {
                 index_start: 0,
                 index_count: wireframe.indices.len(),
+                raw_lod_category: Some(source.raw_lod_category),
                 render_stage: None,
                 technique: None,
                 gear_dye_change_color_index: None,
@@ -2693,6 +2698,7 @@ fn merge_model_wireframes(
                 material_ranges.push(WireframeMaterialRange {
                     index_start,
                     index_count,
+                    raw_lod_category: range.raw_lod_category,
                     render_stage: range.render_stage,
                     technique: range.technique,
                     gear_dye_change_color_index: range.gear_dye_change_color_index,
@@ -4219,6 +4225,7 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         index_start: part.index_start,
         index_count: part.index_count,
         primitive_type: part.primitive_type,
+        raw_lod_category: part.lod_category,
         lod_category: lod_preview_value(part.lod_category),
         input_layout_index: Some(group.input_layout_index),
         index_buffer: buffers.index_buffer,
@@ -4234,6 +4241,7 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            raw_lod_category: Some(source.raw_lod_category),
             render_stage: None,
             technique: source.technique,
             gear_dye_change_color_index: None,
@@ -4269,6 +4277,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         index_start: part.index_start,
         index_count: part.index_count,
         primitive_type: part.primitive_type,
+        raw_lod_category: part.lod_category,
         lod_category: lod_preview_value(part.lod_category),
         input_layout_index: first_dynamic_input_layout(data),
         index_buffer: TagHash(read_u32(data.get(0x10..0x14)?, endian)),
@@ -4284,6 +4293,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            raw_lod_category: Some(source.raw_lod_category),
             render_stage: None,
             technique: source.technique,
             gear_dye_change_color_index: None,
@@ -4331,6 +4341,7 @@ fn parse_geometry_resource_wireframe(
                 index_count
             },
             primitive_type: range.map(|range| range.primitive_type).unwrap_or(0),
+            raw_lod_category: range.map(|range| range.lod_category).unwrap_or(0),
             lod_category: range
                 .map(|range| lod_preview_value(range.lod_category))
                 .unwrap_or(0),
@@ -4371,6 +4382,7 @@ fn parse_geometry_resource_wireframe(
             index_count
         },
         primitive_type: range.map(|range| range.primitive_type).unwrap_or(0),
+        raw_lod_category: range.map(|range| range.lod_category).unwrap_or(0),
         lod_category: range
             .map(|range| lod_preview_value(range.lod_category))
             .unwrap_or(0),
@@ -4521,6 +4533,7 @@ fn build_wireframe_from_refs(
             wireframe.material_ranges.push(WireframeMaterialRange {
                 index_start,
                 index_count,
+                raw_lod_category: range.raw_lod_category,
                 render_stage: range.render_stage,
                 technique: range.technique,
                 gear_dye_change_color_index: range.gear_dye_change_color_index,
@@ -4930,6 +4943,7 @@ struct GeometryIndexRangePreview {
 struct PreviewIndexRange {
     range: std::ops::Range<usize>,
     primitive_type: u8,
+    raw_lod_category: Option<u8>,
     render_stage: Option<u8>,
     technique: Option<TagHash>,
     gear_dye_change_color_index: Option<u8>,
@@ -5280,6 +5294,7 @@ fn index_ranges_from_geometry_ranges(
             range: range.index_start as usize
                 ..range.index_start.saturating_add(range.index_count) as usize,
             primitive_type: range.primitive_type,
+            raw_lod_category: Some(range.lod_category),
             render_stage: range.render_stage,
             technique: Some(range.technique),
             gear_dye_change_color_index: (range.gear_dye_change_color_index <= 5)
@@ -10962,6 +10977,7 @@ mod tests {
             index_start: 0,
             index_count: 0,
             primitive_type: 0,
+            raw_lod_category: 0,
             lod_category: 0,
             input_layout_index: None,
             index_buffer: TagHash(0),

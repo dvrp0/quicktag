@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "asset": "80A9FF17",
+  "case": "revamp-br33-vibrant-sport-deluxe",
+  "owner": "80A7AA89",
+  "attachments": [
+    {
+      "name": "Cold Vigilance Scope",
+      "tag": "80A60FED",
+      "rarity": "Deluxe"
+    },
+    {
+      "name": "Impulse Brake",
+      "tag": "80A60608",
+      "rarity": "Deluxe"
+    }
+  ],
+  "game": "Marathon",
+  "package_variant": "goliath",
+  "output_size": [
+    1024,
+    640
+  ],
+  "yaw_degrees": -24.0,
+  "pitch_degrees": 14.0,
+  "scale": 3.1,
+  "passes": [
+    "final",
+    "base-color",
+    "diffuse",
+    "ao",
+    "specular",
+    "hdr",
+    "normal"
+  ],
+  "quicktag_parent_commit": "289e37a782f1db98d34da7d897b87169400eec92",
+  "quicktag_worktree_dirty": true,
+  "captured_utc": "2026-08-09T06:36:22.9381596Z",
+  "package_path": "D:\\SteamLibrary\\steamapps\\common\\Marathon\\packages",
+  "build_note": "Record exact package build manually when available.",
+  "cargo_features": [
+    "wordlist"
+  ],
+  "xg_enabled": false
+}

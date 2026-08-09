@@ -5730,6 +5730,87 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local updated Marathon package installation"]
+    fn resolves_revamp_br33_visual_fixture() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let weapon = catalog
+            .weapons
+            .iter()
+            .find(|weapon| weapon.name == "BR33 Volley Rifle")
+            .expect("BR33 Volley Rifle catalog entry");
+        let skin = weapon
+            .skins
+            .iter()
+            .find(|skin| skin.model_tag == TagHash(0x80A9FF17))
+            .expect("Vibrant Sport skin");
+        assert_eq!(skin.name, "Vibrant Sport");
+
+        let fixture_mods = weapon
+            .slots
+            .iter()
+            .flat_map(|slot| {
+                slot.mods
+                    .iter()
+                    .map(move |modification| (slot.name.as_str(), modification))
+            })
+            .filter(|(_slot, modification)| {
+                matches!(
+                    modification.name.as_str(),
+                    "Cold Vigilance Scope" | "Impulse Brake"
+                ) && modification.preview_rarity == Some(WeaponModRarity::Deluxe)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fixture_mods.len(),
+            2,
+            "BR33 Deluxe fixture mods: {:?}",
+            weapon
+                .slots
+                .iter()
+                .flat_map(|slot| slot.mods.iter().map(move |item| (
+                    slot.name.as_str(),
+                    item.name.as_str(),
+                    item.rarity.as_str(),
+                    item.model_tag,
+                )))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "REVAMP_BR33_FIXTURE skin={} owner={} mods={:?}",
+            skin.model_tag,
+            weapon.owner_tag,
+            fixture_mods
+                .iter()
+                .map(|(slot, item)| (
+                    *slot,
+                    item.name.as_str(),
+                    item.model_tag,
+                    item.preview_rarity
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local updated Marathon package installation"]
     fn loads_updated_marathon_weapon_skin_catalog() {
         let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
             .map(PathBuf::from)
