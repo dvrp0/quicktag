@@ -919,20 +919,6 @@ pub(crate) fn interpret_tfx_stack_with_object_channels(
     constants: &[[f32; 4]],
     object_channels: &std::collections::HashMap<u32, [f32; 4]>,
 ) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
-    interpret_tfx_stack_with_runtime_inputs(
-        ops,
-        constants,
-        object_channels,
-        &std::collections::HashMap::new(),
-    )
-}
-
-pub(crate) fn interpret_tfx_stack_with_runtime_inputs(
-    ops: &[TfxBytecodeOpPreview],
-    constants: &[[f32; 4]],
-    object_channels: &std::collections::HashMap<u32, [f32; 4]>,
-    extern_values: &std::collections::HashMap<String, [f32; 4]>,
-) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
     let mut stack = Vec::<TfxStackValue>::new();
     let mut temps = std::collections::BTreeMap::<u8, TfxStackValue>::new();
     let mut outputs = std::collections::BTreeMap::<u8, TfxStackValue>::new();
@@ -955,11 +941,10 @@ pub(crate) fn interpret_tfx_stack_with_runtime_inputs(
             | "push_tex_tiling_params"
             | "push_tex_tile_layer_count"
             | "push_marathon_texture_metadata"
-            | "push_marathon_indexed_value" => stack.push(format_tfx_value_with_runtime_inputs(
+            | "push_marathon_indexed_value" => stack.push(format_tfx_value_with_object_channels(
                 op,
                 constants,
                 object_channels,
-                extern_values,
             )),
             "push_from_output" => {
                 let element = op
@@ -1371,20 +1356,6 @@ fn format_tfx_value_with_object_channels(
     constants: &[[f32; 4]],
     object_channels: &std::collections::HashMap<u32, [f32; 4]>,
 ) -> TfxStackValue {
-    format_tfx_value_with_runtime_inputs(
-        op,
-        constants,
-        object_channels,
-        &std::collections::HashMap::new(),
-    )
-}
-
-fn format_tfx_value_with_runtime_inputs(
-    op: &TfxBytecodeOpPreview,
-    constants: &[[f32; 4]],
-    object_channels: &std::collections::HashMap<u32, [f32; 4]>,
-    extern_values: &std::collections::HashMap<String, [f32; 4]>,
-) -> TfxStackValue {
     let (expression, value) = match op.name {
         "push_const_vec4" => op
             .detail
@@ -1412,14 +1383,6 @@ fn format_tfx_value_with_runtime_inputs(
                 .and_then(|hash| object_channels.get(&hash).copied());
             (format!("object_channel({})", op.detail), value)
         }
-        "push_extern_float" | "push_extern_u32" => (
-            format!("{}({})", op.name.trim_start_matches("push_"), op.detail),
-            extern_values.get(&op.detail).map(|value| [value[0]; 4]),
-        ),
-        "push_extern_vec4" => (
-            format!("extern_vec4({})", op.detail),
-            extern_values.get(&op.detail).copied(),
-        ),
         _ => {
             if op.detail.is_empty() {
                 (op.name.to_string(), None)
@@ -2208,30 +2171,6 @@ mod tests {
             decoded.expressions[1].value,
             Some([20.0, 60.0, 120.0, 200.0])
         );
-    }
-
-    #[test]
-    fn evaluates_tfx_runtime_extern_values() {
-        let decoded = parse_tfx_bytecode_with_constants(
-            &[
-                0x3c, 0x01, 0x00, // push_extern_float Frame+0x0
-                0x34, 0x00, // push_const_vec4 constant 0
-                0x01, // add
-                0x44, 0x01, // pop_output element 1
-            ],
-            &[[0.25, 0.5, 0.75, 1.0]],
-        );
-        let extern_values = std::collections::HashMap::from([("Frame+0x0".to_string(), [2.0; 4])]);
-        let (_bindings, expressions) = interpret_tfx_stack_with_runtime_inputs(
-            &decoded.ops,
-            &[[0.25, 0.5, 0.75, 1.0]],
-            &std::collections::HashMap::new(),
-            &extern_values,
-        );
-
-        assert_eq!(expressions.len(), 1);
-        assert_eq!(expressions[0].target, "output[1]");
-        assert_eq!(expressions[0].value, Some([2.25, 2.5, 2.75, 3.0]));
     }
 
     #[test]

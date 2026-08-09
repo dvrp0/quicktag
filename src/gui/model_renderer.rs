@@ -18,9 +18,8 @@ use tiger_pkg::{TagHash, package_manager};
 
 use crate::{
     geometry::{
-        AnimatedDitherMaterial, GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaskMode,
-        InvestmentDecalMaterial, InvestmentDecalMode, UvTransformPreview, WeaponModWearMaterial,
-        WireframePreview,
+        GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaskMode, InvestmentDecalMaterial,
+        InvestmentDecalMode, UvTransformPreview, WeaponModWearMaterial, WireframePreview,
     },
     material::{TechniqueRenderState, is_sticker_proxy_technique, render_state_for_technique},
     texture::{
@@ -59,7 +58,6 @@ struct ModelDraw {
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
     mod_wear: Option<WeaponModWearMaterial>,
-    animated_dither: Option<AnimatedDitherMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
     investment_decal: Option<InvestmentDecalMaterial>,
     authored_shared_atlas: bool,
@@ -199,10 +197,6 @@ impl GpuModelPreview {
             indices: wireframe.indices.clone(),
         })
     }
-
-    pub(crate) fn has_animated_material(&self) -> bool {
-        self.draws.iter().any(|draw| draw.animated_dither.is_some())
-    }
 }
 
 fn model_draws(
@@ -241,7 +235,6 @@ fn model_draws(
                 gear_dye_default: range.textures.gear_dye_default,
                 gear_dye_palette: range.textures.gear_dye_palette,
                 mod_wear: range.textures.mod_wear,
-                animated_dither: range.textures.animated_dither,
                 gear_pattern: range.textures.gear_pattern,
                 investment_decal: range.textures.investment_decal,
                 authored_shared_atlas: range.textures.authored_shared_atlas,
@@ -272,7 +265,6 @@ fn model_draws(
             gear_dye_default: None,
             gear_dye_palette: None,
             mod_wear: None,
-            animated_dither: None,
             gear_pattern: None,
             investment_decal: None,
             authored_shared_atlas: false,
@@ -620,18 +612,6 @@ struct MaterialUniform {
     pattern_contour: [f32; 4],
     pattern_contour_remap: [f32; 4],
     pattern_colors: [[f32; 4]; 2],
-    animated_params: [f32; 4],
-    animated_primary_transform: [f32; 4],
-    animated_secondary_transform: [f32; 4],
-    animated_waveform: [f32; 4],
-    animated_facing_response: [f32; 4],
-    animated_surface_response: [f32; 4],
-    animated_mask_remap: [[f32; 4]; 7],
-    animated_dot_params: [f32; 4],
-    animated_dot_position_scale: [f32; 4],
-    animated_dot_position_offset: [f32; 4],
-    animated_dot_projection: [f32; 4],
-    animated_dot_colors: [[f32; 4]; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -659,7 +639,6 @@ struct LoadedMaterial {
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
     mod_wear: Option<WeaponModWearMaterial>,
-    animated_dither: Option<AnimatedDitherMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
     investment_decal: Option<InvestmentDecalMaterial>,
     sampler_tag: Option<TagHash>,
@@ -671,7 +650,6 @@ struct LoadedMaterial {
     wear_scratches: Option<Arc<Texture>>,
     wear_grime: Option<Arc<Texture>>,
     wear_damage: Option<Arc<Texture>>,
-    animated_field: Option<Arc<Texture>>,
     pattern_field: Option<Arc<Texture>>,
     procedural_scale: f32,
 }
@@ -692,7 +670,6 @@ pub(crate) struct ModelPaintCallback {
     draws: Vec<PreparedDraw>,
     cubemap: Option<Arc<Texture>>,
     decal: Option<Arc<Texture>>,
-    animation_time: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -760,7 +737,6 @@ impl ModelPaintCallback {
         pixels_per_point: f32,
         environment: ModelEnvironment,
     ) -> Self {
-        let animation_time = model_animation_time();
         let camera_frame =
             camera_frame.unwrap_or_else(|| ModelCameraFrame::from_wireframe(wireframe));
         let center = camera_frame.center;
@@ -803,7 +779,6 @@ impl ModelPaintCallback {
                         && material.gear_dye_default == draw.gear_dye_default
                         && material.gear_dye_palette == draw.gear_dye_palette
                         && material.mod_wear == draw.mod_wear
-                        && material.animated_dither == draw.animated_dither
                         && material.gear_pattern == draw.gear_pattern
                         && material.investment_decal == draw.investment_decal
                         && material.sampler_tag == draw.sampler
@@ -839,27 +814,10 @@ impl ModelPaintCallback {
                     };
                     let wear_scratches = draw.mod_wear.and_then(|wear| load_wear(wear.scratches));
                     let wear_grime = draw.mod_wear.and_then(|wear| load_wear(wear.grime));
-                    let wear_damage = draw
-                        .mod_wear
-                        .and_then(|wear| load_wear(wear.damage))
-                        .or_else(|| {
-                            draw.animated_dither
-                                .and_then(|animated| animated.dot_detail)
-                                .and_then(|detail| load_wear(detail.texture))
-                        });
-                    let animated_field = draw
-                        .animated_dither
-                        .and_then(|animated| load_wear(animated.field));
-                    // Gear-pattern and animated-surface families are mutually
-                    // exclusive. Reuse binding 9 for animated PS t6 rather
-                    // than silently dropping its technical mask LUT.
+                    let wear_damage = draw.mod_wear.and_then(|wear| load_wear(wear.damage));
                     let pattern_field = draw
                         .gear_pattern
                         .and_then(|pattern| load_wear(pattern.field));
-                    let pattern_field = pattern_field.or_else(|| {
-                        draw.animated_dither
-                            .and_then(|animated| load_wear(animated.technical_mask))
-                    });
                     let dye_palette = draw_dye_palette(draw);
                     materials.push(LoadedMaterial {
                         key: draw.material,
@@ -874,7 +832,6 @@ impl ModelPaintCallback {
                         gear_dye_default: draw.gear_dye_default,
                         gear_dye_palette: draw.gear_dye_palette,
                         mod_wear: draw.mod_wear,
-                        animated_dither: draw.animated_dither,
                         gear_pattern: draw.gear_pattern,
                         investment_decal: draw.investment_decal,
                         sampler_tag: draw.sampler,
@@ -886,7 +843,6 @@ impl ModelPaintCallback {
                         wear_scratches,
                         wear_grime,
                         wear_damage,
-                        animated_field,
                         pattern_field,
                         procedural_scale: draw.procedural_scale,
                     });
@@ -1015,7 +971,6 @@ impl ModelPaintCallback {
             draws,
             cubemap,
             decal,
-            animation_time,
         }
     }
 
@@ -1050,7 +1005,6 @@ impl ModelPaintCallback {
                     texture_id(&material.wear_scratches),
                     texture_id(&material.wear_grime),
                     texture_id(&material.wear_damage),
-                    texture_id(&material.animated_field),
                     texture_id(&material.pattern_field),
                 ];
                 if let Some(decal) = material.investment_decal {
@@ -1121,35 +1075,6 @@ impl ModelPaintCallback {
                             .map(|value| u64::from(value.to_bits())),
                     );
                 }
-                if let Some(animated) = material.animated_dither {
-                    values.push(u64::from(animated.field.0));
-                    values.push(u64::from(animated.technical_mask.0));
-                    if let Some(detail) = animated.dot_detail {
-                        values.push(u64::from(detail.texture.0));
-                        values.extend(
-                            detail
-                                .position_scale
-                                .into_iter()
-                                .chain(detail.position_offset)
-                                .chain(detail.projection)
-                                .chain(detail.fine_projection)
-                                .chain([detail.normal_power, detail.roughness_target])
-                                .chain(detail.roughness_remap)
-                                .map(|value| u64::from(value.to_bits())),
-                        );
-                    }
-                    values.extend(
-                        [animated.phase_speed]
-                            .into_iter()
-                            .chain(animated.technical_mask_remap.into_iter().flatten())
-                            .chain(animated.primary_transform)
-                            .chain(animated.secondary_transform)
-                            .chain(animated.waveform)
-                            .chain(animated.facing_response)
-                            .chain(animated.surface_response)
-                            .map(|value| u64::from(value.to_bits())),
-                    );
-                }
                 if let Some(color) = material.solid_color {
                     values.extend(color.map(|value| u64::from(value.to_bits())));
                 }
@@ -1194,15 +1119,6 @@ impl ModelPaintCallback {
                 ^ u64::from(draw.pipeline.depth_stencil).rotate_left(53)
                 ^ u64::from(draw.pipeline.depth_bias).rotate_left(59)
         });
-        let materials = if self
-            .materials
-            .iter()
-            .any(|material| material.animated_dither.is_some())
-        {
-            materials ^ u64::from(self.animation_time.to_bits()).rotate_left(17)
-        } else {
-            materials
-        };
         FrameResourceKey {
             preview: Arc::as_ptr(&self.preview) as usize,
             size: self.target_size,
@@ -1226,15 +1142,6 @@ impl ModelPaintCallback {
 const MODEL_RENDER_SUPERSAMPLE: f32 = 2.0;
 const MAX_MODEL_TARGET_DIMENSION: f32 = 4096.0;
 const MAX_MODEL_TARGET_PIXELS: f32 = 8_294_400.0;
-
-fn model_animation_time() -> f32 {
-    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    std::env::var("QUICKTAG_PROBE_ANIMATION_TIME")
-        .ok()
-        .and_then(|value| value.parse::<f32>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or_else(|| START.elapsed().as_secs_f32())
-}
 
 fn bounded_target_size(width: f32, height: f32) -> [u32; 2] {
     let desired = [
@@ -2137,97 +2044,6 @@ impl CallbackTrait for ModelPaintCallback {
                         .gear_pattern
                         .map(|pattern| pattern.colors)
                         .unwrap_or_default(),
-                    animated_params: material
-                        .animated_dither
-                        .map(|animated| {
-                            [
-                                material.animated_field.is_some() as u8 as f32,
-                                self.animation_time,
-                                animated.phase_speed,
-                                0.0,
-                            ]
-                        })
-                        .unwrap_or_default(),
-                    animated_primary_transform: material
-                        .animated_dither
-                        .map(|animated| animated.primary_transform)
-                        .unwrap_or_default(),
-                    animated_secondary_transform: material
-                        .animated_dither
-                        .map(|animated| animated.secondary_transform)
-                        .unwrap_or_default(),
-                    animated_waveform: material
-                        .animated_dither
-                        .map(|animated| animated.waveform)
-                        .unwrap_or_default(),
-                    animated_facing_response: material
-                        .animated_dither
-                        .map(|animated| animated.facing_response)
-                        .unwrap_or_default(),
-                    animated_surface_response: material
-                        .animated_dither
-                        .map(|animated| animated.surface_response)
-                        .unwrap_or_default(),
-                    animated_mask_remap: material
-                        .animated_dither
-                        .map(|animated| {
-                            animated
-                                .technical_mask_remap
-                                .map(|remap| [remap[0], remap[1], 0.0, 0.0])
-                        })
-                        .unwrap_or_default(),
-                    animated_dot_params: material
-                        .animated_dither
-                        .and_then(|animated| animated.dot_detail)
-                        .map(|detail| {
-                            [
-                                material.wear_damage.is_some() as u8 as f32,
-                                detail.normal_power,
-                                detail.roughness_target,
-                                0.0,
-                            ]
-                        })
-                        .unwrap_or_default(),
-                    animated_dot_position_scale: material
-                        .animated_dither
-                        .and_then(|animated| animated.dot_detail)
-                        .map(|detail| {
-                            let [x, y, z] = detail.position_scale;
-                            [x, y, z, material.procedural_scale]
-                        })
-                        .unwrap_or_default(),
-                    animated_dot_position_offset: material
-                        .animated_dither
-                        .and_then(|animated| animated.dot_detail)
-                        .map(|detail| {
-                            [
-                                detail.position_offset[0],
-                                detail.position_offset[1],
-                                detail.position_offset[2],
-                                0.0,
-                            ]
-                        })
-                        .unwrap_or_default(),
-                    animated_dot_projection: material
-                        .animated_dither
-                        .and_then(|animated| animated.dot_detail)
-                        .map(|detail| detail.projection)
-                        .unwrap_or_default(),
-                    animated_dot_colors: material
-                        .animated_dither
-                        .and_then(|animated| animated.dot_detail)
-                        .map(|detail| {
-                            [
-                                [
-                                    detail.roughness_remap[0],
-                                    detail.roughness_remap[1],
-                                    0.0,
-                                    0.0,
-                                ],
-                                detail.fine_projection,
-                            ]
-                        })
-                        .unwrap_or_default(),
                 };
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("quicktag_model_material_uniform"),
@@ -2274,11 +2090,6 @@ impl CallbackTrait for ModelPaintCallback {
                     .unwrap_or_else(|| fallback_color_view.clone());
                 let pattern_field_view = material
                     .pattern_field
-                    .as_ref()
-                    .map(|texture| material_texture_view(texture, false))
-                    .unwrap_or_else(|| fallback_color_view.clone());
-                let animated_field_view = material
-                    .animated_field
                     .as_ref()
                     .map(|texture| material_texture_view(texture, false))
                     .unwrap_or_else(|| fallback_color_view.clone());
@@ -2329,10 +2140,6 @@ impl CallbackTrait for ModelPaintCallback {
                         wgpu::BindGroupEntry {
                             binding: 9,
                             resource: wgpu::BindingResource::TextureView(&pattern_field_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 10,
-                            resource: wgpu::BindingResource::TextureView(&animated_field_view),
                         },
                     ],
                 });
@@ -2827,7 +2634,6 @@ fn create_pipeline_resources(
             texture_entry(7),
             texture_entry(8),
             texture_entry(9),
-            texture_entry(10),
         ],
     });
     let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3551,18 +3357,6 @@ struct MaterialUniform {
     pattern_contour: vec4<f32>,
     pattern_contour_remap: vec4<f32>,
     pattern_colors: array<vec4<f32>, 2>,
-    animated_params: vec4<f32>,
-    animated_primary_transform: vec4<f32>,
-    animated_secondary_transform: vec4<f32>,
-    animated_waveform: vec4<f32>,
-    animated_facing_response: vec4<f32>,
-    animated_surface_response: vec4<f32>,
-    animated_mask_remap: array<vec4<f32>, 7>,
-    animated_dot_params: vec4<f32>,
-    animated_dot_position_scale: vec4<f32>,
-    animated_dot_position_offset: vec4<f32>,
-    animated_dot_projection: vec4<f32>,
-    animated_dot_colors: array<vec4<f32>, 2>,
 }
 @group(1) @binding(0) var color_texture: texture_2d<f32>;
 @group(1) @binding(3) var control_texture: texture_2d<f32>;
@@ -3711,18 +3505,6 @@ struct MaterialUniform {
     pattern_contour: vec4<f32>,
     pattern_contour_remap: vec4<f32>,
     pattern_colors: array<vec4<f32>, 2>,
-    animated_params: vec4<f32>,
-    animated_primary_transform: vec4<f32>,
-    animated_secondary_transform: vec4<f32>,
-    animated_waveform: vec4<f32>,
-    animated_facing_response: vec4<f32>,
-    animated_surface_response: vec4<f32>,
-    animated_mask_remap: array<vec4<f32>, 7>,
-    animated_dot_params: vec4<f32>,
-    animated_dot_position_scale: vec4<f32>,
-    animated_dot_position_offset: vec4<f32>,
-    animated_dot_projection: vec4<f32>,
-    animated_dot_colors: array<vec4<f32>, 2>,
 }
 
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
@@ -3740,7 +3522,6 @@ struct MaterialUniform {
 @group(1) @binding(7) var wear_grime_texture: texture_2d<f32>;
 @group(1) @binding(8) var wear_damage_texture: texture_2d<f32>;
 @group(1) @binding(9) var pattern_field_texture: texture_2d<f32>;
-@group(1) @binding(10) var animated_field_texture: texture_2d<f32>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -3956,171 +3737,13 @@ fn apply_gear_pattern(albedo: vec3<f32>, input: VertexOutput) -> vec3<f32> {
     return mix(albedo, pattern_color, contour);
 }
 
-fn signed_fraction(value: f32) -> f32 {
-    let magnitude = fract(abs(value));
-    return select(-magnitude, magnitude, value >= 0.0);
-}
 
-fn animated_dot_detail(input: VertexOutput) -> f32 {
-    if material.animated_dot_params.x < 0.5 {
-        return 0.0;
-    }
-    let position = input.procedural_position
-        * material.animated_dot_position_scale.xyz
-        * material.animated_dot_position_scale.w
-        + material.animated_dot_position_offset.xyz;
-    // Literal common-surface PS control-material switch: c4 (coarse) is used
-    // by IDs 0, 1, 3, and 4; c5 (fine) only by ID 2; IDs 5 and 6 have no
-    // projected circle field. Applying c5 globally made the effect 7.5x too
-    // dense and was the source of the noisy/micro-dither mismatch.
-    let material_id = control_material_id(input.uv);
-    if material_id >= 5 {
-        return 0.0;
-    }
-    let projection = select(
-        material.animated_dot_projection,
-        material.animated_dot_colors[1],
-        material_id == 2,
-    );
-    let uv_yz = position.yz * projection.xy + projection.zw;
-    let uv_xz = position.xz * projection.xy + projection.zw;
-    let uv_xy = position.xy * projection.xy + projection.zw;
-    let powered = pow(
-        abs(normalize(input.procedural_normal)),
-        vec3<f32>(material.animated_dot_params.y),
-    );
-    let weights = powered / max(dot(powered, vec3<f32>(1.0)), 0.0001);
-    let field = vec3<f32>(
-        textureSampleBias(wear_damage_texture, material_sampler, uv_yz, material.sampler_params.x).r,
-        textureSampleBias(wear_damage_texture, material_sampler, uv_xz, material.sampler_params.x).r,
-        textureSampleBias(wear_damage_texture, material_sampler, uv_xy, material.sampler_params.x).r,
-    );
-    return clamp(dot(field, weights), 0.0, 1.0);
-}
 
-fn animated_dither_field(
-    input: VertexOutput,
-    transform: vec4<f32>,
-) -> vec4<f32> {
-    // TFX outputs 66/71 are scale.xy + negative frame-rate offsets.zw.
-    let scroll = fract(-material.animated_params.y * transform.zw);
-    let uv = input.procedural_position.xy
-        * material.animated_dot_position_scale.w
-        * transform.xy
-        + scroll;
-    return textureSampleBias(
-        animated_field_texture,
-        material_sampler,
-        uv,
-        material.sampler_params.x,
-    );
-}
 
-fn animated_dither_wave(
-    input: VertexOutput,
-    transform: vec4<f32>,
-) -> f32 {
-    let field = animated_dither_field(input, transform);
-    let phase = fract(field.b + material.animated_params.y * material.animated_params.z);
-    let inverse_phase = 1.0 - phase;
-    let signed_period = ((phase - 1.0 + field.a) * material.animated_waveform.x)
-        / max(material.animated_waveform.y, 0.0001);
-    let triangle = 1.0 - abs(
-        signed_fraction(signed_period) * material.animated_waveform.y - 1.0
-    );
-    return clamp(
-        (triangle * material.animated_waveform.z + material.animated_waveform.w)
-            * inverse_phase,
-        0.0,
-        1.0,
-    );
-}
 
-fn animated_dither_authored_mask(input: VertexOutput) -> f32 {
-    // Compiled common-surface PS always evaluates output 71 (secondary wave).
-    // Output 66 (primary wave) is conditional on scope_skinning c17.y bit 0;
-    // rigid-model preview constants use Vec4::ONE (1.0f bits end in zero), so
-    // that condition is false. This is the engine's preview state, not a
-    // hand-selected visual blend.
-    let secondary = animated_dither_wave(input, material.animated_secondary_transform);
-    let facing = clamp(
-        material.animated_facing_response.x
-            + material.animated_facing_response.y
-                * normalize(input.procedural_normal).z,
-        0.0,
-        1.0,
-    );
-    return clamp(
-        facing * secondary * material.animated_facing_response.w,
-        0.0,
-        1.0,
-    );
-}
 
-fn control_material_id(uv: vec2<f32>) -> i32 {
-    let control = textureSampleBias(
-        control_texture,
-        material_sampler,
-        uv,
-        material.sampler_params.x,
-    ).rgb;
-    let low_r = control.r <= 0.5;
-    let low_g = control.g <= 0.5;
-    let low_b = control.b <= 0.5;
-    if low_r && low_g && low_b { return 0; }
-    if !low_r && low_g && low_b { return 1; }
-    if low_r && low_g && !low_b { return 2; }
-    if !low_r && !low_g && low_b { return 3; }
-    if low_r && !low_g && low_b { return 4; }
-    if low_r && !low_g && !low_b { return 5; }
-    return 6;
-}
 
-fn animated_technical_mask(input: VertexOutput) -> f32 {
-    if material.animated_params.x < 0.5 {
-        return 1.0;
-    }
-    let material_id = control_material_id(input.uv);
-    let remap = material.animated_mask_remap[material_id].xy;
-    let raw = textureSampleBias(
-        pattern_field_texture,
-        material_sampler,
-        input.uv,
-        material.sampler_params.x,
-    ).r;
-    return clamp(1.0 - clamp(raw * remap.x + remap.y, 0.0, 1.0), 0.0, 1.0);
-}
 
-fn apply_animated_dither(albedo: vec3<f32>, input: VertexOutput) -> vec4<f32> {
-    if material.animated_params.x < 0.5 {
-        return vec4<f32>(albedo, 0.0);
-    }
-
-    let authored_mask = animated_dither_authored_mask(input);
-    let technical_mask = animated_technical_mask(input);
-
-    // Literal common-surface PS response:
-    //   saturate(c76 * c75 * (1 - facing * wave * c74) * c77)
-    // Preview object-channel defaults evaluate c75/c77 to one. c74 remains
-    // inside the subtraction; treating it as an outer response multiplier was
-    // the root cause of the almost-static, washed-out preview.
-    let response = clamp(
-        material.animated_facing_response.z * (1.0 - authored_mask),
-        0.0,
-        1.0,
-    );
-    let colour_scale = material.animated_surface_response.y * technical_mask;
-    let reshaped = pow(
-        max(albedo * colour_scale, vec3<f32>(0.00001)),
-        vec3<f32>(material.animated_surface_response.x),
-    );
-    let blend = pow(
-        response,
-        max(material.animated_surface_response.w, 0.0001),
-    ) * colour_scale;
-    let color = clamp(mix(albedo, reshaped, blend), vec3<f32>(0.0), vec3<f32>(4.0));
-    return vec4<f32>(color, response);
-}
 
 fn apply_weapon_mod_condition(albedo: vec3<f32>, input: VertexOutput) -> vec3<f32> {
     // wear_params = TFX outputs [24, 42, 49, resources-present]. Game data
@@ -4530,62 +4153,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
         sampled_albedo = dye * detail;
     }
-    let animated_surface = apply_animated_dither(sampled_albedo, input);
-    sampled_albedo = animated_surface.rgb;
     sampled_albedo = apply_weapon_mod_condition(sampled_albedo, input);
     let albedo = sampled_albedo * material.tint.rgb;
-    var normal = mapped_normal(input);
+    let normal = mapped_normal(input);
     let light = normalize(scene.light_direction.xyz);
     let view_direction = vec3<f32>(0.0, 0.0, 1.0);
     let surface = material_surface(input.uv, albedo);
-    var roughness = surface.x;
+    let roughness = surface.x;
     let metalness = surface.y;
-    var animated_dot_glint = 0.0;
-    if material.animated_dot_params.x > 0.5 {
-        // Literal common-surface PS t5 path: triplanar circle field -> c90
-        // affine remap -> blend control alpha toward c89 roughness. Visible
-        // dots are specular response; t5 never paints or tints base colour.
-        let control_alpha = textureSampleBias(
-            control_texture,
-            material_sampler,
-            input.uv,
-            material.sampler_params.x,
-        ).a;
-        let dot_mix = clamp(
-            material.animated_dot_colors[0].x
-                + material.animated_dot_colors[0].y * animated_dot_detail(input),
-            0.0,
-            1.0,
-        );
-        animated_dot_glint = select(
-            0.0,
-            1.0 - dot_mix,
-            control_material_id(input.uv) < 5,
-        );
-        roughness = clamp(
-            mix(control_alpha, material.animated_dot_params.z, dot_mix),
-            0.08,
-            1.0,
-        );
-    }
-    if material.animated_params.x > 0.5 {
-        // Compiled PS raises roughness toward 1 by 0.9 * response, then flattens
-        // mapped normals toward the geometric normal by c80 * response.
-        // Together these turn the moving field into the soft, grazing shimmer
-        // visible in-game instead of a painted albedo decal.
-        roughness = clamp(
-            roughness + (1.0 - roughness) * 0.9
-                * animated_technical_mask(input) * animated_surface.a,
-            0.08,
-            1.0,
-        );
-        let normal_blend = clamp(
-            material.animated_surface_response.z * animated_surface.a,
-            0.0,
-            1.0,
-        );
-        normal = normalize(mix(normal, normalize(input.view_normal), normal_blend));
-    }
     let f0 = mix(vec3<f32>(0.03), albedo, metalness);
     let key_specular = ggx_specular(normal, light, view_direction, roughness, f0);
     let reflection_direction = reflect(-view_direction, normal);
@@ -4648,19 +4223,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         0.14,
     );
 
-    // Tiger's inventory deferred pass reflects a bright sky probe across the
-    // low-roughness circles selected by PS t5. Quicktag has no prefiltered HDR
-    // inventory probe, so retain that authored BRDF response with an analytic
-    // area-sky integral. This is specular-only: the circle texture never
-    // paints albedo. Strength remains controlled by the normal IBL setting.
-    let animated_dot_specular = key_color
-        * animated_dot_glint
-        * scene.postprocess4.w
-        * (0.55 + 0.45 * grazing);
 
     let diagnostic_mode = u32(scene.postprocess2.x + 0.5);
-    var color = direct_diffuse + indirect_diffuse + direct_specular + indirect_specular
-        + animated_dot_specular;
+    var color = direct_diffuse + indirect_diffuse + direct_specular + indirect_specular;
     if diagnostic_mode == 1u {
         color = albedo;
     } else if diagnostic_mode == 2u {
@@ -4668,51 +4233,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     } else if diagnostic_mode == 3u {
         color = vec3<f32>(vertex_ao);
     } else if diagnostic_mode == 4u {
-        color = direct_specular + indirect_specular + animated_dot_specular;
+        color = direct_specular + indirect_specular;
     } else if diagnostic_mode == 6u {
         color = normal * 0.5 + vec3<f32>(0.5);
-    } else if diagnostic_mode == 7u {
-        color = vec3<f32>(animated_dither_authored_mask(input));
-    } else if diagnostic_mode == 8u {
-        if material.animated_params.x > 0.5 {
-            let field = animated_dither_field(input, material.animated_primary_transform);
-            color = vec3<f32>(field.b, field.a, 0.0);
-        } else {
-            color = vec3<f32>(0.0);
-        }
-    } else if diagnostic_mode == 9u {
-        if material.animated_params.x > 0.5 {
-            color = vec3<f32>(animated_dither_wave(
-                input,
-                material.animated_primary_transform,
-            ));
-        } else {
-            color = vec3<f32>(0.0);
-        }
-    } else if diagnostic_mode == 10u {
-        if material.animated_params.x > 0.5 {
-            color = vec3<f32>(clamp(
-                material.animated_facing_response.x
-                    + material.animated_facing_response.y
-                        * normalize(input.procedural_normal).z,
-                0.0,
-                1.0,
-            ));
-        } else {
-            color = vec3<f32>(0.0);
-        }
-    } else if diagnostic_mode == 11u {
-        if material.animated_params.x > 0.5 {
-            color = normalize(input.procedural_normal) * 0.5 + vec3<f32>(0.5);
-        } else {
-            color = vec3<f32>(0.0);
-        }
-    } else if diagnostic_mode == 12u {
-        if material.animated_params.x > 0.5 {
-            color = vec3<f32>(animated_dot_detail(input));
-        } else {
-            color = vec3<f32>(0.0);
-        }
     }
     if material.params.y > 0.5 && (diagnostic_mode == 0u || diagnostic_mode == 5u) {
         color += textureSampleBias(
@@ -4746,12 +4269,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if diagnostic_mode != 1u
         && diagnostic_mode != 3u
         && diagnostic_mode != 6u
-        && diagnostic_mode != 7u
-        && diagnostic_mode != 8u
-        && diagnostic_mode != 9u
-        && diagnostic_mode != 10u
-        && diagnostic_mode != 11u
-        && diagnostic_mode != 12u
     {
         color *= scene.postprocess0.x;
     }
@@ -4997,12 +4514,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             && diagnostic_mode != 3u
             && diagnostic_mode != 5u
             && diagnostic_mode != 6u
-            && diagnostic_mode != 7u
-            && diagnostic_mode != 8u
-            && diagnostic_mode != 9u
-            && diagnostic_mode != 10u
-            && diagnostic_mode != 11u
-            && diagnostic_mode != 12u
         {
             color = filmic_grade(max(color, vec3<f32>(0.0)));
         }
@@ -5195,17 +4706,11 @@ mod tests {
 
     #[test]
     fn exposes_required_render_diagnostics() {
-        for mode in 1..=12 {
+        for mode in 1..=6 {
             assert!(MODEL_SHADER.contains(&format!("diagnostic_mode == {mode}u")));
         }
         assert!(PRESENT_SHADER.contains("diagnostic_mode != 5u"));
         assert!(PRESENT_SHADER.contains("diagnostic_mode != 6u"));
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 7u"));
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 8u"));
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 9u"));
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 10u"));
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 11u"));
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 12u"));
     }
 
     #[test]
@@ -5953,12 +5458,6 @@ mod tests {
             "specular" | "specular-only" => 4,
             "pre-tone" | "pre_tone" | "hdr" => 5,
             "normal" | "normals" => 6,
-            "animated-response" | "animated_response" | "animation" => 7,
-            "animated-field" | "animated_field" | "field" => 8,
-            "animated-wave" | "animated_wave" | "wave" => 9,
-            "animated-facing" | "animated_facing" | "facing" => 10,
-            "animated-normal" | "animated_normal" | "procedural-normal" => 11,
-            "animated-dots" | "animated_dots" | "dots" => 12,
             value => panic!("unknown QUICKTAG_PROBE_PASS {value}"),
         };
         let tuning_probe = std::env::var("QUICKTAG_PROBE_TUNE")
@@ -6161,22 +5660,6 @@ mod tests {
                 -23.5_f32.to_radians(),
             ),
             (
-                "dusk-eliminator-outland-animated",
-                TagHash(0x80B7C3A9),
-                TagHash(0x80B7C3A9),
-                vec![],
-                vec![],
-                -24.3_f32.to_radians(),
-            ),
-            (
-                "pale-death-zeus-animated",
-                TagHash(0x80B7C417),
-                TagHash(0x80B7C417),
-                vec![],
-                vec![],
-                -24.3_f32.to_radians(),
-            ),
-            (
                 "runner-achromatic-rush-decal",
                 TagHash(0x80B141C0),
                 TagHash(0x80B141C0),
@@ -6249,13 +5732,8 @@ mod tests {
                 panic!("weapon preview must be model");
             };
             let wireframe = model.wireframe.as_ref().expect("wireframe");
-            if matches!(
-                name,
-                "syntax-disrupt-v75-decal"
-                    | "arata-vectus-v66-detail"
-                    | "dusk-eliminator-outland-animated"
-                    | "pale-death-zeus-animated"
-            ) && std::env::var_os("QUICKTAG_MODEL_MATERIAL_REPORT").is_some()
+            if matches!(name, "syntax-disrupt-v75-decal" | "arata-vectus-v66-detail")
+                && std::env::var_os("QUICKTAG_MODEL_MATERIAL_REPORT").is_some()
             {
                 let mut report = format!(
                     "{name} geometry parts: {:?}\n{name} mesh source: {:?}\n{name} uv transform: {:?}\n{name} model bounds: {:?}..{:?}\n",
@@ -6330,10 +5808,6 @@ mod tests {
                             .map(|normal| normal[axis])
                             .fold(f32::NEG_INFINITY, f32::max)
                     });
-                    let animated_facing_vertices = range_procedural_normals
-                        .iter()
-                        .filter(|normal| normal[2] > 5.0 / 6.0)
-                        .count();
                     let screen_points = wireframe.indices
                         [range.index_start.min(range_end)..range_end]
                         .iter()
@@ -6373,10 +5847,9 @@ mod tests {
                     });
                     writeln!(
                         report,
-                        "{name} range {index}: idx={}..{} screen={screen_min:?}..{screen_max:?} uv={uv_min:?}..{uv_max:?} procedural_normal={procedural_normal_min:?}..{procedural_normal_max:?} animated_facing={animated_facing_vertices}/{} procedural_scale={} stage={:?} technique={:?} change_color={:?} color={:?} normal={:?} control={:?} solid={:?} dye={:?} palette={:?} investment={:?} aux={:?}",
+                        "{name} range {index}: idx={}..{} screen={screen_min:?}..{screen_max:?} uv={uv_min:?}..{uv_max:?} procedural_normal={procedural_normal_min:?}..{procedural_normal_max:?} procedural_scale={} stage={:?} technique={:?} change_color={:?} color={:?} normal={:?} control={:?} solid={:?} dye={:?} palette={:?} investment={:?} aux={:?}",
                         range.index_start,
                         range.index_start + range.index_count,
-                        range_procedural_normals.len(),
                         range.procedural_scale,
                         range.render_stage,
                         range.technique,
@@ -6494,7 +5967,6 @@ mod tests {
                 if name.starts_with("atrax-sting")
                     || name == "syntax-disrupt-v75-decal"
                     || name == "arata-vectus-v66-detail"
-                    || name.ends_with("-animated")
                     || matches!(
                         tag.0,
                         0x80AA0ED7
@@ -6590,7 +6062,7 @@ mod tests {
                     diagnostic_pass,
                     ..defaults
                 }
-            } else if flat_panel_reference_case || name.ends_with("-animated") {
+            } else if flat_panel_reference_case {
                 ModelEnvironment {
                     diagnostic_pass,
                     ..ModelEnvironment::default()
@@ -6692,51 +6164,6 @@ mod tests {
                             && material.control.is_some()
                     }),
                     "Arata Vectus must decode control-map-selected procedural gear pattern"
-                );
-            }
-            if name.ends_with("-animated") {
-                let expected_fine_projection = if name == "pale-death-zeus-animated" {
-                    400.0
-                } else {
-                    300.0
-                };
-                let animated_materials = callback
-                    .materials
-                    .iter()
-                    .filter_map(|material| {
-                        Some((
-                            material.animated_dither?,
-                            material.animated_field.is_some(),
-                            material.pattern_field.is_some(),
-                            material.sampler_tag,
-                            material.sampler,
-                            material.gear_dye,
-                            material.gear_dye_palette,
-                        ))
-                    })
-                    .collect_vec();
-                eprintln!("{name} animated materials: {}", animated_materials.len());
-                assert!(
-                    !animated_materials.is_empty()
-                        && animated_materials
-                            .iter()
-                            .all(|(_, field, mask, _, _, _, _)| *field && *mask),
-                    "{name}: compiled frame-driven surface must bind slot-6 mask and slot-7 field"
-                );
-                assert!(
-                    animated_materials
-                        .iter()
-                        .all(|(animated, _, _, _, _, _, _)| {
-                            animated.dot_detail.is_some_and(|detail| {
-                                (detail.projection[0] - 40.0).abs() < 0.001
-                                    && (detail.projection[1] - 40.0).abs() < 0.001
-                                    && (detail.fine_projection[0] - expected_fine_projection).abs()
-                                        < 0.001
-                                    && (detail.fine_projection[1] - expected_fine_projection).abs()
-                                        < 0.001
-                            })
-                        }),
-                    "{name}: common-surface PS c4/c5 projections must remain the authored 40/{expected_fine_projection} control-material branches"
                 );
             }
             let dye_palettes = callback

@@ -1339,10 +1339,6 @@ pub(super) fn model_wireframe_ui(
         && wireframe.uvs.is_some()
         && !preview_textures.is_empty()
     {
-        if gpu_preview.has_animated_material() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(16));
-        }
         let callback = ModelPaintCallback::new(
             gpu_preview.clone(),
             texture_cache,
