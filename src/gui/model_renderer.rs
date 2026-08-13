@@ -303,6 +303,22 @@ impl GpuModelPreview {
         if draws.is_empty() {
             return None;
         }
+        let has_authored_shadow = draws.iter().any(|draw| {
+            draw.packet.raw_render_stage
+                == Some(crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE)
+        });
+        if has_authored_shadow {
+            for draw in &mut draws {
+                if draw.packet.raw_render_stage
+                    != Some(crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE)
+                {
+                    draw.packet
+                        .pass_plan
+                        .passes
+                        .retain(|pass| *pass != RenderPassKind::Shadow);
+                }
+            }
+        }
         let mut provenance = ProvenanceStore::default();
         for draw in &mut draws {
             let source_tag = draw.packet.technique_hash.unwrap_or(TagHash(0));
@@ -1859,6 +1875,7 @@ struct ModelPipelineResources {
     // One depth-only pipeline per authored cull mode. A single back-face
     // pipeline makes two-sided and reversed-winding parts cast incorrectly.
     shadow_pipelines: [wgpu::RenderPipeline; 3],
+    depth_pipelines: [wgpu::RenderPipeline; 3],
     shadow_sampler: wgpu::Sampler,
     _fallback_cubemap: wgpu::Texture,
     fallback_cubemap_view: wgpu::TextureView,
@@ -1913,6 +1930,7 @@ struct ModelFrameResources {
     distortion_resolve_bind_group: wgpu::BindGroup,
     opaque_bundles: Vec<wgpu::RenderBundle>,
     decal_bundles: Vec<wgpu::RenderBundle>,
+    additive_bundles: Vec<wgpu::RenderBundle>,
     transparent_bundles: Vec<wgpu::RenderBundle>,
     distortion_bundles: Vec<wgpu::RenderBundle>,
 }
@@ -2737,7 +2755,11 @@ impl CallbackTrait for ModelPaintCallback {
                 RenderPassKind::AlphaTestedCompatibility,
                 RenderPassKind::UnknownCompatibility,
             ]);
-            let decal_bundles = make_bundles(&[RenderPassKind::InvestmentDecalCompatibility]);
+            let decal_bundles = make_bundles(&[
+                RenderPassKind::DecalCompatibility,
+                RenderPassKind::InvestmentDecalCompatibility,
+            ]);
+            let additive_bundles = make_bundles(&[RenderPassKind::ForwardAdditive]);
             let transparent_bundles = make_bundles(&[RenderPassKind::ForwardTransparent]);
             let distortion_bundles = make_bundles(&[RenderPassKind::Distortion]);
             callback_resources.insert(ModelFrameResources {
@@ -2756,6 +2778,7 @@ impl CallbackTrait for ModelPaintCallback {
                 distortion_resolve_bind_group,
                 opaque_bundles,
                 decal_bundles,
+                additive_bundles,
                 transparent_bundles,
                 distortion_bundles,
             });
@@ -2809,6 +2832,43 @@ impl CallbackTrait for ModelPaintCallback {
             }
         }
 
+        let has_authored_depth = self
+            .draws
+            .iter()
+            .any(|draw| draw.passes.contains(&RenderPassKind::DepthOnly));
+        if has_authored_depth {
+            let mut depth_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quicktag_model_authored_depth_prepass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            depth_pass.set_bind_group(0, &frame.scene_bind_group, &[]);
+            depth_pass.set_vertex_buffer(0, self.preview.vertex_buffer.slice(..));
+            depth_pass.set_index_buffer(
+                self.preview.index_buffer.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            for draw in self
+                .draws
+                .iter()
+                .filter(|draw| draw.passes.contains(&RenderPassKind::DepthOnly))
+            {
+                depth_pass.set_pipeline(
+                    &pipelines.depth_pipelines[shadow_pipeline_index(draw.pipeline.rasterizer)],
+                );
+                depth_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
+            }
+        }
+
         let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("quicktag_model_offscreen_pass"),
             color_attachments: &[
@@ -2833,7 +2893,11 @@ impl CallbackTrait for ModelPaintCallback {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &target.depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: if has_authored_depth {
+                        wgpu::LoadOp::Load
+                    } else {
+                        wgpu::LoadOp::Clear(1.0)
+                    },
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -2980,10 +3044,22 @@ impl CallbackTrait for ModelPaintCallback {
             lighting_pass.draw(0..3, 0..1);
         }
 
-        if !frame.transparent_bundles.is_empty() {
+        for (label, bundles) in [
+            (
+                "quicktag_model_forward_additive_pass",
+                frame.additive_bundles.as_slice(),
+            ),
+            (
+                "quicktag_model_forward_transparent_pass",
+                frame.transparent_bundles.as_slice(),
+            ),
+        ] {
+            if bundles.is_empty() {
+                continue;
+            }
             let mut transparent_pass =
                 egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("quicktag_model_forward_transparent_pass"),
+                    label: Some(label),
                     color_attachments: &[Some(load_surface_attachment(&target.lit_color_view))],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &target.depth_view,
@@ -2996,7 +3072,7 @@ impl CallbackTrait for ModelPaintCallback {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-            transparent_pass.execute_bundles(frame.transparent_bundles.iter());
+            transparent_pass.execute_bundles(bundles.iter());
         }
 
         if !frame.distortion_bundles.is_empty() {
@@ -3601,6 +3677,44 @@ fn create_pipeline_resources(
             Some(wgpu::Face::Back),
         ),
     ];
+    let create_depth_pipeline = |label, cull_mode| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&model_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &model_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[model_vertex_layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview: None,
+            cache: None,
+        })
+    };
+    let depth_pipelines = [
+        create_depth_pipeline("quicktag_model_depth_pipeline_two_sided", None),
+        create_depth_pipeline(
+            "quicktag_model_depth_pipeline_cull_front",
+            Some(wgpu::Face::Front),
+        ),
+        create_depth_pipeline(
+            "quicktag_model_depth_pipeline_cull_back",
+            Some(wgpu::Face::Back),
+        ),
+    ];
     let present_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("quicktag_model_present_shader"),
         source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER.into()),
@@ -3720,6 +3834,7 @@ fn create_pipeline_resources(
         bloom_blur_horizontal_pipeline,
         bloom_blur_vertical_pipeline,
         shadow_pipelines,
+        depth_pipelines,
         shadow_sampler,
         _fallback_cubemap: fallback_cubemap,
         fallback_cubemap_view,
@@ -3870,7 +3985,9 @@ fn create_model_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some(match key.pass {
+                RenderPassKind::DecalCompatibility => "fs_main",
                 RenderPassKind::InvestmentDecalCompatibility => "fs_investment_decal",
+                RenderPassKind::ForwardAdditive => "fs_forward_transparent",
                 RenderPassKind::ForwardTransparent => "fs_forward_transparent",
                 RenderPassKind::Distortion => "fs_distortion",
                 RenderPassKind::MaterialEmissive => "fs_material_emissive",
@@ -3883,6 +4000,23 @@ fn create_model_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+fn model_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x3,
+        2 => Float32x2,
+        3 => Float32x4,
+        4 => Float32,
+        5 => Float32x3,
+        6 => Float32x3
+    ];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<ModelVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ATTRIBUTES,
+    }
 }
 
 fn surface_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
@@ -3944,7 +4078,9 @@ fn blend_enabled(index: u8) -> bool {
 fn is_forward_pass(pass: RenderPassKind) -> bool {
     matches!(
         pass,
-        RenderPassKind::ForwardTransparent | RenderPassKind::Distortion
+        RenderPassKind::ForwardAdditive
+            | RenderPassKind::ForwardTransparent
+            | RenderPassKind::Distortion
     )
 }
 

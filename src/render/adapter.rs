@@ -19,18 +19,46 @@ impl GoliathAdapter {
     pub const ADAPTER_VERSION: &'static str = "goliath-render-v1";
     pub const OBSERVED_STAGE_RANGE_COUNT: usize = 25;
     pub const DISTORTION_STAGE: u8 = 8;
+    pub const PRIMARY_STAGE: u8 = 0;
+    pub const DECAL_STAGE: u8 = 1;
+    pub const INVESTMENT_DECAL_STAGE: u8 = 2;
+    pub const AUTHORED_SHADOW_STAGE: u8 = 4;
+    pub const ADDITIVE_STAGE: u8 = 6;
+    pub const TRANSPARENT_STAGE: u8 = 7;
+    pub const OCCLUSION_STAGE: u8 = 9;
+    pub const DEPTH_ONLY_STAGE: u8 = 13;
+    pub const AUXILIARY_STAGE: u8 = 15;
+    pub const FORWARD_SPECIAL_STAGE: u8 = 17;
 
     pub fn stage(raw: u8) -> StageInterpretation {
         StageInterpretation {
             raw: RawRenderStageId(raw),
             semantic_hint: match raw {
-                0 => Some("observed primary entity stage"),
+                Self::PRIMARY_STAGE => Some("observed primary entity stage"),
+                Self::DECAL_STAGE => Some("decal"),
+                Self::INVESTMENT_DECAL_STAGE => Some("investment decal"),
+                Self::AUTHORED_SHADOW_STAGE => Some("observed shadow-only geometry"),
+                Self::ADDITIVE_STAGE => Some("additive"),
+                Self::TRANSPARENT_STAGE => Some("transparent"),
                 Self::DISTORTION_STAGE => Some("distortion"),
+                Self::OCCLUSION_STAGE => Some("observed max-blend forward payload"),
+                Self::DEPTH_ONLY_STAGE => Some("observed depth-only geometry"),
+                Self::AUXILIARY_STAGE => Some("observed auxiliary geometry"),
+                Self::FORWARD_SPECIAL_STAGE => Some("observed forward special"),
                 _ => None,
             },
             evidence: match raw {
-                Self::DISTORTION_STAGE => EvidenceLevel::Confirmed,
-                0 => EvidenceLevel::StronglyCorrelated,
+                Self::DISTORTION_STAGE
+                | Self::AUTHORED_SHADOW_STAGE
+                | Self::OCCLUSION_STAGE
+                | Self::DEPTH_ONLY_STAGE
+                | Self::AUXILIARY_STAGE
+                | Self::FORWARD_SPECIAL_STAGE => EvidenceLevel::Confirmed,
+                Self::PRIMARY_STAGE
+                | Self::DECAL_STAGE
+                | Self::INVESTMENT_DECAL_STAGE
+                | Self::ADDITIVE_STAGE
+                | Self::TRANSPARENT_STAGE => EvidenceLevel::StronglyCorrelated,
                 _ => EvidenceLevel::Unknown,
             },
         }
@@ -40,7 +68,9 @@ impl GoliathAdapter {
         raw_stage: Option<u8>,
         state: TechniqueRenderState,
     ) -> EvidenceLevel {
-        if raw_stage == Some(0) && state.blend.is_none_or(|blend| matches!(blend, 0 | 1 | 57)) {
+        if raw_stage == Some(Self::PRIMARY_STAGE)
+            && state.blend.is_none_or(|blend| matches!(blend, 0 | 1 | 57))
+        {
             EvidenceLevel::Probable
         } else {
             EvidenceLevel::Unknown

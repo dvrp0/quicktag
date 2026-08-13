@@ -223,6 +223,15 @@ pub struct GearView {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ModelWeaponCatalog {
     pub(super) weapons: Vec<ModelWeaponEntry>,
+    pub(super) runner_skins: Vec<ModelRunnerSkinEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ModelRunnerSkinEntry {
+    pub(super) name: String,
+    pub(super) shell_name: String,
+    pub(super) model_tag: TagHash,
+    pub(super) color: Color32,
 }
 
 #[derive(Clone, Debug)]
@@ -423,7 +432,30 @@ impl GearView {
             })
             .collect();
 
-        ModelWeaponCatalog { weapons }
+        let mut runner_skins = self
+            .items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Runner Skin"))
+            .filter_map(|item| {
+                Some(ModelRunnerSkinEntry {
+                    name: item.name.clone(),
+                    shell_name: item.applies_to.clone()?,
+                    model_tag: item.model_tag?,
+                    color: item.rarity.map(GearRarity::color).unwrap_or(Color32::GRAY),
+                })
+            })
+            .collect::<Vec<_>>();
+        runner_skins.sort_by_cached_key(|skin| (skin.model_tag, skin.name.to_lowercase()));
+        runner_skins.dedup_by(|left, right| {
+            left.model_tag == right.model_tag
+                && left.name == right.name
+                && left.shell_name == right.shell_name
+        });
+
+        ModelWeaponCatalog {
+            weapons,
+            runner_skins,
+        }
     }
 
     /// Reconciles cosmetic ownership with the render Pattern templates used by
@@ -7112,10 +7144,80 @@ mod tests {
             .iter()
             .filter(|item| item.item_type.as_deref() == Some("Runner Skin"))
             .collect::<Vec<_>>();
+        for (tag, name, shell, rarity) in [
+            (
+                TagHash(0x80B140CE),
+                "Arata Vectus",
+                "Assassin",
+                GearRarity::Prestige,
+            ),
+            (
+                TagHash(0x80AA053A),
+                "SHADOW INDEX",
+                "Destroyer",
+                GearRarity::Deluxe,
+            ),
+        ] {
+            let skin = catalog
+                .runner_skins
+                .iter()
+                .find(|skin| skin.model_tag == tag)
+                .expect("runner skin Models identity");
+            assert_eq!(skin.name, name);
+            assert_eq!(skin.shell_name, shell);
+            assert_eq!(skin.color, rarity.color());
+        }
         let runner_owner_counts = runner_skins
             .iter()
             .map(|skin| skin.applies_to.as_deref().unwrap_or("<missing>"))
             .counts();
+        let mut shell_combinations_by_package = FxHashMap::default();
+        for package_id in catalog
+            .runner_skins
+            .iter()
+            .map(|skin| skin.model_tag.pkg_id())
+            .unique()
+        {
+            let containers = package_manager().lookup.tag32_entries_by_pkg[&package_id]
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
+                .map(|(index, _)| TagHash::new(package_id, index as u16))
+                .collect_vec();
+            shell_combinations_by_package.insert(
+                package_id,
+                crate::geometry::runner_shell_combinations(&cache, &containers),
+            );
+        }
+        for skin in &catalog.runner_skins {
+            // Rook cosmetics use a separate non-runner-shell assembly family.
+            if skin.shell_name == "Rook" {
+                continue;
+            }
+            let combination = shell_combinations_by_package[&skin.model_tag.pkg_id()]
+                .iter()
+                .find(|combination| combination.contains(skin.model_tag));
+            if skin.shell_name == "Vandal" {
+                let combination = combination.unwrap_or_else(|| {
+                    panic!("unassembled Vandal skin {} ({})", skin.name, skin.model_tag)
+                });
+                assert_eq!(
+                    combination.additional_parts.len(),
+                    1,
+                    "Vandal must assemble body + face + hair: {} ({}) {combination:?}",
+                    skin.name,
+                    skin.model_tag
+                );
+            }
+        }
+        for combinations in shell_combinations_by_package.values() {
+            assert!(
+                combinations
+                    .iter()
+                    .all(|combination| combination.additional_parts.len() <= 1),
+                "runner combination absorbed another skin"
+            );
+        }
         assert!(
             runner_skins
                 .iter()

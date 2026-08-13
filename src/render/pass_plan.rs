@@ -10,11 +10,15 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RenderPassKind {
     Shadow,
+    DepthOnly,
     OpaqueCompatibility,
     AlphaTestedCompatibility,
+    DecalCompatibility,
     InvestmentDecalCompatibility,
+    ForwardAdditive,
     ForwardTransparent,
     Distortion,
+    Auxiliary,
     UnknownCompatibility,
     MaterialEmissive,
     MaterialFlags,
@@ -33,10 +37,62 @@ impl DrawPassPlan {
         state: TechniqueRenderState,
         material: &MaterialIR,
     ) -> Self {
+        let stage = raw_stage.map(GoliathAdapter::stage);
+        if raw_stage == Some(GoliathAdapter::AUTHORED_SHADOW_STAGE) {
+            return Self {
+                evidence: EvidenceLevel::Confirmed,
+                passes: vec![RenderPassKind::Shadow],
+                warnings: vec![],
+            };
+        }
+        if raw_stage == Some(GoliathAdapter::DEPTH_ONLY_STAGE) {
+            return Self {
+                evidence: EvidenceLevel::Confirmed,
+                passes: vec![RenderPassKind::DepthOnly],
+                warnings: vec![],
+            };
+        }
+        if raw_stage == Some(GoliathAdapter::AUXILIARY_STAGE) {
+            return Self {
+                evidence: EvidenceLevel::Confirmed,
+                passes: vec![RenderPassKind::Auxiliary],
+                warnings: vec![],
+            };
+        }
+        if raw_stage == Some(GoliathAdapter::OCCLUSION_STAGE) {
+            return Self {
+                evidence: EvidenceLevel::Confirmed,
+                passes: vec![RenderPassKind::ForwardTransparent],
+                warnings: vec![],
+            };
+        }
         if raw_stage == Some(GoliathAdapter::DISTORTION_STAGE) {
             return Self {
                 evidence: EvidenceLevel::Confirmed,
                 passes: vec![RenderPassKind::Distortion],
+                warnings: vec![],
+            };
+        }
+        if raw_stage == Some(GoliathAdapter::DECAL_STAGE) {
+            return Self {
+                evidence: EvidenceLevel::StronglyCorrelated,
+                passes: vec![RenderPassKind::DecalCompatibility],
+                warnings: vec![],
+            };
+        }
+        if raw_stage == Some(GoliathAdapter::ADDITIVE_STAGE) {
+            return Self {
+                evidence: EvidenceLevel::StronglyCorrelated,
+                passes: vec![RenderPassKind::ForwardAdditive],
+                warnings: vec![],
+            };
+        }
+        if raw_stage == Some(GoliathAdapter::TRANSPARENT_STAGE)
+            || raw_stage == Some(GoliathAdapter::FORWARD_SPECIAL_STAGE)
+        {
+            return Self {
+                evidence: stage.map_or(EvidenceLevel::Unknown, |stage| stage.evidence),
+                passes: vec![RenderPassKind::ForwardTransparent],
                 warnings: vec![],
             };
         }
@@ -114,5 +170,26 @@ mod tests {
         );
         assert_eq!(plan.passes, [RenderPassKind::Distortion]);
         assert_eq!(plan.evidence, EvidenceLevel::Confirmed);
+    }
+
+    #[test]
+    fn authored_auxiliary_stages_never_fall_through_to_opaque() {
+        let material = MaterialIR::classify(&WireframeMaterialTextures::default());
+        for (stage, expected) in [
+            (
+                GoliathAdapter::AUTHORED_SHADOW_STAGE,
+                RenderPassKind::Shadow,
+            ),
+            (GoliathAdapter::DEPTH_ONLY_STAGE, RenderPassKind::DepthOnly),
+            (GoliathAdapter::AUXILIARY_STAGE, RenderPassKind::Auxiliary),
+            (
+                GoliathAdapter::OCCLUSION_STAGE,
+                RenderPassKind::ForwardTransparent,
+            ),
+        ] {
+            let plan =
+                DrawPassPlan::derive(stage.into(), TechniqueRenderState::default(), &material);
+            assert_eq!(plan.passes, [expected]);
+        }
     }
 }

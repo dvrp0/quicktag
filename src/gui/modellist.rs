@@ -14,7 +14,8 @@ use tiger_pkg::{TagHash, manager::PackagePath, package::UEntryHeader, package_ma
 use crate::geometry::{
     GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, UvTransformPreview,
     WeaponModPreviewAttachment, WeaponModSocketIndex, WireframeMaterialLayer, WireframePreview,
-    is_model_catalog_reference, model_info_for_reference, weapon_unoccupied_default_mod_patterns,
+    is_model_catalog_reference, model_info_for_reference, runner_shell_combinations,
+    weapon_unoccupied_default_mod_patterns,
 };
 use crate::gui::common::ResponseExt;
 use crate::gui::tag::format_tag_entry;
@@ -22,7 +23,9 @@ use crate::material::is_sticker_proxy_technique;
 use crate::texture::cache::{MaterialTextureKey, TextureCache};
 use crate::util::{format_file_size, ui_image_rotated};
 
-use super::gear::{ModelModEntry, ModelWeaponCatalog, ModelWeaponEntry, ModelWeaponSkinEntry};
+use super::gear::{
+    ModelModEntry, ModelRunnerSkinEntry, ModelWeaponCatalog, ModelWeaponEntry, ModelWeaponSkinEntry,
+};
 use super::model_renderer::{
     GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelPaintCallback,
 };
@@ -56,6 +59,7 @@ pub struct ModelsView {
     selected_mods: Vec<Option<usize>>,
     selected_mod_unique_ids: Vec<Option<f32>>,
     mod_unique_rng: u32,
+    runner_shell_pairs: Vec<crate::geometry::RunnerShellCombination>,
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +108,7 @@ impl ModelsView {
             selected_mods: vec![],
             selected_mod_unique_ids: vec![],
             mod_unique_rng: 0xA341_316C,
+            runner_shell_pairs: vec![],
         }
     }
 
@@ -152,6 +157,10 @@ impl ModelsView {
 
     pub fn set_cache(&mut self, cache: Arc<TagCache>) {
         self.cache = cache;
+        self.runner_shell_pairs = runner_shell_combinations(
+            &self.cache,
+            &self.models.iter().map(|entry| entry.tag).collect_vec(),
+        );
         for weapon in &mut self.weapon_catalog.weapons {
             weapon.socket_owner = None;
         }
@@ -251,6 +260,10 @@ impl ModelsView {
                 })
             })
             .collect();
+        self.runner_shell_pairs = runner_shell_combinations(
+            &self.cache,
+            &self.models.iter().map(|entry| entry.tag).collect_vec(),
+        );
         self.selected_model = None;
         self.preview = None;
         self.gpu_model_preview = None;
@@ -385,7 +398,13 @@ impl ModelsView {
         let weapon_owner = active_weapon
             .map(|weapon| weapon.socket_owner.unwrap_or(weapon.owner_tag))
             .unwrap_or(tag);
-        self.preview = if model_info_for_reference(entry.reference).is_some() {
+        self.preview = if let Some(combination) = self
+            .runner_shell_pairs
+            .iter()
+            .find(|combination| combination.head == tag)
+        {
+            GeometryTagPreview::load_combined_runner_shell(self.cache.clone(), combination)
+        } else if model_info_for_reference(entry.reference).is_some() {
             GeometryTagPreview::load_model_with_weapon_mod_attachments(
                 self.cache.clone(),
                 tag,
@@ -450,6 +469,18 @@ fn weapon_skin_for_model(
             .filter(move |skin| skin.model_tag == selected)
             .map(move |skin| (weapon, skin))
     });
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
+
+fn runner_skin_for_combination<'a>(
+    catalog: &'a ModelWeaponCatalog,
+    combination: &crate::geometry::RunnerShellCombination,
+) -> Option<&'a ModelRunnerSkinEntry> {
+    let mut matches = catalog
+        .runner_skins
+        .iter()
+        .filter(|skin| combination.contains(skin.model_tag));
     let matched = matches.next()?;
     matches.next().is_none().then_some(matched)
 }
@@ -641,7 +672,22 @@ impl ModelsView {
             .filter(|entry| {
                 filter.is_empty()
                     || entry
-                        .search_label(weapon_skin_for_model(&self.weapon_catalog, entry.tag))
+                        .search_label(
+                            weapon_skin_for_model(&self.weapon_catalog, entry.tag),
+                            self.runner_shell_pairs
+                                .iter()
+                                .find(|pair| pair.head == entry.tag)
+                                .map(|pair| pair.submeshes().collect_vec()),
+                            self.runner_shell_pairs
+                                .iter()
+                                .find(|pair| pair.contains(entry.tag))
+                                .and_then(|pair| {
+                                    runner_skin_for_combination(&self.weapon_catalog, pair)
+                                }),
+                            self.runner_shell_pairs
+                                .iter()
+                                .any(|pair| pair.head != entry.tag && pair.contains(entry.tag)),
+                        )
                         .contains(&filter)
             })
             .cloned()
@@ -797,8 +843,29 @@ impl ModelsView {
                 let mut selected = None;
                 for entry in models {
                     let detected_skin = weapon_skin_for_model(&self.weapon_catalog, entry.tag);
+                    let combination = self
+                        .runner_shell_pairs
+                        .iter()
+                        .find(|combination| combination.head == entry.tag);
+                    let member_combination = self
+                        .runner_shell_pairs
+                        .iter()
+                        .find(|combination| combination.contains(entry.tag));
+                    let is_runner_submesh = combination.is_none() && member_combination.is_some();
+                    let combined_parts =
+                        combination.map(|combination| combination.submeshes().collect_vec());
+                    let runner_skin = member_combination.and_then(|combination| {
+                        runner_skin_for_combination(&self.weapon_catalog, combination)
+                    });
                     if !filter.is_empty()
-                        && !entry.search_label(detected_skin).contains(filter.as_str())
+                        && !entry
+                            .search_label(
+                                detected_skin,
+                                combined_parts.as_deref(),
+                                runner_skin,
+                                is_runner_submesh,
+                            )
+                            .contains(filter.as_str())
                     {
                         continue;
                     }
@@ -807,13 +874,24 @@ impl ModelsView {
                         .add(
                             egui::Button::selectable(
                                 self.selected_model == Some(entry.tag),
-                                entry.list_label(ui, detected_skin),
+                                entry.list_label(
+                                    ui,
+                                    detected_skin,
+                                    combined_parts.as_deref(),
+                                    runner_skin,
+                                    is_runner_submesh,
+                                ),
                             )
-                            .wrap_mode(if detected_skin.is_some() {
-                                egui::TextWrapMode::Wrap
-                            } else {
-                                egui::TextWrapMode::Truncate
-                            }),
+                            .wrap_mode(
+                                if detected_skin.is_some()
+                                    || combined_parts.is_some()
+                                    || runner_skin.is_some()
+                                {
+                                    egui::TextWrapMode::Wrap
+                                } else {
+                                    egui::TextWrapMode::Truncate
+                                },
+                            ),
                         )
                         .tag_context(entry.tag);
 
@@ -856,6 +934,9 @@ impl ModelListEntry {
     fn search_label(
         &self,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
+        combined_parts: Option<&[TagHash]>,
+        runner_skin: Option<&ModelRunnerSkinEntry>,
+        is_runner_submesh: bool,
     ) -> String {
         let identity = detected_skin
             .map(|(weapon, skin)| {
@@ -867,13 +948,39 @@ impl ModelListEntry {
                 )
             })
             .unwrap_or_default();
-        format!("{} {}{identity}", self.label(), self.info.label).to_lowercase()
+        let combined = combined_parts
+            .map(|parts| {
+                format!(
+                    " combined runner shell submeshed {}",
+                    parts.iter().format(" ")
+                )
+            })
+            .unwrap_or_default();
+        let runner_identity = runner_skin
+            .map(|skin| {
+                format!(
+                    " {} {}{}",
+                    skin.shell_name,
+                    skin.name,
+                    if is_runner_submesh { " submesh" } else { "" }
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "{} {}{identity}{combined}{runner_identity}",
+            self.label(),
+            self.info.label
+        )
+        .to_lowercase()
     }
 
     fn list_label(
         &self,
         ui: &egui::Ui,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
+        combined_parts: Option<&[TagHash]>,
+        runner_skin: Option<&ModelRunnerSkinEntry>,
+        is_runner_submesh: bool,
     ) -> egui::text::LayoutJob {
         let mut label = egui::text::LayoutJob::default();
         label.append(
@@ -881,7 +988,11 @@ impl ModelListEntry {
             0.0,
             egui::TextFormat {
                 font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                color: self.role_color(),
+                color: if is_runner_submesh {
+                    Color32::DARK_GRAY
+                } else {
+                    self.role_color()
+                },
                 ..Default::default()
             },
         );
@@ -897,6 +1008,35 @@ impl ModelListEntry {
             );
             label.append(
                 &format!("{}: {}", weapon.name, skin.name),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::TextStyle::Small.resolve(ui.style()),
+                    color: skin.color,
+                    ..Default::default()
+                },
+            );
+        }
+        if let Some(parts) = combined_parts {
+            for part in parts {
+                label.append(
+                    &format!("\n    └ Submeshed – {part}"),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::TextStyle::Small.resolve(ui.style()),
+                        color: Color32::DARK_GRAY,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        if let Some(skin) = runner_skin {
+            label.append(
+                &format!(
+                    "\n    └ {}: {}{}",
+                    skin.shell_name,
+                    skin.name,
+                    if is_runner_submesh { " (submesh)" } else { "" }
+                ),
                 0.0,
                 egui::TextFormat {
                     font_id: egui::TextStyle::Small.resolve(ui.style()),
@@ -1978,6 +2118,7 @@ mod tests {
                 }],
                 slots: vec![],
             }],
+            runner_skins: vec![],
         };
 
         assert_eq!(
@@ -2017,10 +2158,35 @@ mod tests {
                     slots: vec![],
                 })
                 .collect(),
+            runner_skins: vec![],
         };
 
         assert_eq!(weapon_index_for_model(&catalog, shared), None);
         assert!(weapon_skin_for_model(&catalog, shared).is_none());
+    }
+
+    #[test]
+    fn finds_runner_skin_on_combined_body_tag() {
+        let skin = ModelRunnerSkinEntry {
+            name: "Arata Vectus".to_owned(),
+            shell_name: "Assassin".to_owned(),
+            model_tag: TagHash(0x80B140CE),
+            color: Color32::from_rgb(232, 184, 72),
+        };
+        let catalog = ModelWeaponCatalog {
+            weapons: vec![],
+            runner_skins: vec![skin],
+        };
+        let combination = crate::geometry::RunnerShellCombination {
+            head: TagHash(0x80B14135),
+            body: TagHash(0x80B140CE),
+            additional_parts: vec![],
+        };
+        let found = runner_skin_for_combination(&catalog, &combination)
+            .expect("combined runner skin identity");
+        assert_eq!(found.shell_name, "Assassin");
+        assert_eq!(found.name, "Arata Vectus");
+        assert_eq!(found.color, Color32::from_rgb(232, 184, 72));
     }
 
     #[test]

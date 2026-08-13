@@ -199,7 +199,11 @@ impl TechniqueDescriptor {
                     inline_constant_count: stage.inline_constants.len() as u32,
                     tfx_byte_count: stage.bytecode_len as u32,
                 };
-                let tfx_execution = execute_preview(&stage.bytecode, &TfxRuntimeInputs::default());
+                let tfx_execution = execute_preview(
+                    &stage.bytecode,
+                    &stage.constants,
+                    &TfxRuntimeInputs::default(),
+                );
                 TechniqueStageDescriptor {
                     stage: ShaderStage::from_label(stage.stage),
                     raw_stage_label: stage.stage,

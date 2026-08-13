@@ -764,6 +764,17 @@ fn parse_marathon_tfx_bytecode_op(
         Some(value)
     };
     let parsed = match opcode {
+        0x3b => Some(("compare_less_than", String::new())),
+        0x3c => Some(("compare_less_equal", String::new())),
+        0x3d => Some(("compare_greater_than", String::new())),
+        0x3e => Some(("compare_greater_equal", String::new())),
+        0x3f => Some(("compare_equal", String::new())),
+        0x40 => Some(("compare_not_equal", String::new())),
+        0x41 => Some(("compare_not_zero_ternary", String::new())),
+        0x51 => Some((
+            "marathon_context_value",
+            format!("index={}", read_u8(cursor)?),
+        )),
         0x57 => Some((
             "push_marathon_indexed_value",
             format!("index={}", read_u8(cursor)?),
@@ -809,7 +820,7 @@ fn parse_marathon_tfx_bytecode_op(
         });
     }
 
-    if matches!(opcode, 0x21..=0x27 | 0x36..=0x41 | 0x51) {
+    if matches!(opcode, 0x21..=0x27 | 0x36..=0x3a) {
         return Some(TfxBytecodeOpPreview {
             offset,
             opcode,
@@ -829,7 +840,7 @@ fn parse_marathon_tfx_bytecode_op(
 fn marathon_tfx_legacy_opcode(opcode: u8) -> Option<u8> {
     match opcode {
         0x01..=0x20 => Some(opcode),
-        0x28..=0x35 => Some(opcode - 0x07),
+        0x28..=0x35 => Some(opcode - 7),
         0x42..=0x49 => Some(opcode - 0x0e),
         0x4a => Some(0x3c),
         0x4b => Some(0x3d),
@@ -948,6 +959,24 @@ pub(crate) fn interpret_tfx_stack_with_object_channels(
     constants: &[[f32; 4]],
     object_channels: &std::collections::HashMap<u32, [f32; 4]>,
 ) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
+    interpret_tfx_stack_with_runtime_values(
+        ops,
+        constants,
+        object_channels,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    )
+}
+
+pub(crate) fn interpret_tfx_stack_with_runtime_values(
+    ops: &[TfxBytecodeOpPreview],
+    constants: &[[f32; 4]],
+    object_channels: &std::collections::HashMap<u32, [f32; 4]>,
+    extern_values: &std::collections::HashMap<(String, u32), [f32; 4]>,
+    global_channels: &std::collections::HashMap<u32, [f32; 4]>,
+    context_values: &std::collections::HashMap<u32, [f32; 4]>,
+) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
     let mut stack = Vec::<TfxStackValue>::new();
     let mut temps = std::collections::BTreeMap::<u8, TfxStackValue>::new();
     let mut outputs = std::collections::BTreeMap::<u8, TfxStackValue>::new();
@@ -970,10 +999,14 @@ pub(crate) fn interpret_tfx_stack_with_object_channels(
             | "push_tex_tiling_params"
             | "push_tex_tile_layer_count"
             | "push_marathon_texture_metadata"
-            | "push_marathon_indexed_value" => stack.push(format_tfx_value_with_object_channels(
+            | "push_marathon_indexed_value"
+            | "marathon_context_value" => stack.push(format_tfx_runtime_value(
                 op,
                 constants,
                 object_channels,
+                extern_values,
+                global_channels,
+                context_values,
             )),
             "push_from_output" => {
                 let element = op
@@ -1084,6 +1117,13 @@ pub(crate) fn interpret_tfx_stack_with_object_channels(
             "add" | "subtract" | "multiply" | "divide" | "min" | "max" | "less_than" | "dot" => {
                 collapse_stack(&mut stack, op.name, 2);
             }
+            "compare_less_than"
+            | "compare_less_equal"
+            | "compare_greater_than"
+            | "compare_greater_equal"
+            | "compare_equal"
+            | "compare_not_equal" => collapse_stack(&mut stack, op.name, 2),
+            "compare_not_zero_ternary" => collapse_stack(&mut stack, op.name, 3),
             "cubic" => collapse_stack(&mut stack, op.name, 2),
             "lerp" | "lerp_saturated" | "multiply_add" | "clamp" => {
                 collapse_stack(&mut stack, op.name, 3)
@@ -1107,6 +1147,7 @@ pub(crate) fn interpret_tfx_stack_with_object_channels(
             | "vector_rotations_cos"
             | "vector_rotations_sin_cos"
             | "triangle" => collapse_stack(&mut stack, op.name, 1),
+            "normalize3" => collapse_stack(&mut stack, op.name, 1),
             _ => {}
         }
     }
@@ -1427,6 +1468,42 @@ fn format_tfx_value_with_object_channels(
     TfxStackValue { expression, value }
 }
 
+fn format_tfx_runtime_value(
+    op: &TfxBytecodeOpPreview,
+    constants: &[[f32; 4]],
+    object_channels: &std::collections::HashMap<u32, [f32; 4]>,
+    extern_values: &std::collections::HashMap<(String, u32), [f32; 4]>,
+    global_channels: &std::collections::HashMap<u32, [f32; 4]>,
+    context_values: &std::collections::HashMap<u32, [f32; 4]>,
+) -> TfxStackValue {
+    let runtime_value = if op.name.starts_with("push_extern_") {
+        op.detail.split_once("+0x").and_then(|(scope, offset)| {
+            let offset = u32::from_str_radix(offset, 16).ok()?;
+            extern_values.get(&(scope.to_string(), offset)).copied()
+        })
+    } else if op.name == "push_global_channel" {
+        op.detail
+            .strip_prefix("index=")
+            .and_then(|index| index.parse::<u32>().ok())
+            .and_then(|index| global_channels.get(&index).copied())
+    } else if matches!(
+        op.name,
+        "marathon_context_value" | "push_marathon_indexed_value"
+    ) {
+        op.detail
+            .strip_prefix("index=")
+            .and_then(|index| index.parse::<u32>().ok())
+            .and_then(|index| context_values.get(&index).copied())
+    } else {
+        None
+    };
+    let mut value = format_tfx_value_with_object_channels(op, constants, object_channels);
+    if runtime_value.is_some() {
+        value.value = runtime_value;
+    }
+    value
+}
+
 fn evaluate_stack_op(name: &str, args: &[TfxStackValue]) -> Option<[f32; 4]> {
     let values = args
         .iter()
@@ -1447,6 +1524,21 @@ fn evaluate_stack_op(name: &str, args: &[TfxStackValue]) -> Option<[f32; 4]> {
         ("min", [a, b]) => Some(vec4_zip(*a, *b, f32::min)),
         ("max", [a, b]) => Some(vec4_zip(*a, *b, f32::max)),
         ("less_than", [a, b]) => Some(vec4_zip(*a, *b, |a, b| if a < b { 1.0 } else { 0.0 })),
+        ("compare_less_than", [a, b]) => Some(vec4_zip(*a, *b, |a, b| (a < b) as u8 as f32)),
+        ("compare_less_equal", [a, b]) => Some(vec4_zip(*a, *b, |a, b| (a <= b) as u8 as f32)),
+        ("compare_greater_than", [a, b]) => Some(vec4_zip(*a, *b, |a, b| (a > b) as u8 as f32)),
+        ("compare_greater_equal", [a, b]) => Some(vec4_zip(*a, *b, |a, b| (a >= b) as u8 as f32)),
+        ("compare_equal", [a, b]) => Some(vec4_zip(*a, *b, |a, b| (a == b) as u8 as f32)),
+        ("compare_not_equal", [a, b]) => Some(vec4_zip(*a, *b, |a, b| (a != b) as u8 as f32)),
+        ("compare_not_zero_ternary", [condition, if_true, if_false]) => {
+            Some(std::array::from_fn(|lane| {
+                if condition[lane] != 0.0 {
+                    if_true[lane]
+                } else {
+                    if_false[lane]
+                }
+            }))
+        }
         ("dot", [a, b]) => {
             let dot = a.iter().zip(b.iter()).map(|(a, b)| *a * *b).sum();
             Some([dot; 4])
@@ -1495,6 +1587,14 @@ fn evaluate_stack_op(name: &str, args: &[TfxStackValue]) -> Option<[f32; 4]> {
             Some(tfx_sin_rotations([a[0], a[1] + 0.25, a[2], a[3] + 0.25]))
         }
         ("triangle", [a]) => Some(a.map(|value| (value - value.round()).abs() * 2.0)),
+        ("normalize3", [a]) => {
+            let length = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            Some(if length.is_finite() && length > 0.0 {
+                [a[0] / length, a[1] / length, a[2] / length, a[3]]
+            } else {
+                [0.0, 0.0, 0.0, a[3]]
+            })
+        }
         _ => None,
     }
 }

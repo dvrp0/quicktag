@@ -111,11 +111,29 @@ pub struct ModelTagInfo {
     pub label: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerShellCombination {
+    pub head: TagHash,
+    pub body: TagHash,
+    pub additional_parts: Vec<TagHash>,
+}
+
+impl RunnerShellCombination {
+    pub fn submeshes(&self) -> impl Iterator<Item = TagHash> + '_ {
+        std::iter::once(self.body).chain(self.additional_parts.iter().copied())
+    }
+
+    pub fn contains(&self, tag: TagHash) -> bool {
+        self.head == tag || self.submeshes().any(|part| part == tag)
+    }
+}
+
 impl ModelTagInfo {
     /// Whether this tag represents a complete, user-facing model rather than one
     /// of the implementation tags consumed while assembling that model.
     pub fn is_catalog_entry(self) -> bool {
-        matches!(self.role, ModelTagRole::Dynamic) && self.label != "Dynamic mesh"
+        (matches!(self.role, ModelTagRole::Dynamic) && self.label != "Dynamic mesh")
+            || matches!(self.role, ModelTagRole::Container)
     }
 }
 
@@ -637,6 +655,40 @@ impl GeometryTagPreview {
             weapon_owner,
             &attachments,
         )
+    }
+
+    pub fn load_combined_runner_shell(
+        cache: Arc<TagCache>,
+        combination: &RunnerShellCombination,
+    ) -> Option<Self> {
+        let entry = package_manager().get_entry(combination.head)?;
+        let mut model_tags = selected_model_geometry_tags(
+            &cache,
+            combination.body,
+            package_manager().get_entry(combination.body)?.reference,
+        );
+        for container in combination
+            .submeshes()
+            .chain(std::iter::once(combination.head))
+        {
+            let entry = package_manager().get_entry(container)?;
+            model_tags.extend(selected_model_geometry_tags(
+                &cache,
+                container,
+                entry.reference,
+            ));
+        }
+        model_tags = model_tags.into_iter().unique().collect();
+        Some(Self {
+            kind: GeometryPreviewKind::Model(load_model_preview_from_tags(
+                cache,
+                combination.head,
+                &entry,
+                "Combined runner shell",
+                model_tags,
+                &[],
+            )),
+        })
     }
 
     pub fn load_model_with_weapon_mod_attachments(
@@ -1741,6 +1793,145 @@ pub fn is_model_catalog_reference(reference: u32) -> bool {
     // use CLASS_PATTERN_COMPONENT and are only implementation nodes beneath it.
     reference == CLASS_PATTERN
         || model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
+}
+
+/// Match runner-shell head/body containers through their authored component
+/// join. Body containers reference the same component which owns the head
+/// container. Both geometry resources are authored in shell/world space, so
+/// merging must preserve their decoded transforms; no fit-to-bounds scaling is
+/// valid here.
+pub fn runner_shell_combinations(
+    cache: &TagCache,
+    containers: &[TagHash],
+) -> Vec<RunnerShellCombination> {
+    struct Profile {
+        tag: TagHash,
+        parents: rustc_hash::FxHashSet<TagHash>,
+        children: rustc_hash::FxHashSet<TagHash>,
+        min: [f32; 3],
+        max: [f32; 3],
+    }
+
+    impl Profile {
+        fn volume(&self) -> f32 {
+            (0..3)
+                .map(|axis| (self.max[axis] - self.min[axis]).max(0.0))
+                .product()
+        }
+    }
+
+    let profiles = containers
+        .iter()
+        .copied()
+        .filter(|tag| {
+            package_manager()
+                .get_entry(*tag)
+                .is_some_and(|entry| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
+        })
+        .filter_map(|tag| {
+            let scan = cache.hashes.get(&tag)?;
+            let bounds = selected_model_geometry_tags(cache, tag, 0x8080BAAD)
+                .into_iter()
+                .filter_map(|geometry| {
+                    let entry = package_manager().get_entry(geometry)?;
+                    parse_model_wireframe(geometry, &entry)
+                        .map(|(_, wireframe)| (wireframe.min, wireframe.max))
+                })
+                .reduce(|(mut min, mut max), (part_min, part_max)| {
+                    for axis in 0..3 {
+                        min[axis] = min[axis].min(part_min[axis]);
+                        max[axis] = max[axis].max(part_max[axis]);
+                    }
+                    (min, max)
+                })?;
+            Some(Profile {
+                tag,
+                parents: scan.references.iter().copied().collect(),
+                children: scan
+                    .file_hashes
+                    .iter()
+                    .map(|reference| reference.hash)
+                    .chain(
+                        scan.file_hashes64
+                            .iter()
+                            .filter_map(|reference| tag64_to_hash32(reference.hash)),
+                    )
+                    .collect(),
+                min: bounds.0,
+                max: bounds.1,
+            })
+        })
+        .collect_vec();
+
+    let matches = profiles
+        .iter()
+        .cartesian_product(&profiles)
+        // Face/hair normally follow body, but some compiled groups place them
+        // immediately before it. Package-local proximity separates groups.
+        .filter(|(body, head)| {
+            body.tag != head.tag && body.tag.entry_index().abs_diff(head.tag.entry_index()) <= 0x200
+        })
+        .filter(|(body, head)| !body.children.is_disjoint(&head.parents))
+        .filter(|(body, head)| runner_shell_parts_fit(body.min, body.max, head.min, head.max))
+        .map(|(body, head)| (body.tag, head.tag, head.volume()))
+        .into_group_map_by(|(body, _head, _volume)| *body);
+
+    let mut combinations = matches
+        .into_iter()
+        .filter_map(|(body, mut parts)| {
+            parts.sort_by(|left, right| {
+                left.2
+                    .total_cmp(&right.2)
+                    .then_with(|| left.1.cmp(&right.1))
+            });
+            parts.dedup_by_key(|(_body, head, _volume)| *head);
+            if parts.len() == 1 {
+                let linked = profiles.iter().find(|profile| profile.tag == parts[0].1)?;
+                let sibling = profiles
+                    .iter()
+                    .filter(|profile| profile.tag != linked.tag)
+                    .filter(|profile| {
+                        profile.tag.entry_index().abs_diff(linked.tag.entry_index()) <= 4
+                    })
+                    .min_by_key(|profile| profile.tag);
+                if let Some(sibling) = sibling {
+                    parts.push((body, sibling.tag, sibling.volume()));
+                }
+            }
+            parts.truncate(2);
+            let (_body, head, _volume) = parts.first().copied()?;
+            Some(RunnerShellCombination {
+                head,
+                body,
+                additional_parts: parts
+                    .into_iter()
+                    .skip(1)
+                    .map(|(_body, part, _volume)| part)
+                    .collect(),
+            })
+        })
+        .collect_vec();
+    combinations.sort_by_key(|combination| (combination.head, combination.body));
+    combinations
+}
+
+fn runner_shell_parts_fit(
+    body_min: [f32; 3],
+    body_max: [f32; 3],
+    head_min: [f32; 3],
+    head_max: [f32; 3],
+) -> bool {
+    let body_height = body_max[2] - body_min[2];
+    let head_height = head_max[2] - head_min[2];
+    body_height.is_finite()
+        && head_height.is_finite()
+        && body_height > 1.0
+        && head_height > 0.01
+        && head_height < body_height * 0.5
+        && head_min[2] > body_min[2] + body_height * 0.5
+        && head_max[2] <= body_max[2] + body_height * 0.15
+        && (head_max[0] - head_min[0]) < (body_max[0] - body_min[0])
+        && (head_max[1] - head_min[1]) < (body_max[1] - body_min[1])
 }
 
 fn load_vertex_buffer_preview_for_tag(
@@ -5601,9 +5792,8 @@ fn preview_part_indices_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<usize>> {
-    const PREVIEW_STAGES: [usize; 6] = [0, 1, 2, 6, 7, 8];
-    let preview_stages = PREVIEW_STAGES;
-    if boundaries.len() <= preview_stages.iter().copied().max()? + 1
+    let preview_stages = 0..25;
+    if boundaries.len() < 26
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -5612,7 +5802,6 @@ fn preview_part_indices_from_boundaries(
 
     Some(
         preview_stages
-            .into_iter()
             .flat_map(|stage| boundaries[stage]..boundaries[stage + 1])
             .unique()
             .collect(),
@@ -5623,9 +5812,7 @@ fn preview_part_stages_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<Option<u8>>> {
-    const PREVIEW_STAGES: [usize; 6] = [0, 1, 2, 6, 7, 8];
-    let preview_stages = PREVIEW_STAGES;
-    if boundaries.len() <= preview_stages.iter().copied().max()? + 1
+    if boundaries.len() < 26
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -5633,7 +5820,7 @@ fn preview_part_stages_from_boundaries(
     }
 
     let mut stages = vec![None; part_count];
-    for stage in preview_stages {
+    for stage in 0..25 {
         for part in boundaries[stage]..boundaries[stage + 1] {
             stages[part] = Some(stage as u8);
         }
@@ -7710,6 +7897,127 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_render_stage_abi() {
+        init_goliath_test_package_manager();
+        let endian = package_manager().version.endian();
+        let mut stats = std::collections::BTreeMap::<u8, (usize, usize, usize, usize)>::new();
+        let mut states = std::collections::BTreeMap::<
+            u8,
+            std::collections::BTreeMap<(Option<u8>, Option<u8>, Option<u8>, Option<u8>), usize>,
+        >::new();
+        let mut technique_examples = std::collections::BTreeMap::<
+            u8,
+            std::collections::BTreeMap<TagHash, (Vec<&'static str>, usize, usize)>,
+        >::new();
+        for (tag, _entry) in package_manager().get_all_by_reference(CLASS_GEOMETRY_RESOURCE) {
+            let Ok(data) = package_manager().read_tag(tag) else {
+                continue;
+            };
+            let arrays = scan_arrays(&data, endian);
+            let Some(part_array) = arrays
+                .iter()
+                .find(|array| array.class == CLASS_GEOMETRY_PART)
+            else {
+                continue;
+            };
+            let Some(buffer_set) = arrays
+                .iter()
+                .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
+            else {
+                continue;
+            };
+            let Some(boundaries) = (0..26)
+                .map(|i| {
+                    data.get(buffer_set.data_offset + 0x30 + i * 2..)
+                        .map(|b| read_u16(b, endian) as usize)
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if boundaries.windows(2).any(|p| p[0] > p[1])
+                || boundaries.last().copied().unwrap_or_default() > part_array.count
+            {
+                continue;
+            }
+            let candidates = geometry_index_range_candidates(&data, endian);
+            let stage0 = candidates
+                .iter()
+                .filter(|p| {
+                    is_highest_detail_lod(p.lod_category)
+                        && boundaries[0] <= p.part_index
+                        && p.part_index < boundaries[1]
+                })
+                .map(|p| (p.index_start, p.index_count))
+                .collect::<rustc_hash::FxHashSet<_>>();
+            for part in candidates
+                .into_iter()
+                .filter(|p| is_highest_detail_lod(p.lod_category))
+            {
+                let Some(stage) = (0..25).find(|s| {
+                    boundaries[*s] <= part.part_index && part.part_index < boundaries[*s + 1]
+                }) else {
+                    continue;
+                };
+                let stat = stats.entry(stage as u8).or_default();
+                stat.0 += 1;
+                stat.1 += part.index_count as usize;
+                if stage0.contains(&(part.index_start, part.index_count)) {
+                    stat.2 += 1;
+                    stat.3 += part.index_count as usize;
+                }
+                let state = render_state_for_technique(part.technique);
+                *states
+                    .entry(stage as u8)
+                    .or_default()
+                    .entry((
+                        state.blend,
+                        state.depth_stencil,
+                        state.rasterizer,
+                        state.depth_bias,
+                    ))
+                    .or_default() += 1;
+                technique_examples
+                    .entry(stage as u8)
+                    .or_default()
+                    .entry(part.technique)
+                    .or_insert_with(|| {
+                        let Some(entry) = package_manager().get_entry(part.technique) else {
+                            return (vec![], 0, 0);
+                        };
+                        let Ok(data) = package_manager().read_tag(part.technique) else {
+                            return (vec![], 0, 0);
+                        };
+                        let Some(preview) =
+                            crate::material::MaterialTagPreview::load(&entry, &data)
+                        else {
+                            return (vec![], 0, 0);
+                        };
+                        let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+                        (
+                            preview.stages.iter().map(|s| s.stage).collect(),
+                            preview.stages.iter().map(|s| s.textures.len()).sum(),
+                            preview.stages.iter().map(|s| s.bytecode_len).sum(),
+                        )
+                    });
+            }
+        }
+        for (stage, (parts, indices, overlap_parts, overlap_indices)) in stats {
+            eprintln!(
+                "stage_abi={stage:02} parts={parts} indices={indices} overlap0_parts={overlap_parts} overlap0_indices={overlap_indices} states={:?}",
+                states.get(&stage)
+            );
+            eprintln!(
+                "stage_tech={stage:02} examples={:?}",
+                technique_examples
+                    .get(&stage)
+                    .map(|rows| rows.iter().take(32).collect_vec())
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
     fn probes_goliath_render_global_scopes() {
         init_goliath_test_package_manager();
         let cache = quicktag_scanner::load_tag_cache();
@@ -7929,6 +8237,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_runner_shell_pairs() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        for (head, body) in [
+            (TagHash(0x80B14135), TagHash(0x80B140CE)),
+            (TagHash(0x80AA055F), TagHash(0x80AA053A)),
+        ] {
+            let pm = package_manager();
+            let package = pm
+                .lookup
+                .tag32_entries_by_pkg
+                .get(&head.pkg_id())
+                .expect("shell package");
+            let containers = package
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
+                .map(|(index, _)| TagHash::new(head.pkg_id(), index as u16))
+                .collect_vec();
+            let pairs = runner_shell_combinations(&cache, &containers);
+            let expected = pairs
+                .iter()
+                .find(|combination| combination.body == body && combination.contains(head))
+                .cloned();
+            assert!(
+                expected.is_some(),
+                "missing authored runner-shell pair head={head} body={body}; pairs={pairs:?}"
+            );
+            let expected = expected.unwrap();
+            let preview = GeometryTagPreview::load_combined_runner_shell(cache.clone(), &expected)
+                .expect("combined runner shell preview");
+            let GeometryPreviewKind::Model(model) = preview.kind else {
+                panic!("runner shell must be model")
+            };
+            let wireframe = model.wireframe.expect("combined runner shell mesh");
+            assert!(model.geometry_parts.len() >= 2);
+            assert!(wireframe.min[2] < 0.01);
+            assert!(wireframe.max[2] > 1.7 && wireframe.max[2] < 2.1);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_thief_shell_parts() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let thief_bodies = [
+            0x80A9A915, 0x80A9B777, 0x80A9C2C4, 0x80A9C51B, 0x80A9C779, 0x80A9C796, 0x80A9C8A5,
+            0x80A9CD09, 0x80A9D134, 0x80A9D230, 0x80A9E079, 0x80A9E17E, 0x80A9E25E, 0x80A9E347,
+            0x80A9E438, 0x80B1454D, 0x80B14666, 0x80B14758, 0x80B15334,
+        ];
+
+        for body in thief_bodies.map(TagHash) {
+            let pm = package_manager();
+            let containers = pm
+                .lookup
+                .tag32_entries_by_pkg
+                .get(&body.pkg_id())
+                .expect("thief package")
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
+                .map(|(index, _)| TagHash::new(body.pkg_id(), index as u16))
+                .collect_vec();
+            let combination = runner_shell_combinations(&cache, &containers)
+                .into_iter()
+                .find(|combination| combination.body == body)
+                .unwrap_or_else(|| panic!("missing Thief three-part shell for {body}"));
+            assert!(combination.additional_parts.len() <= 1);
+            let preview =
+                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
+                    .unwrap_or_else(|| panic!("failed combining Thief {body}"));
+            let GeometryPreviewKind::Model(model) = preview.kind else {
+                panic!("Thief {body} must be model")
+            };
+            assert_eq!(
+                model.geometry_parts.len(),
+                2 + combination.additional_parts.len(),
+                "wrong part count for {body}"
+            );
+            let wireframe = model.wireframe.expect("combined Thief wireframe");
+            assert!(wireframe.min[2] < 0.01, "floating Thief body {body}");
+            assert!(
+                wireframe.max[2] > 1.7 && wireframe.max[2] < 2.1,
+                "bad Thief proportions for {body}: {wireframe:?}"
+            );
+
+            if body == TagHash(0x80A9A915) {
+                assert_eq!(combination.head, TagHash(0x80A9A966));
+                assert_eq!(combination.additional_parts, [TagHash(0x80A9A997)]);
+            }
+        }
+    }
+
+    #[test]
+    fn runner_shell_fit_rejects_full_height_head() {
+        assert!(runner_shell_parts_fit(
+            [-0.2, -0.5, 0.0],
+            [0.45, 0.5, 1.88],
+            [-0.05, -0.1, 1.53],
+            [0.17, 0.1, 1.82],
+        ));
+        assert!(!runner_shell_parts_fit(
+            [-0.2, -0.5, 0.0],
+            [0.45, 0.5, 1.88],
+            [-0.2, -0.5, 0.0],
+            [0.45, 0.5, 1.88],
+        ));
     }
 
     #[test]
@@ -8314,6 +8734,7 @@ mod tests {
         >::new();
         let mut stages = 0usize;
         let mut complete = 0usize;
+        let mut semantic_partial = 0usize;
 
         for (tag, entry) in package_manager().get_all_by_reference(0x808031D8) {
             let Ok(data) = package_manager().read_tag(tag) else {
@@ -8328,6 +8749,12 @@ mod tests {
                     continue;
                 }
                 stages += 1;
+                semantic_partial += stage
+                    .bytecode
+                    .ops
+                    .iter()
+                    .any(|op| op.name.contains("unknown"))
+                    as usize;
                 let Some(op) = stage.bytecode.ops.iter().find(|op| op.name == "unknown") else {
                     complete += 1;
                     continue;
@@ -8362,7 +8789,9 @@ mod tests {
             }
         }
 
-        eprintln!("marathon_tfx stages={stages} complete={complete}");
+        eprintln!(
+            "marathon_tfx stages={stages} decode_complete={complete} semantic_partial={semantic_partial}"
+        );
         let rows = unknown
             .iter()
             .map(|(opcode, (count, examples))| (*count, *opcode, examples.first()))
@@ -11389,11 +11818,14 @@ mod tests {
     }
 
     #[test]
-    fn selects_visible_marathon_render_stages() {
-        let boundaries = [0, 6, 6, 9, 9, 12, 12, 15, 18, 21];
+    fn preserves_all_marathon_render_stages() {
+        let boundaries = [
+            0, 6, 6, 9, 9, 12, 12, 15, 18, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+            21, 21, 21,
+        ];
         assert_eq!(
             preview_part_indices_from_boundaries(&boundaries, 21),
-            Some((0..9).chain(12..21).collect())
+            Some((0..21).collect())
         );
         assert!(preview_part_indices_from_boundaries(&[0, 3, 2], 3).is_none());
 
@@ -11401,11 +11833,11 @@ mod tests {
         assert_eq!(stages[0], Some(0));
         assert_eq!(stages[4], Some(0));
         assert_eq!(stages[8], Some(2));
+        assert_eq!(stages[10], Some(4));
         assert_eq!(stages[12], Some(6));
         assert_eq!(stages[14], Some(6));
         assert_eq!(stages[15], Some(7));
         assert_eq!(stages[20], Some(8));
-        assert_eq!(stages[10], None);
     }
 
     #[test]

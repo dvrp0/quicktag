@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::material::{TfxBytecodePreview, TfxDecodeStatus};
+use crate::material::{
+    TfxBytecodePreview, TfxDecodeStatus, interpret_tfx_stack_with_runtime_values,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TfxValue {
@@ -18,6 +20,7 @@ pub struct TfxRuntimeInputs {
     pub object_channels: BTreeMap<u32, TfxValue>,
     pub global_channels: BTreeMap<u32, TfxValue>,
     pub gear_channels: BTreeMap<u32, TfxValue>,
+    pub context_values: BTreeMap<u32, TfxValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +51,7 @@ pub struct TfxExecutionResult {
 
 pub fn execute_preview(
     program: &TfxBytecodePreview,
+    constants: &[[f32; 4]],
     inputs: &TfxRuntimeInputs,
 ) -> TfxExecutionResult {
     let dependencies = program
@@ -61,8 +65,45 @@ pub fn execute_preview(
                 .is_some(),
         })
         .collect();
+    let vectors = |values: &BTreeMap<u32, TfxValue>| {
+        values
+            .iter()
+            .filter_map(|(key, value)| value.as_vector().map(|value| (*key, value)))
+            .collect::<HashMap<_, _>>()
+    };
+    let object_channels = vectors(&inputs.object_channels);
+    let global_channels = vectors(&inputs.global_channels);
+    let mut context_values = vectors(&inputs.context_values);
+    context_values.entry(0).or_insert([inputs.time_seconds; 4]);
+    let mut extern_values = HashMap::new();
+    for (scope, values) in [
+        ("Frame", &inputs.frame),
+        ("View", &inputs.view),
+        ("RigidModel", &inputs.object_channels),
+        ("EditorMesh", &inputs.object_channels),
+        ("GlobalChannel", &inputs.global_channels),
+        ("Gear", &inputs.gear_channels),
+        ("TextureSet", &inputs.gear_channels),
+    ] {
+        for (offset, value) in values {
+            if let Some(value) = value.as_vector() {
+                extern_values.insert((scope.to_string(), *offset), value);
+            }
+        }
+    }
+    extern_values
+        .entry(("Frame".to_string(), 0))
+        .or_insert([inputs.time_seconds; 4]);
+    let (bindings, expressions) = interpret_tfx_stack_with_runtime_values(
+        &program.ops,
+        constants,
+        &object_channels,
+        &extern_values,
+        &global_channels,
+        &context_values,
+    );
     let mut outputs = BTreeMap::new();
-    for expression in &program.expressions {
+    for expression in &expressions {
         outputs.insert(
             expression.target.clone(),
             expression
@@ -71,7 +112,7 @@ pub fn execute_preview(
                 .unwrap_or_else(|| TfxValue::Unknown(expression.expression.clone())),
         );
     }
-    for binding in &program.bindings {
+    for binding in &bindings {
         outputs.insert(
             format!("{} {}", binding.kind, binding.slot),
             TfxValue::TextureBinding {
@@ -99,6 +140,16 @@ pub fn execute_preview(
     }
 }
 
+impl TfxValue {
+    fn as_vector(&self) -> Option<[f32; 4]> {
+        match self {
+            Self::Scalar(value) => Some([*value; 4]),
+            Self::Vector(value) => Some(*value),
+            Self::TextureBinding { .. } | Self::Unknown(_) => None,
+        }
+    }
+}
+
 fn resolve_external<'a>(
     inputs: &'a TfxRuntimeInputs,
     scope: &str,
@@ -117,6 +168,7 @@ fn resolve_external<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::material::TfxBytecodeOpPreview;
 
     #[test]
     fn runtime_preserves_partial_state_and_trace() {
@@ -126,8 +178,43 @@ mod tests {
             undecoded_bytes: vec![0xff],
             ..Default::default()
         };
-        let result = execute_preview(&program, &TfxRuntimeInputs::default());
+        let result = execute_preview(&program, &[], &TfxRuntimeInputs::default());
         assert_eq!(result.status, TfxDecodeStatus::StoppedAtUnknown);
         assert_eq!(result.undecoded_bytes, [0xff]);
+    }
+
+    #[test]
+    fn runtime_re_evaluates_live_frame_and_time_inputs() {
+        let program = TfxBytecodePreview {
+            ops: vec![
+                TfxBytecodeOpPreview {
+                    offset: 0,
+                    opcode: 0x4a,
+                    name: "push_extern_float",
+                    detail: "Frame+0x0".into(),
+                    extern_scope_id: Some(0),
+                },
+                TfxBytecodeOpPreview {
+                    offset: 3,
+                    opcode: 0x53,
+                    name: "pop_output",
+                    detail: "element=7".into(),
+                    extern_scope_id: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let result = execute_preview(
+            &program,
+            &[],
+            &TfxRuntimeInputs {
+                time_seconds: 2.5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            result.outputs.get("output[7]"),
+            Some(&TfxValue::Vector([2.5; 4]))
+        );
     }
 }
