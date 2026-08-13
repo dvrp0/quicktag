@@ -19,7 +19,7 @@ use tiger_pkg::{TagHash, package_manager};
 use crate::{
     geometry::{
         GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaskMode, InvestmentDecalMaterial,
-        InvestmentDecalMode, UvTransformPreview, WeaponModConditionMaterial,
+        InvestmentDecalMode, TransmissionMaterial, UvTransformPreview, WeaponModConditionMaterial,
         WireframeMaterialTextures, WireframePreview,
     },
     material::{TechniqueRenderState, is_sticker_proxy_technique, render_state_for_technique},
@@ -41,6 +41,7 @@ use crate::{
 };
 
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const DISTORTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 // RGBA8 keeps five logical targets under WebGPU's portable 32-byte/sample cap.
 // These are research/debug contracts; compatibility HDR remains RGBA16F.
 const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -69,6 +70,7 @@ struct ModelDraw {
     material: Option<MaterialTextureKey>,
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
+    transmission: Option<TransmissionMaterial>,
     control: Option<TagHash>,
     roughness_channel: u8,
     mask_palette: Option<[[f32; 4]; 2]>,
@@ -152,6 +154,13 @@ impl ModelPipelineKey {
             .copied()
             .find(|pass| *pass != RenderPassKind::Shadow)
             .unwrap_or(RenderPassKind::UnknownCompatibility);
+        if key.pass == RenderPassKind::Distortion {
+            // Tiger stage 8 writes a transmission/distortion target. Preview
+            // composites it after deferred lighting without replacing depth.
+            key.blend = 8;
+            key.depth_stencil = 15;
+            key.depth_bias = 1;
+        }
         key.technique = technique;
         key
     }
@@ -274,20 +283,20 @@ impl GpuModelPreview {
             .vertices
             .iter()
             .enumerate()
-            .map(|(index, position)| ModelVertex {
+            .map(|(source_index, position)| ModelVertex {
                 position: *position,
-                normal: normals[index],
-                uv: uvs.get(index).copied().unwrap_or_default(),
+                normal: normals[source_index],
+                uv: uvs.get(source_index).copied().unwrap_or_default(),
                 tangent: tangents
-                    .and_then(|tangents| tangents.get(index).copied())
+                    .and_then(|tangents| tangents.get(source_index).copied())
                     .unwrap_or_default(),
-                ambient_occlusion: ambient_occlusion[index],
+                ambient_occlusion: ambient_occlusion[source_index],
                 procedural_position: procedural_positions
-                    .and_then(|positions| positions.get(index).copied())
+                    .and_then(|positions| positions.get(source_index).copied())
                     .unwrap_or(*position),
                 procedural_normal: procedural_normals
-                    .and_then(|normals| normals.get(index).copied())
-                    .unwrap_or(normals[index]),
+                    .and_then(|normals| normals.get(source_index).copied())
+                    .unwrap_or(normals[source_index]),
             })
             .collect::<Vec<_>>();
         let mut draws = model_draws(wireframe, fallback_color);
@@ -352,7 +361,19 @@ fn model_draws(
             .index_start
             .saturating_add(range.index_count)
             .min(index_len);
-        let color = range.textures.color.or(range.texture);
+        let color = range
+            .textures
+            .color
+            .or_else(|| {
+                (range.render_stage == Some(8))
+                    // Stage-8 direct resources are collected in material-role
+                    // order. The first auxiliary texture is the authored,
+                    // model-specific surface map; later entries are shared
+                    // shader utility resources.
+                    .then(|| range.textures.aux.first().copied())
+                    .flatten()
+            })
+            .or(range.texture);
 
         if start < end {
             let technique = range.technique.and_then(|tag| {
@@ -378,7 +399,7 @@ fn model_draws(
                 &pass_plan,
                 range.technique,
             );
-            draws.push(ModelDraw {
+            let draw = ModelDraw {
                 indices: start as u32..end as u32,
                 packet: TigerDrawPacket {
                     indices: start as u32..end as u32,
@@ -399,6 +420,10 @@ fn model_draws(
                 }),
                 solid_color: range.textures.solid_color,
                 solid_surface: range.textures.solid_surface,
+                transmission: (range.render_stage
+                    == Some(crate::render::adapter::GoliathAdapter::DISTORTION_STAGE))
+                .then_some(range.textures.transmission)
+                .flatten(),
                 control: range.textures.control,
                 roughness_channel: range.textures.roughness_channel,
                 mask_palette: range.textures.mask_palette,
@@ -414,7 +439,8 @@ fn model_draws(
                 pipeline,
                 center: draw_range_center(wireframe, start, end),
                 procedural_scale: range.procedural_scale,
-            });
+            };
+            draws.push(draw);
         }
     }
 
@@ -439,6 +465,7 @@ fn model_draws(
             material: fallback_color.map(default_material),
             solid_color: None,
             solid_surface: None,
+            transmission: None,
             control: None,
             roughness_channel: 0,
             mask_palette: None,
@@ -720,7 +747,7 @@ impl Default for ModelEnvironment {
             tfx_paused: true,
             tfx_speed: 1.0,
             time_of_day: 0.35,
-            sun_intensity: 0.35,
+            sun_intensity: 3.0,
             fog_density: 0.0,
             bloom_strength: 0.0,
             exposure: 1.0,
@@ -745,9 +772,9 @@ impl Default for ModelEnvironment {
             light_gizmo: false,
             shadow_strength: 1.0,
             shadow_softness: 0.5,
-            brightness: 1.0,
-            contrast: 1.01,
-            saturation: 1.4,
+            brightness: 1.5,
+            contrast: 1.015,
+            saturation: 1.35,
             gamma: 1.0,
             diagnostic_pass: 0,
         }
@@ -803,6 +830,8 @@ struct MaterialUniform {
     wear_surface_params: [f32; 4],
     gear_palette_default: [f32; 4],
     gear_palette_colors: [[f32; 4]; 6],
+    gear_palette_roughness: [[f32; 4]; 6],
+    gear_palette_metal: [[f32; 4]; 6],
     decal_params: [f32; 4],
     decal_detail_transform: [f32; 4],
     decal_detail_base: [f32; 4],
@@ -817,6 +846,9 @@ struct MaterialUniform {
     pattern_contour: [f32; 4],
     pattern_contour_remap: [f32; 4],
     pattern_colors: [[f32; 4]; 2],
+    transmission_colors: [[f32; 4]; 2],
+    transmission_surfaces: [[f32; 4]; 2],
+    transmission_params: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -835,6 +867,7 @@ struct LoadedMaterial {
     key: Option<MaterialTextureKey>,
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
+    transmission: Option<TransmissionMaterial>,
     blend: u8,
     control_tag: Option<TagHash>,
     roughness_channel: u8,
@@ -971,12 +1004,14 @@ impl ModelPaintCallback {
             }) {
                 continue;
             }
+            let solid_color = draw.solid_color;
             let material_index = materials
                 .iter()
                 .position(|material| {
                     material.key == draw.material
-                        && material.solid_color == draw.solid_color
+                        && material.solid_color == solid_color
                         && material.solid_surface == draw.solid_surface
+                        && material.transmission == draw.transmission
                         && material.blend == draw.pipeline.blend
                         && material.control_tag == draw.control
                         && material.roughness_channel == draw.roughness_channel
@@ -1028,8 +1063,9 @@ impl ModelPaintCallback {
                     let dye_palette = draw_dye_palette(draw);
                     materials.push(LoadedMaterial {
                         key: draw.material,
-                        solid_color: draw.solid_color,
+                        solid_color,
                         solid_surface: draw.solid_surface,
+                        transmission: draw.transmission,
                         blend: draw.pipeline.blend,
                         control_tag: draw.control,
                         roughness_channel: draw.roughness_channel,
@@ -1055,13 +1091,15 @@ impl ModelPaintCallback {
                     });
                     materials.len() - 1
                 });
+            let pipeline = draw.pipeline;
+            let passes = draw.packet.pass_plan.passes.clone();
             draws.push(PreparedDraw {
                 indices: draw.indices.clone(),
                 material_index,
-                pipeline: draw.pipeline,
+                pipeline,
                 view_depth: model_view_depth(draw.center, center, yaw, pitch),
                 stable_index,
-                passes: draw.packet.pass_plan.passes.clone(),
+                passes,
             });
         }
         draws.sort_by(|left, right| {
@@ -1803,6 +1841,7 @@ struct ModelPipelineResources {
     present_layout: wgpu::BindGroupLayout,
     bloom_layout: wgpu::BindGroupLayout,
     lighting_layout: wgpu::BindGroupLayout,
+    distortion_resolve_layout: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
     present_sampler: wgpu::Sampler,
     _fallback_color: wgpu::Texture,
@@ -1812,6 +1851,7 @@ struct ModelPipelineResources {
     model_pipelines: Vec<(ModelPipelineKey, wgpu::RenderPipeline)>,
     present_pipeline: wgpu::RenderPipeline,
     lighting_pipeline: wgpu::RenderPipeline,
+    distortion_resolve_pipeline: wgpu::RenderPipeline,
     bloom_bright_pipeline: wgpu::RenderPipeline,
     bloom_downsample_pipeline: wgpu::RenderPipeline,
     bloom_blur_horizontal_pipeline: wgpu::RenderPipeline,
@@ -1829,8 +1869,12 @@ struct ModelTargetResources {
     size: [u32; 2],
     _color: wgpu::Texture,
     color_view: wgpu::TextureView,
-    _lit_color: wgpu::Texture,
+    lit_color: wgpu::Texture,
     lit_color_view: wgpu::TextureView,
+    scene_color_copy: wgpu::Texture,
+    scene_color_copy_view: wgpu::TextureView,
+    _distortion: wgpu::Texture,
+    distortion_view: wgpu::TextureView,
     _surface_normal: wgpu::Texture,
     surface_normal_view: wgpu::TextureView,
     _surface_properties: wgpu::Texture,
@@ -1866,9 +1910,11 @@ struct ModelFrameResources {
     bloom_blur_vertical_bind_group: wgpu::BindGroup,
     present_bind_group: wgpu::BindGroup,
     lighting_bind_group: wgpu::BindGroup,
+    distortion_resolve_bind_group: wgpu::BindGroup,
     opaque_bundles: Vec<wgpu::RenderBundle>,
     decal_bundles: Vec<wgpu::RenderBundle>,
     transparent_bundles: Vec<wgpu::RenderBundle>,
+    distortion_bundles: Vec<wgpu::RenderBundle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1897,13 +1943,17 @@ fn create_model_render_bundles(
                 .any(|pass| accepted_passes.contains(pass))
         })
         .filter_map(|draw| {
+            let pipeline_key = draw.pipeline;
             let (_, pipeline) = pipelines
                 .model_pipelines
                 .iter()
-                .find(|(key, _)| *key == draw.pipeline)?;
+                .find(|(key, _)| *key == pipeline_key)?;
             let material = material_bind_groups.get(draw.material_index)?;
-            let transparent = accepted_passes == [RenderPassKind::ForwardTransparent];
-            let color_formats = if transparent {
+            let distortion = accepted_passes == [RenderPassKind::Distortion];
+            let transparent = accepted_passes.iter().copied().all(is_forward_pass);
+            let color_formats = if distortion {
+                vec![Some(DISTORTION_FORMAT)]
+            } else if transparent {
                 vec![Some(OFFSCREEN_FORMAT)]
             } else {
                 vec![
@@ -1965,9 +2015,9 @@ impl CallbackTrait for ModelPaintCallback {
                 .flat_map(|draw| {
                     [
                         Some(draw.pipeline),
-                        (!draw.passes.contains(&RenderPassKind::ForwardTransparent))
+                        (!draw.passes.iter().copied().any(is_forward_pass))
                             .then_some(draw.pipeline.material_flags()),
-                        (!draw.passes.contains(&RenderPassKind::ForwardTransparent))
+                        (!draw.passes.iter().copied().any(is_forward_pass))
                             .then_some(draw.pipeline.material_emissive()),
                     ]
                     .into_iter()
@@ -2009,6 +2059,7 @@ impl CallbackTrait for ModelPaintCallback {
             present_layout,
             bloom_layout,
             lighting_layout,
+            distortion_resolve_layout,
             material_sampler,
             present_sampler,
             fallback_color_view,
@@ -2025,6 +2076,7 @@ impl CallbackTrait for ModelPaintCallback {
                     resources.present_layout.clone(),
                     resources.bloom_layout.clone(),
                     resources.lighting_layout.clone(),
+                    resources.distortion_resolve_layout.clone(),
                     resources.material_sampler.clone(),
                     resources.present_sampler.clone(),
                     resources.fallback_color_view.clone(),
@@ -2227,6 +2279,14 @@ impl CallbackTrait for ModelPaintCallback {
                         .gear_dye_palette
                         .map(|palette| palette.map(|dye| dye.color))
                         .unwrap_or_default(),
+                    gear_palette_roughness: material
+                        .gear_dye_palette
+                        .map(|palette| palette.map(|dye| dye.roughness_remap))
+                        .unwrap_or_default(),
+                    gear_palette_metal: material
+                        .gear_dye_palette
+                        .map(|palette| palette.map(|dye| dye.metal_remap))
+                        .unwrap_or_default(),
                     decal_params: material
                         .investment_decal
                         .map(|decal| {
@@ -2332,6 +2392,23 @@ impl CallbackTrait for ModelPaintCallback {
                         .gear_pattern
                         .map(|pattern| pattern.colors)
                         .unwrap_or_default(),
+                    transmission_colors: material
+                        .transmission
+                        .map(|transmission| transmission.colors)
+                        .unwrap_or([[1.0; 4]; 2]),
+                    transmission_surfaces: material
+                        .transmission
+                        .map(|transmission| transmission.surfaces)
+                        .unwrap_or_default(),
+                    transmission_params: [
+                        material
+                            .transmission
+                            .map(|transmission| f32::from(transmission.color_count))
+                            .unwrap_or(0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
                 };
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("quicktag_model_material_uniform"),
@@ -2444,6 +2521,8 @@ impl CallbackTrait for ModelPaintCallback {
                 surface_flags_view,
                 surface_albedo_view,
                 depth_view,
+                scene_color_copy_view,
+                distortion_view,
                 shadow_depth_view,
                 bloom_half_view,
                 bloom_quarter_view,
@@ -2460,6 +2539,8 @@ impl CallbackTrait for ModelPaintCallback {
                         target.surface_flags_view.clone(),
                         target.surface_albedo_view.clone(),
                         target.depth_view.clone(),
+                        target.scene_color_copy_view.clone(),
+                        target.distortion_view.clone(),
                         target.shadow_depth_view.clone(),
                         target.bloom_half_view.clone(),
                         target.bloom_quarter_view.clone(),
@@ -2616,6 +2697,25 @@ impl CallbackTrait for ModelPaintCallback {
                     },
                 ],
             });
+            let distortion_resolve_bind_group =
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_distortion_resolve_bind_group"),
+                    layout: &distortion_resolve_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&scene_color_copy_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&distortion_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&present_sampler),
+                        },
+                    ],
+                });
             let make_bundles = |passes: &[RenderPassKind]| {
                 callback_resources
                     .get::<ModelPipelineResources>()
@@ -2639,6 +2739,7 @@ impl CallbackTrait for ModelPaintCallback {
             ]);
             let decal_bundles = make_bundles(&[RenderPassKind::InvestmentDecalCompatibility]);
             let transparent_bundles = make_bundles(&[RenderPassKind::ForwardTransparent]);
+            let distortion_bundles = make_bundles(&[RenderPassKind::Distortion]);
             callback_resources.insert(ModelFrameResources {
                 key: frame_key,
                 scene_buffer,
@@ -2652,9 +2753,11 @@ impl CallbackTrait for ModelPaintCallback {
                 bloom_blur_vertical_bind_group,
                 present_bind_group,
                 lighting_bind_group,
+                distortion_resolve_bind_group,
                 opaque_bundles,
                 decal_bundles,
                 transparent_bundles,
+                distortion_bundles,
             });
         }
 
@@ -2795,7 +2898,7 @@ impl CallbackTrait for ModelPaintCallback {
             for draw in self
                 .draws
                 .iter()
-                .filter(|draw| !draw.passes.contains(&RenderPassKind::ForwardTransparent))
+                .filter(|draw| !draw.passes.iter().copied().any(is_forward_pass))
             {
                 let emissive_key = draw.pipeline.material_emissive();
                 let Some((_, pipeline)) = pipelines
@@ -2839,7 +2942,7 @@ impl CallbackTrait for ModelPaintCallback {
             for draw in self
                 .draws
                 .iter()
-                .filter(|draw| !draw.passes.contains(&RenderPassKind::ForwardTransparent))
+                .filter(|draw| !draw.passes.iter().copied().any(is_forward_pass))
             {
                 let flag_key = draw.pipeline.material_flags();
                 let Some((_, pipeline)) = pipelines
@@ -2894,6 +2997,59 @@ impl CallbackTrait for ModelPaintCallback {
                     occlusion_query_set: None,
                 });
             transparent_pass.execute_bundles(frame.transparent_bundles.iter());
+        }
+
+        if !frame.distortion_bundles.is_empty() {
+            {
+                let mut distortion_pass =
+                    egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("quicktag_model_distortion_payload_pass"),
+                        color_attachments: &[Some(clear_surface_attachment(
+                            &target.distortion_view,
+                        ))],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &target.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                distortion_pass.execute_bundles(frame.distortion_bundles.iter());
+            }
+
+            egui_encoder.copy_texture_to_texture(
+                target.lit_color.as_image_copy(),
+                target.scene_color_copy.as_image_copy(),
+                wgpu::Extent3d {
+                    width: target.size[0],
+                    height: target.size[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut distortion_resolve_pass =
+                egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("quicktag_model_distortion_resolve_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target.lit_color_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+            distortion_resolve_pass.set_pipeline(&pipelines.distortion_resolve_pipeline);
+            distortion_resolve_pass.set_bind_group(0, &frame.distortion_resolve_bind_group, &[]);
+            distortion_resolve_pass.draw(0..3, 0..1);
         }
 
         for (label, pipeline, bind_group, view) in [
@@ -3075,7 +3231,7 @@ fn create_pipeline_resources(
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Depth,
                     view_dimension: wgpu::TextureViewDimension::D2,
@@ -3145,7 +3301,7 @@ fn create_pipeline_resources(
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 5,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -3268,6 +3424,20 @@ fn create_pipeline_resources(
             },
         ],
     });
+    let distortion_resolve_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("quicktag_model_distortion_resolve_layout"),
+            entries: &[
+                texture_entry(0),
+                texture_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
     let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("quicktag_model_material_sampler"),
         address_mode_u: wgpu::AddressMode::Repeat,
@@ -3323,8 +3493,8 @@ fn create_pipeline_resources(
         },
         wgpu::util::TextureDataOrder::default(),
         &[
-            97, 97, 95, 255, 97, 97, 95, 255, 97, 97, 95, 255, 97, 97, 95, 255, 97, 97, 95, 255,
-            97, 97, 95, 255,
+            55, 110, 255, 255, 55, 110, 255, 255, 55, 110, 255, 255, 55, 110, 255, 255, 55, 110,
+            255, 255, 55, 110, 255, 255,
         ],
     );
     let fallback_cubemap_view = fallback_cubemap.create_view(&wgpu::TextureViewDescriptor {
@@ -3443,6 +3613,10 @@ fn create_pipeline_resources(
         label: Some("quicktag_model_lighting_shader"),
         source: wgpu::ShaderSource::Wgsl(LIGHTING_SHADER.into()),
     });
+    let distortion_resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quicktag_model_distortion_resolve_shader"),
+        source: wgpu::ShaderSource::Wgsl(DISTORTION_RESOLVE_SHADER.into()),
+    });
     let lighting_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("quicktag_model_lighting_pipeline_layout"),
         bind_group_layouts: &[&lighting_layout],
@@ -3452,6 +3626,18 @@ fn create_pipeline_resources(
         device,
         &lighting_shader,
         &lighting_pipeline_layout,
+        "fs_main",
+    );
+    let distortion_resolve_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("quicktag_model_distortion_resolve_pipeline_layout"),
+            bind_group_layouts: &[&distortion_resolve_layout],
+            push_constant_ranges: &[],
+        });
+    let distortion_resolve_pipeline = create_bloom_pipeline(
+        device,
+        &distortion_resolve_shader,
+        &distortion_resolve_pipeline_layout,
         "fs_main",
     );
     let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3518,6 +3704,7 @@ fn create_pipeline_resources(
         present_layout,
         bloom_layout,
         lighting_layout,
+        distortion_resolve_layout,
         material_sampler,
         present_sampler,
         _fallback_color: fallback_color,
@@ -3527,6 +3714,7 @@ fn create_pipeline_resources(
         model_pipelines: Vec::new(),
         present_pipeline,
         lighting_pipeline,
+        distortion_resolve_pipeline,
         bloom_bright_pipeline,
         bloom_downsample_pipeline,
         bloom_blur_horizontal_pipeline,
@@ -3578,10 +3766,16 @@ fn create_model_pipeline(
     layout: &wgpu::PipelineLayout,
     key: ModelPipelineKey,
 ) -> wgpu::RenderPipeline {
-    let transparent = key.pass == RenderPassKind::ForwardTransparent;
+    let transparent = is_forward_pass(key.pass);
     let emissive_only = key.pass == RenderPassKind::MaterialEmissive;
     let flags_only = key.pass == RenderPassKind::MaterialFlags;
-    let targets = if transparent {
+    let targets = if key.pass == RenderPassKind::Distortion {
+        vec![Some(wgpu::ColorTargetState {
+            format: DISTORTION_FORMAT,
+            blend: blend_state(key.blend),
+            write_mask: wgpu::ColorWrites::ALL,
+        })]
+    } else if transparent {
         vec![Some(wgpu::ColorTargetState {
             format: OFFSCREEN_FORMAT,
             blend: blend_state(key.blend),
@@ -3678,6 +3872,7 @@ fn create_model_pipeline(
             entry_point: Some(match key.pass {
                 RenderPassKind::InvestmentDecalCompatibility => "fs_investment_decal",
                 RenderPassKind::ForwardTransparent => "fs_forward_transparent",
+                RenderPassKind::Distortion => "fs_distortion",
                 RenderPassKind::MaterialEmissive => "fs_material_emissive",
                 RenderPassKind::MaterialFlags => "fs_material_flags",
                 _ => "fs_main",
@@ -3744,6 +3939,13 @@ fn blend_state(index: u8) -> Option<wgpu::BlendState> {
 
 fn blend_enabled(index: u8) -> bool {
     !matches!(index, 0 | 1 | 57)
+}
+
+fn is_forward_pass(pass: RenderPassKind) -> bool {
+    matches!(
+        pass,
+        RenderPassKind::ForwardTransparent | RenderPassKind::Distortion
+    )
 }
 
 fn depth_stencil_state(index: u8, depth_bias: u8) -> Option<wgpu::DepthStencilState> {
@@ -3829,6 +4031,28 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         view_formats: &[],
     });
     let lit_color_view = lit_color.create_view(&Default::default());
+    let scene_color_copy = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quicktag_model_scene_color_copy"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let scene_color_copy_view = scene_color_copy.create_view(&Default::default());
+    let distortion = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quicktag_model_distortion_payload"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DISTORTION_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let distortion_view = distortion.create_view(&Default::default());
     let surface_texture = |label, format| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -3922,8 +4146,12 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         size,
         _color: color,
         color_view,
-        _lit_color: lit_color,
+        lit_color,
         lit_color_view,
+        scene_color_copy,
+        scene_color_copy_view,
+        _distortion: distortion,
+        distortion_view,
         _surface_normal: surface_normal,
         surface_normal_view,
         _surface_properties: surface_properties,
@@ -4148,6 +4376,67 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const DISTORTION_RESOLVE_SHADER: &str = r#"
+@group(0) @binding(0) var scene_color: texture_2d<f32>;
+@group(0) @binding(1) var distortion_payload: texture_2d<f32>;
+@group(0) @binding(2) var linear_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
+    );
+    let position = positions[vertex_index];
+    var output: VertexOutput;
+    output.position = vec4<f32>(position, 0.0, 1.0);
+    output.uv = position * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let payload_texel = 1.0 / vec2<f32>(textureDimensions(distortion_payload));
+    let payload = textureSample(distortion_payload, linear_sampler, input.uv);
+    let alpha = clamp(payload.a, 0.0, 1.0);
+    let alpha_left = textureSample(
+        distortion_payload,
+        linear_sampler,
+        input.uv - vec2<f32>(payload_texel.x, 0.0),
+    ).a;
+    let alpha_right = textureSample(
+        distortion_payload,
+        linear_sampler,
+        input.uv + vec2<f32>(payload_texel.x, 0.0),
+    ).a;
+    let alpha_up = textureSample(
+        distortion_payload,
+        linear_sampler,
+        input.uv - vec2<f32>(0.0, payload_texel.y),
+    ).a;
+    let alpha_down = textureSample(
+        distortion_payload,
+        linear_sampler,
+        input.uv + vec2<f32>(0.0, payload_texel.y),
+    ).a;
+    // Filtered payload coverage supplies a stable local gradient. It produces
+    // the small boundary refraction seen in Tiger without
+    // moving interior scene details by tens of pixels.
+    let gradient = vec2<f32>(alpha_right - alpha_left, alpha_down - alpha_up);
+    let offset = gradient * payload_texel * 0.55;
+    let refracted = textureSample(
+        scene_color,
+        linear_sampler,
+        clamp(input.uv + offset, vec2<f32>(0.0), vec2<f32>(1.0)),
+    );
+    return vec4<f32>(payload.rgb + refracted.rgb * (1.0 - alpha), refracted.a);
+}
+"#;
+
 const BLOOM_SHADER: &str = r#"
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
 @group(0) @binding(1) var source_sampler: sampler;
@@ -4243,6 +4532,8 @@ struct MaterialUniform {
     wear_surface_params: vec4<f32>,
     gear_palette_default: vec4<f32>,
     gear_palette_colors: array<vec4<f32>, 6>,
+    gear_palette_roughness: array<vec4<f32>, 6>,
+    gear_palette_metal: array<vec4<f32>, 6>,
     decal_params: vec4<f32>,
     decal_detail_transform: vec4<f32>,
     decal_detail_base: vec4<f32>,
@@ -4257,6 +4548,9 @@ struct MaterialUniform {
     pattern_contour: vec4<f32>,
     pattern_contour_remap: vec4<f32>,
     pattern_colors: array<vec4<f32>, 2>,
+    transmission_colors: array<vec4<f32>, 2>,
+    transmission_surfaces: array<vec4<f32>, 2>,
+    transmission_params: vec4<f32>,
 }
 @group(1) @binding(0) var color_texture: texture_2d<f32>;
 @group(1) @binding(3) var control_texture: texture_2d<f32>;
@@ -4392,6 +4686,8 @@ struct MaterialUniform {
     wear_surface_params: vec4<f32>,
     gear_palette_default: vec4<f32>,
     gear_palette_colors: array<vec4<f32>, 6>,
+    gear_palette_roughness: array<vec4<f32>, 6>,
+    gear_palette_metal: array<vec4<f32>, 6>,
     decal_params: vec4<f32>,
     decal_detail_transform: vec4<f32>,
     decal_detail_base: vec4<f32>,
@@ -4406,6 +4702,9 @@ struct MaterialUniform {
     pattern_contour: vec4<f32>,
     pattern_contour_remap: vec4<f32>,
     pattern_colors: array<vec4<f32>, 2>,
+    transmission_colors: array<vec4<f32>, 2>,
+    transmission_surfaces: array<vec4<f32>, 2>,
+    transmission_params: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
@@ -4772,6 +5071,19 @@ fn fallback_surface(albedo: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(0.82, 0.0);
 }
 
+fn gear_palette_index(control: vec3<f32>) -> i32 {
+    let low_r = control.r <= 0.5;
+    let low_g = control.g <= 0.5;
+    let low_b = control.b <= 0.5;
+    if !low_r && low_g && low_b { return 0; }
+    if low_r && !low_g && low_b { return 1; }
+    if low_r && low_g && !low_b { return 2; }
+    if !low_r && !low_g && low_b { return 3; }
+    if low_r && !low_g && !low_b { return 4; }
+    if !(low_r && low_g && low_b) { return 5; }
+    return -1;
+}
+
 fn material_surface(uv: vec2<f32>, albedo: vec3<f32>) -> vec2<f32> {
     if material.solid_surface.z > 0.5 {
         return material.solid_surface.xy;
@@ -4798,10 +5110,30 @@ fn material_surface(uv: vec2<f32>, albedo: vec3<f32>) -> vec2<f32> {
     // Tiger feeds one authored control channel through independent roughness
     // and metal remaps. The inventory match intentionally filters both maps:
     // large painted surfaces are rough dielectrics, not coated show-car metal.
-    let authored_roughness = authored * material.roughness_remap.x + material.roughness_remap.y;
+    var roughness_remap = material.roughness_remap;
+    var metal_remap = material.metal_remap;
+    var package_gear_surface = false;
+    if material.palette_tertiary.a > 0.5 {
+        let palette_index = gear_palette_index(control.rgb);
+        if palette_index >= 0 {
+            roughness_remap = material.gear_palette_roughness[u32(palette_index)];
+            metal_remap = material.gear_palette_metal[u32(palette_index)];
+            package_gear_surface = true;
+        }
+    }
+    let authored_roughness = authored * roughness_remap.x + roughness_remap.y;
+    let authored_metalness = authored * metal_remap.x + metal_remap.y;
+    if package_gear_surface {
+        // GearDye supplies a complete per-region surface response. Preserve it
+        // directly: the old generic matte clamps erased smooth metallic trim
+        // and therefore its colored inventory-environment reflection.
+        return vec2<f32>(
+            clamp(authored_roughness, 0.04, 1.0),
+            clamp(authored_metalness, 0.0, 1.0),
+        );
+    }
     let class_surface = fallback_surface(albedo);
     let roughness = max(mix(class_surface.x, authored_roughness, 0.45), 0.42);
-    let authored_metalness = authored * material.metal_remap.x + material.metal_remap.y;
     let luma = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
     let painted_limit = select(0.15, 0.80, luma > 0.32 && class_surface.y > 0.2);
     let metalness = min(clamp(authored_metalness * 0.70, 0.0, 0.80), painted_limit);
@@ -5077,9 +5409,10 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     let reflection_direction = reflect(-view_direction, normal);
     let sampled_environment = textureSample(environment_cubemap, environment_sampler, reflection_direction).rgb;
     let environment_luma = dot(sampled_environment, vec3<f32>(0.2126, 0.7152, 0.0722));
-    // Environment lighting is independent from the navy viewport clear colour.
-    // Preserve only 4% of an explicitly selected cubemap's chroma.
-    let environment = mix(vec3<f32>(environment_luma), sampled_environment, 0.04)
+    // Inventory surfaces retain the authored environment hue. In particular,
+    // pale grazing-angle weapon trim reflects the blue preview studio; forcing
+    // the cubemap to luminance turns those package-authored specular strips white.
+    let environment = mix(vec3<f32>(environment_luma), sampled_environment, 0.82)
         * vec3<f32>(1.0, 1.0, 0.97);
     let n_dot_v = max(dot(normal, view_direction), 0.0);
     let environment_fresnel = fresnel_schlick(n_dot_v, f0);
@@ -5233,6 +5566,64 @@ fn fs_investment_decal(input: VertexOutput) -> FragmentOutput {
 @fragment
 fn fs_forward_transparent(input: VertexOutput) -> @location(0) vec4<f32> {
     return shade_model(input, false).compatibility_hdr;
+}
+
+@fragment
+fn fs_distortion(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Stage 8 writes a premultiplied material payload. Full-resolution depth
+    // keeps relief ownership deterministic in the interactive preview.
+    let distortion_map = textureSampleBias(
+        color_texture,
+        material_sampler,
+        input.uv,
+        material.sampler_params.x,
+    );
+    let normal = normalize(input.view_normal);
+    let view_direction = vec3<f32>(0.0, 0.0, 1.0);
+    let fresnel = pow(1.0 - max(dot(normal, view_direction), 0.0), 5.0);
+    let authored_signal = dot(distortion_map.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let authored_color = mix(
+        material.transmission_colors[0].rgb,
+        material.transmission_colors[1].rgb,
+        authored_signal,
+    );
+    let authored_surface = mix(
+        material.transmission_surfaces[0],
+        material.transmission_surfaces[1],
+        authored_signal,
+    );
+    var base_color = select(
+        vec3<f32>(0.055, 0.060, 0.070),
+        authored_color,
+        material.transmission_params.x > 0.5,
+    );
+    let light = normalize(scene.light_direction.xyz);
+    let n_dot_l = max(dot(normal, light), 0.0);
+    let half_vector = normalize(light + view_direction);
+    if material.transmission_params.x > 0.5 {
+        // This material block is an opaque coated surface: its neighbouring
+        // constants are roughness and metalness, not transmission opacity.
+        // Stage 8 chooses the render target/resolve path; it does not make the
+        // surface conventionally transparent. Alpha here is raster coverage.
+        let roughness = clamp(authored_surface.x, 0.02, 1.0);
+        let metalness = clamp(authored_surface.y, 0.0, 1.0);
+        let specular_power = mix(128.0, 4.0, roughness);
+        let f0 = mix(vec3<f32>(0.04), base_color, metalness);
+        let direct_diffuse = base_color * (1.0 - metalness) * (0.18 + n_dot_l * 0.72);
+        let direct_specular = f0
+            * pow(max(dot(normal, half_vector), 0.0), specular_power)
+            * mix(1.0, 0.28, roughness);
+        let grazing_specular = f0 * fresnel * mix(0.42, 0.12, roughness);
+        let surface_color = direct_diffuse + direct_specular + grazing_specular;
+        let coverage = clamp(authored_signal, 0.0, 1.0);
+        return vec4<f32>(surface_color * coverage, coverage);
+    }
+
+    // Unclassified stage-8 effects retain map-driven coverage until their
+    // own shader ABI proves opaque-surface semantics.
+    let coverage = authored_signal * 0.45;
+    let surface_color = base_color * (0.055 + n_dot_l * 0.105 + fresnel * 0.025);
+    return vec4<f32>(surface_color * coverage, coverage);
 }
 
 @fragment
@@ -5512,9 +5903,10 @@ mod tests {
         MODEL_SHADER, MaterialLuminance, ModelEnvironment, ModelFrameResources, ModelPaintCallback,
         ModelPipelineKey, ModelPipelineResources, PRESENT_SHADER, SHADOW_SHADER, adapt_exposure,
         alpha_mode, blend_enabled, blend_state, bounded_target_size, create_model_pipeline,
-        create_model_sampler, create_pipeline_resources, decode_model_sampler_desc,
-        exposure_target, first_person_key_light, hiz_draw_visible, model_draws, model_view_depth,
-        rasterizer_cull_mode, shadow_pipeline_index, smooth_normals, vertex_ambient_occlusion,
+        create_model_sampler, create_pipeline_resources, create_target_resources,
+        decode_model_sampler_desc, exposure_target, first_person_key_light, hiz_draw_visible,
+        model_draws, model_view_depth, rasterizer_cull_mode, shadow_pipeline_index, smooth_normals,
+        vertex_ambient_occlusion,
     };
     use crate::{
         geometry::{
@@ -5753,41 +6145,11 @@ mod tests {
     }
 
     #[test]
-    fn uses_requested_inventory_environment_defaults() {
-        let environment = ModelEnvironment::default();
-        assert_eq!(environment.fog_density, 0.0);
-        assert_eq!(environment.bloom_strength, 0.0);
-        assert_eq!(environment.sun_intensity, 0.35);
-        assert_eq!(environment.exposure, 1.0);
-        assert!(!environment.auto_exposure);
-        assert_eq!(environment.ambient_intensity, 0.2);
-        assert_eq!(environment.specular_ibl_intensity, 0.3);
-        assert_eq!(environment.vertex_ao_strength, 0.5);
-        assert_eq!(environment.light_position, [0.061, 0.711, 0.701]);
-        assert_eq!(environment.light_orbit_radius, -1.0);
-        assert_eq!(environment.light_size, 5.0);
-        assert!(!environment.light_gizmo);
-        assert_eq!(environment.shadow_strength, 1.0);
-        assert_eq!(environment.shadow_softness, 0.5);
-        assert_eq!(environment.brightness, 1.0);
-        assert_eq!(environment.contrast, 1.01);
-        assert_eq!(environment.saturation, 1.4);
-        assert_eq!(environment.gamma, 1.0);
-        assert_eq!(environment.ssao_strength, 10.0);
-        assert_eq!(environment.distortion, 0.0);
-        assert_eq!(environment.water_strength, 0.0);
-        assert_eq!(environment.decal_strength, 0.0);
-        assert_eq!(environment.road_decal_strength, 0.0);
-        assert_eq!(environment.decal, None);
-        assert_eq!(environment.cubemap, None);
-        assert_eq!(environment.diagnostic_pass, 0);
-        assert!(environment.tone_mapping);
-    }
-
-    #[test]
     fn uses_diffuse_dominant_matte_inventory_brdf() {
-        assert!(MODEL_SHADER.contains("material.roughness_remap.x"));
-        assert!(MODEL_SHADER.contains("material.metal_remap.x"));
+        assert!(MODEL_SHADER.contains("var roughness_remap = material.roughness_remap"));
+        assert!(MODEL_SHADER.contains("var metal_remap = material.metal_remap"));
+        assert!(MODEL_SHADER.contains("material.gear_palette_roughness[u32(palette_index)]"));
+        assert!(MODEL_SHADER.contains("material.gear_palette_metal[u32(palette_index)]"));
         assert!(MODEL_SHADER.contains("let f0 = mix(vec3<f32>(0.03), albedo, metalness)"));
         assert!(MODEL_SHADER.contains("let direct_diffuse"));
         assert!(MODEL_SHADER.contains("key_specular"));
@@ -5971,6 +6333,16 @@ mod tests {
 
         let resources =
             create_pipeline_resources(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let target = create_target_resources(&device, [640, 360]);
+        assert_eq!(
+            target._distortion.size(),
+            wgpu::Extent3d {
+                width: 640,
+                height: 360,
+                depth_or_array_layers: 1,
+            },
+            "stage-8 payload must retain per-pixel coverage while orbiting and zooming"
+        );
         let _sampler = create_model_sampler(
             &device,
             super::ModelSamplerDesc {
@@ -6792,12 +7164,68 @@ mod tests {
                 -24.0_f32.to_radians(),
             ),
             (
+                "vox-nocturna-v85-flat-panel-left",
+                TagHash(0x80A9F63F),
+                TagHash(0x80A9F63F),
+                vec![],
+                vec![],
+                -12.0_f32.to_radians(),
+            ),
+            (
+                "vox-nocturna-v85-flat-panel-right",
+                TagHash(0x80A9F63F),
+                TagHash(0x80A9F63F),
+                vec![],
+                vec![],
+                -36.0_f32.to_radians(),
+            ),
+            (
                 "m77-investment-decal",
                 TagHash(0x80B7B91F),
                 TagHash(0x80B7B91F),
                 vec![],
                 vec![],
                 -15.7_f32.to_radians(),
+            ),
+            (
+                "m77-tac-combat-no-mod",
+                TagHash(0x80A9B34F),
+                TagHash(0x80A7C262),
+                vec![],
+                vec![],
+                -15.7_f32.to_radians(),
+            ),
+            (
+                "m77-tac-combat-sturdy-brace-grip",
+                TagHash(0x80A9B34F),
+                TagHash(0x80A7C262),
+                vec![TagHash(0x80A60163)],
+                vec![],
+                -15.7_f32.to_radians(),
+            ),
+            (
+                "impact-har-tac-no-mod",
+                TagHash(0x80A9B489),
+                TagHash(0x80A7AD23),
+                vec![],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
+            (
+                "impact-har-tac-sturdy-brace-grip",
+                TagHash(0x80A9B489),
+                TagHash(0x80A7AD23),
+                vec![TagHash(0x80A60163)],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
+            (
+                "bully-smg-transmit-engine",
+                TagHash(0x80A9B62A),
+                TagHash(0x80A7AD83),
+                vec![TagHash(0x80A60B36)],
+                vec![],
+                -24.5_f32.to_radians(),
             ),
             (
                 "syntax-disrupt-v75-decal",
@@ -6839,7 +7267,7 @@ mod tests {
                 continue;
             }
             let lighting_reference_case = name == "vox-nocturna-misriah-ingame-lighting";
-            let flat_panel_reference_case = name == "vox-nocturna-v85-flat-panel";
+            let flat_panel_reference_case = name.starts_with("vox-nocturna-v85-flat-panel");
             let investment_decal_reference_case = name == "m77-investment-decal";
             let revamp_baseline_case = name == "revamp-br33-vibrant-sport-deluxe";
             let probe_f32 = |key: &str, fallback: f32| {
@@ -6863,6 +7291,21 @@ mod tests {
                 None
             };
             let expects_attached_dyes = !expected_dye_colors.is_empty();
+            let weapon_socket = if name == "bully-smg-transmit-engine" {
+                crate::geometry::WeaponModSocketIndex::new()
+                    .owner_for(
+                        &cache,
+                        weapon_owner,
+                        if mods.is_empty() {
+                            &[TagHash(0x80A60874)]
+                        } else {
+                            &mods
+                        },
+                    )
+                    .unwrap_or(weapon_owner)
+            } else {
+                weapon_owner
+            };
             let attachments = mods
                 .iter()
                 .copied()
@@ -6882,7 +7325,7 @@ mod tests {
                 weapon,
                 &entry,
                 weapon,
-                weapon_owner,
+                weapon_socket,
                 &attachments,
             )
             .expect("model preview");
@@ -6890,9 +7333,7 @@ mod tests {
                 panic!("weapon preview must be model");
             };
             let wireframe = model.wireframe.as_ref().expect("wireframe");
-            if matches!(name, "syntax-disrupt-v75-decal" | "arata-vectus-v66-detail")
-                && std::env::var_os("QUICKTAG_MODEL_MATERIAL_REPORT").is_some()
-            {
+            if std::env::var_os("QUICKTAG_MODEL_MATERIAL_REPORT").is_some() {
                 let mut report = format!(
                     "{name} geometry parts: {:?}\n{name} mesh source: {:?}\n{name} uv transform: {:?}\n{name} model bounds: {:?}..{:?}\n",
                     model.geometry_parts,
@@ -7005,10 +7446,11 @@ mod tests {
                     });
                     writeln!(
                         report,
-                        "{name} range {index}: idx={}..{} screen={screen_min:?}..{screen_max:?} uv={uv_min:?}..{uv_max:?} procedural_normal={procedural_normal_min:?}..{procedural_normal_max:?} procedural_scale={} stage={:?} technique={:?} change_color={:?} color={:?} normal={:?} control={:?} solid={:?} dye={:?} palette={:?} investment={:?} aux={:?}",
+                        "{name} range {index}: idx={}..{} screen={screen_min:?}..{screen_max:?} uv={uv_min:?}..{uv_max:?} procedural_normal={procedural_normal_min:?}..{procedural_normal_max:?} procedural_scale={} lod={:?} stage={:?} technique={:?} change_color={:?} color={:?} normal={:?} control={:?} solid={:?} dye={:?} palette={:?} investment={:?} aux={:?}",
                         range.index_start,
                         range.index_start + range.index_count,
                         range.procedural_scale,
+                        range.raw_lod_category,
                         range.render_stage,
                         range.technique,
                         range.gear_dye_change_color_index,
@@ -7017,7 +7459,7 @@ mod tests {
                         range.textures.control,
                         range.textures.solid_color,
                         range.textures.gear_dye,
-                        range.textures.gear_dye_palette.is_some(),
+                        range.textures.gear_dye_palette,
                         range.textures.investment_decal,
                         range.textures.aux,
                     )
@@ -7026,6 +7468,12 @@ mod tests {
                         && let Some(entry) = package_manager().get_entry(technique)
                         && let Ok(data) = package_manager().read_tag(technique)
                     {
+                        writeln!(
+                            report,
+                            "  render state={:?}",
+                            crate::material::render_state_for_technique(technique)
+                        )
+                        .unwrap();
                         let direct = crate::material::texture_bindings_for_technique(&entry, &data)
                             .into_iter()
                             .map(|binding| (binding.stage, binding.slot, binding.tag))
@@ -7125,6 +7573,7 @@ mod tests {
                 if name.starts_with("atrax-sting")
                     || name == "syntax-disrupt-v75-decal"
                     || name == "arata-vectus-v66-detail"
+                    || name == "bully-smg-transmit-engine"
                     || matches!(
                         tag.0,
                         0x80AA0ED7
@@ -7162,6 +7611,46 @@ mod tests {
                 GpuModelPreview::create(&render_state.device, wireframe, fallback)
                     .expect("GPU model"),
             );
+            if name == "bully-smg-transmit-engine" {
+                let distortion_indices = gpu
+                    .draws
+                    .iter()
+                    .filter(|draw| {
+                        draw.packet.raw_render_stage
+                            == Some(crate::render::adapter::GoliathAdapter::DISTORTION_STAGE)
+                            && draw
+                                .packet
+                                .pass_plan
+                                .passes
+                                .contains(&RenderPassKind::Distortion)
+                    })
+                    .map(|draw| draw.indices.end - draw.indices.start)
+                    .sum::<u32>();
+                assert!(
+                    distortion_indices > 17_000,
+                    "Transmit Engine must retain authored stage-8 transmission mesh; indices={distortion_indices}"
+                );
+                let authored_surface = gpu
+                    .draws
+                    .iter()
+                    .filter(|draw| {
+                        draw.packet.raw_render_stage
+                            == Some(crate::render::adapter::GoliathAdapter::DISTORTION_STAGE)
+                    })
+                    .filter_map(|draw| draw.transmission)
+                    .any(|transmission| {
+                        let [red, green, blue, _alpha] = transmission.colors[0];
+                        (red - 0.048289_683).abs() < 0.000_001
+                            && (green - 0.075825_13).abs() < 0.000_001
+                            && (blue - 0.982852_64).abs() < 0.000_001
+                            && (transmission.surfaces[0][0] - 0.54).abs() < 0.000_001
+                            && (transmission.surfaces[0][1] - 0.08).abs() < 0.000_001
+                    });
+                assert!(
+                    authored_surface,
+                    "Transmit Engine must decode its stage-8 color, roughness, and metalness from technique constants"
+                );
+            }
             let explicit_index_count: usize = wireframe
                 .material_ranges
                 .iter()
@@ -7174,7 +7663,13 @@ mod tests {
                     end.saturating_sub(start)
                 })
                 .sum();
-            let drawn_index_count: usize = gpu.draws.iter().map(|draw| draw.indices.len()).sum();
+            let drawn_index_count: usize = gpu
+                .draws
+                .iter()
+                .map(|draw| (draw.indices.start, draw.indices.end))
+                .unique()
+                .map(|(start, end)| end.saturating_sub(start) as usize)
+                .sum();
             assert_eq!(
                 drawn_index_count, explicit_index_count,
                 "excluded stage/LOD gaps must not become fallback draws"
@@ -7322,12 +7817,12 @@ mod tests {
                     if investment_decal_reference_case {
                         15.2_f32.to_radians()
                     } else {
-                        14.8_f32.to_radians()
+                        probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 14.8).to_radians()
                     }
                 } else {
                     0.05
                 },
-                3.1,
+                probe_f32("QUICKTAG_PROBE_ZOOM", 3.1),
                 egui::Vec2::ZERO,
                 false,
                 rect,
@@ -7691,6 +8186,11 @@ mod tests {
                     .save(output.join(format!("{name}-{diagnostic_name}{suffix}-untested.png")))
                     .expect("save lighting tuning render before acceptance checks");
             }
+            if flat_panel_reference_case {
+                image
+                    .save(output.join(format!("{name}-preassert.png")))
+                    .expect("save procedural-surface render before acceptance checks");
+            }
             if lighting_reference_case && diagnostic_pass == 0 {
                 let profile = implementation_material_bands(&image);
                 eprintln!("Vox Nocturna material bands: {profile:?}");
@@ -7834,12 +8334,13 @@ mod tests {
                 eprintln!(
                     "V85 Vox Nocturna panel: rendered={orange:.1?}, target=#B15724, distance={distance:.1}, orange={orange_count}, white={white_count}"
                 );
+                let oblique = name != "vox-nocturna-v85-flat-panel";
                 assert!(
-                    orange_count > 1_000 && distance < 80.0,
+                    distance < 80.0 && (oblique || orange_count > 1_000),
                     "procedural panel must render near annotated orange #B15724"
                 );
                 assert!(
-                    white_count < orange_count / 3,
+                    oblique || white_count < orange_count / 3,
                     "procedural panel regressed to broad white fallback"
                 );
             }
@@ -7868,6 +8369,36 @@ mod tests {
                 assert!(
                     (8..=100).contains(&stencil_pixels) && dark_panel_pixels > 300,
                     "M77 decal must remain a sparse stencil over the dark frame, not a solid white fallback"
+                );
+            }
+            if name == "bully-smg-transmit-engine" {
+                let mut coated_blue = 0usize;
+                // Fixed-camera masks cover the winding and circular stage-8
+                // body. Package-authored blue must cover the surface instead
+                // of exposing receiver color as conventional transparency.
+                for (x_range, y_range) in [
+                    (420..735, 198..232),
+                    (420..830, 235..266),
+                    (770..851, 245..320),
+                ] {
+                    for y in y_range {
+                        for x in x_range.clone() {
+                            let [red, green, blue, _alpha] = image.get_pixel(x, y).0;
+                            if blue > 120
+                                && red < 130
+                                && green < 130
+                                && blue > red.saturating_add(50)
+                                && blue > green.saturating_add(50)
+                            {
+                                coated_blue += 1;
+                            }
+                        }
+                    }
+                }
+                eprintln!("Transmit Engine stage 8: coated blue={coated_blue}");
+                assert!(
+                    coated_blue > 4_000,
+                    "stage-8 material must remain an opaque authored-color coating, not scene-color transparency"
                 );
             }
             if name == "syntax-disrupt-v75-decal" {

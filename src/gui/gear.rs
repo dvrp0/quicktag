@@ -5793,6 +5793,52 @@ mod tests {
                 )))
                 .collect::<Vec<_>>()
         );
+
+        let mod_tags = fixture_mods
+            .iter()
+            .map(|(_, item)| item.model_tag)
+            .collect::<Vec<_>>();
+        let socket = crate::geometry::WeaponModSocketIndex::new()
+            .owner_for(&cache, weapon.owner_tag, &mod_tags)
+            .expect("BR33 socket owner");
+        let entry = tiger_pkg::package_manager()
+            .get_entry(skin.model_tag)
+            .expect("Vibrant Sport Pattern");
+        let attachments = fixture_mods
+            .iter()
+            .map(|(_, item)| crate::geometry::WeaponModPreviewAttachment {
+                model_tag: item.model_tag,
+                rarity: item.preview_rarity,
+                unique_id: 0.5,
+            })
+            .collect::<Vec<_>>();
+        let preview = crate::geometry::GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache.clone(),
+            skin.model_tag,
+            &entry,
+            weapon.owner_tag,
+            socket,
+            &attachments,
+        )
+        .expect("assembled BR33 fixture");
+        let crate::geometry::GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("BR33 fixture must be a model")
+        };
+        let wireframe = model.wireframe.expect("BR33 fixture wireframe");
+        let expected_palette =
+            crate::geometry::weapon_skin_gear_dye_palette(&cache, skin.model_tag)
+                .expect("Vibrant Sport GearDye palette");
+        let dyed_ranges = wireframe
+            .material_ranges
+            .iter()
+            .filter(|range| range.textures.gear_dye_palette.is_some())
+            .collect::<Vec<_>>();
+        assert!(!dyed_ranges.is_empty(), "fixture mods must consume GearDye");
+        assert!(dyed_ranges.iter().all(|range| {
+            let index = usize::from(range.gear_dye_change_color_index.expect("GearDye channel"));
+            range.textures.gear_dye_palette == Some(expected_palette)
+                && range.textures.gear_dye == expected_palette.get(index).copied()
+        }));
         eprintln!(
             "REVAMP_BR33_FIXTURE skin={} owner={} mods={:?}",
             skin.model_tag,
@@ -5807,6 +5853,472 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local updated Marathon package installation"]
+    fn applies_every_br33_skin_palette_to_every_br33_mod() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let weapon = catalog
+            .weapons
+            .iter()
+            .find(|weapon| weapon.name == "BR33 Volley Rifle")
+            .expect("BR33 Volley Rifle catalog entry");
+        let mods = weapon
+            .slots
+            .iter()
+            .flat_map(|slot| slot.mods.iter())
+            .unique_by(|modification| modification.model_tag)
+            .collect::<Vec<_>>();
+        assert!(!weapon.skins.is_empty(), "BR33 skins");
+        assert!(!mods.is_empty(), "BR33 mods");
+
+        for skin in &weapon.skins {
+            let expected_palette =
+                crate::geometry::weapon_skin_gear_dye_palette(&cache, skin.model_tag)
+                    .unwrap_or_else(|| {
+                        panic!("{} ({}) has no GearDye palette", skin.name, skin.model_tag)
+                    });
+            let entry = tiger_pkg::package_manager()
+                .get_entry(skin.model_tag)
+                .unwrap_or_else(|| panic!("missing skin Pattern {}", skin.model_tag));
+
+            for modification in &mods {
+                let socket = crate::geometry::WeaponModSocketIndex::new()
+                    .owner_for(&cache, weapon.owner_tag, &[modification.model_tag])
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} ({}) has no BR33 socket",
+                            modification.name, modification.model_tag
+                        )
+                    });
+                let attachment = crate::geometry::WeaponModPreviewAttachment {
+                    model_tag: modification.model_tag,
+                    rarity: modification.preview_rarity,
+                    unique_id: 0.5,
+                };
+                let preview =
+                    crate::geometry::GeometryTagPreview::load_model_with_weapon_mod_attachments(
+                        cache.clone(),
+                        skin.model_tag,
+                        &entry,
+                        weapon.owner_tag,
+                        socket,
+                        &[attachment],
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "could not assemble skin {} with mod {}",
+                            skin.model_tag, modification.model_tag
+                        )
+                    });
+                let crate::geometry::GeometryPreviewKind::Model(model) = preview.kind else {
+                    panic!("BR33 skin/mod preview must be a model")
+                };
+                let wireframe = model.wireframe.expect("BR33 skin/mod wireframe");
+                let dyed_ranges = wireframe
+                    .material_ranges
+                    .iter()
+                    .filter(|range| range.textures.gear_dye_palette.is_some())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !dyed_ranges.is_empty(),
+                    "{} ({}) on {} ({}) has no dyed material ranges",
+                    modification.name,
+                    modification.model_tag,
+                    skin.name,
+                    skin.model_tag
+                );
+                assert!(dyed_ranges.iter().all(|range| {
+                    let Some(index) = range.gear_dye_change_color_index.map(usize::from) else {
+                        return false;
+                    };
+                    range.textures.gear_dye_palette == Some(expected_palette)
+                        && range.textures.gear_dye == expected_palette.get(index).copied()
+                }));
+            }
+        }
+
+        eprintln!(
+            "verified {} BR33 skins x {} BR33 mods = {} GearDye assemblies",
+            weapon.skins.len(),
+            mods.len(),
+            weapon.skins.len() * mods.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local updated Marathon package installation"]
+    fn applies_crash_casket_palette_to_every_overrun_mod() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let weapon = catalog
+            .weapons
+            .iter()
+            .find(|weapon| weapon.name == "Overrun AR")
+            .expect("Overrun AR catalog entry");
+        let skin = weapon
+            .skins
+            .iter()
+            .find(|skin| skin.name == "Crash Casket")
+            .expect("Crash Casket skin");
+        assert_eq!(skin.model_tag, TagHash(0x80B7B76C));
+        let expected_palette =
+            crate::geometry::weapon_skin_gear_dye_palette(&cache, skin.model_tag)
+                .expect("Crash Casket GearDye palette");
+        assert_eq!(
+            expected_palette[4].color,
+            [0.021219, 0.107023, 0.491021, 1.0]
+        );
+        assert_eq!(
+            expected_palette[5].color,
+            [0.637597, 0.042311, 0.042311, 1.0]
+        );
+        let mods = weapon
+            .slots
+            .iter()
+            .flat_map(|slot| slot.mods.iter())
+            .unique_by(|modification| modification.model_tag)
+            .collect::<Vec<_>>();
+        assert_eq!(mods.len(), 15, "Overrun AR mod models");
+        let entry = tiger_pkg::package_manager()
+            .get_entry(skin.model_tag)
+            .expect("Crash Casket Pattern");
+
+        for modification in mods {
+            let socket = crate::geometry::WeaponModSocketIndex::new()
+                .owner_for(&cache, weapon.owner_tag, &[modification.model_tag])
+                .unwrap_or_else(|| panic!("{} has no Overrun socket", modification.name));
+            let attachment = crate::geometry::WeaponModPreviewAttachment {
+                model_tag: modification.model_tag,
+                rarity: modification.preview_rarity,
+                unique_id: 0.5,
+            };
+            let preview =
+                crate::geometry::GeometryTagPreview::load_model_with_weapon_mod_attachments(
+                    cache.clone(),
+                    skin.model_tag,
+                    &entry,
+                    weapon.owner_tag,
+                    socket,
+                    &[attachment],
+                )
+                .unwrap_or_else(|| panic!("could not assemble {}", modification.name));
+            let crate::geometry::GeometryPreviewKind::Model(model) = preview.kind else {
+                panic!("Crash Casket mod preview must be a model")
+            };
+            let dyed_ranges = model
+                .wireframe
+                .expect("Crash Casket mod wireframe")
+                .material_ranges
+                .into_iter()
+                .filter(|range| range.textures.gear_dye_palette.is_some())
+                .collect::<Vec<_>>();
+            assert!(
+                !dyed_ranges.is_empty(),
+                "{} ({}) has no dyed ranges",
+                modification.name,
+                modification.model_tag
+            );
+            assert!(dyed_ranges.iter().all(|range| {
+                let Some(index) = range.gear_dye_change_color_index.map(usize::from) else {
+                    return false;
+                };
+                range.textures.gear_dye_palette == Some(expected_palette)
+                    && range.textures.gear_dye == expected_palette.get(index).copied()
+            }));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local updated Marathon package installation"]
+    fn audits_every_catalog_weapon_skin_gear_dye_palette() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let mut checked = 0usize;
+        let mut object_channels = 0usize;
+        let mut legacy_singletons = 0usize;
+        let mut missing = vec![];
+        for weapon in &catalog.weapons {
+            for skin in &weapon.skins {
+                checked += 1;
+                match crate::geometry::weapon_skin_gear_dye_uses_object_channels(
+                    &cache,
+                    skin.model_tag,
+                ) {
+                    Some(true) => object_channels += 1,
+                    Some(false) => legacy_singletons += 1,
+                    None => {
+                        missing.push((weapon.name.as_str(), skin.name.as_str(), skin.model_tag))
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "catalog GearDye palettes: checked={checked} object_channels={object_channels} legacy_singletons={legacy_singletons} missing={}",
+            missing.len()
+        );
+        assert!(
+            missing.is_empty(),
+            "catalog weapon skins missing GearDye palettes: {missing:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local updated Marathon package installation"]
+    fn audits_every_catalog_weapon_skin_mod_gear_dye_contract() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let socket_index = crate::geometry::WeaponModSocketIndex::new();
+        let mut associations = 0usize;
+        let mut combinations = 0usize;
+        let mut failures = vec![];
+
+        for weapon in &catalog.weapons {
+            let mods = weapon
+                .slots
+                .iter()
+                .flat_map(|slot| slot.mods.iter())
+                .unique_by(|modification| modification.model_tag)
+                .collect::<Vec<_>>();
+            combinations += weapon.skins.len() * mods.len();
+            for modification in mods {
+                associations += 1;
+                if socket_index
+                    .owner_for(&cache, weapon.owner_tag, &[modification.model_tag])
+                    .is_none()
+                {
+                    failures.push((
+                        weapon.name.as_str(),
+                        modification.name.as_str(),
+                        modification.model_tag,
+                        "missing socket",
+                    ));
+                    continue;
+                }
+                let geometry =
+                    crate::geometry::weapon_mod_gear_dye_channels(&cache, modification.model_tag);
+                if geometry.is_empty() {
+                    failures.push((
+                        weapon.name.as_str(),
+                        modification.name.as_str(),
+                        modification.model_tag,
+                        "missing geometry",
+                    ));
+                } else if geometry
+                    .iter()
+                    .all(|(_geometry, channels)| channels.is_empty())
+                {
+                    failures.push((
+                        weapon.name.as_str(),
+                        modification.name.as_str(),
+                        modification.model_tag,
+                        "missing GearDye channels",
+                    ));
+                } else if geometry
+                    .iter()
+                    .flat_map(|(_geometry, channels)| channels)
+                    .any(|channel| *channel >= 6)
+                {
+                    failures.push((
+                        weapon.name.as_str(),
+                        modification.name.as_str(),
+                        modification.model_tag,
+                        "invalid GearDye channel",
+                    ));
+                }
+            }
+        }
+
+        eprintln!(
+            "catalog mod GearDye: associations={associations} skin_mod_combinations={combinations} failures={}",
+            failures.len()
+        );
+        assert!(
+            failures.is_empty(),
+            "catalog weapon mod GearDye contract failures: {failures:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local updated Marathon package installation"]
+    fn verifies_shared_grips_use_authored_weapon_socket_transforms() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let weapon = catalog
+            .weapons
+            .iter()
+            .find(|weapon| weapon.name == "M77 Assault Rifle")
+            .expect("M77 catalog entry");
+        let grips = weapon
+            .slots
+            .iter()
+            .find(|slot| slot.name == "Grip")
+            .expect("M77 grip slot")
+            .mods
+            .iter()
+            .unique_by(|modification| modification.model_tag)
+            .collect::<Vec<_>>();
+        assert_eq!(grips.len(), 4, "M77 grip model count");
+        let tags = grips
+            .iter()
+            .map(|modification| modification.model_tag)
+            .collect::<Vec<_>>();
+        let socket_index = crate::geometry::WeaponModSocketIndex::new();
+        let socket = socket_index
+            .owner_for(&cache, weapon.owner_tag, &tags)
+            .expect("M77 socket owner");
+        let impact = catalog
+            .weapons
+            .iter()
+            .find(|weapon| weapon.name == "Impact H-AR")
+            .expect("Impact catalog entry");
+        let impact_socket = socket_index
+            .owner_for(&cache, impact.owner_tag, &[TagHash(0x80A60163)])
+            .expect("Impact socket owner");
+        assert_eq!(socket, TagHash(0x80A7C09E));
+        assert_eq!(impact_socket, TagHash(0x80A7C165));
+        let impact_pose =
+            crate::geometry::weapon_mod_attachment_pose(&cache, impact_socket, TagHash(0x80A60163))
+                .expect("Impact Sturdy pose");
+        assert!((impact_pose.translation[0] - 0.24762633).abs() < 0.000_001);
+        assert!((impact_pose.translation[2] - 0.0621138).abs() < 0.000_001);
+        assert!((impact_pose.scale - 1.0).abs() < 0.000_001);
+        let reference_pose = crate::geometry::weapon_mod_attachment_pose(&cache, socket, tags[0])
+            .expect("M77 reference grip pose");
+        for grip in grips {
+            let pose = crate::geometry::weapon_mod_attachment_pose(&cache, socket, grip.model_tag)
+                .expect("M77 grip pose");
+            assert_eq!(pose.family_id, 0x88116137, "{} family", grip.name);
+            assert_eq!(pose.bone_index, 0, "{} bone", grip.name);
+            assert!(pose.rotation.iter().all(|value| value.is_finite()));
+            assert!(pose.translation.iter().all(|value| value.is_finite()));
+            assert!(pose.scale.is_finite() && pose.scale > 0.0);
+            if grip.model_tag == TagHash(0x80A60163) {
+                assert!((pose.translation[0] - 0.24254519).abs() < 0.000_001);
+                assert!((pose.translation[2] - 0.0811943).abs() < 0.000_001);
+            }
+
+            let bounds =
+                crate::geometry::debug_weapon_mod_geometry_bounds(&cache, grip.model_tag, pose);
+            assert!(!bounds.is_empty(), "{} geometry", grip.name);
+            for (_geometry, _raw_min, _raw_max, placed_min, placed_max) in bounds {
+                for axis in 0..3 {
+                    assert!(placed_min[axis].is_finite());
+                    assert!(placed_max[axis].is_finite());
+                    assert!(placed_min[axis] <= placed_max[axis]);
+                }
+            }
+        }
+
+        // Cosmetic M77 Patterns that carry their own socket signature resolve
+        // the same transform. Carbon Bloom and Crash Casket omit that duplicate
+        // table and intentionally fall back to the owning weapon above.
+        for skin in &weapon.skins {
+            let Some(skin_socket) = socket_index.owner_for(&cache, skin.model_tag, &tags) else {
+                continue;
+            };
+            let pose = crate::geometry::weapon_mod_attachment_pose(&cache, skin_socket, tags[0])
+                .unwrap_or_else(|| panic!("{} grip pose", skin.name));
+            assert_eq!(
+                pose.rotation, reference_pose.rotation,
+                "{} rotation",
+                skin.name
+            );
+            assert_eq!(pose.scale, reference_pose.scale, "{} scale", skin.name);
+            assert_eq!(
+                pose.translation, reference_pose.translation,
+                "{} translation",
+                skin.name
+            );
+        }
     }
 
     #[test]

@@ -316,6 +316,18 @@ pub struct WireframeMaterialTextures {
     pub solid_color: Option<[f32; 4]>,
     /// Authored `(roughness, metalness)` for a decoded textureless material.
     pub solid_surface: Option<[f32; 2]>,
+    /// Authored colour filters used by stage-8 transmission/distortion
+    /// shaders. Colours come from compiled pixel-shader material blocks;
+    /// stage 8 itself stores displacement, not a universal blue surface.
+    pub transmission: Option<TransmissionMaterial>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransmissionMaterial {
+    pub colors: [[f32; 4]; 2],
+    /// `(roughness, metalness, _, _)` paired with each decoded colour.
+    pub surfaces: [[f32; 4]; 2],
+    pub color_count: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +458,7 @@ impl Default for WireframeMaterialTextures {
             emissive_strength: 0,
             solid_color: None,
             solid_surface: None,
+            transmission: None,
         }
     }
 }
@@ -728,6 +741,7 @@ const CLASS_SKELETON_NODE_HIERARCHY: u32 = 0x8080AF42;
 const CLASS_SKELETON_TRANSFORMS: u32 = 0x8080BF47;
 const CLASS_VECTOR4: u32 = 0x80800090;
 const CLASS_PATTERN_VECTOR_BINDINGS: u32 = 0x8080AF85;
+const CLASS_PATTERN_OBJECT_CHANNELS: u32 = 0x8080AF86;
 const PATTERN_LOCAL_SCOPE_HASH: u32 = 0x811C9DC5;
 
 // The pattern compiler hashes the six material parameters independently from
@@ -759,6 +773,7 @@ pub struct WeaponModAttachmentPose {
     pub bone_index: u32,
     pub rotation: [f32; 4],
     pub translation: [f32; 3],
+    pub scale: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -800,15 +815,113 @@ pub fn weapon_mod_attachment_pose(
         .into_iter()
         .find(|(_node, pose)| pose.family_id == matched_family)
         .map(|(_node, pose)| pose)?;
-    if pose.bone_index != 0 {
-        let bone = weapon_skeleton_bone_transform(cache, weapon, pose.bone_index as usize)?;
+    let bone = weapon_skeleton_bone_transform(cache, weapon, pose.bone_index as usize);
+    if pose.bone_index != 0 && bone.is_none() {
+        return None;
+    }
+    if let Some(bone) = bone {
         let local_translation = pose.translation.map(|value| value * bone.scale);
         let rotated_translation = rotate_quaternion(local_translation, bone.rotation);
         pose.translation =
             std::array::from_fn(|axis| bone.translation[axis] + rotated_translation[axis]);
         pose.rotation = multiply_quaternions(bone.rotation, pose.rotation);
+        pose.scale *= bone.scale;
+    }
+    // A visual mod is itself a Pattern entity. Its visual binding names the
+    // local attachment frame that must meet the weapon socket. Tiger therefore
+    // places it as `weapon_socket * inverse(mod_attachment_frame)`, not by
+    // treating the mod mesh origin as the socket origin.
+    if let Some(anchor) = weapon_mod_local_attachment_anchor(cache, modification, matched_family) {
+        let socket = ObjectSpaceTransform {
+            rotation: pose.rotation,
+            translation: pose.translation,
+            scale: pose.scale,
+        };
+        let placed =
+            compose_object_space_transforms(socket, inverse_object_space_transform(anchor)?);
+        pose.rotation = placed.rotation;
+        pose.translation = placed.translation;
+        pose.scale = placed.scale;
     }
     Some(pose)
+}
+
+fn weapon_mod_local_attachment_anchor(
+    cache: &TagCache,
+    modification: TagHash,
+    socket_family: u32,
+) -> Option<ObjectSpaceTransform> {
+    let endian = package_manager().version.endian();
+    let anchor_families = descendant_pattern_nodes(cache, modification, 8)
+        .into_iter()
+        .filter_map(|node| package_manager().read_tag(node).ok())
+        .flat_map(|data| {
+            (0..data.len().saturating_sub(11))
+                .step_by(4)
+                .filter_map(move |offset| {
+                    (read_u32_at(&data, offset, endian) == Some(CLASS_WEAPON_MOD_VISUAL_BINDING)
+                        && read_u32_at(&data, offset + 4, endian) == Some(socket_family))
+                    .then(|| read_u32_at(&data, offset + 8, endian))
+                    .flatten()
+                    .filter(|family| *family != 0)
+                })
+                .collect_vec()
+        })
+        .unique()
+        .collect_vec();
+    let [anchor_family] = anchor_families.as_slice() else {
+        return None;
+    };
+
+    let mut anchors = descendant_pattern_nodes(cache, modification, 12)
+        .into_iter()
+        .flat_map(weapon_attachment_poses)
+        .filter(|pose| pose.family_id == *anchor_family)
+        .map(|pose| ObjectSpaceTransform {
+            rotation: pose.rotation,
+            translation: pose.translation,
+            scale: pose.scale,
+        });
+    let first = anchors.next()?;
+    anchors
+        .all(|anchor| object_space_transforms_match(first, anchor))
+        .then_some(first)
+}
+
+fn inverse_object_space_transform(transform: ObjectSpaceTransform) -> Option<ObjectSpaceTransform> {
+    (transform.scale.is_finite() && transform.scale.abs() > f32::EPSILON).then(|| {
+        let rotation = [
+            -transform.rotation[0],
+            -transform.rotation[1],
+            -transform.rotation[2],
+            transform.rotation[3],
+        ];
+        let inverse_scale = transform.scale.recip();
+        let translation = rotate_quaternion(
+            transform.translation.map(|value| -value * inverse_scale),
+            rotation,
+        );
+        ObjectSpaceTransform {
+            rotation,
+            translation,
+            scale: inverse_scale,
+        }
+    })
+}
+
+fn compose_object_space_transforms(
+    parent: ObjectSpaceTransform,
+    child: ObjectSpaceTransform,
+) -> ObjectSpaceTransform {
+    let local_translation = child.translation.map(|value| value * parent.scale);
+    let rotated_translation = rotate_quaternion(local_translation, parent.rotation);
+    ObjectSpaceTransform {
+        rotation: multiply_quaternions(parent.rotation, child.rotation),
+        translation: std::array::from_fn(|axis| {
+            parent.translation[axis] + rotated_translation[axis]
+        }),
+        scale: parent.scale * child.scale,
+    }
 }
 
 /// Geometry branch spawned by one visual-mod Pattern. Kept public so Models
@@ -823,6 +936,60 @@ pub fn weapon_mod_geometry_tags(cache: &TagCache, modification: TagHash) -> Vec<
     } else {
         pattern_nearest_geometry_tags(cache, modification)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn weapon_mod_gear_dye_channels(
+    cache: &TagCache,
+    modification: TagHash,
+) -> Vec<(TagHash, Vec<u8>)> {
+    weapon_mod_geometry_tags(cache, modification)
+        .into_iter()
+        .filter_map(|geometry| {
+            let entry = package_manager().get_entry(geometry)?;
+            let (_source, wireframe) = parse_model_wireframe(geometry, &entry)?;
+            let channels = wireframe
+                .material_ranges
+                .into_iter()
+                .filter_map(|range| range.gear_dye_change_color_index)
+                .unique()
+                .sorted_unstable()
+                .collect::<Vec<_>>();
+            Some((geometry, channels))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn debug_weapon_mod_geometry_bounds(
+    cache: &TagCache,
+    modification: TagHash,
+    pose: WeaponModAttachmentPose,
+) -> Vec<(TagHash, [f32; 3], [f32; 3], [f32; 3], [f32; 3])> {
+    weapon_mod_geometry_tags(cache, modification)
+        .into_iter()
+        .filter_map(|geometry| {
+            let entry = package_manager().get_entry(geometry)?;
+            let (_source, wireframe) = parse_model_wireframe(geometry, &entry)?;
+            let raw_min = wireframe.min;
+            let raw_max = wireframe.max;
+            let vertices = wireframe
+                .vertices
+                .into_iter()
+                .map(|vertex| {
+                    let local = vertex.map(|value| value * pose.scale);
+                    let rotated = rotate_quaternion(local, pose.rotation);
+                    [
+                        rotated[0] + pose.translation[0],
+                        rotated[1] + pose.translation[1],
+                        rotated[2] + pose.translation[2],
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let (placed_min, placed_max) = bounds(&vertices)?;
+            Some((geometry, raw_min, raw_max, placed_min, placed_max))
+        })
+        .collect()
 }
 
 /// Returns attachment Patterns spawned by the weapon Pattern when no runtime
@@ -1483,6 +1650,7 @@ fn weapon_attachment_poses(tag: TagHash) -> Vec<WeaponModAttachmentPose> {
                 bone_index,
                 rotation,
                 translation: [translation[0], translation[1], translation[2]],
+                scale: translation[3],
             })
         })
         .collect()
@@ -2065,10 +2233,27 @@ fn technique_default_gear_dye_color(technique: TagHash) -> Option<[f32; 4]> {
     valid_dye_color(color).then_some(color)
 }
 
-fn weapon_skin_gear_dye_palette(
+pub(crate) fn weapon_skin_gear_dye_palette(
     cache: &TagCache,
     selected_pattern: TagHash,
 ) -> Option<[GearDyeMaterial; 6]> {
+    weapon_skin_gear_dye_palette_with_source(cache, selected_pattern)
+        .map(|(palette, _object_channels)| palette)
+}
+
+#[cfg(test)]
+pub(crate) fn weapon_skin_gear_dye_uses_object_channels(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+) -> Option<bool> {
+    weapon_skin_gear_dye_palette_with_source(cache, selected_pattern)
+        .map(|(_palette, object_channels)| object_channels)
+}
+
+fn weapon_skin_gear_dye_palette_with_source(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+) -> Option<([GearDyeMaterial; 6], bool)> {
     let mut queue = std::collections::VecDeque::from([(selected_pattern, 0usize)]);
     let mut seen = rustc_hash::FxHashSet::default();
     seen.insert(selected_pattern);
@@ -2077,7 +2262,7 @@ fn weapon_skin_gear_dye_palette(
         let entry = package_manager().get_entry(tag)?;
         if entry.reference == CLASS_PATTERN_COMPONENT
             && let Ok(data) = package_manager().read_tag(tag)
-            && let Some(palette) = decode_weapon_skin_gear_dye_palette(&data)
+            && let Some(palette) = decode_weapon_skin_gear_dye_palette_with_source(&data)
         {
             return Some(palette);
         }
@@ -2107,16 +2292,62 @@ fn weapon_skin_gear_dye_palette(
 }
 
 fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 6]> {
+    decode_weapon_skin_gear_dye_palette_with_source(data).map(|(palette, _object_channels)| palette)
+}
+
+fn decode_weapon_skin_gear_dye_palette_with_source(
+    data: &[u8],
+) -> Option<([GearDyeMaterial; 6], bool)> {
     let endian = package_manager().version.endian();
     let arrays = scan_arrays(data, endian);
+    // Updated Goliath components bind parameters to object-channel expression
+    // records. Read each record's authored Vector4 constant by binding index;
+    // singleton Vector4 arrays alone lose gaps occupied by scalar expressions.
+    for binding_array in arrays
+        .iter()
+        .copied()
+        .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+    {
+        let parameter_indices = array_records(data, binding_array, 0x0c)
+            .into_iter()
+            .filter_map(|record| {
+                (read_u32_at(record, 0x00, endian)? == PATTERN_LOCAL_SCOPE_HASH).then_some(())?;
+                Some((
+                    read_u32_at(record, 0x04, endian)?,
+                    usize::try_from(read_u32_at(record, 0x08, endian)?).ok()?,
+                ))
+            })
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        for channel_array in arrays
+            .iter()
+            .copied()
+            .filter(|array| array.class == CLASS_PATTERN_OBJECT_CHANNELS)
+        {
+            let channel_records = array_records(data, channel_array, 0x70);
+            let parameter_vector = |parameter: u32| {
+                let index = *parameter_indices.get(&parameter)?;
+                let record = *channel_records.get(index)?;
+                (read_u32_at(record, 0, endian)? == parameter).then_some(())?;
+                let record_offset = channel_array.data_offset + index * 0x70;
+                let constants = read_array(data, record_offset + 0x18, 0x10, endian)?;
+                let mut value = read_vec4_f32(constants.get(..0x10)?, 0, endian)?;
+                value[3] = 1.0;
+                Some(value)
+            };
+            if let Some(palette) = decode_gear_dye_palette(parameter_vector) {
+                return Some((palette, true));
+            }
+        }
+    }
+
     let singleton_vectors = arrays
         .iter()
         .copied()
         .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
         .collect_vec();
-    if singleton_vectors.len() != 29 {
-        return None;
-    }
+    // Goliath Pattern components can carry unrelated extension vectors. The
+    // authored local-scope binding table, not a build-specific total count,
+    // identifies the 18 GearDye color/roughness/metal vectors.
     let vectors = singleton_vectors
         .iter()
         .copied()
@@ -2135,12 +2366,18 @@ fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 
             ))
         })
         .collect::<rustc_hash::FxHashMap<_, _>>();
-    let parameter_vector = |parameter: u32| {
+    decode_gear_dye_palette(|parameter| {
         parameter_indices
             .get(&parameter)
             .and_then(|index| vectors.get(*index))
             .copied()
-    };
+    })
+    .map(|palette| (palette, false))
+}
+
+fn decode_gear_dye_palette(
+    parameter_vector: impl Fn(u32) -> Option<[f32; 4]>,
+) -> Option<[GearDyeMaterial; 6]> {
     let palette = std::array::from_fn(|slot| GearDyeMaterial {
         color: parameter_vector(GEAR_DYE_COLOR_PARAMETERS[slot]).unwrap_or_default(),
         roughness_remap: parameter_vector(GEAR_DYE_ROUGHNESS_PARAMETERS[slot]).unwrap_or_default(),
@@ -2166,10 +2403,14 @@ fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 
 
 fn read_serialized_dye_vector(data: &[u8], array: TagArray, endian: Endian) -> Option<[f32; 4]> {
     let record = data.get(array.data_offset..array.data_offset + 0x10)?;
+    read_dye_vector(record, endian)
+}
+
+fn read_dye_vector(record: &[u8], endian: Endian) -> Option<[f32; 4]> {
     Some([
-        read_f32(&record[0x0..0x4], endian),
-        read_f32(&record[0x4..0x8], endian),
-        read_f32(&record[0x8..0xc], endian),
+        read_f32(record.get(0x0..0x4)?, endian),
+        read_f32(record.get(0x4..0x8)?, endian),
+        read_f32(record.get(0x8..0xc)?, endian),
         1.0,
     ])
 }
@@ -2207,7 +2448,8 @@ fn apply_weapon_mod_attachment_poses(
             wireframe.procedural_normals = wireframe.normals.clone();
         }
         for vertex in &mut wireframe.vertices {
-            let rotated = rotate_quaternion(*vertex, pose.rotation);
+            let local = vertex.map(|value| value * pose.scale);
+            let rotated = rotate_quaternion(local, pose.rotation);
             *vertex = [
                 rotated[0] + pose.translation[0],
                 rotated[1] + pose.translation[1],
@@ -3041,6 +3283,7 @@ fn material_textures_for_technique(
     }
 
     promote_auxiliary_preview_color(&mut material, technique);
+    material.transmission = transmission_material_for_technique(technique);
 
     if material.color.is_none()
         && let Some(flat) = textureless_flat_material_for_technique(technique)
@@ -3055,6 +3298,98 @@ fn material_textures_for_technique(
     }
 
     material
+}
+
+/// Decode common stage-8 transmission material block.
+///
+/// Marathon surface permutations keep each base colour followed by metalness
+/// at +17 vectors and roughness at +21. Transmission permutations reuse this
+/// ABI for one or two absorption colours. Locating relative surface fields
+/// avoids shader/tag/weapon-specific constant indices.
+fn transmission_material_for_technique(technique: TagHash) -> Option<TransmissionMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let constants = &preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .inline_constants;
+    transmission_material_from_constants(constants)
+}
+
+fn transmission_material_from_constants(constants: &[[f32; 4]]) -> Option<TransmissionMaterial> {
+    let mut candidates = Vec::new();
+    for (index, mut color) in constants.iter().copied().enumerate() {
+        let Some(metalness) = constants.get(index + 17).map(|value| value[0]) else {
+            continue;
+        };
+        let Some(roughness) = constants.get(index + 21).map(|value| value[0]) else {
+            continue;
+        };
+        let valid_color = color[..3]
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            && color[..3].iter().filter(|value| **value > 0.001).count() >= 2
+            && color[3].is_finite()
+            && (0.0..=1.0).contains(&color[3]);
+        if valid_color
+            && metalness.is_finite()
+            && (0.0..=1.0).contains(&metalness)
+            && roughness.is_finite()
+            && (0.02..=1.0).contains(&roughness)
+        {
+            color[3] = 1.0;
+            candidates.push((index, color, [roughness, metalness, 0.0, 0.0]));
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Procedural surface blocks carry the same epsilon sentinel used by the
+    // compiled stage-8 shader. Other inline constants can coincidentally look
+    // like valid colour/surface tuples (Vox Nocturna has white and green false
+    // positives before its authored orange block), so sentinel-backed tuples
+    // take precedence. Older permutations without the sentinel retain the
+    // relative-offset fallback.
+    let marked = candidates
+        .iter()
+        .filter(|(index, _, _)| {
+            constants
+                .get(index.saturating_sub(1))
+                .is_some_and(|marker| {
+                    (0.0001..=0.01).contains(&marker[0])
+                        && marker[1..].iter().all(|value| value.abs() < 0.0001)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected = if marked.is_empty() {
+        &candidates
+    } else {
+        &marked
+    };
+    let mut colors = Vec::with_capacity(2);
+    let mut surfaces = Vec::with_capacity(2);
+    for (_, color, surface) in selected {
+        if !colors.contains(color) {
+            colors.push(*color);
+            surfaces.push(*surface);
+        }
+        if colors.len() == 2 {
+            break;
+        }
+    }
+    let color_count = colors.len() as u8;
+    colors.resize(2, colors[0]);
+    surfaces.resize(2, surfaces[0]);
+    Some(TransmissionMaterial {
+        colors: [colors[0], colors[1]],
+        surfaces: [surfaces[0], surfaces[1]],
+        color_count,
+    })
 }
 
 /// Resolve an opaque material whose authored colour is a shared atlas.
@@ -3371,27 +3706,69 @@ fn textureless_flat_material_for_technique(technique: TagHash) -> Option<Texture
         expression.target == "output[3]"
             && expression.expression.contains("object_channel(0xC9A5E5AC)")
     });
-    if !sends_frame_color || !sends_selector {
-        return None;
+    if sends_frame_color && sends_selector {
+        let color = *pixel.inline_constants.get(1)?;
+        let epsilon = pixel.inline_constants.get(4)?.first().copied()?;
+        if !color.iter().all(|value| value.is_finite())
+            || !color[..3].iter().all(|value| (0.0..=1.0).contains(value))
+            || !(0.0..=0.001).contains(&epsilon)
+        {
+            return None;
+        }
+        let metalness = pixel
+            .inline_constants
+            .get(36)
+            .map(|value| value[0].clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        return Some(TexturelessFlatMaterial {
+            color,
+            roughness: 0.5,
+            metalness,
+        });
     }
 
-    let color = *pixel.inline_constants.get(1)?;
-    let epsilon = pixel.inline_constants.get(4)?.first().copied()?;
+    // Animated textureless panels can build their base colour through a TFX
+    // spline/gradient instead of storing one fixed inline vector. Evaluate
+    // every authored object-channel dependency at the preview default (zero),
+    // then consume the proven colour output. Syntax Disrupt resolves through
+    // this path to the gradient's [0.0, 0.4, 1.0, 1.0] endpoint.
+    let color_target = pixel.bytecode.expressions.iter().find(|expression| {
+        expression.target == "output[0]"
+            && expression.expression.contains("gradient4_const")
+            && expression.expression.contains("object_channel(")
+    })?;
+    let object_channels = pixel
+        .bytecode
+        .ops
+        .iter()
+        .filter(|op| op.name == "push_object_channel")
+        .filter_map(|op| {
+            let hash = op.detail.strip_prefix("0x")?;
+            Some((u32::from_str_radix(hash, 16).ok()?, [0.0; 4]))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if object_channels.is_empty() {
+        return None;
+    }
+    let (_bindings, expressions) = interpret_tfx_stack_with_object_channels(
+        &pixel.bytecode.ops,
+        &pixel.constants,
+        &object_channels,
+    );
+    let color = expressions
+        .iter()
+        .find(|expression| expression.target == color_target.target)
+        .and_then(|expression| expression.value)?;
     if !color.iter().all(|value| value.is_finite())
-        || !color[..3].iter().all(|value| (0.0..=1.0).contains(value))
-        || !(0.0..=0.001).contains(&epsilon)
+        || !color.iter().all(|value| (0.0..=1.0).contains(value))
+        || color[3] <= 0.001
     {
         return None;
     }
-    let metalness = pixel
-        .inline_constants
-        .get(36)
-        .map(|value| value[0].clamp(0.0, 1.0))
-        .unwrap_or(0.0);
     Some(TexturelessFlatMaterial {
         color,
         roughness: 0.5,
-        metalness,
+        metalness: 0.0,
     })
 }
 
@@ -5224,8 +5601,9 @@ fn preview_part_indices_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<usize>> {
-    const PREVIEW_STAGES: [usize; 5] = [0, 1, 2, 6, 7];
-    if boundaries.len() <= PREVIEW_STAGES.into_iter().max()? + 1
+    const PREVIEW_STAGES: [usize; 6] = [0, 1, 2, 6, 7, 8];
+    let preview_stages = PREVIEW_STAGES;
+    if boundaries.len() <= preview_stages.iter().copied().max()? + 1
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -5233,7 +5611,7 @@ fn preview_part_indices_from_boundaries(
     }
 
     Some(
-        PREVIEW_STAGES
+        preview_stages
             .into_iter()
             .flat_map(|stage| boundaries[stage]..boundaries[stage + 1])
             .unique()
@@ -5245,8 +5623,9 @@ fn preview_part_stages_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<Option<u8>>> {
-    const PREVIEW_STAGES: [usize; 5] = [0, 1, 2, 6, 7];
-    if boundaries.len() <= PREVIEW_STAGES.into_iter().max()? + 1
+    const PREVIEW_STAGES: [usize; 6] = [0, 1, 2, 6, 7, 8];
+    let preview_stages = PREVIEW_STAGES;
+    if boundaries.len() <= preview_stages.iter().copied().max()? + 1
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -5254,7 +5633,7 @@ fn preview_part_stages_from_boundaries(
     }
 
     let mut stages = vec![None; part_count];
-    for stage in PREVIEW_STAGES {
+    for stage in preview_stages {
         for part in boundaries[stage]..boundaries[stage + 1] {
             stages[part] = Some(stage as u8);
         }
@@ -6359,12 +6738,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_authored_stage8_transmission_color_by_relative_surface_abi() {
+        let mut constants = vec![[0.0; 4]; 40];
+        constants[18] = [0.048289_683, 0.075825_13, 0.982852_64, 0.0];
+        constants[35][0] = 0.08;
+        constants[39][0] = 0.54;
+
+        let material = transmission_material_from_constants(&constants).expect("transmission");
+        assert_eq!(material.color_count, 1);
+        assert_eq!(
+            material.colors[0],
+            [0.048289_683, 0.075825_13, 0.982852_64, 1.0]
+        );
+        assert_eq!(material.colors[1], material.colors[0]);
+        assert_eq!(material.surfaces[0], [0.54, 0.08, 0.0, 0.0]);
+        assert_eq!(material.surfaces[1], material.surfaces[0]);
+    }
+
+    #[test]
+    fn decodes_two_authored_stage8_transmission_colors_without_scalar_markers() {
+        let mut constants = vec![[0.0; 4]; 40];
+        constants[14] = [0.0477528, 0.0, 0.0, 0.0];
+        constants[15] = [0.03514347, 0.040455855, 0.039489966, 0.0];
+        constants[16] = [0.03721612, 0.047669638, 0.0518929, 0.0];
+        constants[32][0] = 1.0;
+        constants[33][0] = 0.5;
+        constants[36][0] = 0.6;
+        constants[37][0] = 0.54;
+
+        let material = transmission_material_from_constants(&constants).expect("transmission");
+        assert_eq!(material.color_count, 2);
+        assert_eq!(
+            material.colors[0],
+            [0.03514347, 0.040455855, 0.039489966, 1.0]
+        );
+        assert_eq!(
+            material.colors[1],
+            [0.03721612, 0.047669638, 0.0518929, 1.0]
+        );
+        assert_eq!(material.surfaces[0], [0.6, 1.0, 0.0, 0.0]);
+        assert_eq!(material.surfaces[1], [0.54, 0.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn stage8_epsilon_marker_rejects_earlier_false_surface_candidates() {
+        let mut constants = vec![[0.0; 4]; 44];
+        constants[13] = [1.0, 1.0, 1.0, 0.0];
+        constants[17] = [0.32, 0.68, 0.0, 0.0];
+        constants[30][0] = 0.0;
+        constants[34][0] = 1.0;
+        constants[38][0] = 1.0;
+        constants[21] = [0.003, 0.0, 0.0, 0.0];
+        constants[22] = [0.44368514, 0.18800727, 0.035853356, 0.0];
+        constants[39][0] = 0.08;
+        constants[43][0] = 0.54;
+
+        let material = transmission_material_from_constants(&constants).expect("transmission");
+        assert_eq!(material.color_count, 1);
+        assert_eq!(
+            material.colors[0],
+            [0.44368514, 0.18800727, 0.035853356, 1.0]
+        );
+        assert_eq!(material.surfaces[0], [0.54, 0.08, 0.0, 0.0]);
+    }
+
+    #[test]
     fn rotates_decorator_instances_with_normalized_quaternions() {
         let half = std::f32::consts::FRAC_1_SQRT_2;
         let rotated = rotate_quaternion([1.0, 0.0, 0.0], [0.0, 0.0, half, half]);
         assert!(rotated[0].abs() < 0.0001);
         assert!((rotated[1] - 1.0).abs() < 0.0001);
         assert!(rotated[2].abs() < 0.0001);
+    }
+
+    #[test]
+    fn composes_weapon_socket_with_inverse_mod_attachment_anchor() {
+        let socket = ObjectSpaceTransform {
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            translation: [0.2903411, 0.0, 0.0811943],
+            scale: 1.0,
+        };
+        let anchor = ObjectSpaceTransform {
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            translation: [0.04779592, 0.0, 0.0],
+            scale: 1.0,
+        };
+        let placed = compose_object_space_transforms(
+            socket,
+            inverse_object_space_transform(anchor).expect("invertible attachment anchor"),
+        );
+        assert!((placed.translation[0] - 0.24254519).abs() < 0.000_001);
+        assert!((placed.translation[1]).abs() < 0.000_001);
+        assert!((placed.translation[2] - 0.0811943).abs() < 0.000_001);
+        assert_eq!(placed.rotation, socket.rotation);
+        assert_eq!(placed.scale, socket.scale);
     }
 
     #[test]
@@ -7149,6 +7616,14 @@ mod tests {
         assert_eq!(
             supplemental.textures.solid_color,
             Some([0.44368514, 0.18800727, 0.035853356, 1.0])
+        );
+        assert_eq!(
+            supplemental.textures.transmission,
+            Some(TransmissionMaterial {
+                colors: [[0.44368514, 0.18800727, 0.035853356, 1.0]; 2],
+                surfaces: [[0.54, 0.08, 0.0, 0.0]; 2],
+                color_count: 1,
+            })
         );
         assert_eq!(supplemental.textures.solid_surface, Some([0.54, 0.08]));
         assert_eq!(supplemental.textures.gear_dye, None);
@@ -10915,20 +11390,21 @@ mod tests {
 
     #[test]
     fn selects_visible_marathon_render_stages() {
-        let boundaries = [0, 6, 6, 9, 9, 12, 12, 15, 18, 18];
+        let boundaries = [0, 6, 6, 9, 9, 12, 12, 15, 18, 21];
         assert_eq!(
-            preview_part_indices_from_boundaries(&boundaries, 18),
-            Some((0..9).chain(12..18).collect())
+            preview_part_indices_from_boundaries(&boundaries, 21),
+            Some((0..9).chain(12..21).collect())
         );
         assert!(preview_part_indices_from_boundaries(&[0, 3, 2], 3).is_none());
 
-        let stages = preview_part_stages_from_boundaries(&boundaries, 18).expect("stage map");
+        let stages = preview_part_stages_from_boundaries(&boundaries, 21).expect("stage map");
         assert_eq!(stages[0], Some(0));
         assert_eq!(stages[4], Some(0));
         assert_eq!(stages[8], Some(2));
         assert_eq!(stages[12], Some(6));
         assert_eq!(stages[14], Some(6));
         assert_eq!(stages[15], Some(7));
+        assert_eq!(stages[20], Some(8));
         assert_eq!(stages[10], None);
     }
 
@@ -11014,6 +11490,7 @@ mod tests {
                 bone_index: 0,
                 rotation: [0.0, 0.0, half_sqrt, half_sqrt],
                 translation: [5.0, 6.0, 7.0],
+                scale: 2.0,
             },
             rarity: Some(WeaponModRarity::Enhanced),
             unique_id: 0.25,
@@ -11023,7 +11500,7 @@ mod tests {
         apply_weapon_mod_attachment_poses(&mut parts, &[attachment]);
 
         let transformed = &parts[0].2;
-        for (actual, expected) in transformed.vertices[0].into_iter().zip([5.0, 7.0, 7.0]) {
+        for (actual, expected) in transformed.vertices[0].into_iter().zip([5.0, 8.0, 7.0]) {
             assert!((actual - expected).abs() < 0.000_01);
         }
         assert_eq!(

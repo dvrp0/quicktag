@@ -14,6 +14,7 @@ pub enum RenderPassKind {
     AlphaTestedCompatibility,
     InvestmentDecalCompatibility,
     ForwardTransparent,
+    Distortion,
     UnknownCompatibility,
     MaterialEmissive,
     MaterialFlags,
@@ -32,6 +33,13 @@ impl DrawPassPlan {
         state: TechniqueRenderState,
         material: &MaterialIR,
     ) -> Self {
+        if raw_stage == Some(GoliathAdapter::DISTORTION_STAGE) {
+            return Self {
+                evidence: EvidenceLevel::Confirmed,
+                passes: vec![RenderPassKind::Distortion],
+                warnings: vec![],
+            };
+        }
         let blended = state
             .blend
             .is_some_and(|index| !matches!(index, 0 | 1 | 57));
@@ -94,5 +102,17 @@ mod tests {
         let plan = DrawPassPlan::derive(None, TechniqueRenderState::default(), &material);
         assert_eq!(plan.passes, [RenderPassKind::UnknownCompatibility]);
         assert!(!plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn distortion_stage_uses_forward_distortion_pass() {
+        let material = MaterialIR::classify(&WireframeMaterialTextures::default());
+        let plan = DrawPassPlan::derive(
+            Some(GoliathAdapter::DISTORTION_STAGE),
+            TechniqueRenderState::default(),
+            &material,
+        );
+        assert_eq!(plan.passes, [RenderPassKind::Distortion]);
+        assert_eq!(plan.evidence, EvidenceLevel::Confirmed);
     }
 }

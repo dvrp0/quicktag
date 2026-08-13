@@ -18,15 +18,20 @@ pub struct GoliathAdapter;
 impl GoliathAdapter {
     pub const ADAPTER_VERSION: &'static str = "goliath-render-v1";
     pub const OBSERVED_STAGE_RANGE_COUNT: usize = 25;
+    pub const DISTORTION_STAGE: u8 = 8;
 
     pub fn stage(raw: u8) -> StageInterpretation {
         StageInterpretation {
             raw: RawRenderStageId(raw),
-            semantic_hint: (raw == 0).then_some("observed primary entity stage"),
-            evidence: if raw == 0 {
-                EvidenceLevel::StronglyCorrelated
-            } else {
-                EvidenceLevel::Unknown
+            semantic_hint: match raw {
+                0 => Some("observed primary entity stage"),
+                Self::DISTORTION_STAGE => Some("distortion"),
+                _ => None,
+            },
+            evidence: match raw {
+                Self::DISTORTION_STAGE => EvidenceLevel::Confirmed,
+                0 => EvidenceLevel::StronglyCorrelated,
+                _ => EvidenceLevel::Unknown,
             },
         }
     }
@@ -57,5 +62,12 @@ mod tests {
         assert_eq!(stage.raw, RawRenderStageId(24));
         assert_eq!(stage.evidence, EvidenceLevel::Unknown);
         assert!(stage.semantic_hint.is_none());
+    }
+
+    #[test]
+    fn identifies_authored_distortion_stage() {
+        let stage = GoliathAdapter::stage(GoliathAdapter::DISTORTION_STAGE);
+        assert_eq!(stage.semantic_hint, Some("distortion"));
+        assert_eq!(stage.evidence, EvidenceLevel::Confirmed);
     }
 }
