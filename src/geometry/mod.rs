@@ -33,6 +33,7 @@ const CLASS_ENTITY_RESOURCE: u32 = 0x80809B06;
 const CLASS_PATTERN: u32 = 0x8080BAAD;
 const CLASS_PATTERN_COMPONENT: u32 = 0x8080BADB;
 const CLASS_DECORATOR: u32 = 0x80806C98;
+const SEMANTIC_POSITION: u8 = 0x00;
 const SEMANTIC_NORMAL: u8 = 0x03;
 const SEMANTIC_TEXCOORD: u8 = 0x05;
 const SEMANTIC_TANGENT: u8 = 0x06;
@@ -257,6 +258,9 @@ pub struct WireframePreview {
     pub position_format: &'static str,
     pub uv_format: Option<String>,
     pub vertices: Vec<[f32; 3]>,
+    /// Rigid skeleton node selected by POSITION.w. Present only for layouts
+    /// whose fourth position component is an authored bone index.
+    pub rigid_indices: Option<Vec<u16>>,
     pub normals: Option<Vec<[f32; 3]>>,
     /// Raw shader-input POSITION consumed by common-surface procedural passes.
     /// For `R16G16B16A16_SNORM` geometry this is the hardware-decoded
@@ -299,12 +303,131 @@ pub struct GearDyeMaterial {
     pub metal_remap: [f32; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CharacterSurfaceMaterial {
+    /// 1 = common detail-gate, 2 = palette-mask, 3 = physical-only common surface.
+    pub mode: u8,
+    pub surface: TagHash,
+    pub selector: TagHash,
+    pub detail_color: TagHash,
+    pub detail_normal: TagHash,
+    /// Optional object-space procedural field used by palette-mask runner
+    /// shaders (Arata t2). Kept separate from the UV selector and normal map.
+    pub procedural: Option<TagHash>,
+    pub detail_transform: [f32; 4],
+    pub detail_base: [f32; 4],
+    pub detail_scale: [f32; 4],
+    pub detail_gate: f32,
+    pub extra: [[f32; 4]; 2],
+    pub palette: [[f32; 4]; 2],
+    pub procedural_constants: [[f32; 4]; 11],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunnerLayeredSurfaceMaterial {
+    /// 1 = full9 dual gated layers, 2 = t1.r switched dual layer,
+    /// 3 = full10 four-layer runner surface, 4 = procedural full9 dual layer,
+    /// 5 = t1.r-gated single detail layer, 6 = local full9 four-detail stack,
+    /// 8 = procedural full8 with a t1.r-gated t3 detail over base t4,
+    /// 9 = local full10 three-detail stack, 10 = full11 four-detail stack,
+    /// 11 = full10 A/G/B/R-gated three-detail stack,
+    /// 12 = local full11 A/G/B/R-gated three-detail stack,
+    /// 13 = A/B/R selected three-detail stack, 14 = G/B/R selected stack,
+    /// 15 = procedural A/B/G/R-gated dual-detail stack,
+    /// 16 = A/B-gated dual-detail stack with material response,
+    /// 17 = A/G/B/R-selected four-detail stack,
+    /// 18 = G/B/R-selected dual-detail stack with material response,
+    /// 19 = procedural pattern/mask surface with an authored detail normal,
+    /// 20 = G/B/R-selected stack with two authored R variants,
+    /// 21 = A/G/B/R-selected stack with two authored R variants,
+    /// 22 = A/G-gated stack with a B-selected authored detail and response,
+    /// 23 = local full9 stack with response, 24 = expanded local full9 with response,
+    /// 25 = local three-detail stack with response,
+    /// 26 = A/G-gated B/R-selected dual-detail stack,
+    /// 27 = G/B/R-selected stack with two R variants plus response/AO,
+    /// 28 = procedural A/G/B/R stack with response/AO,
+    /// 29 = A/G-gated dual B/R switch stack,
+    /// 30 = A/G/B/R-gated procedural stack with response/AO,
+    /// 31 = character full11 A/B/R-selected three-detail stack,
+    /// 32 = character full13 A/G/B/R-selected four-detail stack,
+    /// 33 = character full11 A/B/R stack sharing the B/R detail texture,
+    /// 34 = procedural character full11 A/G/B/R stack,
+    /// 35 = compact character A/R-selected dual-detail stack,
+    /// 36 = local panel R-selected single-detail stack with response,
+    /// 37 = package-394 full13 A/G/B/R four-detail stack,
+    /// 41 = runner skin/subsurface surface with authored pore mask and AO,
+    /// 42/43 = generated procedural full12/compact sibling stacks.
+    pub mode: u8,
+    /// Packed surface/selector response sampled at the mesh UV.
+    pub surface: TagHash,
+    /// Optional two-channel field sampled at the mesh UV. Red controls the
+    /// layered normal response and green contributes authored roughness.
+    pub material_response: Option<TagHash>,
+    /// Authored detail normals selected by channels from the packed surface.
+    pub detail_normal_a: TagHash,
+    pub detail_normal_b: TagHash,
+    pub detail_normal_c: Option<TagHash>,
+    pub detail_normal_d: Option<TagHash>,
+    /// Optional object-space procedural field used by generated runner
+    /// material branches. It shares no draw ABI with weapon gear patterns.
+    pub procedural: Option<TagHash>,
+    /// Optional authored sRGB colour mask. This is independent from the
+    /// packed selector, material-response, and object-space procedural maps.
+    pub color_overlay: Option<TagHash>,
+    /// Shader-family constants for the optional colour layer. Kept separate
+    /// from normal-stack constants because wide runner shaders use all 24
+    /// normal rows already.
+    pub color_overlay_constants: [[f32; 4]; 7],
+    /// Optional runner condition stack: UV scratch mask, RG distortion field,
+    /// and UV breakup field. This ABI occupies t9..t11 in 80A9E4DB.
+    pub procedural_wear: Option<[TagHash; 3]>,
+    /// Shader-family constants in the semantic layout decoded below.
+    pub constants: [[f32; 4]; 24],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerOcclusionMaterial {
+    pub texture: TagHash,
+    pub channel: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlphaMaskMaterial {
+    /// PS t1 scalar coverage texture. Tiger samples this independently from
+    /// the t0 colour texture; using t0 alpha turns runner cutouts into blocks.
+    pub texture: TagHash,
+    /// Coverage = sample.r * remap[1] + remap[0]. Some compiled runner
+    /// surfaces amplify their scalar mask before the authored cutoff.
+    pub remap: [f32; 2],
+    pub threshold: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SharedAtlasDetailMaterial {
+    /// Linear PS t1 field multiplied into the direct sRGB PS t0 atlas.
+    pub detail: TagHash,
+    pub projection: [f32; 4],
+    pub exponent: f32,
+    pub base: [f32; 3],
+    pub scale: [f32; 3],
+}
+
 #[derive(Debug, Clone)]
 pub struct WireframeMaterialTextures {
     pub color: Option<TagHash>,
     pub normal: Option<TagHash>,
     pub emissive: Option<TagHash>,
     pub control: Option<TagHash>,
+    /// Compiled character common-surface ABI. PS t0 remains local albedo; this
+    /// block preserves t1/t2/t3/t7 and the constants that compose detail.
+    pub character_surface: Option<CharacterSurfaceMaterial>,
+    /// Additional packed/detail layers consumed by audited runner shaders.
+    pub runner_layered_surface: Option<RunnerLayeredSurfaceMaterial>,
+    /// Independent runner AO mask. The audited alpha/physical shader averages
+    /// this scalar with its geometry/procedural occlusion before RT2.g.
+    pub runner_occlusion: Option<RunnerOcclusionMaterial>,
+    pub alpha_mask: Option<AlphaMaskMaterial>,
+    pub shared_atlas_detail: Option<SharedAtlasDetailMaterial>,
     pub roughness_channel: u8,
     pub sampler: Option<TagHash>,
     pub aux: Vec<TagHash>,
@@ -315,6 +438,7 @@ pub struct WireframeMaterialTextures {
     pub gear_dye_default: Option<[f32; 4]>,
     pub gear_dye_palette: Option<[GearDyeMaterial; 6]>,
     pub mod_wear: Option<WeaponModConditionMaterial>,
+    pub surface_condition: Option<WeaponSurfaceConditionMaterial>,
     /// Object-space contour/detail layer decoded from the common gear surface
     /// shader. The control map selects which material IDs receive the layer;
     /// the bound field texture perturbs the authored tri-planar line function.
@@ -446,6 +570,32 @@ pub struct WeaponModConditionMaterial {
     pub rarity: Option<WeaponModRarity>,
 }
 
+/// Common weapon-body condition pass. Unlike detachable-mod wear, this ABI
+/// owns one packed breakup field at PS t6 and changes albedo, roughness, and
+/// detail-normal response together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeaponSurfaceConditionMaterial {
+    /// PS t2 authored material response. Common weapon shaders remap red to
+    /// G-buffer metalness; it is not the control atlas roughness channel.
+    pub response: TagHash,
+    /// PS t4 object-space material-detail field selected by t3 RGB IDs.
+    pub detail: TagHash,
+    pub breakup: TagHash,
+    pub detail_projection: [f32; 4],
+    pub detail_exponent: f32,
+    /// Material-class fallback roughness mixed with PS t3.a by the projected
+    /// t4 field. These are physical-surface parameters, never albedo gains.
+    pub detail_roughness: f32,
+    pub detail_remap: [f32; 2],
+    pub projection: [f32; 4],
+    pub phase: f32,
+    pub triangle: [f32; 4],
+    pub orientation: [f32; 2],
+    pub albedo: [f32; 3],
+    pub roughness: f32,
+    pub normal_flatten: f32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WireframeMaterialLayer {
     pub color: Option<TagHash>,
@@ -460,6 +610,11 @@ impl Default for WireframeMaterialTextures {
             normal: None,
             emissive: None,
             control: None,
+            character_surface: None,
+            runner_layered_surface: None,
+            runner_occlusion: None,
+            alpha_mask: None,
+            shared_atlas_detail: None,
             roughness_channel: 0,
             sampler: None,
             aux: vec![],
@@ -470,6 +625,7 @@ impl Default for WireframeMaterialTextures {
             gear_dye_default: None,
             gear_dye_palette: None,
             mod_wear: None,
+            surface_condition: None,
             gear_pattern: None,
             authored_shared_atlas: false,
             investment_decal: None,
@@ -679,15 +835,44 @@ impl GeometryTagPreview {
             ));
         }
         model_tags = model_tags.into_iter().unique().collect();
+        let mut model = load_model_preview_from_tags(
+            cache.clone(),
+            combination.head,
+            &entry,
+            "Combined runner shell",
+            model_tags,
+            &[],
+        );
+        if let Some(palette) = runner_shell_gear_dye_palette(&cache, combination) {
+            if let Some(wireframe) = &mut model.wireframe {
+                for range in &mut wireframe.material_ranges {
+                    let Some(technique) = range.technique else {
+                        continue;
+                    };
+                    let default = technique_default_gear_dye_color(technique).or_else(|| {
+                        range
+                            .textures
+                            .character_surface
+                            .is_some()
+                            .then_some([1.0; 4])
+                    });
+                    let Some(default) = default else {
+                        continue;
+                    };
+                    let Some(dye) = range
+                        .gear_dye_change_color_index
+                        .and_then(|index| palette.get(index as usize).copied())
+                    else {
+                        continue;
+                    };
+                    range.textures.gear_dye_palette = Some(palette);
+                    range.textures.gear_dye = Some(dye);
+                    range.textures.gear_dye_default = Some(default);
+                }
+            }
+        }
         Some(Self {
-            kind: GeometryPreviewKind::Model(load_model_preview_from_tags(
-                cache,
-                combination.head,
-                &entry,
-                "Combined runner shell",
-                model_tags,
-                &[],
-            )),
+            kind: GeometryPreviewKind::Model(model),
         })
     }
 
@@ -833,6 +1018,13 @@ struct ObjectSpaceTransform {
     rotation: [f32; 4],
     translation: [f32; 3],
     scale: f32,
+}
+
+#[derive(Debug, Clone)]
+struct SkeletonPreview {
+    node_hashes: Vec<u32>,
+    parents: Vec<i32>,
+    transforms: Vec<ObjectSpaceTransform>,
 }
 
 /// Resolves a mod pattern against the selected weapon's authored socket table.
@@ -1598,27 +1790,325 @@ fn object_space_transforms_match(left: ObjectSpaceTransform, right: ObjectSpaceT
 }
 
 fn skeleton_bone_transform(tag: TagHash, bone_index: usize) -> Option<ObjectSpaceTransform> {
+    skeleton_object_space_transforms(tag)
+        .get(bone_index)
+        .copied()
+}
+
+fn skeleton_object_space_transforms(tag: TagHash) -> Vec<ObjectSpaceTransform> {
+    let endian = package_manager().version.endian();
+    let Ok(data) = package_manager().read_tag(tag) else {
+        return vec![];
+    };
+    let arrays = scan_arrays(&data, endian);
+    let Some(hierarchy_index) = arrays
+        .iter()
+        .position(|array| array.class == CLASS_SKELETON_NODE_HIERARCHY)
+    else {
+        return vec![];
+    };
+    let hierarchy_count = arrays[hierarchy_index].count;
+    let Some(transforms) = arrays
+        .iter()
+        .skip(hierarchy_index + 1)
+        .find(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == hierarchy_count)
+    else {
+        return vec![];
+    };
+    array_records(&data, *transforms, 0x20)
+        .into_iter()
+        .filter_map(|record| {
+            let rotation = read_vec4_f32(record, 0, endian)?;
+            let translation = read_vec4_f32(record, 0x10, endian)?;
+            Some(ObjectSpaceTransform {
+                rotation,
+                translation: [translation[0], translation[1], translation[2]],
+                scale: translation[3],
+            })
+        })
+        .collect()
+}
+
+fn skeleton_preview(tag: TagHash) -> Option<SkeletonPreview> {
     let endian = package_manager().version.endian();
     let data = package_manager().read_tag(tag).ok()?;
     let arrays = scan_arrays(&data, endian);
-    let hierarchy_index = arrays.iter().position(|array| {
-        array.class == CLASS_SKELETON_NODE_HIERARCHY && array.count > bone_index
-    })?;
-    let hierarchy_count = arrays[hierarchy_index].count;
+    let hierarchy_index = arrays
+        .iter()
+        .position(|array| array.class == CLASS_SKELETON_NODE_HIERARCHY)?;
+    let hierarchy = arrays[hierarchy_index];
     let transforms = arrays
         .iter()
         .skip(hierarchy_index + 1)
-        .find(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == hierarchy_count)?;
-    let record = array_records(&data, *transforms, 0x20)
-        .get(bone_index)
-        .copied()?;
-    let rotation = read_vec4_f32(record, 0, endian)?;
-    let translation = read_vec4_f32(record, 0x10, endian)?;
-    Some(ObjectSpaceTransform {
-        rotation,
-        translation: [translation[0], translation[1], translation[2]],
-        scale: translation[3],
-    })
+        .find(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == hierarchy.count)?;
+    let hierarchy_records = array_records(&data, hierarchy, 0x10);
+    let node_hashes = hierarchy_records
+        .iter()
+        .filter_map(|record| read_u32_at(record, 0, endian))
+        .collect_vec();
+    let parents = hierarchy_records
+        .iter()
+        .filter_map(|record| read_u32_at(record, 4, endian).map(|value| value as i32))
+        .collect_vec();
+    let transforms = array_records(&data, *transforms, 0x20)
+        .into_iter()
+        .filter_map(|record| {
+            let rotation = read_vec4_f32(record, 0, endian)?;
+            let translation = read_vec4_f32(record, 0x10, endian)?;
+            Some(ObjectSpaceTransform {
+                rotation,
+                translation: [translation[0], translation[1], translation[2]],
+                scale: translation[3],
+            })
+        })
+        .collect_vec();
+    (node_hashes.len() == hierarchy.count
+        && parents.len() == hierarchy.count
+        && transforms.len() == hierarchy.count)
+        .then_some(SkeletonPreview {
+            node_hashes,
+            parents,
+            transforms,
+        })
+}
+
+fn related_skeletons(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+    model_tags: impl IntoIterator<Item = TagHash>,
+) -> Vec<SkeletonPreview> {
+    let mut frontier = std::collections::VecDeque::from_iter(
+        std::iter::once(selected_pattern)
+            .chain(model_tags)
+            .map(|tag| (tag, 0_usize)),
+    );
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut candidates = rustc_hash::FxHashSet::default();
+    while let Some((tag, depth)) = frontier.pop_front() {
+        if !seen.insert(tag) {
+            continue;
+        }
+        candidates.insert(tag);
+        if depth >= 6 {
+            continue;
+        }
+        let neighbors = pattern_graph_children(cache, tag).into_iter().chain(
+            cache
+                .hashes
+                .get(&tag)
+                .into_iter()
+                .flat_map(|scan| scan.references.iter().copied()),
+        );
+        for neighbor in neighbors.unique() {
+            if package_manager().get_entry(neighbor).is_some_and(|entry| {
+                matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+            }) {
+                frontier.push_back((neighbor, depth + 1));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            package_manager()
+                .get_entry(*candidate)
+                .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
+        })
+        .filter_map(skeleton_preview)
+        .collect()
+}
+
+fn apply_inventory_rigid_chain_visibility(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+    parts: &mut [(TagHash, MeshSourcePreview, WireframePreview)],
+) {
+    let skeletons = related_skeletons(cache, selected_pattern, parts.iter().map(|part| part.0));
+    if skeletons.is_empty() {
+        return;
+    }
+    for (_tag, _source, wireframe) in parts {
+        let Some(rigid_indices) = wireframe.rigid_indices.as_ref() else {
+            continue;
+        };
+        if rigid_indices.len() != wireframe.vertices.len() {
+            continue;
+        }
+        let mut counts = rustc_hash::FxHashMap::<usize, usize>::default();
+        for index in rigid_indices {
+            *counts.entry(*index as usize).or_default() += 1;
+        }
+        let best = skeletons
+            .iter()
+            .filter_map(|skeleton| {
+                let chain = longest_repeated_rigid_chain(skeleton, &counts);
+                (!chain.is_empty()).then_some((skeleton, chain))
+            })
+            .max_by_key(|(_skeleton, chain)| chain.len());
+        let Some((skeleton, chain)) = best else {
+            continue;
+        };
+        if chain.len() < 7 {
+            continue;
+        }
+        retain_rigid_chain_window(wireframe, skeleton, &chain);
+    }
+}
+
+fn longest_repeated_rigid_chain(
+    skeleton: &SkeletonPreview,
+    counts: &rustc_hash::FxHashMap<usize, usize>,
+) -> Vec<usize> {
+    let eligible = counts
+        .iter()
+        .filter_map(|(&index, &count)| {
+            (count >= 64 && index < skeleton.parents.len() && index < skeleton.transforms.len())
+                .then_some((index, count))
+        })
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut best = vec![];
+    for &tail in eligible.keys() {
+        let mut chain = vec![tail];
+        let mut current = tail;
+        while let Some(parent) = skeleton.parents.get(current).copied() {
+            let Ok(parent) = usize::try_from(parent) else {
+                break;
+            };
+            let (Some(&child_count), Some(&parent_count)) =
+                (eligible.get(&current), eligible.get(&parent))
+            else {
+                break;
+            };
+            let ratio = child_count as f32 / parent_count as f32;
+            if !(0.75..=1.25).contains(&ratio) {
+                break;
+            }
+            chain.push(parent);
+            current = parent;
+        }
+        chain.reverse();
+        if chain.len() > best.len() {
+            best = chain;
+        }
+    }
+    best
+}
+
+fn retain_rigid_chain_window(
+    wireframe: &mut WireframePreview,
+    skeleton: &SkeletonPreview,
+    chain: &[usize],
+) {
+    let Some(rigid_indices) = wireframe.rigid_indices.as_ref() else {
+        return;
+    };
+    let centers = chain
+        .iter()
+        .map(|&bone| {
+            skeleton
+                .transforms
+                .get(bone)
+                .map(|transform| transform.translation)
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(centers) = centers else { return };
+    // The bind pose contains the complete 11-round state chain. Static item
+    // presentation exposes only the rounds between two package-authored
+    // endpoints: b_bolt at the receiver and the duplicated magazine anchor.
+    // The five rounds in that interval already have the correct parallel pose;
+    // neither their transforms nor their spacing may be changed.
+    let chain_set = chain.iter().copied().collect::<rustc_hash::FxHashSet<_>>();
+    let Some(visible) = rigid_chain_window_bones(skeleton, chain, &centers) else {
+        return;
+    };
+    for triangle in wireframe.indices.chunks_exact_mut(3) {
+        let hides_chain_vertex = triangle.iter().any(|index| {
+            let bone = rigid_indices[*index as usize] as usize;
+            chain_set.contains(&bone) && !visible.contains(&bone)
+        });
+        if hides_chain_vertex {
+            triangle[1] = triangle[0];
+            triangle[2] = triangle[0];
+        }
+    }
+}
+
+fn rigid_chain_window_bones(
+    skeleton: &SkeletonPreview,
+    chain: &[usize],
+    centers: &[[f32; 3]],
+) -> Option<rustc_hash::FxHashSet<usize>> {
+    if centers.len() != chain.len() || centers.len() < 2 {
+        return None;
+    }
+    let chain_set = chain.iter().copied().collect::<rustc_hash::FxHashSet<_>>();
+    let rest = vec3_normalize(vec3_sub(*centers.last()?, centers[0]));
+    let chain_start = centers[0];
+    let chain_length = vec3_length(vec3_sub(*centers.last()?, chain_start));
+    let bolt_hash = quicktag_core::util::fnv1(b"b_bolt");
+    let upper = skeleton
+        .node_hashes
+        .iter()
+        .position(|hash| *hash == bolt_hash)
+        .and_then(|index| skeleton.transforms.get(index))
+        .map(|transform| vec3_dot(vec3_sub(transform.translation, chain_start), rest))?;
+    let mut lower = None::<f32>;
+    for (left_index, left) in skeleton.transforms.iter().enumerate() {
+        if chain_set.contains(&left_index) {
+            continue;
+        }
+        let duplicate = skeleton
+            .transforms
+            .iter()
+            .enumerate()
+            .skip(left_index + 1)
+            .any(|(right_index, right)| {
+                !chain_set.contains(&right_index)
+                    && vec3_length(vec3_sub(left.translation, right.translation)) < 0.00001
+            });
+        if !duplicate {
+            continue;
+        }
+        let along = vec3_dot(vec3_sub(left.translation, chain_start), rest);
+        if (upper..=chain_length).contains(&along) && lower.is_none_or(|current| along < current) {
+            lower = Some(along);
+        }
+    }
+    let lower = lower?;
+    let spacing = centers
+        .windows(2)
+        .map(|pair| vec3_length(vec3_sub(pair[1], pair[0])))
+        .sum::<f32>()
+        / (centers.len() - 1) as f32;
+    let visible = chain
+        .iter()
+        .zip(centers)
+        .filter_map(|(&bone, center)| {
+            let along = vec3_dot(vec3_sub(*center, chain_start), rest);
+            ((upper - spacing * 0.25..=lower + spacing * 0.25).contains(&along)).then_some(bone)
+        })
+        .collect::<rustc_hash::FxHashSet<_>>();
+    (visible.len() >= 2 && visible.len() < chain.len()).then_some(visible)
+}
+
+fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|i| a[i] - b[i])
+}
+fn vec3_scale(v: [f32; 3], scale: f32) -> [f32; 3] {
+    v.map(|value| value * scale)
+}
+fn vec3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a.into_iter().zip(b).map(|(a, b)| a * b).sum()
+}
+fn vec3_length(v: [f32; 3]) -> f32 {
+    vec3_dot(v, v).sqrt()
+}
+fn vec3_try_normalize(v: [f32; 3]) -> Option<[f32; 3]> {
+    let length = vec3_length(v);
+    (length > 0.000001).then(|| vec3_scale(v, length.recip()))
+}
+fn vec3_normalize(v: [f32; 3]) -> [f32; 3] {
+    vec3_try_normalize(v).unwrap_or([0.0, 0.0, 1.0])
 }
 
 fn descendant_pattern_nodes(cache: &TagCache, root: TagHash, max_depth: usize) -> Vec<TagHash> {
@@ -1789,10 +2279,36 @@ pub fn model_label_for_reference(reference: u32) -> Option<&'static str> {
 }
 
 pub fn is_model_catalog_reference(reference: u32) -> bool {
-    // Marathon gear is exposed through top-level patterns. Pattern components
-    // use CLASS_PATTERN_COMPONENT and are only implementation nodes beneath it.
+    // Keep PatternComponents loadable: runner-shell assembly needs their
+    // containers. Catalog UIs collapse components owned by authored roots.
     reference == CLASS_PATTERN
         || model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
+}
+
+/// PatternComponent tags are render implementation nodes. Return every such
+/// node reachable below authored Pattern roots so catalog UIs can show one row
+/// per cosmetic without losing the components needed to assemble its preview.
+pub fn pattern_component_descendants(
+    cache: &TagCache,
+    roots: impl IntoIterator<Item = TagHash>,
+) -> rustc_hash::FxHashSet<TagHash> {
+    let roots = roots.into_iter().collect::<rustc_hash::FxHashSet<_>>();
+    let mut components = rustc_hash::FxHashSet::default();
+    let mut frontier = roots.iter().copied().collect_vec();
+    while let Some(parent) = frontier.pop() {
+        for child in pattern_graph_children(cache, parent) {
+            if roots.contains(&child)
+                || !package_manager()
+                    .get_entry(child)
+                    .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
+                || !components.insert(child)
+            {
+                continue;
+            }
+            frontier.push(child);
+        }
+    }
+    components
 }
 
 /// Match runner-shell head/body containers through their authored component
@@ -2336,6 +2852,7 @@ fn load_model_preview_from_tags(
                 .map(|(source, wireframe)| (*model_tag, source, wireframe))
         })
         .collect_vec();
+    apply_inventory_rigid_chain_visibility(&cache, tag, &mut parsed);
     apply_weapon_mod_attachment_poses(&mut parsed, attachments);
     let mesh_source = parsed
         .iter()
@@ -2373,13 +2890,16 @@ fn load_model_preview_from_tags(
             // a color offset.
             let attachment_palette = palette;
             for range in &mut wireframe.material_ranges {
+                let Some(default) = range.technique.and_then(technique_default_gear_dye_color)
+                else {
+                    continue;
+                };
                 if let Some(dye) = range
                     .gear_dye_change_color_index
                     .and_then(|index| attachment_palette.get(index as usize).copied())
                 {
                     range.textures.gear_dye = Some(dye);
-                    range.textures.gear_dye_default =
-                        range.technique.and_then(technique_default_gear_dye_color);
+                    range.textures.gear_dye_default = Some(default);
                     range.textures.gear_dye_palette = Some(attachment_palette);
                 }
             }
@@ -2411,17 +2931,1605 @@ fn technique_default_gear_dye_color(technique: TagHash) -> Option<[f32; 4]> {
         .stages
         .into_iter()
         .find(|stage| stage.stage == "PS")?;
-    // The common Tiger GearDye material reserves cbuffer outputs 8..13 for
-    // the six change-color regions. Output 7 is initialized from inline
-    // constant 7 and is the seventh/default (black-ID) material color.
-    let gear_dye_shader = (8..=13).all(|output| {
-        pixel.bytecode.expressions.iter().any(|expression| {
-            expression.target == format!("output[{output}]")
-                && expression.expression.contains("object_channel")
+    // GearDye shaders map material IDs 1..6 to six consecutive cbuffer
+    // outputs. ID 0 reads the immediately preceding inline output. Output
+    // bases vary between shader families (8 in older gear shaders, 11 in the
+    // D54 optic), so derive the ABI layout from the authored channel hashes.
+    let material_id_parameters = [
+        GEAR_DYE_COLOR_PARAMETERS[0],
+        GEAR_DYE_COLOR_PARAMETERS[2],
+        GEAR_DYE_COLOR_PARAMETERS[3],
+        GEAR_DYE_COLOR_PARAMETERS[1],
+        GEAR_DYE_COLOR_PARAMETERS[4],
+        GEAR_DYE_COLOR_PARAMETERS[5],
+    ];
+    let first_output = pixel
+        .bytecode
+        .expressions
+        .iter()
+        .filter(|expression| {
+            expression
+                .expression
+                .contains(&format!("0x{:08X}", material_id_parameters[0]))
         })
-    });
-    let color = gear_dye_shader.then(|| pixel.inline_constants.get(7).copied())??;
+        .filter_map(|expression| {
+            expression
+                .target
+                .strip_prefix("output[")?
+                .strip_suffix(']')?
+                .parse::<usize>()
+                .ok()
+        })
+        .find(|first_output| {
+            material_id_parameters
+                .into_iter()
+                .enumerate()
+                .all(|(material_id, parameter)| {
+                    let target = format!("output[{}]", first_output + material_id);
+                    pixel.bytecode.expressions.iter().any(|expression| {
+                        expression.target == target
+                            && expression
+                                .expression
+                                .contains(&format!("0x{parameter:08X}"))
+                    })
+                })
+        })?;
+    let default_output = first_output.checked_sub(1)?;
+    let color = pixel.inline_constants.get(default_output).copied()?;
     valid_dye_color(color).then_some(color)
+}
+
+fn bindings_use_character_gear_surface(
+    bindings: &[TechniqueTextureBinding],
+    normal_slot: Option<u32>,
+) -> bool {
+    bindings.iter().any(|binding| binding.slot >= 10)
+        && [0, 1, 2, 3]
+            .into_iter()
+            .all(|slot| bindings.iter().any(|binding| binding.slot == slot))
+        && bindings
+            .iter()
+            .any(|binding| binding.slot == 0 && texture_is_srgb(binding.tag))
+        // Caller already resolved the compiled shader's exact normal ABI.
+        // Re-running generic inference here rejects legitimate shared runner
+        // normals and silently drops the whole character material.
+        && normal_slot.is_some()
+}
+
+fn bindings_use_compact_character_surface(
+    bindings: &[TechniqueTextureBinding],
+    normal_slot: Option<u32>,
+) -> bool {
+    let max_slot = bindings
+        .iter()
+        .map(|binding| binding.slot)
+        .max()
+        .unwrap_or(0);
+    (5..10).contains(&max_slot)
+        && bindings
+            .iter()
+            .any(|binding| binding.slot == 0 && texture_is_srgb(binding.tag))
+        && [2, 3].into_iter().all(|slot| {
+            bindings.iter().any(|binding| {
+                binding.slot == slot
+                    && !texture_is_srgb(binding.tag)
+                    && material_control_texture_candidate(binding.tag)
+            })
+        })
+        && normal_slot.is_some()
+}
+
+fn runner_alpha_mask_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<AlphaMaskMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+
+    // Match compiled shader ABIs, never skin hashes.
+    let (remap, threshold) = match pixel.shader {
+        // t0 supplies RGB; t1.r supplies coverage; c1.x is the cutoff.
+        Some(TagHash(0x80A9BE22)) => ([0.0, 1.0], pixel.inline_constants.get(1)?[0]),
+        // Two-mask runner surface: coverage = c89.y * t1.r + c89.x, then
+        // discard below c90.x. t2 is a separate material mask.
+        Some(TagHash(0x80A9A9D3)) => {
+            let c89 = *pixel.inline_constants.get(89)?;
+            ([c89[0], c89[1]], pixel.inline_constants.get(90)?[0])
+        }
+        _ => return None,
+    };
+    let texture = bindings
+        .iter()
+        .find(|binding| binding.slot == 1 && texture_preview_format(binding.tag).contains("Bc4"))?
+        .tag;
+    (remap.into_iter().all(f32::is_finite)
+        && threshold.is_finite()
+        && (0.0..=1.0).contains(&threshold))
+    .then_some(AlphaMaskMaterial {
+        texture,
+        remap,
+        threshold,
+    })
+}
+
+fn runner_solid_surface_material(technique: TagHash) -> Option<[f32; 2]> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let shader = preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .shader?;
+    match shader {
+        // 80A9B032 writes RT1.a = 0.67 and RT2.r = 0.0. Its PS t1 is a
+        // shared 1D lighting lookup, not an ORM texture.
+        TagHash(0x80A9B032) => Some([0.67, 0.0]),
+        // Skin/subsurface PS writes literal RT1.a = 0.67 and RT2.r = 0.
+        TagHash(0x80A9B860) => Some([0.67, 0.0]),
+        _ => None,
+    }
+}
+
+fn runner_layered_surface_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<RunnerLayeredSurfaceMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+
+    let tag_at = |slot| {
+        bindings
+            .iter()
+            .find(|binding| binding.slot == slot)
+            .map(|binding| binding.tag)
+    };
+    let (
+        mode,
+        surface,
+        detail_normal_a,
+        detail_normal_b,
+        detail_normal_c,
+        detail_normal_d,
+        material_response,
+        constants,
+    ) = match pixel.shader? {
+        // Runner skin/subsurface ABI. t0 is authored pore/feature field, t1
+        // is a shared cellular response LUT (never direct albedo), t2 is
+        // scalar AO, and t3 is tangent normal. c121/c122/c123 provide primary,
+        // variation, and recessed-feature colours; c130 is subsurface tint.
+        TagHash(0x80A9B860) if pixel.inline_constants.len() >= 233 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[121];
+            rows[1] = pixel.inline_constants[122];
+            rows[2] = pixel.inline_constants[123];
+            rows[3] = pixel.inline_constants[130];
+            rows[4] = pixel.inline_constants[120];
+            rows[5] = pixel.inline_constants[127];
+            rows[6] = pixel.inline_constants[159];
+            rows[7] = pixel.inline_constants[231];
+            rows[8] = pixel.inline_constants[232];
+            rows[9] = pixel.inline_constants[124];
+            (
+                41,
+                tag_at(0)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full9: t4/t5 with c29..c38, selected by t1.b/t1.r, base t6.
+        TagHash(0x80A9B07B) if pixel.inline_constants.len() >= 39 => {
+            (1, tag_at(2)?, tag_at(4)?, tag_at(5)?, None, None, None, {
+                let mut rows = [[0.0; 4]; 24];
+                rows[0] = pixel.inline_constants[13];
+                rows[1..=10].copy_from_slice(&pixel.inline_constants[29..=38]);
+                rows
+            })
+        }
+        // Switched dual layer: t1.r < c83 chooses t2; otherwise t3. c77..c82
+        // are the two affine UV/remap triples and t4 is the base normal.
+        TagHash(0x80A9B855) if pixel.inline_constants.len() >= 87 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[83];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[77..=79]);
+            rows[4..=6].copy_from_slice(&pixel.inline_constants[80..=82]);
+            rows[7] = pixel.inline_constants[86];
+            (
+                2,
+                tag_at(1)?,
+                tag_at(2)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full10: t4 is always applied. t5/t6/t7 are gated by t2 G/B/R;
+        // t6 owns two authored transforms selected by the literal c10.x.
+        // The base normal is t8 and remains resolved by the normal-slot ABI.
+        TagHash(0x80A9C244) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[10];
+            rows[1..=21].copy_from_slice(&pixel.inline_constants[21..=41]);
+            (
+                3,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(7)?),
+                None,
+                rows,
+            )
+        }
+        // Procedural full9: t4/t5 authored normals are gated by t2 G/B.
+        // t6 is the base normal; t9 is an independent object-space field.
+        TagHash(0x80A9AFB4) if pixel.inline_constants.len() >= 48 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[38..=42]);
+            rows[6..=10].copy_from_slice(&pixel.inline_constants[43..=47]);
+            (
+                4,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Sibling switched surfaces: t1.r < c15 gates t2; c12/c13/c14 are
+        // its affine UV and normal remap. t3 is the base normal.
+        TagHash(0x80A9B857) | TagHash(0x80A9B85A) if pixel.inline_constants.len() >= 16 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[15];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[12..=14]);
+            (
+                5,
+                tag_at(1)?,
+                tag_at(2)?,
+                tag_at(2)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Local full9 stack: t3 is G-gated, t4 is B-selected, and t5 carries
+        // the two R-selected transforms. t6 is the base normal.
+        TagHash(0x80A9B93E) | TagHash(0x80A9BBDD) | TagHash(0x80A9DC9A)
+            if pixel.inline_constants.len() >= 41 =>
+        {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[24..=40]);
+            (
+                6,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        // Same local full9 normal ABI with the normal block at c24..c40.
+        TagHash(0x80A9DEEC) if pixel.inline_constants.len() >= 41 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[24..=40]);
+            (
+                23,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // E4DB embeds the same local full9+response ABI before its larger
+        // procedural material branch. Normal rows are shifted to c16..c32.
+        TagHash(0x80A9E4DB) if pixel.inline_constants.len() >= 135 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[16..=32]);
+            // UV transforms shared by t9/t11, six authored t11 exponents,
+            // then the final two condition remaps packed into one row.
+            rows[18..=20].copy_from_slice(&pixel.inline_constants[107..=109]);
+            rows[21] = [
+                pixel.inline_constants[126][0],
+                pixel.inline_constants[127][0],
+                pixel.inline_constants[128][0],
+                pixel.inline_constants[129][0],
+            ];
+            rows[22] = [
+                pixel.inline_constants[130][0],
+                pixel.inline_constants[131][0],
+                pixel.inline_constants[84][0],
+                pixel.inline_constants[114][0],
+            ];
+            rows[23] = [
+                pixel.inline_constants[133][0],
+                pixel.inline_constants[133][1],
+                pixel.inline_constants[134][0],
+                pixel.inline_constants[134][1],
+            ];
+            (
+                23,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Same generated full9 ABI with six fewer preceding material rows.
+        TagHash(0x80A9CBAE) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[18..=34]);
+            (
+                6,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        // Expanded local full9 stack: t1 A/G independently gate t3/t4,
+        // t1 B selects t3, and t1 R selects between two t5 transforms.
+        TagHash(0x80A9D6FD) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=18].copy_from_slice(&pixel.inline_constants[24..=41]);
+            (
+                7,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        // A-expanded sibling of the local full9 ABI: c24..c41 contains the
+        // A/G gates, B range, and two authored t5 transforms.
+        TagHash(0x80A9E0FD) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=18].copy_from_slice(&pixel.inline_constants[24..=41]);
+            (
+                24,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Procedural full8: t4 is the base tangent normal. t3 is transformed
+        // by c17/c18, remapped by c19, then applied only while t1.r lies
+        // between c20/c21. t5/t6 are later object-space procedural fields,
+        // not substitutes for the base normal.
+        TagHash(0x80A9AFB6) if pixel.inline_constants.len() >= 22 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[17..=21]);
+            (
+                8,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Same generated procedural ABI with thirteen preceding material
+        // rows: t4 base, transformed t3, t1.r band c33/c34.
+        TagHash(0x80A9BBBE) | TagHash(0x80A9BBBF) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[30..=34]);
+            (
+                8,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Full10 three-detail stack: t7 is base normal. t4 is selected by
+        // round(t2.g-c24), t5 by the c28/c29 t2.b band, and t6 by the
+        // c33/c34 t2.r band.
+        TagHash(0x80A9C3F6) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[21..=34]);
+            (
+                9,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Generated sibling of the Full10 three-detail ABI with three more
+        // material rows before the normal block: t7 base; t4/t5/t6 selected
+        // by t2 G/B/R using c24..c37.
+        TagHash(0x80A9B610) if pixel.inline_constants.len() >= 38 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[24..=37]);
+            (
+                9,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Full9 sibling of the same generated three-detail stack. Its
+        // selector/detail/base resources are shifted down one register:
+        // t1 selects t3/t4/t5 and t6 is the base tangent normal. LLVM shows
+        // the identical c24..c37 G/B/R gate and affine-transform block.
+        TagHash(0x80A9E76C) if pixel.inline_constants.len() >= 38 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[24..=37]);
+            (
+                25,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full11 surface: t4 is the packed selector. Its G channel selects
+        // t5/t6, B selects either authored transform of t7, and R gates t8.
+        // t9 is the base tangent normal. The two generated siblings differ
+        // only by the number of material rows preceding this shared ABI.
+        TagHash(0x80A9A9AD) if pixel.inline_constants.len() >= 105 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows.copy_from_slice(&pixel.inline_constants[81..=104]);
+            (
+                10,
+                tag_at(4)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(8)?),
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9A9B1) if pixel.inline_constants.len() >= 72 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows.copy_from_slice(&pixel.inline_constants[48..=71]);
+            (
+                10,
+                tag_at(4)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(8)?),
+                None,
+                rows,
+            )
+        }
+        // Earlier full11 runner-skin permutation. DXIL uses the identical
+        // 24-row normal ABI at c24..c47, shifted resources: t1 selector;
+        // t3/t4/t5/t6 details (t5 has two transforms); t7 base tangent
+        // normal. t2 independently supplies response and green-channel AO.
+        TagHash(0x80A9A8CF) if pixel.inline_constants.len() >= 48 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows.copy_from_slice(&pixel.inline_constants[24..=47]);
+            (
+                10,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(6)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Generated full12 runner surface. t4 is the packed A/G/B/R
+        // selector; t6/t7/t8 are its authored normal layers and t9 is the
+        // base tangent normal. The normal program occupies c53..c71.
+        TagHash(0x80A9AD5D) if pixel.inline_constants.len() >= 72 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[..=18].copy_from_slice(&pixel.inline_constants[53..=71]);
+            (
+                42,
+                tag_at(4)?,
+                tag_at(6)?,
+                tag_at(7)?,
+                Some(tag_at(8)?),
+                None,
+                Some(tag_at(5)?),
+                rows,
+            )
+        }
+        // Compact sibling of AD5D. t3 selects authored t5/t6 over the t7
+        // base tangent normal. c46..c61 is the complete normal/response ABI.
+        TagHash(0x80A9AD68) if pixel.inline_constants.len() >= 62 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[..=15].copy_from_slice(&pixel.inline_constants[46..=61]);
+            (
+                43,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                None,
+                None,
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // B71C compact A/G/B/R surface. t1 is selector; all four selector
+        // tests gate transformed t3 over base t4. Local t2 is response/AO.
+        TagHash(0x80A9B71C) if pixel.inline_constants.len() >= 37 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[..=8].copy_from_slice(&pixel.inline_constants[24..=32]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[35..=36]);
+            (
+                44,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full10 A/G/B/R stack: t1 is the selector, t3 is A/G gated,
+        // t4 is B selected, t5 is R selected, and t6 is the base normal.
+        TagHash(0x80A9B065) if pixel.inline_constants.len() >= 43 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[24..=42]);
+            (
+                11,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Response/AO-bearing sibling of B065. LLVM has the identical
+        // c24..c42 A/G/B/R normal program; local t2 additionally supplies
+        // material response and green-channel AO.
+        TagHash(0x80A9B06A) if pixel.inline_constants.len() >= 43 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[24..=42]);
+            (
+                11,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        TagHash(0x80A9DE77) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[16..=34]);
+            (
+                11,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Local full11: t2 selector, t4 A/G controlled, t5 B selected,
+        // t6 R gated, t7 base. c38..c56 are the complete normal ABI.
+        TagHash(0x80A9DB9A) if pixel.inline_constants.len() >= 57 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[38..=56]);
+            (
+                12,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9AE19) if pixel.inline_constants.len() >= 39 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[20..=38]);
+            (
+                12,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9C27C) if pixel.inline_constants.len() >= 38 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[27];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[24..=26]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[28..=30]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[31..=32]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[33..=35]);
+            rows[13..=14].copy_from_slice(&pixel.inline_constants[36..=37]);
+            (
+                13,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9DAC9) if pixel.inline_constants.len() >= 40 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[28];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[25..=27]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[33..=34]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[35..=37]);
+            rows[13..=14].copy_from_slice(&pixel.inline_constants[38..=39]);
+            (
+                14,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9AFBF) if pixel.inline_constants.len() >= 49 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[40];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[37..=39]);
+            rows[5] = pixel.inline_constants[41];
+            rows[6..=7].copy_from_slice(&pixel.inline_constants[42..=43]);
+            rows[8..=10].copy_from_slice(&pixel.inline_constants[44..=46]);
+            rows[11..=12].copy_from_slice(&pixel.inline_constants[47..=48]);
+            (
+                15,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80AA0261) if pixel.inline_constants.len() >= 31 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[25];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[26..=28]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[29..=30]);
+            (
+                16,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        TagHash(0x80AA0263) if pixel.inline_constants.len() >= 33 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[27];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[24..=26]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[28..=30]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[31..=32]);
+            (
+                16,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        TagHash(0x80A9B86A) if pixel.inline_constants.len() >= 31 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[10];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[11..=13]);
+            rows[5] = pixel.inline_constants[14];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[15..=17]);
+            rows[9..=11].copy_from_slice(&pixel.inline_constants[18..=20]);
+            rows[12..=13].copy_from_slice(&pixel.inline_constants[21..=22]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[23..=25]);
+            rows[17..=19].copy_from_slice(&pixel.inline_constants[26..=28]);
+            rows[20..=21].copy_from_slice(&pixel.inline_constants[29..=30]);
+            (
+                17,
+                tag_at(6)?,
+                tag_at(2)?,
+                tag_at(3)?,
+                Some(tag_at(4)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9D952) if pixel.inline_constants.len() >= 65 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[47..=49]);
+            rows[4..=5].copy_from_slice(&pixel.inline_constants[50..=51]);
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[52..=54]);
+            rows[9..=11].copy_from_slice(&pixel.inline_constants[55..=57]);
+            rows[12..=13].copy_from_slice(&pixel.inline_constants[58..=59]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[60..=62]);
+            rows[17..=18].copy_from_slice(&pixel.inline_constants[63..=64]);
+            (
+                18,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                None,
+                None,
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // Procedural runner panel family. DXIL uses t2 as the packed selector,
+        // t4 as the scalar pattern atlas, t5 as its RG procedural field, t6 as
+        // the local panel mask, t8 as the authored detail normal, and t9 as the
+        // base tangent normal. The generated AFB8/AFBA siblings share this ABI.
+        TagHash(0x80A9AFB8) | TagHash(0x80A9AFBA) if pixel.inline_constants.len() >= 103 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[94..=96]);
+            rows[4..=6].copy_from_slice(&pixel.inline_constants[60..=62]);
+            rows[7..=9].copy_from_slice(&pixel.inline_constants[78..=80]);
+            rows[10..=13].copy_from_slice(&pixel.inline_constants[90..=93]);
+            rows[14] = pixel.inline_constants[97];
+            rows[15] = pixel.inline_constants[98];
+            rows[16] = pixel.inline_constants[101];
+            rows[17] = pixel.inline_constants[102];
+            (
+                19,
+                tag_at(2)?,
+                tag_at(8)?,
+                tag_at(4)?,
+                Some(tag_at(6)?),
+                None,
+                Some(tag_at(5)?),
+                rows,
+            )
+        }
+        // Full10 generated siblings: t2.g gates t4, t2.b gates t5, and t2.r
+        // selects either authored transform of t6 before the t7 base normal.
+        TagHash(0x80A9BD17) if pixel.inline_constants.len() >= 39 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[7];
+            rows[1] = pixel.inline_constants[21];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[18..=20]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[25..=26]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[27..=29]);
+            rows[13..=15].copy_from_slice(&pixel.inline_constants[30..=32]);
+            rows[16..=17].copy_from_slice(&pixel.inline_constants[33..=34]);
+            (
+                20,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(6)?),
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9DA29) if pixel.inline_constants.len() >= 40 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[7];
+            rows[1] = pixel.inline_constants[22];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[19..=21]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[23..=25]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[26..=27]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[28..=30]);
+            rows[13..=15].copy_from_slice(&pixel.inline_constants[31..=33]);
+            rows[16..=17].copy_from_slice(&pixel.inline_constants[34..=35]);
+            (
+                20,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(6)?),
+                None,
+                rows,
+            )
+        }
+        // Expanded sibling also gates t4 from t2.a. Its normal block starts
+        // four rows later but otherwise shares the dual-R ABI above.
+        TagHash(0x80A9E64F) if pixel.inline_constants.len() >= 43 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[7];
+            rows[1] = pixel.inline_constants[21];
+            rows[2] = pixel.inline_constants[25];
+            rows[3..=5].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[26..=28]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[29..=30]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[31..=33]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[34..=36]);
+            rows[17..=18].copy_from_slice(&pixel.inline_constants[37..=38]);
+            (
+                21,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(6)?),
+                None,
+                rows,
+            )
+        }
+        // Full9 A/G/B stack. t1.a gates the composite, t1.g gates t3,
+        // t1.b selects the authored t4 detail, and t5 is the base tangent
+        // normal. DXIL c24..c33 owns the exact gate/transform block.
+        TagHash(0x80A9C31E) if pixel.inline_constants.len() >= 34 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1] = pixel.inline_constants[24];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[25..=27]);
+            rows[5] = pixel.inline_constants[28];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[32..=33]);
+            (
+                22,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // DCF8 compact dual-detail ABI. t2 carries A/G/B/R selectors; B
+        // selects transformed t4 and R selects transformed t5 over t6 base.
+        TagHash(0x80A9DCF8) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[9];
+            rows[1..=2].copy_from_slice(&pixel.inline_constants[20..=21]);
+            rows[3..=5].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[6..=7].copy_from_slice(&pixel.inline_constants[25..=26]);
+            rows[8..=10].copy_from_slice(&pixel.inline_constants[27..=29]);
+            rows[11..=12].copy_from_slice(&pixel.inline_constants[30..=31]);
+            rows[13] = pixel.inline_constants[34];
+            (
+                26,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // C96F wide runner stack: t3 selector; t5 G detail; t6 B detail;
+        // t7 has two R-selected transforms; t8 base. t4.r/t4.g provide
+        // authored normal response and AO respectively.
+        TagHash(0x80A9C96F) if pixel.inline_constants.len() >= 44 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[14];
+            rows[1] = pixel.inline_constants[28];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[25..=27]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[32..=33]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[34..=36]);
+            rows[13..=15].copy_from_slice(&pixel.inline_constants[37..=39]);
+            rows[16..=17].copy_from_slice(&pixel.inline_constants[40..=41]);
+            // Object-space t2 field: B-band thresholds, tri-planar
+            // exponent/projection, then authored colour base and scale. This
+            // generated technique's object transform is identity/zero.
+            rows[18] = pixel.inline_constants[11];
+            rows[19] = pixel.inline_constants[12];
+            rows[20] = pixel.inline_constants[2];
+            rows[21] = pixel.inline_constants[8];
+            rows[22] = pixel.inline_constants[9];
+            rows[23] = pixel.inline_constants[10];
+            (
+                27,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(7)?),
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // D3FC combines a large procedural material branch with the standard
+        // A/G/B/R normal ABI. t3 selects t5/t6/t7 over t8 base; t4.r/t4.g
+        // remain the authored normal response and AO channels.
+        TagHash(0x80A9D3FC) if pixel.inline_constants.len() >= 62 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[43];
+            rows[1] = pixel.inline_constants[44];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[46..=48]);
+            rows[5] = pixel.inline_constants[45];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[49..=51]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[52..=53]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[54..=56]);
+            rows[14..=15].copy_from_slice(&pixel.inline_constants[57..=58]);
+            // Object-space t0 field. c0/c1 are identity/zero for this
+            // generated technique; c2 is the tri-planar exponent, c3 the
+            // projection, and c4/c5 the authored colour base/scale.
+            rows[16] = pixel.inline_constants[2];
+            rows[17] = pixel.inline_constants[3];
+            rows[18] = pixel.inline_constants[4];
+            rows[19] = pixel.inline_constants[5];
+            (
+                28,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                None,
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // D2D7: t2 A/G gates the authored stack. B switches t4/t5; R
+        // switches t6/t7; t8 is the base tangent normal.
+        TagHash(0x80A9D2D7) if pixel.inline_constants.len() >= 61 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[38];
+            rows[1] = pixel.inline_constants[39];
+            rows[2] = pixel.inline_constants[43];
+            rows[3..=5].copy_from_slice(&pixel.inline_constants[40..=42]);
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[44..=46]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[47..=48]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[49..=51]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[52..=54]);
+            rows[17..=18].copy_from_slice(&pixel.inline_constants[55..=56]);
+            (
+                29,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(7)?),
+                None,
+                rows,
+            )
+        }
+        // D569: t4 is selector; A gates t6, G gates t7, B/R jointly gate
+        // t8 over t9 base. t5.r/t5.g provide material response and AO.
+        TagHash(0x80A9D569) if pixel.inline_constants.len() >= 72 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[52];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[53..=55]);
+            rows[4] = pixel.inline_constants[56];
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[57..=59]);
+            rows[8] = pixel.inline_constants[60];
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[61..=62]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[63..=65]);
+            rows[14..=15].copy_from_slice(&pixel.inline_constants[66..=67]);
+            (
+                30,
+                tag_at(4)?,
+                tag_at(6)?,
+                tag_at(7)?,
+                Some(tag_at(8)?),
+                None,
+                Some(tag_at(5)?),
+                rows,
+            )
+        }
+        // Full character surface used by Emerald Impact. t2.a gates t4,
+        // t2.b selects t5, and t2.r selects t6 over the remapped t7 base.
+        // Unlike the compact character path these authored normals are a
+        // visible part of the shell material and cannot be discarded merely
+        // because the same shader also owns procedural t1/t9/t10 effects.
+        TagHash(0x80A9F4E5) if pixel.inline_constants.len() >= 33 => {
+            let mut rows = [[0.0; 4]; 24];
+            let detail_scale = pixel.inline_constants[0];
+            rows[0] = [detail_scale[0], 0.0, detail_scale[2], 0.0];
+            rows[14] = [0.0, detail_scale[1], detail_scale[3], 0.0];
+            rows[1] = pixel.inline_constants[18];
+            rows[2] = pixel.inline_constants[19];
+            rows[3..=7].copy_from_slice(&pixel.inline_constants[20..=24]);
+            rows[8..=12].copy_from_slice(&pixel.inline_constants[25..=29]);
+            rows[13] = pixel.inline_constants[32];
+            (
+                31,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Emerald Impact sibling: t2 selects t4/t5/t6/t7 through A/G/B/R,
+        // then t8 supplies the authored base normal. LLVM establishes the
+        // normal block at c18..c35; t6/t7 share c24/c25 UV transforms.
+        TagHash(0x80A9F500) if pixel.inline_constants.len() >= 36 => {
+            let mut rows = [[0.0; 4]; 24];
+            let a_uv = pixel.inline_constants[0];
+            rows[0] = [a_uv[0], 0.0, a_uv[2], 0.0];
+            rows[1] = [0.0, a_uv[1], a_uv[3], 0.0];
+            rows[2..=3].copy_from_slice(&pixel.inline_constants[18..=19]);
+            rows[4..=7].copy_from_slice(&pixel.inline_constants[20..=23]);
+            rows[8..=12].copy_from_slice(&pixel.inline_constants[24..=28]);
+            rows[13] = pixel.inline_constants[29];
+            rows[14..=15].copy_from_slice(&pixel.inline_constants[30..=31]);
+            rows[16] = pixel.inline_constants[34];
+            rows[17] = pixel.inline_constants[35];
+            (
+                32,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(7)?),
+                None,
+                rows,
+            )
+        }
+        // Compact Emerald sibling: A selects t4. B and R independently
+        // select two authored transforms of t5, over the remapped t7 base.
+        TagHash(0x80A9F518) if pixel.inline_constants.len() >= 36 => {
+            let mut rows = [[0.0; 4]; 24];
+            let a_uv = pixel.inline_constants[0];
+            rows[0] = [a_uv[0], 0.0, a_uv[2], 0.0];
+            rows[1] = [0.0, a_uv[1], a_uv[3], 0.0];
+            rows[2..=3].copy_from_slice(&pixel.inline_constants[18..=19]);
+            rows[4..=8].copy_from_slice(&pixel.inline_constants[20..=24]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[25..=26]);
+            rows[11..=15].copy_from_slice(&pixel.inline_constants[28..=32]);
+            rows[16] = pixel.inline_constants[35];
+            (
+                33,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Procedural Emerald sibling. Its normal block is shifted to c42:
+        // t4 A, t5 G, t6 B, a second t4 transform for R, then t7 base.
+        TagHash(0x80A9F4B3) if pixel.inline_constants.len() >= 64 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0..=3].copy_from_slice(&pixel.inline_constants[42..=45]);
+            rows[4..=7].copy_from_slice(&pixel.inline_constants[46..=49]);
+            rows[8..=15].copy_from_slice(&pixel.inline_constants[50..=57]);
+            rows[16..=18].copy_from_slice(&pixel.inline_constants[50..=52]);
+            rows[19..=20].copy_from_slice(&pixel.inline_constants[58..=59]);
+            rows[21..=22].copy_from_slice(&pixel.inline_constants[62..=63]);
+            rows[23] = pixel.inline_constants[31];
+            (
+                34,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(4)?),
+                None,
+                rows,
+            )
+        }
+        // Compact character surface: t2.a gates transformed t4, t2.r selects
+        // t5, and t6 is the remapped base normal (80A9F528 LLVM c18..c28).
+        TagHash(0x80A9F528) if pixel.inline_constants.len() >= 29 => {
+            let mut rows = [[0.0; 4]; 24];
+            let a_uv = pixel.inline_constants[0];
+            rows[0] = [a_uv[0], 0.0, a_uv[2], 0.0];
+            rows[1] = [0.0, a_uv[1], a_uv[3], 0.0];
+            rows[2..=3].copy_from_slice(&pixel.inline_constants[18..=19]);
+            rows[4..=8].copy_from_slice(&pixel.inline_constants[20..=24]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[27..=28]);
+            (
+                35,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Local panel/face surface: t1.r selects transformed t3 over t4.
+        // t2 is its independent material-response field.
+        TagHash(0x80A9F589) if pixel.inline_constants.len() >= 23 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0..=4].copy_from_slice(&pixel.inline_constants[14..=18]);
+            rows[5..=6].copy_from_slice(&pixel.inline_constants[21..=22]);
+            (
+                36,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full13 package-394 surface. t3 carries A/G/B/R selectors; t5/t6
+        // provide A/G, t7/t8 are authored B alternatives, t7 is reused for
+        // R, and t9 is base tangent normal. DXIL c43..c66 is exact ABI block.
+        TagHash(0x80B142A5) if pixel.inline_constants.len() >= 67 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[32];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[43..=47]);
+            rows[6..=10].copy_from_slice(&pixel.inline_constants[48..=52]);
+            rows[11..=18].copy_from_slice(&pixel.inline_constants[53..=60]);
+            rows[19..=20].copy_from_slice(&pixel.inline_constants[61..=62]);
+            rows[21..=22].copy_from_slice(&pixel.inline_constants[65..=66]);
+            (
+                37,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(8)?),
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // Package-394 full10 surface. t1 is an A/G/B/R selector. G gates
+        // t3, B and R select t4/t5, and t6 is the authored base normal.
+        // The response/AO field remains independently packed in t2.
+        TagHash(0x80B143A0) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=15].copy_from_slice(&pixel.inline_constants[24..=38]);
+            rows[16] = pixel.inline_constants[41];
+            (
+                38,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Package-394 full10 siblings. t2 selects the t4/t5/t6 stack using
+        // G/B/R; t7 is the remapped base and t3 is response/AO. The shaders
+        // differ only by two preceding constant rows.
+        TagHash(0x80B1444E) if pixel.inline_constants.len() >= 39 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[11];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[22..=35]);
+            rows[15] = pixel.inline_constants[38];
+            (
+                39,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                Some(tag_at(3)?),
+                rows,
+            )
+        }
+        TagHash(0x80B14BF9) if pixel.inline_constants.len() >= 41 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[24..=37]);
+            rows[15] = pixel.inline_constants[40];
+            (
+                39,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                Some(tag_at(3)?),
+                rows,
+            )
+        }
+        // Package-394 expanded full11 surface. t1 G selects t3/t4, B selects
+        // two transforms of t5, R gates t6, and t7 is the remapped base.
+        // t2 owns response/AO.
+        TagHash(0x80B14701) if pixel.inline_constants.len() >= 48 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=21].copy_from_slice(&pixel.inline_constants[24..=44]);
+            rows[22] = pixel.inline_constants[47];
+            (
+                40,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(6)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Woven runner fabric. t1 is the packed selector, t3 is a broad
+        // authored detail normal, t4 is the tiled weave normal, t5 is the
+        // base tangent normal, and t2 carries material response/AO.
+        TagHash(0x80A9C430) if pixel.inline_constants.len() >= 45 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[24..=26]);
+            rows[4] = pixel.inline_constants[27];
+            rows[5] = pixel.inline_constants[28];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[9] = pixel.inline_constants[44];
+            (
+                45,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Compact woven runner fabric. t1 selects transformed t3 relief over
+        // the authored t4 base normal; t2 carries response/AO.
+        TagHash(0x80A9C65C) if pixel.inline_constants.len() >= 25 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[1];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[14..=16]);
+            rows[4] = pixel.inline_constants[24];
+            (
+                46,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Dual-gated armor relief. t2.a/t2.g gate transformed t4 over the
+        // authored t5 base normal; t3 supplies material response/AO.
+        TagHash(0x80A9CBEE) if pixel.inline_constants.len() >= 49 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[37];
+            rows[1] = pixel.inline_constants[41];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[38..=40]);
+            rows[5] = pixel.inline_constants[48];
+            (
+                47,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(3)?),
+                rows,
+            )
+        }
+        _ => return None,
+    };
+    let procedural = match pixel.shader? {
+        TagHash(0x80A9B860) => Some(tag_at(1)?),
+        TagHash(0x80A9C96F) => Some(tag_at(2)?),
+        TagHash(0x80A9D3FC) => Some(tag_at(0)?),
+        TagHash(0x80A9AD5D) => Some(tag_at(3)?),
+        TagHash(0x80A9AD68) => Some(tag_at(10)?),
+        _ => None,
+    };
+    let color_overlay = match pixel.shader? {
+        TagHash(0x80A9D569) => Some(tag_at(1)?),
+        TagHash(0x80B142A5) => Some(tag_at(2)?),
+        _ => None,
+    };
+    let mut color_overlay_constants = [[0.0; 4]; 7];
+    match pixel.shader? {
+        TagHash(0x80A9D569) => {
+            // c0 colour, c1/c2 UV rows, c3 selector-alpha reference.
+            color_overlay_constants[0..=3].copy_from_slice(&pixel.inline_constants[0..=3]);
+        }
+        TagHash(0x80B142A5) => {
+            // c24/c25 UV rows, c28/c29 colour remap, c30 selector-G reference.
+            for (target, source) in [24usize, 25, 28, 29, 30].into_iter().enumerate() {
+                color_overlay_constants[target] = pixel.inline_constants[source];
+            }
+        }
+        _ => {}
+    }
+    let procedural_wear = match pixel.shader? {
+        TagHash(0x80A9E4DB) => Some([tag_at(9)?, tag_at(10)?, tag_at(11)?]),
+        _ => None,
+    };
+    constants
+        .iter()
+        .chain(color_overlay_constants.iter())
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(RunnerLayeredSurfaceMaterial {
+            mode,
+            surface,
+            detail_normal_a,
+            detail_normal_b,
+            detail_normal_c,
+            detail_normal_d,
+            procedural,
+            color_overlay,
+            color_overlay_constants,
+            procedural_wear,
+            material_response,
+            constants,
+        })
+}
+
+fn runner_occlusion_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<RunnerOcclusionMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let shader = preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .shader?;
+    let (slot, channel) = match shader {
+        TagHash(0x80A9A9D3) | TagHash(0x80A9B860) => (2, 0),
+        TagHash(0x80A9A8CF) => (2, 1),
+        // AF8D/AF93 sample local t2 at mesh UV. DXIL routes t2.g into RT2.g
+        // by averaging it with the generated geometry/procedural occlusion.
+        TagHash(0x80A9AF8D) | TagHash(0x80A9AF93) => (2, 1),
+        TagHash(0x80A9B06A) => (2, 1),
+        TagHash(0x80A9B71C) => (2, 1),
+        // Face/skin surface: t3.g is written into RT2.g after combining with
+        // the generated response. t2 is the independent packed dye selector.
+        TagHash(0x80A9B85C) => (3, 1),
+        TagHash(0x80A9C430) => (2, 1),
+        TagHash(0x80A9C65C) => (2, 1),
+        TagHash(0x80A9CBEE) => (3, 1),
+        TagHash(0x80A9AFB6) | TagHash(0x80A9B75C) | TagHash(0x80A9B93E) | TagHash(0x80A9BBBE)
+        | TagHash(0x80A9BBBF) | TagHash(0x80A9BBDD) | TagHash(0x80A9CBAE) | TagHash(0x80A9D6FD)
+        | TagHash(0x80A9DC9A) => (2, 1),
+        TagHash(0x80A9C3F6) => (3, 1),
+        TagHash(0x80A9AE19) | TagHash(0x80A9AFBF) | TagHash(0x80A9DAC9) | TagHash(0x80A9DB9A) => {
+            (3, 1)
+        }
+        TagHash(0x80A9A9AD) | TagHash(0x80A9A9B1) | TagHash(0x80A9AFC1) | TagHash(0x80A9B065)
+        | TagHash(0x80A9C27C) | TagHash(0x80A9DE77) | TagHash(0x80AA02A7) => (2, 1),
+        // These generated runner surfaces use t2.r as normal response and
+        // feed t2.g into RT2.g AO. Keep both roles bound independently.
+        TagHash(0x80A9C31E) | TagHash(0x80A9DEEC) | TagHash(0x80A9E0FD) | TagHash(0x80A9E4DB)
+        | TagHash(0x80A9E76C) => (2, 1),
+        TagHash(0x80A9C96F) | TagHash(0x80A9D3FC) => (4, 1),
+        TagHash(0x80A9D569) => (5, 1),
+        TagHash(0x80B142A5) => (4, 1),
+        TagHash(0x80B143A0) | TagHash(0x80B14701) => (2, 1),
+        TagHash(0x80B1444E) | TagHash(0x80B14BF9) => (3, 1),
+        _ => return None,
+    };
+    Some(RunnerOcclusionMaterial {
+        texture: bindings.iter().find(|binding| binding.slot == slot)?.tag,
+        channel,
+    })
+}
+
+fn character_surface_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+    normal_slot: Option<u32>,
+) -> Option<CharacterSurfaceMaterial> {
+    if !bindings_use_character_gear_surface(bindings, normal_slot)
+        && !bindings_use_compact_character_surface(bindings, normal_slot)
+    {
+        return None;
+    }
+    let tag_at = |slot| {
+        bindings
+            .iter()
+            .find(|binding| binding.slot == slot)
+            .map(|binding| binding.tag)
+    };
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let constants = &preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .inline_constants;
+    let detail_transform = *constants.first()?;
+    let detail_base = *constants.get(3)?;
+    let detail_scale = *constants.get(4)?;
+    let detail_gate = constants.get(5)?[0];
+    let common_valid = detail_transform
+        .iter()
+        .chain(&detail_base)
+        .chain(&detail_scale)
+        .all(|value| value.is_finite())
+        && detail_transform[0].abs() > 0.0001
+        && detail_transform[1].abs() > 0.0001
+        && detail_transform[..2]
+            .iter()
+            .all(|value| value.abs() <= 1024.0)
+        // Common-character c3 is an authored linear RGBA colour. Several
+        // unrelated runner shaders share the same wide t0..tn resource shape,
+        // but place UV/scalar rows in c3/c4 and leave c3.a at zero. Treating
+        // those rows as RGB produced the vivid cyan/green/red shell panels.
+        && (detail_base[3] - 1.0).abs() <= 0.0001
+        && detail_base[..3]
+            .iter()
+            .all(|value| (0.0..=1.0).contains(value))
+        && detail_scale[..3]
+            .iter()
+            .all(|value| (-1.0..=1.0).contains(value))
+        && (0.0..=1.0).contains(&detail_gate)
+        && texture_is_srgb(tag_at(1)?);
+    if common_valid {
+        return Some(CharacterSurfaceMaterial {
+            mode: 1,
+            surface: tag_at(2)?,
+            selector: tag_at(3)?,
+            detail_color: tag_at(1)?,
+            detail_normal: tag_at(normal_slot?)?,
+            procedural: None,
+            detail_transform,
+            detail_base,
+            detail_scale,
+            detail_gate,
+            extra: [[0.0; 4]; 2],
+            palette: [[1.0; 4]; 2],
+            procedural_constants: [[0.0; 4]; 11],
+        });
+    }
+
+    // Newer runner cosmetics use two transformed samples from t1 as a
+    // procedural palette mask. t4.g selects that palette over local t0; t3
+    // contributes the authored secondary mask. This is the literal layout in
+    // Arata-family DXIL, detected by its four affine UV rows rather than tags.
+    let palette = [*constants.first()?, *constants.get(1)?];
+    let transforms = [
+        *constants.get(2)?,
+        *constants.get(3)?,
+        *constants.get(4)?,
+        *constants.get(5)?,
+    ];
+    let palette_gate = constants.get(25)?[0];
+    let palette_valid = palette
+        .iter()
+        .flatten()
+        .chain(transforms.iter().flatten())
+        .all(|value| value.is_finite())
+        && palette
+            .iter()
+            .all(|color| color[..3].iter().all(|value| (0.0..=1.0).contains(value)))
+        && transforms
+            .iter()
+            .all(|row| row[..2].iter().any(|value| value.abs() > 0.0001))
+        && (0.0..=1.0).contains(&palette_gate)
+        && texture_preview_format(tag_at(2)?).contains("Rg16")
+        && texture_is_srgb(tag_at(3)?)
+        && !texture_is_srgb(tag_at(4)?)
+        && normal_slot.is_some();
+    if palette_valid {
+        return Some(CharacterSurfaceMaterial {
+            mode: 2,
+            surface: tag_at(4)?,
+            selector: tag_at(3)?,
+            detail_color: tag_at(1)?,
+            detail_normal: tag_at(normal_slot?)?,
+            procedural: Some(tag_at(2)?),
+            detail_transform: transforms[0],
+            detail_base: transforms[1],
+            detail_scale: transforms[2],
+            detail_gate: palette_gate,
+            extra: [transforms[3], [0.0; 4]],
+            palette,
+            procedural_constants: [
+                *constants.get(6)?,
+                *constants.get(10)?,
+                *constants.get(11)?,
+                *constants.get(12)?,
+                *constants.get(13)?,
+                *constants.get(14)?,
+                *constants.get(15)?,
+                *constants.get(20)?,
+                *constants.get(22)?,
+                *constants.get(23)?,
+                *constants.get(24)?,
+            ],
+        });
+    }
+
+    // A wide resource table is not a material ABI. These remaining shaders
+    // are separate cloth/skin/eye/layer families; routing all of them through
+    // one invented palette branch caused the missing and white runner panels.
+    // Leave them unclassified until their compiled shader contract is decoded.
+    None
+}
+
+fn runner_shell_gear_dye_palette(
+    cache: &TagCache,
+    combination: &RunnerShellCombination,
+) -> Option<[GearDyeMaterial; 6]> {
+    // The model container's immediate PatternComponent parent owns its exact
+    // cosmetic parameters. Walking the shared graph reaches sibling/default
+    // components and can apply another skin's palette (observed as red Emerald
+    // Impact). Body is authoritative; face/hair inherit it.
+    std::iter::once(combination.body)
+        .chain(std::iter::once(combination.head))
+        .chain(combination.additional_parts.iter().copied())
+        .flat_map(|container| {
+            cache
+                .hashes
+                .get(&container)
+                .into_iter()
+                .flat_map(|scan| scan.references.iter().copied())
+        })
+        .unique()
+        .filter(|parent| {
+            package_manager()
+                .get_entry(*parent)
+                .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
+        })
+        .find_map(|component| {
+            package_manager()
+                .read_tag(component)
+                .ok()
+                .and_then(|data| decode_weapon_skin_gear_dye_palette(&data))
+        })
 }
 
 pub(crate) fn weapon_skin_gear_dye_palette(
@@ -2997,6 +5105,9 @@ fn merge_model_wireframes(
     let has_complete_tangents = parts
         .iter()
         .all(|(_tag, _source, wireframe)| wireframe.tangents.is_some());
+    let has_complete_rigid_indices = parts
+        .iter()
+        .all(|(_tag, _source, wireframe)| wireframe.rigid_indices.is_some());
     let normal_format = has_complete_normals
         .then(|| {
             parts
@@ -3033,6 +5144,7 @@ fn merge_model_wireframes(
             .format(" + ")
     );
     let mut vertices = Vec::new();
+    let mut rigid_indices = has_complete_rigid_indices.then(Vec::new);
     let mut normals = has_complete_normals.then(Vec::new);
     let mut procedural_positions = Some(Vec::new());
     let mut procedural_normals = has_complete_normals.then(Vec::new);
@@ -3049,6 +5161,9 @@ fn merge_model_wireframes(
         let copied_vertices = wireframe.vertices.len().min(available_vertices);
         let vertex_base = vertices.len() as u32;
         vertices.extend(wireframe.vertices.iter().copied().take(copied_vertices));
+        if let (Some(output), Some(part)) = (&mut rigid_indices, &wireframe.rigid_indices) {
+            output.extend(part.iter().copied().take(copied_vertices));
+        }
         if let Some(output_positions) = &mut procedural_positions {
             output_positions.extend(
                 wireframe
@@ -3152,6 +5267,7 @@ fn merge_model_wireframes(
         position_format,
         uv_format,
         vertices,
+        rigid_indices,
         normals,
         procedural_positions,
         procedural_normals,
@@ -3407,11 +5523,19 @@ fn material_textures_for_technique(
         .filter(|binding| binding.stage == "PS")
         .sorted_by_key(|binding| texture_binding_rank(*binding))
         .collect_vec();
-    let normal_slot = material_normal_texture_slot(&candidates);
-    let control_slot = material_control_texture_slot(&candidates, normal_slot);
+    let normal_slot = material_normal_texture_slot_for_technique(technique, &candidates);
+    let control_slot = material_control_texture_slot(technique, &candidates, normal_slot);
+    let color_slot = material_color_texture_slot_for_technique(technique, &candidates);
+    let character_surface = character_surface_material(technique, &candidates, normal_slot);
+    let runner_layered_surface = runner_layered_surface_material(technique, &candidates);
+    let runner_occlusion = runner_occlusion_material(technique, &candidates);
+    let alpha_mask = runner_alpha_mask_material(technique, &candidates);
     let investment_decal = investment_decal_for_technique(technique, &candidates);
     let direct_shared_color_atlas = direct_shared_color_atlas_for_technique(technique, &candidates);
+    material.shared_atlas_detail = direct_shared_color_atlas
+        .and_then(|_| shared_atlas_detail_material(technique, &candidates));
     material.mod_wear = weapon_mod_wear_material(technique, &candidates);
+    material.surface_condition = weapon_surface_condition_material(technique, &candidates);
     // Both families can expose eight PS textures, but slots 5..7 mean physical
     // age/wear when the TFX wear ABI is present. Never reinterpret those wear
     // resources as decorative contour inputs.
@@ -3421,7 +5545,13 @@ fn material_textures_for_technique(
 
     for binding in &candidates {
         let binding = *binding;
-        let mut role = material_texture_role(binding, normal_slot, control_slot);
+        let mut role = if color_slot == Some(binding.slot) {
+            MaterialTextureRole::Color
+        } else if color_slot.is_some() && binding.slot == 0 {
+            MaterialTextureRole::Aux
+        } else {
+            material_texture_role(binding, normal_slot, control_slot)
+        };
         if investment_decal
             .as_ref()
             .is_some_and(|decal| decal.color() == binding.tag)
@@ -3429,10 +5559,39 @@ fn material_textures_for_technique(
             role = MaterialTextureRole::Color;
         } else if direct_shared_color_atlas == Some(binding.tag) {
             role = MaterialTextureRole::Color;
-        } else if fallback_aux_texture(binding.tag) {
+        } else if fallback_aux_texture(binding.tag)
+            && !matches!(
+                role,
+                MaterialTextureRole::Control(_) | MaterialTextureRole::Normal
+            )
+        {
             role = MaterialTextureRole::Aux;
         }
         assign_material_texture(&mut material, binding.tag, role);
+    }
+
+    material.character_surface = character_surface;
+    material.runner_layered_surface = runner_layered_surface;
+    material.runner_occlusion = runner_occlusion;
+    material.alpha_mask = alpha_mask;
+    if let Some(alpha_mask) = alpha_mask {
+        material.control = Some(alpha_mask.texture);
+        material
+            .aux
+            .retain(|texture| *texture != alpha_mask.texture);
+    }
+
+    // Compact character permutations omit the extended t10+ character block,
+    // but their compiled shaders write the same Goliath MRT contract as the
+    // full family: RT1.a = 0.67 roughness and RT2.r = 0 metalness. Their t2/t3
+    // textures are selectors/packed masks, not an ORM map.
+    if material.character_surface.is_none()
+        && bindings_use_compact_character_surface(&candidates, normal_slot)
+    {
+        material.solid_surface = Some([0.67, 0.0]);
+    }
+    if material.solid_surface.is_none() {
+        material.solid_surface = runner_solid_surface_material(technique);
     }
 
     if let Some(investment_decal) = investment_decal {
@@ -3452,6 +5611,14 @@ fn material_textures_for_technique(
         material.color = Some(atlas);
         material.authored_shared_atlas = true;
         material.aux.retain(|texture| *texture != atlas);
+        if material.shared_atlas_detail.is_some() {
+            // Audited MRT ABI: RT1.a = 0.67 and RT2.r = 0 for this direct
+            // atlas + linear triplanar-response family.
+            material.solid_surface = Some([0.67, 0.0]);
+        }
+    }
+    if let Some(condition) = material.surface_condition {
+        material.aux.retain(|texture| *texture != condition.breakup);
     }
 
     for texture in textures
@@ -3536,7 +5703,7 @@ fn transmission_material_from_constants(constants: &[[f32; 4]]) -> Option<Transm
         }
     }
     if candidates.is_empty() {
-        return None;
+        return stage8_alpha_color_material(constants);
     }
 
     // Procedural surface blocks carry the same epsilon sentinel used by the
@@ -3583,12 +5750,103 @@ fn transmission_material_from_constants(constants: &[[f32; 4]]) -> Option<Transm
     })
 }
 
+/// Decode the compact stage-8 material ABI used by runner-shell effects.
+///
+/// Unlike the extended surface block above, these permutations mark authored
+/// colours with alpha = 1. A scalar immediately after the colour is roughness;
+/// older variants place that scalar shortly before the colour. Remaining
+/// effect constants have alpha = 0, which keeps this decoder structural rather
+/// than tied to a particular tag or colour.
+fn stage8_alpha_color_material(constants: &[[f32; 4]]) -> Option<TransmissionMaterial> {
+    let mut authored_colors = constants
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, color)| {
+            color[3].is_finite()
+                && (color[3] - 1.0).abs() <= 0.001
+                && color[..3]
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                && color[..3].iter().any(|value| *value > 0.001)
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    if authored_colors.is_empty() {
+        // Procedural runner energy uses an emissive RGB vector with alpha 0,
+        // followed by its signed edge remap (positive scale, negative bias and
+        // epsilon). This is a separate compiled stage-8 ABI from absorption
+        // glass; preserve its authored blue/orange/etc. instead of falling
+        // back to the first bound single-channel mask.
+        authored_colors = constants
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, color)| {
+                color[3].abs() <= 0.001
+                    && color[..3]
+                        .iter()
+                        .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                    && color[..3].iter().filter(|value| **value > 0.01).count() >= 2
+                    && constants.get(index + 1).is_some_and(|remap| {
+                        (1.0..=4.0).contains(&remap[0])
+                            && remap[1] < -1.0
+                            && (-0.1..0.0).contains(&remap[2])
+                            && remap[3].abs() <= 0.001
+                    })
+            })
+            .take(1)
+            .collect();
+        if authored_colors.is_empty() {
+            return None;
+        }
+    }
+
+    let scalar_roughness = |color_index: usize| {
+        let scalar = |value: &[f32; 4]| {
+            value[0].is_finite()
+                && (0.02..=1.0).contains(&value[0])
+                && value[1..].iter().all(|component| component.abs() <= 0.0001)
+        };
+        constants
+            .get(color_index + 1)
+            .filter(|value| scalar(value))
+            .map(|value| value[0])
+            .or_else(|| {
+                (color_index.saturating_sub(6)..color_index)
+                    .rev()
+                    .find_map(|index| constants.get(index).filter(|value| scalar(value)))
+                    .map(|value| value[0])
+            })
+            .unwrap_or(0.5)
+    };
+
+    let mut colors = Vec::with_capacity(2);
+    let mut surfaces = Vec::with_capacity(2);
+    for (index, mut color) in authored_colors {
+        color[3] = 1.0;
+        if !colors.contains(&color) {
+            colors.push(color);
+            surfaces.push([scalar_roughness(index), 0.0, 0.0, 0.0]);
+        }
+    }
+    let color_count = colors.len() as u8;
+    colors.resize(2, colors[0]);
+    surfaces.resize(2, surfaces[0]);
+    Some(TransmissionMaterial {
+        colors: [colors[0], colors[1]],
+        surfaces: [surfaces[0], surfaces[1]],
+        color_count,
+    })
+}
+
 /// Resolve an opaque material whose authored colour is a shared atlas.
 ///
 /// Shared atlases are normally technical resources and must not win generic
 /// albedo guessing. An opaque decal technique, however, can bind that same
-/// atlas as its sole PS t0 colour source. Direct-slot ownership makes that use
-/// unambiguous without naming a weapon or technique tag.
+/// atlas as its direct PS t0 colour source, optionally beside linear response
+/// maps. Direct-slot ownership makes that use unambiguous without naming a
+/// weapon or technique tag.
 fn direct_shared_color_atlas_for_technique(
     technique: TagHash,
     bindings: &[TechniqueTextureBinding],
@@ -3612,13 +5870,61 @@ fn direct_shared_color_atlas_for_technique(
         .copied()
         .unique_by(|binding| binding.slot)
         .collect_vec();
-    let [atlas] = pixel_textures.as_slice() else {
+    let color_sources = pixel_textures
+        .iter()
+        .filter(|binding| texture_is_srgb(binding.tag))
+        .copied()
+        .collect_vec();
+    let [atlas] = color_sources.as_slice() else {
         return None;
     };
-    (atlas.slot == 0
-        && texture_is_srgb(atlas.tag)
-        && !matches!(render_state_for_technique(technique).blend, Some(26 | 27)))
-    .then_some(atlas.tag)
+    // Shared-atlas surface shaders may pair t0 colour with linear BC4/BC5
+    // response maps. Requiring one total texture discarded the proven t0
+    // colour and replaced it with Quicktag's white fallback.
+    (atlas.slot == 0 && !matches!(render_state_for_technique(technique).blend, Some(26 | 27)))
+        .then_some(atlas.tag)
+}
+
+/// Decode the common two-texture shared-atlas surface ABI.
+///
+/// Its compiled pixel shader writes `t0.rgb * (base + scale * triplanar(t1))`
+/// to RT0. Recognize the binding/constant shape, never a weapon or tag hash.
+fn shared_atlas_detail_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<SharedAtlasDetailMaterial> {
+    let detail = bindings
+        .iter()
+        .find(|binding| {
+            binding.stage == "PS" && binding.slot == 1 && !texture_is_srgb(binding.tag)
+        })?
+        .tag;
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let constants = &preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .inline_constants;
+    let exponent = constants.get(3)?[0];
+    let projection = *constants.get(4)?;
+    let base = constants.get(5)?;
+    let scale = constants.get(6)?;
+    (exponent.is_finite()
+        && exponent > 0.0
+        && projection[0].is_finite()
+        && projection[1].is_finite()
+        && projection[0] > 0.0
+        && projection[1] > 0.0)
+        .then_some(SharedAtlasDetailMaterial {
+            detail,
+            projection,
+            exponent,
+            base: [base[0], base[1], base[2]],
+            scale: [scale[0], scale[1], scale[2]],
+        })
 }
 
 /// Resolve Tiger's investment-decal pass.
@@ -4028,6 +6334,104 @@ const WEAPON_MOD_SCRATCHES_PROJECTION_AGE_DELTA: usize = 10;
 const WEAPON_MOD_SCRATCHES_REMAP_BASE_AGE_DELTA: usize = 9;
 const WEAPON_MOD_SCRATCHES_REMAP_SCALE_AGE_DELTA: usize = 8;
 
+fn weapon_surface_condition_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<WeaponSurfaceConditionMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+
+    // Compiled common-weapon body ABI. These object-channel expressions are
+    // the stable semantic signature; register numbers move between shader
+    // permutations, so locate the condition gate first and read relative rows.
+    let gate = pixel.bytecode.expressions.iter().find(|expression| {
+        expression.expression.contains("object_channel(0xA590EEC6)")
+            && expression.expression.contains("object_channel(0x714FE9CA)")
+    })?;
+    if !pixel.bytecode.expressions.iter().any(|expression| {
+        expression.expression.contains("object_channel(0xD4FB5E33)")
+            && expression.expression.contains("object_channel(0xEAA8E3CF)")
+    }) {
+        return None;
+    }
+    let gate_index = gate
+        .target
+        .strip_prefix("output[")?
+        .strip_suffix(']')?
+        .parse::<usize>()
+        .ok()?;
+    let row = |delta: isize| {
+        let index = gate_index.checked_add_signed(delta)?;
+        pixel.inline_constants.get(index).copied()
+    };
+    let projection_target = format!("output[{}]", gate_index.checked_sub(4)?);
+    let projection_expression = pixel
+        .bytecode
+        .expressions
+        .iter()
+        .find(|expression| expression.target == projection_target)?;
+    let projection_constant = projection_expression
+        .expression
+        .split("constant[")
+        .nth(1)?
+        .split(']')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    let projection = *pixel.constants.get(projection_constant)?;
+    if projection[0] <= 0.0 || projection[1] <= 0.0 {
+        return None;
+    }
+    let breakup = bindings
+        .iter()
+        .find(|binding| binding.stage == "PS" && binding.slot == 6)?
+        .tag;
+    let response = bindings
+        .iter()
+        .find(|binding| binding.stage == "PS" && binding.slot == 2)?
+        .tag;
+    let detail = bindings
+        .iter()
+        .find(|binding| binding.stage == "PS" && binding.slot == 4)?
+        .tag;
+
+    let detail_projection = row(-70)?;
+    let detail_exponent = row(-71)?[0];
+    let detail_roughness = row(14)?[0];
+    let detail_remap = [row(15)?[0], row(15)?[1]];
+    if !detail_projection.into_iter().all(f32::is_finite)
+        || detail_projection[0] <= 0.0
+        || detail_projection[1] <= 0.0
+        || !detail_exponent.is_finite()
+        || detail_exponent <= 0.0
+        || !detail_roughness.is_finite()
+        || !(0.0..=1.0).contains(&detail_roughness)
+        || !detail_remap.into_iter().all(f32::is_finite)
+    {
+        return None;
+    }
+
+    Some(WeaponSurfaceConditionMaterial {
+        response,
+        detail,
+        breakup,
+        detail_projection,
+        detail_exponent,
+        detail_roughness,
+        detail_remap,
+        projection,
+        phase: row(-8)?[0],
+        triangle: [row(-7)?[0], row(-6)?[0], row(-5)?[0], row(-5)?[1]],
+        orientation: [row(-2)?[0], row(-2)?[1]],
+        albedo: [row(3)?[0], row(4)?[0], row(6)?[0]],
+        roughness: 0.9,
+        normal_flatten: row(5)?[0],
+    })
+}
+
 /// Marathon's common weapon-part shader exposes extra surface inputs at PS
 /// t5..t7. Inventory rarities share one Pattern and texture set. Runtime sends
 /// the authored tier (1 Enhanced, 2 Deluxe, 3 Superior) through object channel
@@ -4224,6 +6628,9 @@ fn promote_auxiliary_preview_color(material: &mut WireframeMaterialTextures, tec
             .copied()
             .find(|texture| preview_mask_candidate(*texture));
     }
+    if let Some(color) = material.color {
+        material.aux.retain(|texture| *texture != color);
+    }
 }
 
 fn local_surface_texture_candidate(texture: TagHash, technique: TagHash) -> bool {
@@ -4286,28 +6693,46 @@ fn assign_material_texture(
     texture: TagHash,
     role: MaterialTextureRole,
 ) {
-    if Some(texture) == material.color
-        || Some(texture) == material.normal
-        || Some(texture) == material.emissive
-        || Some(texture) == material.control
-        || material.aux.contains(&texture)
-        || material.layers.iter().any(|layer| {
-            layer.color == Some(texture)
-                || layer.normal == Some(texture)
-                || layer.emissive == Some(texture)
-        })
-    {
-        return;
-    }
-
     match role {
-        MaterialTextureRole::Color => assign_color_layer(material, texture),
-        MaterialTextureRole::Normal => assign_normal_layer(material, texture),
+        MaterialTextureRole::Color => {
+            material.aux.retain(|candidate| *candidate != texture);
+            if !material
+                .layers
+                .iter()
+                .any(|layer| layer.color == Some(texture))
+            {
+                assign_color_layer(material, texture);
+            }
+        }
+        MaterialTextureRole::Normal => {
+            material.aux.retain(|candidate| *candidate != texture);
+            if !material
+                .layers
+                .iter()
+                .any(|layer| layer.normal == Some(texture))
+            {
+                assign_normal_layer(material, texture);
+            }
+        }
         MaterialTextureRole::Control(channel) => {
+            material.aux.retain(|candidate| *candidate != texture);
             material.control = Some(texture);
             material.roughness_channel = channel;
         }
-        _ => material.aux.push(texture),
+        MaterialTextureRole::Aux => {
+            let semantic = Some(texture) == material.color
+                || Some(texture) == material.normal
+                || Some(texture) == material.emissive
+                || Some(texture) == material.control
+                || material.layers.iter().any(|layer| {
+                    layer.color == Some(texture)
+                        || layer.normal == Some(texture)
+                        || layer.emissive == Some(texture)
+                });
+            if !semantic && !material.aux.contains(&texture) {
+                material.aux.push(texture);
+            }
+        }
     }
 }
 
@@ -4375,35 +6800,105 @@ fn material_texture_role(
     }
 }
 
+fn material_color_texture_slot_for_technique(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<u32> {
+    let pixel_shader = package_manager()
+        .get_entry(technique)
+        .zip(package_manager().read_tag(technique).ok())
+        .and_then(|(entry, data)| MaterialTagPreview::load(&entry, &data))
+        .and_then(|preview| {
+            let MaterialPreviewKind::Technique(preview) = preview.kind;
+            preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .and_then(|stage| stage.shader)
+        });
+
+    let exact = match pixel_shader {
+        // B860 generates skin colour from c121/c122/c123. t1 is a shared
+        // cellular response LUT, not model albedo. Keep t0 as the material
+        // key so local normal/AO resources remain attached; mode 41 replaces
+        // its scalar preview colour in WGSL.
+        Some(TagHash(0x80A9B860)) => Some(0),
+        // Compiled hair/fiber shaders bind shared environment lookup at t0
+        // and local strand albedo at t1. Treating t0 as model color discards
+        // every authored hair texture on Thief/Vandal-style three-part shells.
+        Some(TagHash(0x80A4840A)) | Some(TagHash(0x80B073D2)) | Some(TagHash(0x80B08209)) => {
+            Some(1)
+        }
+        _ => None,
+    };
+    if exact.is_some() {
+        return exact;
+    }
+
+    // Scalar t0 cannot supply albedo. Generated procedural runner shaders
+    // place authored sRGB color later in their resource table. Prefer it over
+    // rendering the scalar selector as gray.
+    let slot0_is_scalar = bindings
+        .iter()
+        .any(|binding| binding.slot == 0 && texture_preview_format(binding.tag).contains("Bc4"));
+    if !slot0_is_scalar {
+        return None;
+    }
+    bindings
+        .iter()
+        .filter(|binding| texture_is_srgb(binding.tag) && !fallback_aux_texture(binding.tag))
+        .min_by_key(|binding| (binding.tag.pkg_id() != technique.pkg_id(), binding.slot))
+        .map(|binding| binding.slot)
+}
+
 fn material_control_texture_slot(
+    technique: TagHash,
     bindings: &[TechniqueTextureBinding],
     normal_slot: Option<u32>,
 ) -> Option<(u32, u8)> {
+    // Face/skin surface 80A9B85C binds its packed region selector at t2.
+    // t3 is a shared response field, while t5 is the tangent-space normal.
+    // The compact-family heuristic otherwise mistakes t3 for the dye selector.
+    match material_pixel_shader(technique) {
+        Some(TagHash(0x80A9B85C)) => return Some((2, 4)),
+        Some(TagHash(0x80A9C430)) => return Some((1, 4)),
+        Some(TagHash(0x80A9C65C)) => return Some((1, 4)),
+        Some(TagHash(0x80A9CBEE)) => return Some((2, 4)),
+        _ => {}
+    }
     let max_slot = bindings.iter().map(|binding| binding.slot).max()?;
     let usable = |slot| {
-        bindings.iter().any(|binding| {
-            binding.slot == slot
-                && !fallback_aux_texture(binding.tag)
-                && material_control_texture_candidate(binding.tag)
-        })
+        Some(slot) != normal_slot
+            && bindings.iter().any(|binding| {
+                binding.slot == slot
+                    && !fallback_aux_texture(binding.tag)
+                    && material_control_texture_candidate(binding.tag)
+            })
     };
     let usable_multichannel = |slot| {
-        bindings.iter().any(|binding| {
-            binding.slot == slot
-                && !fallback_aux_texture(binding.tag)
-                && material_control_texture_candidate(binding.tag)
-                && !texture_preview_format(binding.tag).contains("Bc4")
-        })
+        Some(slot) != normal_slot
+            && bindings.iter().any(|binding| {
+                binding.slot == slot
+                    && !fallback_aux_texture(binding.tag)
+                    && material_control_texture_candidate(binding.tag)
+                    && !texture_preview_format(binding.tag).contains("Bc4")
+            })
     };
 
-    if max_slot >= 10 && usable_multichannel(2) {
-        return Some((2, 3));
+    if max_slot >= 10 && usable_multichannel(3) {
+        return Some((3, 3));
     }
     if max_slot <= 4 && normal_slot == Some(2) && usable(1) {
         return Some((1, 1));
     }
     if (5..10).contains(&max_slot) && usable_multichannel(3) {
         return Some((3, 4));
+    }
+    if (5..10).contains(&max_slot) && usable_multichannel(1) {
+        // Compact/full runner gear permutations bind their local packed
+        // region/surface selector at t1. t3 is often the shared 80A613F5
+        // lighting ramp and must never drive GearDye region IDs.
+        return Some((1, 4));
     }
     None
 }
@@ -4424,6 +6919,106 @@ fn material_control_texture_candidate(texture: TagHash) -> bool {
         && desc.width > 1
         && desc.height > 1
         && !format.contains("Srgb")
+}
+
+fn material_normal_texture_slot_for_technique(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<u32> {
+    // Generated runner shaders do not consistently place their base tangent
+    // normal in the last linear 2D slot. These two audited families append
+    // procedural/detail fields after the base normal:
+    //
+    // 80A9B75C: t3 base normal, t4 procedural 2D field, t5 3D field.
+    // 80A9AFB6: t4 base normal, t3 gated detail normal, t5 procedural field.
+    //
+    // Resolve from compiled PS ABI before applying the generic table rule.
+    let pixel_shader = material_pixel_shader(technique);
+    match pixel_shader {
+        // Two-mask runner surface. PS t1 is scalar coverage, t2 is scalar AO,
+        // and DXIL samples t3 at mesh UV before reconstructing tangent-space Z.
+        Some(TagHash(0x80A9A9D3)) => return Some(3),
+        Some(TagHash(0x80A9B860)) => return Some(3),
+        Some(TagHash(0x80A9B07B)) => return Some(6),
+        Some(TagHash(0x80A9B855)) => return Some(4),
+        Some(TagHash(0x80A9B857)) | Some(TagHash(0x80A9B85A)) => return Some(3),
+        Some(TagHash(0x80A9C244)) => return Some(8),
+        Some(TagHash(0x80A9AFB4)) => return Some(6),
+        Some(TagHash(0x80A9B75C)) => return Some(3),
+        Some(TagHash(0x80A9AFB6)) | Some(TagHash(0x80A9BBBE)) | Some(TagHash(0x80A9BBBF)) => {
+            return Some(4);
+        }
+        Some(TagHash(0x80A9B93E))
+        | Some(TagHash(0x80A9BBDD))
+        | Some(TagHash(0x80A9CBAE))
+        | Some(TagHash(0x80A9D6FD))
+        | Some(TagHash(0x80A9DC9A))
+        | Some(TagHash(0x80A9DEEC))
+        | Some(TagHash(0x80A9E0FD))
+        | Some(TagHash(0x80A9E4DB))
+        | Some(TagHash(0x80A9E76C)) => return Some(6),
+        Some(TagHash(0x80A9B610)) | Some(TagHash(0x80A9C3F6)) => return Some(7),
+        Some(TagHash(0x80A9A8CF)) => return Some(7),
+        Some(TagHash(0x80A9AD5D)) => return Some(9),
+        Some(TagHash(0x80A9AD68)) => return Some(7),
+        Some(TagHash(0x80A9A9AD)) | Some(TagHash(0x80A9A9B1)) => return Some(9),
+        Some(TagHash(0x80A9B065)) | Some(TagHash(0x80A9DE77)) => return Some(6),
+        Some(TagHash(0x80A9B06A)) => return Some(6),
+        Some(TagHash(0x80A9B71C)) => return Some(4),
+        Some(TagHash(0x80A9B85C)) => return Some(5),
+        Some(TagHash(0x80A9C430)) => return Some(5),
+        Some(TagHash(0x80A9C65C)) => return Some(4),
+        Some(TagHash(0x80A9CBEE)) => return Some(5),
+        Some(TagHash(0x80A9C27C)) => return Some(6),
+        Some(TagHash(0x80A9AFBF)) => return Some(6),
+        Some(TagHash(0x80AA0261)) | Some(TagHash(0x80AA0263)) => return Some(5),
+        Some(TagHash(0x80AA02A7)) => return Some(4),
+        Some(TagHash(0x80A9B86A)) => return Some(7),
+        Some(TagHash(0x80A9D952)) => return Some(7),
+        Some(TagHash(0x80A9AE19)) | Some(TagHash(0x80A9DAC9)) | Some(TagHash(0x80A9DB9A)) => {
+            return Some(7);
+        }
+        Some(TagHash(0x80A9AFB8)) | Some(TagHash(0x80A9AFBA)) => return Some(9),
+        Some(TagHash(0x80A9BD17)) | Some(TagHash(0x80A9DA29)) | Some(TagHash(0x80A9E64F)) => {
+            return Some(7);
+        }
+        Some(TagHash(0x80A9C31E)) => return Some(5),
+        Some(TagHash(0x80A9DCF8)) => return Some(6),
+        Some(TagHash(0x80A9C96F)) | Some(TagHash(0x80A9D2D7)) | Some(TagHash(0x80A9D3FC)) => {
+            return Some(8);
+        }
+        Some(TagHash(0x80A9D569)) => return Some(9),
+        Some(TagHash(0x80A9F4E5)) => return Some(7),
+        Some(TagHash(0x80A9F500)) => return Some(8),
+        Some(TagHash(0x80A9F518)) | Some(TagHash(0x80A9F4B3)) => return Some(7),
+        Some(TagHash(0x80A9F528)) => return Some(6),
+        Some(TagHash(0x80A9F589)) => return Some(4),
+        // Runner character permutations below t10 need explicit PS ABI slots;
+        // generic material inference intentionally stays weapon-safe.
+        Some(TagHash(0x80AA043B)) => return Some(5),
+        Some(TagHash(0x80AA046E)) => return Some(6),
+        Some(TagHash(0x80AA0498)) | Some(TagHash(0x80B14062)) => return Some(8),
+        Some(TagHash(0x80B142A5)) => return Some(9),
+        Some(TagHash(0x80B143A0)) => return Some(6),
+        Some(TagHash(0x80B1444E)) | Some(TagHash(0x80B14701)) | Some(TagHash(0x80B14BF9)) => {
+            return Some(7);
+        }
+        _ => {}
+    }
+
+    material_normal_texture_slot(bindings)
+}
+
+fn material_pixel_shader(technique: TagHash) -> Option<TagHash> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .shader
 }
 
 fn material_normal_texture_slot(bindings: &[TechniqueTextureBinding]) -> Option<u32> {
@@ -4500,17 +7095,21 @@ fn fallback_color_candidate(texture: TagHash, technique: TagHash) -> bool {
 }
 
 fn fallback_aux_texture(texture: TagHash) -> bool {
-    matches!(
-        texture.0,
-        0x80A60058
-            | 0x80A4050F
-            | 0x80A46D44
-            | 0x80A46D48
-            | 0x80A60055
-            | 0x80A6007D
-            | 0x80A43539
-            | 0x80B6CC6E
-    )
+    texture == TagHash::new(288, 1296)
+        || matches!(
+            texture.0,
+            0x80A60000
+                | 0x80A60058
+                | 0x80A60089
+                | 0x80A613F5
+                | 0x80A4050F
+                | 0x80A46D44
+                | 0x80A46D48
+                | 0x80A60055
+                | 0x80A6007D
+                | 0x80A43539
+                | 0x80B6CC6E
+        )
 }
 
 fn texture_has_parent_technique(cache: &TagCache, texture: TagHash, technique: TagHash) -> bool {
@@ -4998,6 +7597,33 @@ fn build_wireframe_from_refs(
         .iter_mut()
         .find_map(|(vertex_tag, preview)| Some((*vertex_tag, preview.wireframe.take()?)))?;
 
+    wireframe.rigid_indices = input_layout_rigid_indices(
+        &vertex_previews,
+        input_layout_index,
+        wireframe.vertices.len(),
+    );
+
+    if input_layout_index == Some(13)
+        && let Some((_position_tag, InputLayoutFormat::R32G32B32A32Float, positions)) =
+            input_layout_vectors(
+                &vertex_previews,
+                input_layout_index,
+                SEMANTIC_POSITION,
+                wireframe.vertices.len(),
+            )
+    {
+        wireframe.vertices = positions
+            .into_iter()
+            .map(|position| [position[0], position[1], position[2]])
+            .collect();
+        wireframe.procedural_positions = Some(wireframe.vertices.clone());
+        wireframe.position_format = "R32G32B32A32_FLOAT POSITION layout 13";
+        if let Some((min, max)) = bounds(&wireframe.vertices) {
+            wireframe.min = min;
+            wireframe.max = max;
+        }
+    }
+
     if let Some((uv_tag, uv_format, uvs)) = input_layout_uvs(
         &vertex_previews,
         input_layout_index,
@@ -5237,6 +7863,30 @@ fn input_layout_vectors(
     )?;
 
     (vectors.len() == vertex_count).then_some((*tag, layout.format, vectors))
+}
+
+fn input_layout_rigid_indices(
+    vertex_previews: &[(TagHash, VertexBufferPreview)],
+    input_layout_index: Option<u8>,
+    vertex_count: usize,
+) -> Option<Vec<u16>> {
+    let layout = resolved_input_layout_vector(input_layout_index?, SEMANTIC_POSITION, 0)?;
+    if layout.format != InputLayoutFormat::R16G16B16A16Snorm {
+        return None;
+    }
+    let (tag, preview) = vertex_previews.get(layout.buffer_index)?;
+    let entry = package_manager().get_entry(*tag)?;
+    let data = package_manager().read_tag(TagHash(entry.reference)).ok()?;
+    let stride = preview.header.stride as usize;
+    let offset = layout.offset.checked_add(6)?;
+    (stride >= offset + 2).then_some(())?;
+    let endian = package_manager().version.endian();
+    let indices = data
+        .chunks_exact(stride)
+        .take(vertex_count.min(MAX_PREVIEW_VERTICES))
+        .map(|vertex| read_i16(&vertex[offset..offset + 2], endian).max(0) as u16)
+        .collect_vec();
+    (indices.len() == vertex_count).then_some(indices)
 }
 
 fn normalize_input_layout_vector(
@@ -6097,25 +8747,35 @@ fn apply_geometry_position_transform(
     wireframe: &mut WireframePreview,
     transform: GeometryPositionTransform,
 ) {
-    if !wireframe.position_format.starts_with("i16") {
-        return;
-    }
+    let quantized = wireframe.position_format.starts_with("i16");
     for position in &mut wireframe.vertices {
         for axis in 0..3 {
-            position[axis] = read_snorm_position(position[axis]) * transform.scale[axis]
-                + transform.offset[axis];
+            let source = if quantized {
+                read_snorm_position(position[axis])
+            } else {
+                position[axis]
+            };
+            position[axis] = source * transform.scale[axis] + transform.offset[axis];
         }
     }
     // Compiled common-surface VS writes input POSITION straight to its
     // procedural varying, while rendered position follows geometry
     // dequantization. Vertex fetch supplies R16G16B16A16_SNORM, so preserve
     // exactly that normalized pre-transform value for pattern/wear.
-    if let Some(positions) = &mut wireframe.procedural_positions {
+    if quantized && let Some(positions) = &mut wireframe.procedural_positions {
         for position in positions {
             for axis in 0..3 {
                 position[axis] = read_snorm_position(position[axis]);
             }
         }
+    }
+    // The same scope_skinning row that dequantizes POSITION carries a
+    // separate object-space frequency multiplier in .w. Compiled common-
+    // surface shaders apply it before evaluating procedural wear/patterns.
+    // Keep that authored value on every draw range instead of silently using
+    // the preview default (1.0).
+    for range in &mut wireframe.material_ranges {
+        range.procedural_scale = transform.procedural_scale;
     }
     if let Some((min, max)) = bounds(&wireframe.vertices) {
         wireframe.min = min;
@@ -6741,6 +9401,7 @@ fn build_vertex_wireframe(
         vertex_count_total,
         procedural_positions: Some(vertices.clone()),
         vertices,
+        rigid_indices: None,
         normals: None,
         procedural_normals: None,
         tangents: None,
@@ -6987,6 +9648,48 @@ mod tests {
             [0.44368514, 0.18800727, 0.035853356, 1.0]
         );
         assert_eq!(material.surfaces[0], [0.54, 0.08, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn decodes_compact_runner_stage8_color_and_following_roughness() {
+        let mut constants = vec![[0.0; 4]; 32];
+        constants[18] = [0.27855745, 0.1740984, 0.2524427, 1.0];
+        constants[19] = [0.23, 0.0, 0.0, 0.0];
+
+        let material = transmission_material_from_constants(&constants).expect("transmission");
+        assert_eq!(material.color_count, 1);
+        assert_eq!(material.colors[0], constants[18]);
+        assert_eq!(material.surfaces[0], [0.23, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn decodes_compact_runner_stage8_two_color_block_and_prior_roughness() {
+        let mut constants = vec![[0.0; 4]; 32];
+        constants[13] = [0.75, 0.0, 0.0, 0.0];
+        constants[17] = [0.4, 0.4, 0.4, 1.0];
+        constants[18] = [0.1, 0.1, 0.1, 1.0];
+
+        let material = transmission_material_from_constants(&constants).expect("transmission");
+        assert_eq!(material.color_count, 2);
+        assert_eq!(material.colors, [constants[17], constants[18]]);
+        assert_eq!(material.surfaces[0], [0.75, 0.0, 0.0, 0.0]);
+        assert_eq!(material.surfaces[1], [0.75, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn decodes_procedural_runner_stage8_emissive_color() {
+        let mut constants = vec![[0.0; 4]; 35];
+        constants[16] = [0.0129830325, 0.14126329, 0.91309863, 0.0];
+        constants[17] = [1.75, -22.727272, -0.01, 0.0];
+        constants[18] = [20.0, 0.0, 0.0, 0.0];
+
+        let material = transmission_material_from_constants(&constants).expect("transmission");
+        assert_eq!(material.color_count, 1);
+        assert_eq!(
+            material.colors[0],
+            [0.0129830325, 0.14126329, 0.91309863, 1.0]
+        );
+        assert_eq!(material.surfaces[0], [0.5, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -7730,7 +10433,8 @@ mod tests {
                         .filter(|binding| binding.stage == "PS")
                         .collect_vec();
                     let normal_slot = material_normal_texture_slot(&direct_bindings);
-                    let control_slot = material_control_texture_slot(&direct_bindings, normal_slot);
+                    let control_slot =
+                        material_control_texture_slot(*technique, &direct_bindings, normal_slot);
                     eprintln!(
                         "{tag}: direct={:?}",
                         direct_bindings
@@ -7854,6 +10558,16 @@ mod tests {
         let blended_atlas = material_textures_for_technique(TagHash(0x80A9B0ED), &cache, &[]);
         assert_eq!(blended_atlas.color, Some(TagHash(0x80A60058)));
         assert!(blended_atlas.authored_shared_atlas);
+
+        let atlas_with_response = material_textures_for_technique(TagHash(0x80A9B8CE), &cache, &[]);
+        assert_eq!(atlas_with_response.color, Some(TagHash(0x80A60058)));
+        assert!(atlas_with_response.authored_shared_atlas);
+        let detail = atlas_with_response
+            .shared_atlas_detail
+            .expect("linear t1 shared-atlas response");
+        assert_eq!(detail.detail, TagHash(0x80A60055));
+        assert_eq!(detail.projection, [15.0, 15.0, 0.0, 0.0]);
+        assert_eq!(detail.exponent, 40.0);
     }
 
     #[test]
@@ -8020,7 +10734,7 @@ mod tests {
     #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
     fn probes_goliath_render_global_scopes() {
         init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
         for class in [0x8080B61C, 0x80808070, 0x80808075, 0x808031DC] {
             eprintln!("class {class:08X}");
             for (tag, entry) in package_manager().get_all_by_reference(class) {
@@ -8283,6 +10997,194 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn rejects_cross_family_character_surface_false_colors() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        // Arata, Neo-Cortex, and White Rabbit techniques which previously
+        // matched only because their texture tables looked character-like.
+        for technique in [
+            TagHash::new(394, 140),
+            TagHash::new(394, 188),
+            TagHash::new(334, 5454),
+            TagHash::new(334, 5477),
+            TagHash::new(334, 5529),
+            TagHash::new(334, 5541),
+            TagHash::new(334, 5574),
+            TagHash::new(334, 5180),
+            TagHash::new(335, 5751),
+            TagHash::new(334, 5415),
+        ] {
+            assert_ne!(
+                material_textures_for_technique(technique, &cache, &[])
+                    .character_surface
+                    .map(|surface| surface.mode),
+                Some(1),
+                "{technique} crossed into common-character ABI"
+            );
+        }
+
+        let arata = material_textures_for_technique(TagHash::new(394, 106), &cache, &[]);
+        assert_eq!(arata.character_surface.map(|surface| surface.mode), Some(2));
+        let white_rabbit = material_textures_for_technique(TagHash::new(334, 5123), &cache, &[]);
+        assert_eq!(
+            white_rabbit
+                .runner_layered_surface
+                .map(|surface| surface.mode),
+            Some(28)
+        );
+        let neo_cortex = material_textures_for_technique(TagHash::new(334, 5529), &cache, &[]);
+        assert_eq!(
+            neo_cortex
+                .runner_layered_surface
+                .map(|surface| surface.mode),
+            Some(30)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn resolves_layered_runner_fixtures() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        for (technique, expected_mode) in [
+            (TagHash::new(394, 935), 38),
+            (TagHash::new(394, 1109), 39),
+            (TagHash::new(394, 1610), 40),
+            (TagHash::new(394, 3072), 39),
+        ] {
+            let decoded = material_textures_for_technique(technique, &cache, &[])
+                .runner_layered_surface
+                .unwrap_or_else(|| panic!("{technique} package-394 layered ABI"));
+            assert_eq!(decoded.mode, expected_mode, "{technique}");
+            assert!(decoded.material_response.is_some(), "{technique}");
+        }
+        for (label, head, expected_mode) in [
+            ("full9", TagHash::new(334, 978), 1),
+            ("switched", TagHash::new(334, 3769), 2),
+            ("switched-single", TagHash::new(334, 3769), 5),
+            ("full10", TagHash::new(394, 1737), 3),
+            ("full9-procedural", TagHash::new(334, 3021), 4),
+            ("full9-local", TagHash::new(334, 6663), 6),
+            ("full9-local-deec", TagHash::new(334, 8162), 23),
+            ("full9-local-e4db", TagHash::new(335, 1460), 23),
+            ("full9-local-expanded", TagHash::new(334, 6076), 7),
+            ("full9-local-expanded-e0fd", TagHash::new(335, 1067), 24),
+            ("full8-procedural", TagHash::new(333, 3975), 8),
+            ("full8-procedural-sibling", TagHash::new(335, 1067), 8),
+            ("full10-local", TagHash::new(334, 7362), 9),
+            ("full10-b610", TagHash::new(333, 5878), 9),
+            ("full9-e76c", TagHash::new(335, 2199), 25),
+            ("full11", TagHash::new(335, 465), 10),
+            ("full10-agrb", TagHash::new(334, 791), 11),
+            ("full11-local-agrb", TagHash::new(334, 7214), 12),
+            ("full11-local-agrb-sibling", TagHash::new(333, 3780), 12),
+            ("full10-abr", TagHash::new(334, 791), 13),
+            ("full10-gbr", TagHash::new(334, 6996), 14),
+            ("full10-agrb-sibling", TagHash::new(334, 7934), 11),
+            ("full8-procedural-secondary", TagHash::new(333, 3975), 15),
+            ("full9-aa0261", TagHash::new(394, 7712), 16),
+            ("full9-aa0263", TagHash::new(394, 7555), 16),
+            ("full10-b86a", TagHash::new(333, 6659), 17),
+            ("full10-d952", TagHash::new(334, 4789), 18),
+            ("procedural-pattern-afb8", TagHash::new(334, 3021), 19),
+            ("full10-dual-r-bd17", TagHash::new(333, 7705), 20),
+            ("full10-dual-r-da29", TagHash::new(334, 7053), 20),
+            ("full10-agr-dual-r-e64f", TagHash::new(335, 1899), 21),
+            ("full9-agb-c31e", TagHash::new(334, 791), 22),
+            ("compact-agrb-dcf8", TagHash::new(334, 7570), 26),
+            ("wide-gbr-c96f", TagHash::new(334, 2783), 27),
+            ("procedural-agrb-d3fc", TagHash::new(334, 5374), 28),
+            ("package394-full13", TagHash::new(394, 770), 37),
+            ("package394-full10-agrb", TagHash::new(394, 1034), 38),
+            ("package394-full10-gbr", TagHash::new(394, 1217), 39),
+            ("package394-full11-gbr", TagHash::new(334, 1062), 40),
+        ] {
+            let containers = package_manager().lookup.tag32_entries_by_pkg[&head.pkg_id()]
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
+                .map(|(index, _)| TagHash::new(head.pkg_id(), index as u16))
+                .collect_vec();
+            let combination = runner_shell_combinations(&cache, &containers)
+                .into_iter()
+                .find(|combination| combination.contains(head))
+                .unwrap_or_else(|| panic!("{label} representative runner combination"));
+            eprintln!(
+                "RUNNER_LAYERED_FIXTURE mode={expected_mode} head={} body={} parts={:?}",
+                combination.head, combination.body, combination.additional_parts
+            );
+            let preview =
+                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
+                    .unwrap_or_else(|| panic!("{label} combined runner preview"));
+            let GeometryPreviewKind::Model(model) = preview.kind else {
+                panic!("{label} runner fixture must be a model")
+            };
+            let wireframe = model.wireframe.expect("layered runner wireframe");
+            assert!(
+                wireframe.material_ranges.iter().any(|range| {
+                    range
+                        .textures
+                        .runner_layered_surface
+                        .is_some_and(|surface| surface.mode == expected_mode)
+                }),
+                "{label} fixture lost decoded layered-surface ABI"
+            );
+            if matches!(
+                expected_mode,
+                16 | 18 | 22..=25 | 27..=28 | 30 | 37..=40
+            ) {
+                assert!(
+                    wireframe.material_ranges.iter().any(|range| {
+                        range
+                            .textures
+                            .runner_layered_surface
+                            .is_some_and(|surface| {
+                                surface.mode == expected_mode && surface.material_response.is_some()
+                            })
+                    }),
+                    "{label} fixture lost its authored material-response field"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn resolves_runner_occlusion_fixture() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let head = TagHash::new(334, 1062);
+        let containers = package_manager().lookup.tag32_entries_by_pkg[&head.pkg_id()]
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
+            .map(|(index, _)| TagHash::new(head.pkg_id(), index as u16))
+            .collect_vec();
+        let combination = runner_shell_combinations(&cache, &containers)
+            .into_iter()
+            .find(|combination| combination.contains(head))
+            .expect("AO representative runner combination");
+        eprintln!(
+            "RUNNER_OCCLUSION_FIXTURE head={} body={} parts={:?}",
+            combination.head, combination.body, combination.additional_parts
+        );
+        let preview = GeometryTagPreview::load_combined_runner_shell(cache, &combination)
+            .expect("AO combined runner preview");
+        let GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("AO runner fixture must be a model")
+        };
+        assert!(
+            model
+                .wireframe
+                .expect("AO runner wireframe")
+                .material_ranges
+                .iter()
+                .any(|range| range.textures.runner_occlusion.is_some())
+        );
+    }
+
+    #[test]
     #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
     fn probes_goliath_thief_shell_parts() {
         init_goliath_test_package_manager();
@@ -8333,6 +11235,903 @@ mod tests {
                 assert_eq!(combination.additional_parts, [TagHash(0x80A9A997)]);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn audits_emerald_impact_runner_material_coverage() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let combination = RunnerShellCombination {
+            head: TagHash(0x80A9F542),
+            body: TagHash(0x80A9F5AD),
+            additional_parts: vec![TagHash(0x80A9F541)],
+        };
+        let palette = weapon_skin_gear_dye_palette(&cache, combination.body)
+            .or_else(|| weapon_skin_gear_dye_palette(&cache, combination.head));
+        eprintln!("EMERALD palette={palette:?}");
+        let preview = GeometryTagPreview::load_combined_runner_shell(cache, &combination)
+            .expect("Emerald Impact combined preview");
+        let GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("Emerald Impact must be model")
+        };
+        let wireframe = model.wireframe.expect("Emerald Impact wireframe");
+        let mut layered_modes = std::collections::BTreeSet::new();
+        let mut decal_ranges = 0usize;
+        for (index, range) in wireframe.material_ranges.iter().enumerate() {
+            if let Some(surface) = range.textures.runner_layered_surface {
+                layered_modes.insert(surface.mode);
+            }
+            decal_ranges += range.textures.investment_decal.is_some() as usize;
+            let shader = range.technique.and_then(|technique| {
+                let entry = package_manager().get_entry(technique)?;
+                let data = package_manager().read_tag(technique).ok()?;
+                let preview = MaterialTagPreview::load(&entry, &data)?;
+                let MaterialPreviewKind::Technique(preview) = preview.kind;
+                preview
+                    .stages
+                    .iter()
+                    .find(|stage| stage.stage == "PS")
+                    .and_then(|stage| stage.shader)
+            });
+            eprintln!(
+                "EMERALD range={index} stage={:?} dye_index={:?} tech={:?} shader={shader:?} color={:?} control={:?} aux={:?} dye={} decal={} pattern={} transmission={} character={:?} layered={:?}",
+                range.render_stage,
+                range.gear_dye_change_color_index,
+                range.technique,
+                range.textures.color,
+                range.textures.control,
+                range.textures.aux,
+                range.textures.gear_dye.is_some(),
+                range.textures.investment_decal.is_some(),
+                range.textures.gear_pattern.is_some(),
+                range.textures.transmission.is_some(),
+                range.textures.character_surface.map(|surface| surface.mode),
+                range
+                    .textures
+                    .runner_layered_surface
+                    .map(|surface| surface.mode),
+            );
+        }
+        assert_eq!(layered_modes, [31, 32, 33, 34, 35, 36].into());
+        assert!(decal_ranges >= 6, "Emerald Impact lost decal passes");
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn audits_known_combined_runner_shader_families() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        for (name, combination) in [
+            (
+                "Arata Vectus Assassin",
+                RunnerShellCombination {
+                    head: TagHash(0x80B14135),
+                    body: TagHash(0x80B140CE),
+                    additional_parts: vec![],
+                },
+            ),
+            (
+                "Destroyer base",
+                RunnerShellCombination {
+                    head: TagHash(0x80AA055F),
+                    body: TagHash(0x80AA053A),
+                    additional_parts: vec![],
+                },
+            ),
+            (
+                "Emerald Impact",
+                RunnerShellCombination {
+                    head: TagHash(0x80A9F542),
+                    body: TagHash(0x80A9F5AD),
+                    additional_parts: vec![TagHash(0x80A9F541)],
+                },
+            ),
+        ] {
+            let preview =
+                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
+                    .unwrap_or_else(|| panic!("missing {name}"));
+            let GeometryPreviewKind::Model(model) = preview.kind else {
+                panic!("{name} must be model")
+            };
+            let wireframe = model.wireframe.expect("combined wireframe");
+            let mut seen = std::collections::BTreeSet::new();
+            for (index, range) in wireframe.material_ranges.iter().enumerate() {
+                let Some(technique) = range.technique else {
+                    continue;
+                };
+                if range.render_stage != Some(0) || !seen.insert(technique) {
+                    continue;
+                }
+                let Some(entry) = package_manager().get_entry(technique) else {
+                    continue;
+                };
+                let Ok(data) = package_manager().read_tag(technique) else {
+                    continue;
+                };
+                let preview = MaterialTagPreview::load(&entry, &data).expect("technique preview");
+                let MaterialPreviewKind::Technique(preview) = preview.kind;
+                let pixel = preview.stages.iter().find(|stage| stage.stage == "PS");
+                let bindings = texture_bindings_for_technique(&entry, &data)
+                    .into_iter()
+                    .filter(|binding| binding.stage == "PS")
+                    .map(|binding| (binding.slot, binding.tag))
+                    .collect_vec();
+                let binding_formats = bindings
+                    .iter()
+                    .take(8)
+                    .map(|(slot, tag)| (*slot, texture_preview_format(*tag)))
+                    .collect_vec();
+                let leading_constants = pixel
+                    .map(|stage| stage.inline_constants.iter().take(6).copied().collect_vec())
+                    .unwrap_or_default();
+                eprintln!(
+                    "RUNNER_FAMILY name={name:?} range={index} stage={:?} tech={technique} shader={:?} bindings={bindings:?} formats={binding_formats:?} constants={} leading={leading_constants:?} normal_slot={:?} character={}",
+                    range.render_stage,
+                    pixel.and_then(|stage| stage.shader),
+                    pixel.map_or(0, |stage| stage.inline_constants.len()),
+                    material_normal_texture_slot(&texture_bindings_for_technique(&entry, &data)),
+                    range.textures.character_surface.is_some(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn resolves_runner_hair_local_albedo_abi() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        for (technique, expected_color) in [
+            (TagHash::new(292, 1039), TagHash::new(290, 5692)),
+            (TagHash::new(387, 5082), TagHash::new(290, 5692)),
+            (TagHash::new(388, 527), TagHash::new(288, 1203)),
+            (TagHash::new(335, 1321), TagHash::new(304, 5111)),
+        ] {
+            let material = material_textures_for_technique(technique, &cache, &[]);
+            assert_eq!(material.color, Some(expected_color), "{technique}");
+            assert_ne!(material.color, Some(TagHash::new(288, 1296)));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn audits_runner_stage8_technique_abi() {
+        init_goliath_test_package_manager();
+        for technique in [
+            TagHash::new(290, 3030),
+            TagHash::new(290, 5351),
+            TagHash::new(335, 5332),
+            TagHash::new(388, 493),
+            TagHash::new(388, 1566),
+            TagHash::new(391, 4227),
+            TagHash::new(391, 4307),
+            TagHash::new(394, 3914),
+        ] {
+            let entry = package_manager()
+                .get_entry(technique)
+                .expect("stage8 technique");
+            let data = package_manager().read_tag(technique).expect("stage8 data");
+            let preview = MaterialTagPreview::load(&entry, &data).expect("stage8 preview");
+            let MaterialPreviewKind::Technique(preview) = preview.kind;
+            let pixel = preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .unwrap();
+            let nonzero = pixel
+                .inline_constants
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, value)| value.iter().any(|channel| channel.abs() > 0.000001))
+                .collect_vec();
+            eprintln!(
+                "RUNNER_STAGE8 tech={technique} state={:?} bindings={:?} inline_count={} nonzero={nonzero:?} shader={:?} transmission={:?}",
+                render_state_for_technique(technique),
+                texture_bindings_for_technique(&entry, &data)
+                    .into_iter()
+                    .map(|binding| (
+                        binding.slot,
+                        binding.tag,
+                        texture_preview_format(binding.tag)
+                    ))
+                    .collect_vec(),
+                pixel.inline_constants.len(),
+                pixel.shader,
+                transmission_material_for_technique(technique),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn audits_all_combined_runner_material_contracts() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let mut audited = 0usize;
+        let mut failures = Vec::new();
+        let mut stages = std::collections::BTreeMap::<Option<u8>, usize>::new();
+        let mut passes = std::collections::BTreeMap::<String, usize>::new();
+        let mut stage8_techniques =
+            std::collections::BTreeMap::<TagHash, (usize, bool, bool)>::new();
+        let mut character_surfaces = 0usize;
+        let mut alpha_mask_surfaces = 0usize;
+        let mut character_modes = std::collections::BTreeMap::<u8, usize>::new();
+        let mut character_mode3_families =
+            std::collections::BTreeMap::<TagHash, (usize, TagHash, TagHash)>::new();
+        let mut stage0_shader_widths = std::collections::BTreeMap::<u32, usize>::new();
+        let mut unmodeled_stage0_resources = std::collections::BTreeMap::<String, usize>::new();
+        let mut unmodeled_stage0_families = std::collections::BTreeMap::<
+            String,
+            (usize, std::collections::BTreeSet<(TagHash, TagHash)>),
+        >::new();
+        let mut layered_mode_representatives =
+            std::collections::BTreeMap::<u8, (TagHash, TagHash)>::new();
+        for package_id in package_manager()
+            .lookup
+            .tag32_entries_by_pkg
+            .keys()
+            .copied()
+        {
+            let containers = package_manager().lookup.tag32_entries_by_pkg[&package_id]
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
+                .map(|(index, _)| TagHash::new(package_id, index as u16))
+                .collect_vec();
+            for combination in runner_shell_combinations(&cache, &containers) {
+                let Some(preview) =
+                    GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
+                else {
+                    continue;
+                };
+                let GeometryPreviewKind::Model(model) = preview.kind else {
+                    continue;
+                };
+                let Some(wireframe) = model.wireframe else {
+                    continue;
+                };
+                audited += 1;
+                for (index, range) in wireframe.material_ranges.iter().enumerate() {
+                    if let Some(surface) = range.textures.runner_layered_surface {
+                        layered_mode_representatives
+                            .entry(surface.mode)
+                            .or_insert((combination.head, range.technique.unwrap_or_default()));
+                    }
+                    *stages.entry(range.render_stage).or_default() += 1;
+                    let Some(technique) = range.technique else {
+                        failures.push(format!(
+                            "{} range {index}: missing technique",
+                            combination.head
+                        ));
+                        continue;
+                    };
+                    if range.render_stage == Some(8) {
+                        let summary = stage8_techniques.entry(technique).or_default();
+                        summary.0 += 1;
+                        summary.1 |= range.textures.transmission.is_some();
+                        summary.2 |=
+                            range.textures.color.is_some() || !range.textures.aux.is_empty();
+                    }
+                    let material = crate::render::material::MaterialIR::classify(&range.textures);
+                    let plan = crate::render::pass_plan::DrawPassPlan::derive(
+                        range.render_stage,
+                        render_state_for_technique(technique),
+                        &material,
+                    );
+                    for pass in plan.passes {
+                        *passes.entry(format!("{pass:?}")).or_default() += 1;
+                    }
+                    if range.render_stage == Some(0)
+                        && let Some(entry) = package_manager().get_entry(technique)
+                        && let Ok(data) = package_manager().read_tag(technique)
+                    {
+                        let bindings = texture_bindings_for_technique(&entry, &data)
+                            .into_iter()
+                            .filter(|binding| binding.stage == "PS")
+                            .collect_vec();
+                        let max_slot = bindings
+                            .iter()
+                            .map(|binding| binding.slot)
+                            .max()
+                            .unwrap_or(0);
+                        *stage0_shader_widths.entry(max_slot).or_default() += 1;
+                        let unmodeled = range
+                            .textures
+                            .aux
+                            .iter()
+                            .copied()
+                            .filter(|texture| {
+                                !fallback_aux_texture(*texture)
+                                    && ![
+                                        range.textures.color,
+                                        range.textures.normal,
+                                        range.textures.emissive,
+                                        range.textures.control,
+                                    ]
+                                    .contains(&Some(*texture))
+                                    && !range.textures.character_surface.is_some_and(|surface| {
+                                        [
+                                            surface.surface,
+                                            surface.selector,
+                                            surface.detail_color,
+                                            surface.detail_normal,
+                                        ]
+                                        .contains(texture)
+                                            || surface.procedural == Some(*texture)
+                                    })
+                                    && !range.textures.runner_layered_surface.is_some_and(
+                                        |surface| {
+                                            [
+                                                surface.surface,
+                                                surface.detail_normal_a,
+                                                surface.detail_normal_b,
+                                            ]
+                                            .contains(texture)
+                                                || surface.detail_normal_c == Some(*texture)
+                                                || surface.detail_normal_d == Some(*texture)
+                                                || surface.procedural == Some(*texture)
+                                                || surface.color_overlay == Some(*texture)
+                                                || surface
+                                                    .procedural_wear
+                                                    .is_some_and(|wear| wear.contains(texture))
+                                                || surface.material_response == Some(*texture)
+                                        },
+                                    )
+                                    && !range
+                                        .textures
+                                        .runner_occlusion
+                                        .is_some_and(|occlusion| occlusion.texture == *texture)
+                                    && !range.textures.mod_wear.is_some_and(|wear| {
+                                        [wear.scratches, wear.grime, wear.damage].contains(texture)
+                                    })
+                                    && !range
+                                        .textures
+                                        .gear_pattern
+                                        .is_some_and(|pattern| pattern.field == *texture)
+                            })
+                            .filter_map(|texture| {
+                                bindings.iter().find(|binding| binding.tag == texture).map(
+                                    |binding| {
+                                        format!(
+                                            "t{}:{}",
+                                            binding.slot,
+                                            texture_preview_format(texture)
+                                        )
+                                    },
+                                )
+                            })
+                            .sorted()
+                            .join(",");
+                        if !unmodeled.is_empty() {
+                            let shader = MaterialTagPreview::load(&entry, &data)
+                                .and_then(|preview| {
+                                    let MaterialPreviewKind::Technique(preview) = preview.kind;
+                                    preview
+                                        .stages
+                                        .iter()
+                                        .find(|stage| stage.stage == "PS")
+                                        .and_then(|stage| stage.shader)
+                                })
+                                .unwrap_or_default();
+                            let key = format!("shader={shader} max=t{max_slot} aux=[{unmodeled}]");
+                            let summary = unmodeled_stage0_families
+                                .entry(key)
+                                .or_insert_with(|| (0, std::collections::BTreeSet::new()));
+                            summary.0 += 1;
+                            summary.1.insert((technique, combination.head));
+                        }
+                        for texture in range.textures.aux.iter().copied().filter(|texture| {
+                            !fallback_aux_texture(*texture)
+                                && ![
+                                    range.textures.color,
+                                    range.textures.normal,
+                                    range.textures.emissive,
+                                    range.textures.control,
+                                ]
+                                .contains(&Some(*texture))
+                                && !range.textures.character_surface.is_some_and(|surface| {
+                                    [
+                                        surface.surface,
+                                        surface.selector,
+                                        surface.detail_color,
+                                        surface.detail_normal,
+                                    ]
+                                    .contains(texture)
+                                        || surface.procedural == Some(*texture)
+                                })
+                                && !range
+                                    .textures
+                                    .runner_layered_surface
+                                    .is_some_and(|surface| {
+                                        [
+                                            surface.surface,
+                                            surface.detail_normal_a,
+                                            surface.detail_normal_b,
+                                        ]
+                                        .contains(texture)
+                                            || surface.detail_normal_c == Some(*texture)
+                                            || surface.detail_normal_d == Some(*texture)
+                                            || surface.procedural == Some(*texture)
+                                            || surface.color_overlay == Some(*texture)
+                                            || surface
+                                                .procedural_wear
+                                                .is_some_and(|wear| wear.contains(texture))
+                                            || surface.material_response == Some(*texture)
+                                    })
+                                && !range
+                                    .textures
+                                    .runner_occlusion
+                                    .is_some_and(|occlusion| occlusion.texture == *texture)
+                                && !range.textures.mod_wear.is_some_and(|wear| {
+                                    [wear.scratches, wear.grime, wear.damage].contains(texture)
+                                })
+                                && !range
+                                    .textures
+                                    .gear_pattern
+                                    .is_some_and(|pattern| pattern.field == *texture)
+                        }) {
+                            let slot = bindings
+                                .iter()
+                                .find(|binding| binding.tag == texture)
+                                .map(|binding| binding.slot)
+                                .map_or_else(|| "?".into(), |slot| slot.to_string());
+                            let key = format!("t{slot}:{}", texture_preview_format(texture));
+                            *unmodeled_stage0_resources.entry(key).or_default() += 1;
+                        }
+                    }
+                    if range.textures.alpha_mask.is_some() {
+                        alpha_mask_surfaces += 1;
+                    }
+                    if range.render_stage == Some(0) && range.textures.character_surface.is_some() {
+                        character_surfaces += 1;
+                        let Some(entry) = package_manager().get_entry(technique) else {
+                            continue;
+                        };
+                        let Ok(data) = package_manager().read_tag(technique) else {
+                            continue;
+                        };
+                        let bindings = texture_bindings_for_technique(&entry, &data);
+                        let expected_control = bindings
+                            .iter()
+                            .find(|binding| binding.stage == "PS" && binding.slot == 3)
+                            .map(|binding| binding.tag);
+                        if expected_control.is_some()
+                            && material_control_texture_candidate(expected_control.unwrap())
+                            && !texture_preview_format(expected_control.unwrap()).contains("Bc4")
+                            && range.textures.control != expected_control
+                        {
+                            failures.push(format!("{} range {index}: character selector {:?}, expected PS t3 {expected_control:?}", combination.head, range.textures.control));
+                        }
+                        let expected_normal =
+                            material_normal_texture_slot_for_technique(technique, &bindings);
+                        if expected_normal.is_some() && range.textures.normal.is_none() {
+                            failures.push(format!(
+                                "{} range {index}: character surface missing local normal",
+                                combination.head
+                            ));
+                        }
+                        let Some(surface) = range.textures.character_surface else {
+                            failures.push(format!(
+                                "{} range {index}: character t1/t2/t3/t7 ABI missing",
+                                combination.head
+                            ));
+                            continue;
+                        };
+                        *character_modes.entry(surface.mode).or_default() += 1;
+                        if surface.mode == 3 {
+                            let shader = MaterialTagPreview::load(&entry, &data)
+                                .and_then(|preview| {
+                                    let MaterialPreviewKind::Technique(preview) = preview.kind;
+                                    preview
+                                        .stages
+                                        .iter()
+                                        .find(|stage| stage.stage == "PS")
+                                        .and_then(|stage| stage.shader)
+                                })
+                                .unwrap_or_default();
+                            let summary = character_mode3_families.entry(shader).or_insert((
+                                0,
+                                technique,
+                                combination.head,
+                            ));
+                            summary.0 += 1;
+                        }
+                        if Some(surface.selector) != expected_control
+                            || Some(surface.detail_normal)
+                                != expected_normal.and_then(|slot| {
+                                    bindings
+                                        .iter()
+                                        .find(|binding| binding.slot == slot)
+                                        .map(|binding| binding.tag)
+                                })
+                            || !surface
+                                .detail_transform
+                                .iter()
+                                .all(|value| value.is_finite())
+                        {
+                            failures.push(format!(
+                                "{} range {index}: invalid character surface {surface:?}",
+                                combination.head
+                            ));
+                        }
+                    }
+                    if range.textures.investment_decal.is_some() && range.render_stage != Some(2) {
+                        failures.push(format!(
+                            "{} range {index}: investment decal on unexpected stage {:?}",
+                            combination.head, range.render_stage
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            audited >= 50,
+            "runner audit found only {audited} combinations"
+        );
+        eprintln!("RUNNER_STAGE_COUNTS {stages:?}");
+        eprintln!("RUNNER_PASS_COUNTS {passes:?}");
+        eprintln!("RUNNER_STAGE8_TECHNIQUES {stage8_techniques:?}");
+        eprintln!("RUNNER_CHARACTER_SURFACES {character_surfaces}");
+        eprintln!("RUNNER_ALPHA_MASK_SURFACES {alpha_mask_surfaces}");
+        eprintln!("RUNNER_CHARACTER_MODES {character_modes:?}");
+        let mut character_mode3_families = character_mode3_families.into_iter().collect_vec();
+        character_mode3_families.sort_by_key(|(_, (count, _, _))| std::cmp::Reverse(*count));
+        eprintln!(
+            "RUNNER_CHARACTER_MODE3_FAMILIES {:?}",
+            character_mode3_families.into_iter().take(40).collect_vec()
+        );
+        eprintln!("RUNNER_STAGE0_SHADER_WIDTHS {stage0_shader_widths:?}");
+        eprintln!("RUNNER_LAYERED_MODE_REPRESENTATIVES {layered_mode_representatives:?}");
+        eprintln!("RUNNER_UNMODELED_STAGE0_RESOURCES {unmodeled_stage0_resources:?}");
+        let mut unmodeled_stage0_families = unmodeled_stage0_families.into_iter().collect_vec();
+        unmodeled_stage0_families.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        let unmodeled_stage0_ledger = unmodeled_stage0_families
+            .iter()
+            .map(|family| format!("{family:?}"))
+            .join("\n");
+        std::fs::create_dir_all("target/quicktag-runner-audit").unwrap();
+        std::fs::write(
+            "target/quicktag-runner-audit/unmodeled-stage0-families.txt",
+            &unmodeled_stage0_ledger,
+        )
+        .unwrap();
+        for family in &unmodeled_stage0_families {
+            eprintln!("RUNNER_UNMODELED_FAMILY {family:?}");
+        }
+        // Only techniques with c3.a == 1 carry common-character colour
+        // constants. Previous >=110 threshold counted unrelated wide runner
+        // tables and institutionalized their false cyan/green/red overlays.
+        // Exact shader-aware normal resolution intentionally replaced the old
+        // generic 5..9-slot inference (which contaminated weapon materials).
+        // Current package corpus has seven valid common-character surfaces;
+        // keep that exact family from silently disappearing.
+        assert!(
+            character_surfaces >= 7,
+            "decoded common-character ABI set unexpectedly disappeared"
+        );
+        assert!(
+            alpha_mask_surfaces >= 90,
+            "runner separate-coverage ABI coverage collapsed"
+        );
+        for failure in &failures {
+            eprintln!("RUNNER_FAILURE {failure}");
+        }
+        assert!(
+            failures.is_empty(),
+            "runner material audit failures ({audited} combinations):\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages and GPU"]
+    fn captures_known_runner_texture_abis() {
+        init_goliath_test_package_manager();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("GPU adapter");
+        let required_features = adapter.features()
+            & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features,
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let renderer = eframe::egui_wgpu::Renderer::new(
+            &device,
+            wgpu::TextureFormat::Bgra8Unorm,
+            eframe::egui_wgpu::RendererOptions::default(),
+        );
+        let render_state = eframe::egui_wgpu::RenderState {
+            adapter,
+            available_adapters: vec![],
+            device,
+            queue,
+            target_format: wgpu::TextureFormat::Bgra8Unorm,
+            renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
+        };
+        let output = std::path::Path::new("target/quicktag-runner-audit");
+        std::fs::create_dir_all(output).expect("audit directory");
+        let requested = std::env::var("QUICKTAG_RUNNER_ABI_CASE").ok();
+        let requested_slots = std::env::var("QUICKTAG_RUNNER_ABI_SLOTS")
+            .ok()
+            .map(|slots| {
+                slots
+                    .split(',')
+                    .map(|slot| slot.trim().parse::<u32>().expect("runner ABI slot"))
+                    .collect::<std::collections::HashSet<_>>()
+            });
+        for (name, technique) in [
+            ("emerald", TagHash(0x80A9F4F2)),
+            ("arata", TagHash(0x80B1406A)),
+            ("destroyer", TagHash(0x80AA04A1)),
+            ("destroyer-compact", TagHash(0x80AA044D)),
+            ("runner-mask", TagHash::new(336, 1123)),
+            ("runner-alpha-physical", TagHash::new(334, 806)),
+            ("runner-full9-procedural", TagHash::new(334, 2823)),
+            ("runner-compact7-procedural", TagHash::new(334, 2876)),
+            ("runner-switched-surface-a", TagHash::new(334, 3273)),
+            ("runner-switched-surface-b", TagHash::new(334, 3314)),
+            ("runner-full9-local", TagHash::new(333, 6472)),
+            ("runner-full9-local-bbdd", TagHash::new(333, 7140)),
+            ("runner-full9-local-cbae", TagHash::new(334, 3004)),
+            ("runner-full9-local-d6fd", TagHash::new(334, 5893)),
+            ("runner-full9-local-dc9a", TagHash::new(334, 7332)),
+            ("runner-wide-panel", TagHash::new(334, 5956)),
+            ("runner-b75c", TagHash::new(394, 80)),
+            ("runner-afb6", TagHash::new(333, 3834)),
+            ("runner-bbbe", TagHash::new(335, 676)),
+            ("runner-bbbf", TagHash::new(335, 736)),
+            ("runner-c3f6", TagHash::new(334, 1021)),
+            ("runner-layer", TagHash::new(333, 4153)),
+            ("runner-full9", TagHash::new(334, 849)),
+            ("runner-two-mask", TagHash::new(394, 1752)),
+            ("runner-compact6", TagHash::new(336, 92)),
+            ("runner-color-layer", TagHash::new(333, 4043)),
+            ("runner-full10", TagHash::new(394, 1543)),
+            ("runner-full11-a", TagHash::new(335, 313)),
+            ("runner-full11-b", TagHash::new(335, 293)),
+            ("runner-compact6-local", TagHash::new(333, 7150)),
+            ("runner-layered2", TagHash::new(334, 3063)),
+            ("runner-b065", TagHash::new(334, 662)),
+            ("runner-db9a", TagHash::new(334, 7073)),
+            ("runner-afc1", TagHash::new(333, 3923)),
+            ("runner-aa02a7", TagHash::new(336, 980)),
+            ("runner-ae19", TagHash::new(333, 3659)),
+            ("runner-afbf", TagHash::new(333, 3933)),
+            ("runner-afb8", TagHash::new(334, 2866)),
+            ("runner-afba", TagHash::new(334, 2856)),
+            ("runner-b610", TagHash::new(333, 5655)),
+            ("runner-a8cf", TagHash::new(333, 2262)),
+            ("runner-ad5d", TagHash::new(333, 3428)),
+            ("runner-ad68", TagHash::new(333, 3440)),
+            ("runner-af8d", TagHash::new(333, 3804)),
+            ("runner-af93", TagHash::new(333, 3814)),
+            ("runner-b06a", TagHash::new(334, 954)),
+            ("runner-b71c", TagHash::new(333, 5836)),
+            ("runner-b85c", TagHash::new(333, 6639)),
+            ("runner-c430", TagHash::new(334, 637)),
+            ("runner-c65c", TagHash::new(334, 1635)),
+            ("runner-cbee", TagHash::new(334, 3062)),
+            ("runner-b860-stage0", TagHash::new(333, 6591)),
+            ("runner-b860-334-3556", TagHash::new(334, 3556)),
+            ("runner-b860-334-6610", TagHash::new(334, 6610)),
+            ("runner-b860", TagHash::new(335, 1321)),
+            ("runner-b860-335-1792", TagHash::new(335, 1792)),
+            ("runner-bd17", TagHash::new(333, 7455)),
+            ("runner-c31e", TagHash::new(334, 631)),
+            ("runner-c96f", TagHash::new(334, 2422)),
+            ("runner-d2d7", TagHash::new(334, 4830)),
+            ("runner-d3fc", TagHash::new(334, 5123)),
+            ("runner-d569", TagHash::new(334, 5529)),
+            ("runner-b142a5", TagHash::new(394, 685)),
+            ("runner-b85c", TagHash::new(333, 6639)),
+            ("runner-c430", TagHash::new(334, 637)),
+            ("runner-c65c", TagHash::new(334, 1635)),
+            ("runner-cbee", TagHash::new(334, 3062)),
+            ("runner-da29", TagHash::new(334, 6704)),
+            ("runner-dcf8", TagHash::new(334, 7423)),
+            ("runner-deec", TagHash::new(334, 7946)),
+            ("runner-e0fd", TagHash::new(335, 292)),
+            ("runner-e4db", TagHash::new(335, 1250)),
+            ("runner-e64f", TagHash::new(335, 1622)),
+            ("runner-e76c", TagHash::new(335, 1908)),
+            ("runner-b86a", TagHash::new(333, 6400)),
+            ("runner-layout13", TagHash::new(333, 6552)),
+            ("runner-c27c", TagHash::new(334, 643)),
+            ("runner-d952", TagHash::new(335, 303)),
+            ("runner-dac9", TagHash::new(334, 6865)),
+            ("runner-de77", TagHash::new(334, 7807)),
+            ("runner-aa0261", TagHash::new(336, 390)),
+            ("runner-aa0263", TagHash::new(336, 403)),
+        ] {
+            if requested
+                .as_deref()
+                .is_some_and(|requested| requested != name)
+            {
+                continue;
+            }
+            let entry = package_manager().get_entry(technique).expect("technique");
+            let data = package_manager()
+                .read_tag(technique)
+                .expect("technique data");
+            let textures = texture_bindings_for_technique(&entry, &data)
+                .into_iter()
+                .filter(|binding| binding.stage == "PS")
+                .filter(|binding| {
+                    requested_slots
+                        .as_ref()
+                        .is_none_or(|slots| slots.contains(&binding.slot))
+                })
+                .sorted_by_key(|binding| binding.slot)
+                .collect_vec();
+            let rows = textures.len().div_ceil(4).max(1) as u32;
+            let mut sheet = image::RgbaImage::new(4 * 256, rows * 256);
+            for binding in textures {
+                let loaded =
+                    Texture::load(&render_state, binding.tag, false).unwrap_or_else(|error| {
+                        panic!("{name} t{} {}: {error}", binding.slot, binding.tag)
+                    });
+                let image = loaded.to_image(&render_state, 0).unwrap_or_else(|error| {
+                    panic!("{name} t{} {}: {error}", binding.slot, binding.tag)
+                });
+                image
+                    .save(output.join(format!("{name}-t{}-{}.png", binding.slot, binding.tag)))
+                    .expect("save texture");
+                let thumbnail = image.thumbnail(256, 256).to_rgba8();
+                image::imageops::overlay(
+                    &mut sheet,
+                    &thumbnail,
+                    ((binding.slot % 4) * 256) as i64,
+                    ((binding.slot / 4) * 256) as i64,
+                );
+            }
+            sheet
+                .save(output.join(format!("{name}-material.png")))
+                .expect("save sheet");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires current installed Marathon packages"]
+    fn resolves_known_runner_normal_slots_from_shader_abis() {
+        init_goliath_test_package_manager();
+        for (technique, expected_slot) in [
+            (TagHash(0x80AA044D), 5),
+            (TagHash(0x80AA0478), 6),
+            (TagHash(0x80AA04A1), 8),
+            (TagHash(0x80A9F4F2), 7),
+            (TagHash(0x80B1406A), 8),
+            (TagHash::new(336, 980), 4),
+            (TagHash::new(333, 6639), 5),
+            (TagHash::new(334, 637), 5),
+            (TagHash::new(334, 1635), 4),
+            (TagHash::new(334, 3062), 5),
+        ] {
+            let entry = package_manager()
+                .get_entry(technique)
+                .unwrap_or_else(|| panic!("missing runner technique {technique}"));
+            let data = package_manager()
+                .read_tag(technique)
+                .unwrap_or_else(|error| panic!("failed to read {technique}: {error}"));
+            let bindings = texture_bindings_for_technique(&entry, &data)
+                .into_iter()
+                .filter(|binding| binding.stage == "PS")
+                .collect_vec();
+            assert_eq!(
+                material_normal_texture_slot_for_technique(technique, &bindings),
+                Some(expected_slot),
+                "runner normal ABI drifted for {technique}: {bindings:?}"
+            );
+        }
+        let cache = quicktag_scanner::load_tag_cache();
+        let compact = material_textures_for_technique(TagHash(0x80AA044D), &cache, &[]);
+        assert_eq!(compact.solid_surface, Some([0.67, 0.0]));
+        assert!(compact.character_surface.is_none());
+        let runner_layer = material_textures_for_technique(TagHash(0x80A9B039), &cache, &[]);
+        assert_eq!(runner_layer.solid_surface, Some([0.67, 0.0]));
+        let full9 = material_textures_for_technique(TagHash(0x80A9C351), &cache, &[]);
+        assert_eq!(full9.color, Some(TagHash(0x80A9C390)));
+        assert_eq!(full9.normal, Some(TagHash(0x80B14D61)));
+        assert_eq!(full9.control, Some(TagHash(0x80A9B068)));
+        assert_eq!(full9.roughness_channel, 4);
+        assert_eq!(full9.solid_surface, Some([0.67, 0.0]));
+        assert!(full9.character_surface.is_none());
+        let masked = material_textures_for_technique(TagHash(0x80AA0463), &cache, &[]);
+        assert_eq!(
+            masked.alpha_mask,
+            Some(AlphaMaskMaterial {
+                texture: TagHash(0x80A9CA7C),
+                remap: [0.0, 1.0],
+                threshold: 0.055,
+            })
+        );
+        assert_eq!(masked.control, Some(TagHash(0x80A9CA7C)));
+        assert!(!masked.aux.contains(&TagHash(0x80A9CA7C)));
+
+        let two_mask = material_textures_for_technique(TagHash(0x80B146D8), &cache, &[]);
+        let expected_two_mask = TagHash::new(333, 2510);
+        let alpha = two_mask
+            .alpha_mask
+            .expect("two-mask runner shader must preserve its independent coverage ABI");
+        assert_eq!(alpha.texture, expected_two_mask);
+        assert!((alpha.remap[0] - 0.0).abs() < 1e-6);
+        assert!((alpha.remap[1] - 1.685384).abs() < 1e-6);
+        assert!((alpha.threshold - 0.8).abs() < 1e-6);
+        assert_eq!(two_mask.control, Some(expected_two_mask));
+        assert!(!two_mask.aux.contains(&expected_two_mask));
+        assert_eq!(two_mask.normal, Some(TagHash(0x80A9A9CB)));
+        assert!(!two_mask.aux.contains(&TagHash(0x80A9A9CB)));
+
+        let face = material_textures_for_technique(TagHash::new(333, 6639), &cache, &[]);
+        assert_eq!(face.normal, Some(TagHash(0x80A9AAD1)));
+        assert_eq!(face.control, Some(TagHash(0x80A9AB9A)));
+        assert_eq!(face.roughness_channel, 4);
+        assert_eq!(
+            face.runner_occlusion,
+            Some(RunnerOcclusionMaterial {
+                texture: TagHash(0x80A9AB99),
+                channel: 1,
+            })
+        );
+        assert!(!face.aux.contains(&TagHash(0x80A9AAD1)));
+        assert!(!face.aux.contains(&TagHash(0x80A9AB9A)));
+
+        let fabric = material_textures_for_technique(TagHash::new(334, 637), &cache, &[]);
+        assert_eq!(fabric.normal, Some(TagHash(0x80B14703)));
+        assert_eq!(fabric.control, Some(TagHash(0x80A9E180)));
+        assert_eq!(
+            fabric.runner_occlusion,
+            Some(RunnerOcclusionMaterial {
+                texture: TagHash(0x80A9C2F2),
+                channel: 1,
+            })
+        );
+        let layered = fabric
+            .runner_layered_surface
+            .expect("woven runner fabric must retain its normal stack");
+        assert_eq!(layered.mode, 45);
+        assert_eq!(layered.surface, TagHash(0x80A9E180));
+        assert_eq!(layered.detail_normal_a, TagHash(0x80A6005C));
+        assert_eq!(layered.detail_normal_b, TagHash(0x80A61406));
+        assert_eq!(layered.material_response, Some(TagHash(0x80A9C2F2)));
+
+        let compact_fabric = material_textures_for_technique(TagHash::new(334, 1635), &cache, &[]);
+        assert_eq!(compact_fabric.normal, Some(TagHash(0x80A9C6DB)));
+        assert_eq!(compact_fabric.control, Some(TagHash(0x80A9C6D2)));
+        assert_eq!(
+            compact_fabric.runner_occlusion,
+            Some(RunnerOcclusionMaterial {
+                texture: TagHash(0x80A9C6D6),
+                channel: 1,
+            })
+        );
+        let layered = compact_fabric
+            .runner_layered_surface
+            .expect("compact woven runner fabric must retain its normal stack");
+        assert_eq!(layered.mode, 46);
+        assert_eq!(layered.detail_normal_a, TagHash(0x80A61463));
+        assert_eq!(layered.material_response, Some(TagHash(0x80A9C6D6)));
+
+        let dual_gate = material_textures_for_technique(TagHash::new(334, 3062), &cache, &[]);
+        assert_eq!(dual_gate.normal, Some(TagHash(0x80A9AFAD)));
+        assert_eq!(dual_gate.control, Some(TagHash(0x80A9CC3B)));
+        assert_eq!(
+            dual_gate.runner_occlusion,
+            Some(RunnerOcclusionMaterial {
+                texture: TagHash(0x80A9CC3D),
+                channel: 1,
+            })
+        );
+        let layered = dual_gate
+            .runner_layered_surface
+            .expect("dual-gated runner armor must retain its relief normal");
+        assert_eq!(layered.mode, 47);
+        assert_eq!(layered.detail_normal_a, TagHash(0x80A61463));
+        assert_eq!(layered.material_response, Some(TagHash(0x80A9CC3D)));
     }
 
     #[test]
@@ -9181,6 +12980,72 @@ mod tests {
         }
         let wireframe = model.wireframe.expect("assembled preview has no geometry");
         assert!(!wireframe.vertices.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn derives_shifted_gear_dye_abi_for_d54_default_optic() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let skin = TagHash(0x80B7CAE9);
+        let entry = package_manager().get_entry(skin).expect("D54 skin pattern");
+        let GeometryPreviewKind::Model(model) = GeometryTagPreview::load_model_with_weapon_mods(
+            cache,
+            skin,
+            &entry,
+            TagHash(0x80A7C982),
+            &[TagHash(0x80A9B332)],
+        )
+        .expect("assembled D54 preview")
+        .kind
+        else {
+            panic!("expected model preview");
+        };
+        assert!(model.geometry_parts.contains(&TagHash(0x80A9B329)));
+        let ranges = model
+            .wireframe
+            .expect("assembled D54 preview has no geometry")
+            .material_ranges;
+        let body_condition = ranges
+            .iter()
+            .find(|range| range.technique == Some(TagHash(0x80B7CACE)))
+            .and_then(|range| range.textures.surface_condition)
+            .expect("D54 body surface-condition ABI");
+        assert_eq!(body_condition.breakup, TagHash(0x80A46D44));
+        assert_eq!(body_condition.response, TagHash(0x80A4050F));
+        assert_eq!(body_condition.detail, TagHash(0x80A60055));
+        assert_eq!(body_condition.detail_projection, [40.0, 40.0, 0.0, 0.0]);
+        assert_eq!(body_condition.detail_exponent, 40.0);
+        assert_eq!(body_condition.detail_roughness, 0.86);
+        assert_eq!(body_condition.detail_remap, [-0.2, 1.8000001]);
+        assert_eq!(body_condition.projection, [5.0, 5.0, 0.0, 0.0]);
+        assert_eq!(body_condition.orientation, [-5.0, 6.0]);
+        assert_eq!(body_condition.albedo, [1.7, 0.85, 0.4]);
+        assert_eq!(body_condition.normal_flatten, 0.4);
+        let local_surface = ranges
+            .iter()
+            .filter(|range| range.technique == Some(TagHash(0x80A9B2F7)))
+            .collect_vec();
+        assert_eq!(local_surface.len(), 2);
+        let expected_default = [0.2158605, 0.2158605, 0.2158605, 1.0];
+        let palette = weapon_skin_gear_dye_palette(&quicktag_scanner::load_tag_cache(), skin)
+            .expect("D54 skin GearDye palette");
+        assert!(local_surface.iter().all(|range| {
+            range.textures.color == Some(TagHash(0x80A9B361))
+                && range.textures.normal == Some(TagHash(0x80A9B363))
+                && range.textures.control == Some(TagHash(0x80A9B367))
+                && range.textures.gear_dye_default == Some(expected_default)
+                && range.textures.gear_dye_palette == Some(palette)
+        }));
+        assert_eq!(
+            technique_default_gear_dye_color(TagHash(0x80A9B2F7)),
+            Some(expected_default),
+            "D54 optic uses shifted outputs 11..16; output 10 is material ID 0"
+        );
+        assert!(
+            technique_default_gear_dye_color(TagHash(0x80A60C3B)).is_some(),
+            "legacy outputs 8..13 must remain supported"
+        );
     }
 
     #[test]
@@ -10092,6 +13957,658 @@ mod tests {
             )
             .unwrap();
         }
+    }
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn extracts_known_runner_surface_pixel_shaders() {
+        init_goliath_test_package_manager();
+        std::fs::create_dir_all("target/quicktag-runner-audit").unwrap();
+        let requested = std::env::var("QUICKTAG_RUNNER_ABI_CASE").ok();
+        for (name, technique) in [
+            ("shared-color-atlas", TagHash::new(445, 4734)),
+            ("shared-color-atlas-detail", TagHash::new(333, 6350)),
+            ("emerald-character", TagHash(0x80A9F4F2)),
+            ("emerald-character-b", TagHash(0x80A9F50B)),
+            ("emerald-character-c", TagHash(0x80A9F524)),
+            ("emerald-character-d", TagHash(0x80A9F4C1)),
+            ("emerald-surface-e", TagHash(0x80A9F530)),
+            ("emerald-surface-f", TagHash(0x80A9F595)),
+            ("runner-hair-a4840a", TagHash::new(292, 1039)),
+            ("runner-hair-b073d2", TagHash::new(387, 5082)),
+            ("runner-hair-b08209", TagHash::new(388, 527)),
+            ("runner-b142a5", TagHash::new(394, 685)),
+            ("runner-b85c", TagHash::new(333, 6639)),
+            ("runner-c430", TagHash::new(334, 637)),
+            ("runner-c65c", TagHash::new(334, 1635)),
+            ("runner-cbee", TagHash::new(334, 3062)),
+            ("runner-b143a0", TagHash::new(394, 935)),
+            ("runner-b1444e", TagHash::new(394, 1109)),
+            ("runner-b14701", TagHash::new(394, 1610)),
+            ("runner-b14bf9", TagHash::new(394, 3072)),
+            ("arata-character", TagHash(0x80B1406A)),
+            ("destroyer-character", TagHash(0x80AA04A1)),
+            ("destroyer-character-b", TagHash(0x80AA0478)),
+            ("destroyer-compact", TagHash(0x80AA044D)),
+            ("runner-mask", TagHash::new(336, 1123)),
+            ("runner-alpha-physical", TagHash::new(334, 806)),
+            ("runner-full9-procedural", TagHash::new(334, 2823)),
+            ("runner-compact7-procedural", TagHash::new(334, 2876)),
+            ("runner-switched-surface-a", TagHash::new(334, 3273)),
+            ("runner-switched-surface-b", TagHash::new(334, 3314)),
+            ("runner-full9-local", TagHash::new(333, 6472)),
+            ("runner-full9-local-bbdd", TagHash::new(333, 7140)),
+            ("runner-full9-local-cbae", TagHash::new(334, 3004)),
+            ("runner-full9-local-d6fd", TagHash::new(334, 5893)),
+            ("runner-full9-local-dc9a", TagHash::new(334, 7332)),
+            ("runner-wide-panel", TagHash::new(334, 5956)),
+            ("runner-b75c", TagHash::new(394, 80)),
+            ("runner-afb6", TagHash::new(333, 3834)),
+            ("runner-bbbe", TagHash::new(335, 676)),
+            ("runner-bbbf", TagHash::new(335, 736)),
+            ("runner-c3f6", TagHash::new(334, 1021)),
+            ("runner-layer", TagHash::new(333, 4153)),
+            ("runner-full9", TagHash::new(334, 849)),
+            ("runner-two-mask", TagHash::new(394, 1752)),
+            ("runner-compact6", TagHash::new(336, 92)),
+            ("runner-color-layer", TagHash::new(333, 4043)),
+            ("runner-full10", TagHash::new(394, 1543)),
+            ("runner-full11-a", TagHash::new(335, 313)),
+            ("runner-full11-b", TagHash::new(335, 293)),
+            ("runner-compact6-local", TagHash::new(333, 7150)),
+            ("runner-layered2", TagHash::new(334, 3063)),
+            ("runner-b065", TagHash::new(334, 662)),
+            ("runner-db9a", TagHash::new(334, 7073)),
+            ("runner-afc1", TagHash::new(333, 3923)),
+            ("runner-aa02a7", TagHash::new(336, 980)),
+            ("runner-ae19", TagHash::new(333, 3659)),
+            ("runner-afbf", TagHash::new(333, 3933)),
+            ("runner-afb8", TagHash::new(334, 2866)),
+            ("runner-afba", TagHash::new(334, 2856)),
+            ("runner-b610", TagHash::new(333, 5655)),
+            ("runner-a8cf", TagHash::new(333, 2262)),
+            ("runner-ad5d", TagHash::new(333, 3428)),
+            ("runner-ad68", TagHash::new(333, 3440)),
+            ("runner-af8d", TagHash::new(333, 3804)),
+            ("runner-af93", TagHash::new(333, 3814)),
+            ("runner-b06a", TagHash::new(334, 954)),
+            ("runner-b71c", TagHash::new(333, 5836)),
+            ("runner-b85c", TagHash::new(333, 6639)),
+            ("runner-b860-stage0", TagHash::new(333, 6591)),
+            ("runner-b860-334-3556", TagHash::new(334, 3556)),
+            ("runner-b860-334-6610", TagHash::new(334, 6610)),
+            ("runner-b860", TagHash::new(335, 1321)),
+            ("runner-b860-335-1792", TagHash::new(335, 1792)),
+            ("runner-bd17", TagHash::new(333, 7455)),
+            ("runner-c31e", TagHash::new(334, 631)),
+            ("runner-c96f", TagHash::new(334, 2422)),
+            ("runner-d2d7", TagHash::new(334, 4830)),
+            ("runner-d3fc", TagHash::new(334, 5123)),
+            ("runner-d569", TagHash::new(334, 5529)),
+            ("runner-da29", TagHash::new(334, 6704)),
+            ("runner-dcf8", TagHash::new(334, 7423)),
+            ("runner-deec", TagHash::new(334, 7946)),
+            ("runner-e0fd", TagHash::new(335, 292)),
+            ("runner-e4db", TagHash::new(335, 1250)),
+            ("runner-e64f", TagHash::new(335, 1622)),
+            ("runner-e76c", TagHash::new(335, 1908)),
+            ("runner-b86a", TagHash::new(333, 6400)),
+            ("runner-layout13", TagHash::new(333, 6552)),
+            ("runner-c27c", TagHash::new(334, 643)),
+            ("runner-d952", TagHash::new(335, 303)),
+            ("runner-dac9", TagHash::new(334, 6865)),
+            ("runner-de77", TagHash::new(334, 7807)),
+            ("runner-aa0261", TagHash::new(336, 390)),
+            ("runner-aa0263", TagHash::new(336, 403)),
+        ] {
+            if requested
+                .as_deref()
+                .is_some_and(|requested| requested != name)
+            {
+                continue;
+            }
+            let entry = package_manager().get_entry(technique).expect("technique");
+            let data = package_manager()
+                .read_tag(technique)
+                .expect("technique data");
+            let preview = crate::material::MaterialTagPreview::load(&entry, &data)
+                .expect("technique preview");
+            let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+            let shader = preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .and_then(|stage| stage.shader)
+                .expect("pixel shader");
+            for stage_name in ["VS", "PS"] {
+                let Some(stage_shader) = preview
+                    .stages
+                    .iter()
+                    .find(|stage| stage.stage == stage_name)
+                    .and_then(|stage| stage.shader)
+                else {
+                    continue;
+                };
+                let shader_entry = package_manager()
+                    .get_entry(stage_shader)
+                    .expect("shader header");
+                let bytecode = package_manager()
+                    .read_tag(TagHash(shader_entry.reference))
+                    .expect("shader bytecode");
+                std::fs::write(
+                    format!(
+                        "target/quicktag-runner-audit/{name}-{}.dxil",
+                        stage_name.to_ascii_lowercase()
+                    ),
+                    bytecode,
+                )
+                .unwrap();
+            }
+            let pixel = preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .expect("pixel stage");
+            eprintln!(
+                "RUNNER_PS name={name} technique={technique} shader={shader} bindings={:?} constants={:?}",
+                texture_bindings_for_technique(&entry, &data)
+                    .into_iter()
+                    .filter(|binding| binding.stage == "PS")
+                    .map(|binding| (
+                        binding.slot,
+                        binding.tag,
+                        texture_preview_format(binding.tag)
+                    ))
+                    .collect_vec(),
+                pixel
+                    .inline_constants
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, value)| value.iter().any(|channel| channel.abs() > 0.000001))
+                    .collect_vec(),
+            );
+            if let Some(vertex) = preview.stages.iter().find(|stage| stage.stage == "VS") {
+                eprintln!(
+                    "RUNNER_VS name={name} shader={:?} bindings={:?} constants={:?}",
+                    vertex.shader,
+                    texture_bindings_for_technique(&entry, &data)
+                        .into_iter()
+                        .filter(|binding| binding.stage == "VS")
+                        .map(|binding| (binding.slot, binding.tag))
+                        .collect_vec(),
+                    vertex.inline_constants
+                );
+            }
+        }
+    }
+
+    #[cfg(any())]
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_runner_skinning_ownership() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let roots = [
+            TagHash(0x80A9BA03),
+            TagHash(0x80A9B9B8),
+            TagHash(0x80A9B9E8),
+        ];
+        eprintln!(
+            "RUNNER_SKINNING_OWNERS {:?}",
+            roots
+                .into_iter()
+                .map(|root| (
+                    root,
+                    pattern_graph_children(&cache, root).contains(&TagHash(0x80A9B806))
+                ))
+                .collect_vec()
+        );
+        eprintln!(
+            "RUNNER_SKINNING_LAYOUT13 streams={:?}",
+            vertex_layout_stream_sets_for_any_mapping(13)
+        );
+        for elements_tag in tags_by_class(CLASS_VERTEX_INPUT_ELEMENT_SETS) {
+            let sets = vertex_input_element_sets(elements_tag);
+            if let Some(streams) = vertex_layout_stream_sets_for_any_mapping(13) {
+                let selected = streams
+                    .iter()
+                    .filter_map(|index| sets.get(*index).map(|set| (*index, set.clone())))
+                    .collect_vec();
+                if !selected.is_empty() {
+                    eprintln!(
+                        "RUNNER_SKINNING_LAYOUT13_ELEMENTS tag={elements_tag} selected={selected:?}"
+                    );
+                }
+            }
+        }
+        for root in roots {
+            let entry = package_manager().get_entry(root).expect("runner component");
+            let preview = load_model_preview(cache.clone(), root, &entry, "Runner skinning probe");
+            eprintln!(
+                "RUNNER_SKINNING_MODEL root={root} geometry={:?} source={:?} assembled={:?} buffers={:?}",
+                preview.geometry_parts,
+                preview.mesh_source,
+                preview.wireframe.as_ref().map(|wireframe| (
+                    wireframe.position_format,
+                    wireframe.min,
+                    wireframe.max
+                )),
+                preview
+                    .vertex_buffers
+                    .iter()
+                    .filter_map(|(tag, _)| {
+                        let data = package_manager().read_tag(*tag).ok()?;
+                        let header =
+                            VertexBufferHeader::parse(&data, package_manager().version.endian())
+                                .ok()?;
+                        Some((*tag, header.stride, header.vtype, header.data_size))
+                    })
+                    .collect_vec()
+            );
+            for geometry in &preview.geometry_parts {
+                if let Ok(data) = package_manager().read_tag(*geometry) {
+                    for array in scan_arrays(&data, package_manager().version.endian())
+                        .into_iter()
+                        .filter(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
+                    {
+                        for record in array_records(&data, array, 0x80) {
+                            let references = (0..0x80)
+                                .step_by(4)
+                                .filter_map(|offset| {
+                                    let tag = read_tag_at(
+                                        record,
+                                        offset,
+                                        package_manager().version.endian(),
+                                    )?;
+                                    let entry = package_manager().get_entry(tag)?;
+                                    Some((
+                                        offset,
+                                        tag,
+                                        entry.reference,
+                                        entry.file_type,
+                                        entry.file_subtype,
+                                    ))
+                                })
+                                .collect_vec();
+                            eprintln!(
+                                "RUNNER_SKINNING_BUFFER_SET geometry={geometry} words={:?} refs={references:?}",
+                                (0..8)
+                                    .map(|index| read_u32_at(
+                                        record,
+                                        index * 4,
+                                        package_manager().version.endian()
+                                    ))
+                                    .collect_vec()
+                            );
+                        }
+                    }
+                }
+                if let Some((source, wireframe)) = parse_geometry_resource_wireframe(*geometry) {
+                    let data = package_manager().read_tag(*geometry).unwrap();
+                    let mut skinned_wireframe = wireframe.clone();
+                    let skinning_debug = dynamic_mesh_skeleton(&cache, root, *geometry, 12)
+                        .map(|skeleton| skeleton.transforms.len());
+                    let combined_skinning_debug =
+                        dynamic_mesh_skeleton(&cache, TagHash(0x80A9BA03), *geometry, 12)
+                            .map(|skeleton| skeleton.transforms.len());
+                    let skinned = apply_dynamic_bind_pose_skinning(
+                        &cache,
+                        root,
+                        *geometry,
+                        &mut skinned_wireframe,
+                    );
+                    let raw_transform_rows: [[f32; 4]; 6] =
+                        [0x50usize, 0x60, 0x70, 0xa0, 0xb0, 0xc0].map(|offset| {
+                            std::array::from_fn(|component| {
+                                read_f32(
+                                    &data[offset + component * 4..offset + component * 4 + 4],
+                                    package_manager().version.endian(),
+                                )
+                            })
+                        });
+                    eprintln!(
+                        "RUNNER_SKINNING_GEOMETRY root={root} geometry={geometry} source={source:?} bounds={:?}..{:?} vertices={} skinned={skinned:?}/{skinning_debug:?}/{combined_skinning_debug:?}/{:?}..{:?}/{} raw_transform_rows={raw_transform_rows:?} techniques={:?}",
+                        wireframe.min,
+                        wireframe.max,
+                        wireframe.vertices.len(),
+                        skinned_wireframe.min,
+                        skinned_wireframe.max,
+                        skinned_wireframe.position_format,
+                        wireframe
+                            .material_ranges
+                            .iter()
+                            .filter_map(|range| range.technique)
+                            .unique()
+                            .collect_vec()
+                    );
+                    if source.input_layout_index == Some(13) {
+                        let position_entry =
+                            package_manager().get_entry(source.vertex0_buffer).unwrap();
+                        let index_entry =
+                            package_manager().get_entry(source.vertex1_buffer).unwrap();
+                        let positions = package_manager()
+                            .read_tag(TagHash(position_entry.reference))
+                            .unwrap();
+                        let indices = package_manager()
+                            .read_tag(TagHash(index_entry.reference))
+                            .unwrap();
+                        eprintln!(
+                            "RUNNER_SKINNING_INPUT_SAMPLE geometry={geometry} records={:?}",
+                            (0..8)
+                                .map(|vertex| {
+                                    let record = &positions[vertex * 48..vertex * 48 + 48];
+                                    let weights = (0..4)
+                                        .map(|component| {
+                                            read_f32(
+                                                &record[32 + component * 4..36 + component * 4],
+                                                package_manager().version.endian(),
+                                            )
+                                        })
+                                        .collect_vec();
+                                    (weights, indices[vertex * 4..vertex * 4 + 4].to_vec())
+                                })
+                                .collect_vec()
+                        );
+                        let geometry_data = package_manager().read_tag(*geometry).unwrap();
+                        let buffer_set =
+                            scan_arrays(&geometry_data, package_manager().version.endian())
+                                .into_iter()
+                                .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
+                                .unwrap();
+                        let packed_header = read_tag_at(
+                            &geometry_data,
+                            buffer_set.data_offset + 8,
+                            package_manager().version.endian(),
+                        )
+                        .unwrap();
+                        let packed_entry = package_manager().get_entry(packed_header).unwrap();
+                        let packed = package_manager()
+                            .read_tag(TagHash(packed_entry.reference))
+                            .unwrap();
+                        let packed_positions = packed
+                            .chunks_exact(8)
+                            .map(|record| {
+                                let a = read_u32(&record[0..4], package_manager().version.endian());
+                                let b = read_u32(&record[4..8], package_manager().version.endian());
+                                let sign_extend = |value: u32, bits: u32| {
+                                    ((value << (32 - bits)) as i32 >> (32 - bits)) as f32
+                                };
+                                [
+                                    sign_extend(a, 21) / 1_048_575.0,
+                                    sign_extend((a >> 21) | (b << 11), 21) / 1_048_575.0,
+                                    (b as i32 >> 10) as f32 / 2_097_151.0,
+                                ]
+                            })
+                            .collect_vec();
+                        let source_positions = positions
+                            .chunks_exact(48)
+                            .map(|record| {
+                                std::array::from_fn(|axis| {
+                                    read_f32(
+                                        &record[axis * 4..axis * 4 + 4],
+                                        package_manager().version.endian(),
+                                    )
+                                })
+                            })
+                            .collect_vec();
+                        let skin = |position: [f32; 3], record: &[u8], inverse: bool| {
+                            let mut result = [0.0; 3];
+                            for influence in 0..4 {
+                                let weight = record[influence] as f32 / 255.0;
+                                if weight == 0.0 {
+                                    continue;
+                                }
+                                let mut transform = skeleton_bone_transform(
+                                    TagHash(0x80A9B806),
+                                    record[4 + influence] as usize,
+                                )
+                                .unwrap();
+                                if inverse {
+                                    transform = inverse_object_space_transform(transform).unwrap();
+                                }
+                                let rotated = rotate_quaternion(
+                                    position.map(|component| component * transform.scale),
+                                    transform.rotation,
+                                );
+                                for axis in 0..3 {
+                                    result[axis] +=
+                                        weight * (rotated[axis] + transform.translation[axis]);
+                                }
+                            }
+                            result
+                        };
+                        let transform = read_geometry_position_transform(
+                            &geometry_data,
+                            package_manager().version.endian(),
+                        )
+                        .unwrap();
+                        let transformed_positions = source_positions
+                            .iter()
+                            .map(|position| {
+                                std::array::from_fn(|axis| {
+                                    position[axis] * transform.scale[axis] + transform.offset[axis]
+                                })
+                            })
+                            .collect_vec();
+                        let skin_bounds = [
+                            ("bone(raw)", false, false),
+                            ("bone(transformed)", true, false),
+                            ("inverse(raw)", false, true),
+                            ("inverse(transformed)", true, true),
+                        ]
+                        .map(|(name, transformed, inverse)| {
+                            let source = if transformed {
+                                &transformed_positions
+                            } else {
+                                &source_positions
+                            };
+                            (
+                                name,
+                                bounds(
+                                    &source
+                                        .iter()
+                                        .zip(packed.chunks_exact(8))
+                                        .map(|(position, record)| skin(*position, record, inverse))
+                                        .collect_vec(),
+                                ),
+                            )
+                        });
+                        eprintln!(
+                            "RUNNER_SKINNING_PACKED geometry={geometry} tag={packed_header} sample={:?} max_index={} bounds={:?} skin_bounds={skin_bounds:?} transform={:?}",
+                            packed
+                                .chunks_exact(8)
+                                .take(8)
+                                .map(|record| (&record[..4], &record[4..]))
+                                .collect_vec(),
+                            packed
+                                .chunks_exact(8)
+                                .flat_map(|record| (0..4).filter_map(
+                                    |index| (record[index] != 0).then_some(record[4 + index])
+                                ))
+                                .max()
+                                .unwrap_or_default(),
+                            bounds(&packed_positions),
+                            read_geometry_position_transform(
+                                &geometry_data,
+                                package_manager().version.endian(),
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        let mut queue =
+            std::collections::VecDeque::from_iter(roots.into_iter().map(|tag| (tag, 0usize)));
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some((tag, depth)) = queue.pop_front() {
+            if depth > 10 || !seen.insert(tag) {
+                continue;
+            }
+            if let Ok(data) = package_manager().read_tag(tag) {
+                if data.len() >= 0x440
+                    && let Some(palette) =
+                        read_array(&data, 0x420, 2, package_manager().version.endian())
+                    && !palette.is_empty()
+                {
+                    eprintln!(
+                        "RUNNER_SKINNING_PALETTE tag={tag} depth={depth} reference={:08X} values={:?}",
+                        package_manager()
+                            .get_entry(tag)
+                            .map(|entry| entry.reference)
+                            .unwrap_or_default(),
+                        palette
+                            .chunks_exact(2)
+                            .map(|value| read_u16(value, package_manager().version.endian()))
+                            .collect_vec()
+                    );
+                }
+                let arrays = scan_arrays(&data, package_manager().version.endian());
+                for array in &arrays {
+                    if !(13..=128).contains(&array.count) {
+                        continue;
+                    }
+                    let values = data
+                        .get(array.data_offset..array.data_offset + array.count * 2)
+                        .into_iter()
+                        .flat_map(|bytes| bytes.chunks_exact(2))
+                        .map(|value| read_u16(value, package_manager().version.endian()))
+                        .collect_vec();
+                    if values.len() == array.count && values.iter().all(|value| *value < 46) {
+                        eprintln!(
+                            "RUNNER_SKINNING_SMALL_ARRAY tag={tag} depth={depth} class={:08X} values={values:?}",
+                            array.class
+                        );
+                    }
+                }
+                let skeleton = arrays
+                    .iter()
+                    .filter(|array| {
+                        matches!(
+                            array.class,
+                            CLASS_SKELETON_NODE_HIERARCHY | CLASS_SKELETON_TRANSFORMS
+                        )
+                    })
+                    .map(|array| {
+                        (
+                            array.class,
+                            array.count,
+                            array.data_offset,
+                            array.end_offset,
+                        )
+                    })
+                    .collect_vec();
+                if !skeleton.is_empty() {
+                    eprintln!("RUNNER_SKINNING tag={tag} depth={depth} arrays={skeleton:?}");
+                    if matches!(tag, TagHash(0x80A9B806) | TagHash(0x80A9B807)) {
+                        eprintln!(
+                            "RUNNER_SKINNING_OBJECT_TRANSFORMS tag={tag} sample={:?}",
+                            (0..8)
+                                .filter_map(|index| skeleton_bone_transform(tag, index)
+                                    .map(|transform| (index, transform)))
+                                .collect_vec()
+                        );
+                        for array in arrays.iter().filter(|array| {
+                            matches!(
+                                array.class,
+                                CLASS_SKELETON_NODE_HIERARCHY | CLASS_SKELETON_TRANSFORMS
+                            )
+                        }) {
+                            let stride = if array.class == CLASS_SKELETON_NODE_HIERARCHY {
+                                0x10
+                            } else {
+                                0x20
+                            };
+                            let records = array_records(&data, *array, stride);
+                            eprintln!(
+                                "RUNNER_SKINNING_RECORDS tag={tag} class={:08X} sample={:?}",
+                                array.class,
+                                records
+                                    .iter()
+                                    .take(6)
+                                    .map(|record| record
+                                        .chunks_exact(4)
+                                        .map(|word| read_u32(
+                                            word,
+                                            package_manager().version.endian()
+                                        ))
+                                        .collect_vec())
+                                    .collect_vec()
+                            );
+                        }
+                    }
+                }
+            }
+            let Some(scan) = cache.hashes.get(&tag) else {
+                continue;
+            };
+            for child in scan.file_hashes.iter().map(|value| value.hash).chain(
+                scan.file_hashes64
+                    .iter()
+                    .filter_map(|value| tag64_to_hash32(value.hash)),
+            ) {
+                if package_manager().get_entry(child).is_some() {
+                    queue.push_back((child, depth + 1));
+                }
+            }
+        }
+        eprintln!("RUNNER_SKINNING_SCANNED {}", seen.len());
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn transforms_vandal_layout13_bind_positions_once() {
+        init_goliath_test_package_manager();
+        for geometry in [TagHash(0x80A9F696), TagHash(0x80A9D346)] {
+            let (source, wireframe) =
+                parse_geometry_resource_wireframe(geometry).expect("Vandal cloth geometry");
+            assert_eq!(source.input_layout_index, Some(13));
+            assert_eq!(
+                wireframe.position_format,
+                "R32G32B32A32_FLOAT POSITION layout 13"
+            );
+            let raw = wireframe
+                .procedural_positions
+                .as_ref()
+                .expect("layout-13 bind positions");
+            let (raw_min, raw_max) = bounds(raw).expect("raw bounds");
+            assert_ne!((raw_min, raw_max), (wireframe.min, wireframe.max));
+            assert!(wireframe.min[2] > 0.45, "cloth remained below runner");
+            assert!(
+                wireframe.max[2] < 1.55,
+                "cloth was bone-stretched above runner"
+            );
+            assert!(wireframe.max[0] - wireframe.min[0] < 0.2);
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn audits_emerald_impact_character_surface_constants() {
+        init_goliath_test_package_manager();
+        let technique = TagHash(0x80A9F4F2);
+        let entry = package_manager().get_entry(technique).expect("technique");
+        let data = package_manager()
+            .read_tag(technique)
+            .expect("technique data");
+        let preview =
+            crate::material::MaterialTagPreview::load(&entry, &data).expect("technique preview");
+        let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
+        let pixel = preview
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "PS")
+            .expect("pixel stage");
+        let nonzero = pixel
+            .inline_constants
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.iter().any(|component| component.abs() > 0.000001))
+            .collect_vec();
+        eprintln!("EMERALD_CHARACTER_CONSTANTS {nonzero:?}");
+        eprintln!(
+            "EMERALD_CHARACTER_EXPRESSIONS {:?}",
+            pixel.bytecode.expressions
+        );
     }
 
     #[test]
@@ -11072,6 +15589,699 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn selects_goliath_lmg_inventory_belt_window_from_rigid_skeleton() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let chain = [7_usize, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        let expected_visible = [13_usize, 14, 15, 16, 17]
+            .into_iter()
+            .collect::<rustc_hash::FxHashSet<_>>();
+        for (name, owner) in [
+            ("Conquest LMG", TagHash(0x80A7ACCA)),
+            ("Retaliator LMG", TagHash(0x80A7AF21)),
+            ("Demolition HMG", TagHash(0x80A7B89F)),
+        ] {
+            let skeleton = related_skeletons(&cache, owner, [])
+                .into_iter()
+                .find(|skeleton| {
+                    chain
+                        .windows(2)
+                        .all(|pair| skeleton.parents.get(pair[1]) == Some(&(pair[0] as i32)))
+                })
+                .unwrap_or_else(|| panic!("{name} lost its authored ammunition-belt skeleton"));
+            let authored_centers = chain.map(|bone| skeleton.transforms[bone].translation);
+            assert_eq!(
+                rigid_chain_window_bones(&skeleton, &chain, &authored_centers),
+                Some(expected_visible.clone()),
+                "{name} package anchors no longer select the five-round feed window"
+            );
+            let first_rotation = skeleton.transforms[chain[0]].rotation;
+            assert!(
+                chain.iter().all(|bone| {
+                    skeleton.transforms[*bone]
+                        .rotation
+                        .iter()
+                        .zip(first_rotation)
+                        .all(|(value, first)| (value.abs() - first.abs()).abs() < 0.00001)
+                }),
+                "{name} authored rounds must remain parallel"
+            );
+            let spacing = vec3_length(vec3_sub(authored_centers[1], authored_centers[0]));
+            assert!(
+                authored_centers.windows(2).all(|pair| {
+                    (vec3_length(vec3_sub(pair[1], pair[0])) - spacing).abs() < 0.00001
+                }),
+                "{name} authored rounds must retain uniform spacing"
+            );
+        }
+        let root = TagHash(0x80B7C031);
+        let skeleton = related_skeletons(&cache, TagHash(0x80A7ACCA), [])
+            .into_iter()
+            .find(|skeleton| {
+                [7_usize, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+                    .windows(2)
+                    .all(|pair| skeleton.parents.get(pair[1]) == Some(&(pair[0] as i32)))
+            })
+            .expect("Conquest ammunition skeleton");
+        let root_entry = package_manager().get_entry(root).expect("Conquest skin");
+        let mut wireframe = selected_model_geometry_tags(&cache, root, root_entry.reference)
+            .into_iter()
+            .find_map(|model_tag| {
+                let entry = package_manager().get_entry(model_tag)?;
+                let (_, wireframe) = parse_model_wireframe(model_tag, &entry)?;
+                wireframe.rigid_indices.is_some().then_some(wireframe)
+            })
+            .expect("rigid wireframe");
+        let wireframe = &mut wireframe;
+        let rigid = wireframe
+            .rigid_indices
+            .as_ref()
+            .expect("rigid indices")
+            .clone();
+        let centers = chain.map(|bone| {
+            let points = wireframe
+                .vertices
+                .iter()
+                .zip(&rigid)
+                .filter_map(|(position, index)| (*index as usize == bone).then_some(*position))
+                .collect_vec();
+            assert!(!points.is_empty(), "belt bone {bone} has no rigid mesh");
+            let mut center = [0.0; 3];
+            for point in &points {
+                for axis in 0..3 {
+                    center[axis] += point[axis];
+                }
+            }
+            center.map(|value| value / points.len() as f32)
+        });
+        let authored_centers = chain.map(|bone| skeleton.transforms[bone].translation);
+        let visible = rigid_chain_window_bones(&skeleton, &chain, &authored_centers)
+            .expect("package-authored belt window");
+        assert_eq!(visible, expected_visible);
+        let vertices_before = wireframe.vertices.clone();
+        let normals_before = wireframe.normals.clone();
+        let tangents_before = wireframe.tangents.clone();
+        retain_rigid_chain_window(wireframe, &skeleton, &chain);
+        assert_eq!(
+            wireframe.vertices, vertices_before,
+            "cartridge positions changed"
+        );
+        assert_eq!(
+            wireframe.normals, normals_before,
+            "cartridge rotation changed normals"
+        );
+        assert_eq!(
+            wireframe.tangents, tangents_before,
+            "cartridge rotation changed tangents"
+        );
+        let mut live_bones = rustc_hash::FxHashSet::default();
+        for triangle in wireframe.indices.chunks_exact(3) {
+            if triangle[0] == triangle[1] && triangle[1] == triangle[2] {
+                continue;
+            }
+            for index in triangle {
+                live_bones.insert(rigid[*index as usize] as usize);
+            }
+        }
+        assert!(visible.iter().all(|bone| live_bones.contains(bone)));
+        assert!(
+            chain
+                .iter()
+                .filter(|bone| !visible.contains(bone))
+                .all(|bone| { !live_bones.contains(bone) })
+        );
+
+        let output = std::path::Path::new("target/lmg-belt-visual");
+        std::fs::create_dir_all(output).expect("visual harness directory");
+        let mut image = image::RgbaImage::from_pixel(720, 720, image::Rgba([14, 20, 32, 255]));
+        let project = |point: [f32; 3]| {
+            let x = 55.0 + ((point[1] + 0.06) / 0.16) * 610.0;
+            let y = 665.0 - ((point[2] + 0.04) / 0.24) * 610.0;
+            [x.round() as i32, y.round() as i32]
+        };
+        let mut draw_line = |start: [i32; 2], end: [i32; 2], color: image::Rgba<u8>| {
+            let steps = (end[0] - start[0])
+                .abs()
+                .max((end[1] - start[1]).abs())
+                .max(1);
+            for step in 0..=steps {
+                let alpha = step as f32 / steps as f32;
+                let x = (start[0] as f32 + (end[0] - start[0]) as f32 * alpha).round() as i32;
+                let y = (start[1] as f32 + (end[1] - start[1]) as f32 * alpha).round() as i32;
+                for offset_y in -3..=3 {
+                    for offset_x in -3..=3 {
+                        let (x, y) = (x + offset_x, y + offset_y);
+                        if (0..image.width() as i32).contains(&x)
+                            && (0..image.height() as i32).contains(&y)
+                        {
+                            image.put_pixel(x as u32, y as u32, color);
+                        }
+                    }
+                }
+            }
+        };
+        for pair in centers.windows(2) {
+            draw_line(
+                project(pair[0]),
+                project(pair[1]),
+                image::Rgba([235, 52, 65, 255]),
+            );
+        }
+        for (&bone, center) in chain.iter().zip(&authored_centers) {
+            if visible.contains(&bone) {
+                let point = project(*center);
+                draw_line(point, point, image::Rgba([255, 224, 35, 255]));
+            }
+        }
+        image
+            .save(output.join("conquest-authored-feed-window.png"))
+            .expect("save LMG belt visual harness");
+    }
+
+    #[test]
+    #[ignore = "probe: requires installed Marathon packages"]
+    fn probes_goliath_lmg_animation_graph() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let output = std::path::Path::new("target/lmg-belt-evidence");
+        std::fs::create_dir_all(output).expect("LMG evidence directory");
+        let mut evidence = Vec::new();
+        let mut words = rustc_hash::FxHashMap::default();
+        quicktag_strings::wordlist::load_wordlist(|word, hash| {
+            words.entry(hash).or_insert_with(|| word.to_owned());
+        });
+        let tag = TagHash(0x80A7C8C8);
+        let data = package_manager()
+            .read_tag(tag)
+            .expect("LMG state component");
+        let scan = &cache.hashes[&tag];
+        for value in &scan.wordlist_hashes {
+            if (0x8800..0x8D40).contains(&(value.offset as usize)) {
+                evidence.push(format!(
+                    "LMG_WORD offset={:X} hash={:08X} word={:?}",
+                    value.offset,
+                    value.hash,
+                    words.get(&value.hash)
+                ));
+            }
+        }
+        for reference in &scan.file_hashes {
+            if (0x89C0..0x8C80).contains(&(reference.offset as usize)) {
+                let class = package_manager()
+                    .get_entry(reference.hash)
+                    .map(|entry| entry.reference);
+                evidence.push(format!(
+                    "LMG_REF offset={:X} tag={} class={class:08X?}",
+                    reference.offset, reference.hash
+                ));
+            }
+        }
+        for (class, start, stride, count) in [
+            (0x80809F8C_u32, 0x43E0_usize, 0x50_usize, 18_usize),
+            (0x80809F8D_u32, 0x9930_usize, 0x78_usize, 18_usize),
+        ] {
+            for (index, record) in data[start..start + stride * count]
+                .chunks_exact(stride)
+                .enumerate()
+            {
+                let fields = record
+                    .chunks_exact(4)
+                    .enumerate()
+                    .filter_map(|(field, bytes)| {
+                        let raw = read_u32(bytes, package_manager().version.endian());
+                        (raw != 0).then(|| {
+                            let meaning = words
+                                .get(&raw)
+                                .cloned()
+                                .or_else(|| {
+                                    package_manager()
+                                        .get_entry(TagHash(raw))
+                                        .map(|entry| format!("tag:{:08X}", entry.reference))
+                                })
+                                .unwrap_or_default();
+                            format!(
+                                "+{:02X}={raw:08X}/{}:{meaning}",
+                                field * 4,
+                                f32::from_bits(raw)
+                            )
+                        })
+                    })
+                    .collect_vec();
+                evidence.push(format!(
+                    "LMG_STATE_RECORD class={class:08X} index={index} {fields:?}"
+                ));
+            }
+        }
+
+        let skeleton_data = package_manager()
+            .read_tag(TagHash(0x80A7B9B5))
+            .expect("LMG skeleton");
+        std::fs::write(output.join("80A7B9B5.bin"), &skeleton_data)
+            .expect("write raw LMG skeleton evidence");
+        for (index, array) in scan_arrays(&skeleton_data, package_manager().version.endian())
+            .into_iter()
+            .enumerate()
+        {
+            evidence.push(format!(
+                "LMG_SKELETON_ARRAY index={index} class={:08X} count={} data={:X} end={:X}",
+                array.class, array.count, array.data_offset, array.end_offset
+            ));
+            if array.class == CLASS_SKELETON_TRANSFORMS && array.count == 21 {
+                for (bone, record) in array_records(&skeleton_data, array, 0x20)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let rotation = read_vec4_f32(record, 0, package_manager().version.endian())
+                        .expect("skeleton rotation");
+                    let translation =
+                        read_vec4_f32(record, 0x10, package_manager().version.endian())
+                            .expect("skeleton translation");
+                    evidence.push(format!(
+                        "LMG_TRANSFORM array={index} bone={bone} rotation={rotation:?} translation={translation:?}"
+                    ));
+                }
+            }
+        }
+        let hierarchy = scan_arrays(&skeleton_data, package_manager().version.endian())
+            .into_iter()
+            .find(|array| array.class == CLASS_SKELETON_NODE_HIERARCHY)
+            .expect("node hierarchy");
+        let records = array_records(&skeleton_data, hierarchy, 0x10);
+        let target_hashes = records
+            .iter()
+            .flat_map(|record| record.chunks_exact(4))
+            .map(|bytes| read_u32(bytes, package_manager().version.endian()))
+            .collect::<rustc_hash::FxHashSet<_>>();
+        if let Ok(extra) = std::fs::read_to_string("alkhahest-6/wordlist.txt") {
+            for word in extra.lines() {
+                let hash = quicktag_core::util::fnv1(word.as_bytes());
+                if target_hashes.contains(&hash) {
+                    words.entry(hash).or_insert_with(|| word.to_owned());
+                }
+            }
+        }
+        for (index, record) in records.into_iter().enumerate() {
+            let fields = record
+                .chunks_exact(4)
+                .map(|bytes| read_u32(bytes, package_manager().version.endian()))
+                .map(|raw| (raw, words.get(&raw)))
+                .collect_vec();
+            evidence.push(format!("LMG_BONE index={index} fields={fields:?}"));
+        }
+        for prefix in [
+            "b_belt_",
+            "b_bullet_",
+            "b_round_",
+            "b_ammo_",
+            "b_cartridge_",
+            "b_belt",
+            "b_bullet",
+            "b_round",
+            "b_ammo",
+            "b_cartridge",
+            "belt_",
+            "bullet_",
+            "round_",
+            "ammo_",
+            "cartridge_",
+        ] {
+            for index in 0..=24 {
+                for candidate in [
+                    format!("{prefix}{index}"),
+                    format!("{prefix}{index:02}"),
+                    format!("{prefix}_{index}"),
+                    format!("{prefix}_{index:02}"),
+                ] {
+                    let hash = quicktag_core::util::fnv1(candidate.as_bytes());
+                    if target_hashes.contains(&hash) {
+                        evidence.push(format!("LMG_BONE_NAME {hash:08X}={candidate}"));
+                    }
+                }
+            }
+        }
+        for candidate in [
+            "b_magazine",
+            "b_magazine_root",
+            "b_mag",
+            "b_ammo_box",
+            "b_ammo_belt",
+            "b_ammo_belt_root",
+            "b_belt_root",
+            "b_belt_feed",
+            "b_feed",
+            "b_feed_root",
+            "b_feed_tray",
+            "b_receiver",
+            "b_rounds",
+            "b_rounds_inventory",
+            "magazine",
+            "ammo_box",
+            "ammo_belt",
+            "belt_root",
+            "belt_feed",
+            "feed",
+            "feed_tray",
+        ] {
+            let hash = quicktag_core::util::fnv1(candidate.as_bytes());
+            if target_hashes.contains(&hash) {
+                evidence.push(format!("LMG_BONE_NAME {hash:08X}={candidate}"));
+            }
+        }
+        let skeleton = TagHash(0x80A7B9B5);
+        for owner in cache.hashes[&skeleton].references.iter().copied().unique() {
+            let Some(entry) = package_manager().get_entry(owner) else {
+                continue;
+            };
+            let owner_scan = &cache.hashes[&owner];
+            let offsets = owner_scan
+                .file_hashes
+                .iter()
+                .filter(|reference| reference.hash == skeleton)
+                .map(|reference| format!("{:X}", reference.offset))
+                .collect_vec();
+            let outgoing = owner_scan
+                .file_hashes
+                .iter()
+                .map(|reference| {
+                    let class = package_manager()
+                        .get_entry(reference.hash)
+                        .map(|entry| entry.reference)
+                        .unwrap_or_default();
+                    format!("{:X}:{}:{class:08X}", reference.offset, reference.hash)
+                })
+                .collect_vec();
+            evidence.push(format!(
+                "LMG_SKELETON_OWNER owner={owner} class={:08X} offsets={offsets:?} outgoing={outgoing:?}",
+                entry.reference
+            ));
+            if entry.reference == CLASS_PATTERN {
+                let owner_data = package_manager().read_tag(owner).expect("pattern owner");
+                for reference in owner_scan
+                    .file_hashes
+                    .iter()
+                    .filter(|reference| reference.hash == skeleton)
+                {
+                    let start = (reference.offset as usize).saturating_sub(16);
+                    let end = (reference.offset as usize + 40).min(owner_data.len());
+                    evidence.push(format!(
+                        "LMG_PATTERN_SKELETON_CONTEXT offset={:X} bytes={}",
+                        reference.offset,
+                        owner_data[start..end]
+                            .iter()
+                            .map(|byte| format!("{byte:02X}"))
+                            .join(" ")
+                    ));
+                }
+            }
+        }
+        for descriptor in [
+            TagHash(0x80A7A7FE),
+            TagHash(0x80A7BA01),
+            TagHash(0x80A7BA02),
+            TagHash(0x80A7BA03),
+            TagHash(0x80A7BA10),
+            TagHash(0x80A7BA11),
+        ] {
+            let bytes = package_manager()
+                .read_tag(descriptor)
+                .expect("state descriptor");
+            let hex = bytes
+                .chunks(16)
+                .enumerate()
+                .map(|(row, chunk)| {
+                    format!(
+                        "{:04X}: {}",
+                        row * 16,
+                        chunk.iter().map(|byte| format!("{byte:02X}")).join(" ")
+                    )
+                })
+                .join(" | ");
+            evidence.push(format!("LMG_DESCRIPTOR tag={descriptor} bytes={hex}"));
+        }
+        for component in [
+            TagHash(0x80A7B9B6),
+            TagHash(0x80A7B9BF),
+            TagHash(0x80A7B9C0),
+            TagHash(0x80A7B9CD),
+            TagHash(0x80A7BAA9),
+            TagHash(0x80A7BAAA),
+            TagHash(0x80A7BAAB),
+            TagHash(0x80A7BAAC),
+            TagHash(0x80A7BAAE),
+            TagHash(0x80A7BAAF),
+            TagHash(0x80A7BAB0),
+            TagHash(0x80A7BA12),
+            TagHash(0x80A7BA13),
+            TagHash(0x80A7BA18),
+            TagHash(0x80A7BA1A),
+            TagHash(0x80A7BA1B),
+            TagHash(0x80A7BB5D),
+            TagHash(0x80A7BB5E),
+            TagHash(0x80A7BB5F),
+            TagHash(0x80A7BB60),
+            TagHash(0x80A7BB61),
+            TagHash(0x80A7C985),
+            TagHash(0x80A7C986),
+            TagHash(0x80A7C987),
+            TagHash(0x80A7C988),
+            TagHash(0x80A7C989),
+            TagHash(0x80A7C98A),
+            TagHash(0x80A7C98B),
+            TagHash(0x80A7C98C),
+            TagHash(0x80A7C993),
+        ] {
+            let Some(entry) = package_manager().get_entry(component) else {
+                continue;
+            };
+            let data = package_manager()
+                .read_tag(component)
+                .expect("pattern component");
+            if matches!(
+                component.0,
+                0x80A7B9C0 | 0x80A7B9CD | 0x80A7BAAC | 0x80A7BAAF | 0x80A7BB5D | 0x80A7BB60
+            ) {
+                std::fs::write(output.join(format!("{component}.bin")), &data)
+                    .expect("write LMG state component");
+            }
+            let scan = &cache.hashes[&component];
+            let component_words = scan
+                .wordlist_hashes
+                .iter()
+                .map(|value| {
+                    format!(
+                        "{:X}:{:08X}:{:?}",
+                        value.offset,
+                        value.hash,
+                        words.get(&value.hash)
+                    )
+                })
+                .collect_vec();
+            let arrays = scan_arrays(&data, package_manager().version.endian())
+                .into_iter()
+                .map(|array| {
+                    format!(
+                        "{:08X}/{}@{:X}..{:X}",
+                        array.class, array.count, array.data_offset, array.end_offset
+                    )
+                })
+                .collect_vec();
+            let refs = scan
+                .file_hashes
+                .iter()
+                .map(|reference| {
+                    let class = package_manager()
+                        .get_entry(reference.hash)
+                        .map(|entry| entry.reference)
+                        .unwrap_or_default();
+                    format!("{:X}:{}:{class:08X}", reference.offset, reference.hash)
+                })
+                .collect_vec();
+            evidence.push(format!(
+                "LMG_COMPONENT tag={component} class={:08X} size={} words={component_words:?} arrays={arrays:?} refs={refs:?}",
+                entry.reference,
+                data.len()
+            ));
+        }
+        let root = TagHash(0x80B7C031);
+        for model_tag in selected_model_geometry_tags(
+            &cache,
+            root,
+            package_manager()
+                .get_entry(root)
+                .expect("Conquest skin")
+                .reference,
+        ) {
+            let Some(entry) = package_manager().get_entry(model_tag) else {
+                continue;
+            };
+            let Some((_source, wireframe)) = parse_model_wireframe(model_tag, &entry) else {
+                continue;
+            };
+            let Some(rigid) = wireframe.rigid_indices.as_ref() else {
+                continue;
+            };
+            let mut by_bone = rustc_hash::FxHashMap::<u16, Vec<[f32; 3]>>::default();
+            for (&bone, &position) in rigid.iter().zip(&wireframe.vertices) {
+                by_bone.entry(bone).or_default().push(position);
+            }
+            for (bone, points) in by_bone.into_iter().sorted_by_key(|(bone, _)| *bone) {
+                let mut center = [0.0_f32; 3];
+                for point in &points {
+                    for axis in 0..3 {
+                        center[axis] += point[axis];
+                    }
+                }
+                center = center.map(|value| value / points.len() as f32);
+                evidence.push(format!(
+                    "LMG_RAW_BONE model={model_tag} bone={bone} count={} center={center:?}",
+                    points.len()
+                ));
+            }
+        }
+        let bone_hashes = [
+            0x755DE3BD_u32,
+            0x755DE3BE,
+            0x755DE3BF,
+            0x755DE3B8,
+            0x755DE3B9,
+            0x755DE3BA,
+            0x755DE3BB,
+            0x755DE3B4,
+            0x755DE3B5,
+            0x7FCD82B7,
+            0x7FCD82B6,
+        ];
+        for (&owner, scan) in &cache.hashes {
+            let hits = scan
+                .wordlist_hashes
+                .iter()
+                .filter(|value| bone_hashes.contains(&value.hash))
+                .map(|value| format!("{:08X}@{:X}", value.hash, value.offset))
+                .collect_vec();
+            if hits.is_empty() {
+                continue;
+            }
+            let class = package_manager()
+                .get_entry(owner)
+                .map(|entry| entry.reference)
+                .unwrap_or_default();
+            evidence.push(format!(
+                "LMG_GLOBAL_BONE_WORD_OWNER tag={owner} class={class:08X} hits={hits:?}"
+            ));
+        }
+        for owner in [
+            TagHash(0x80A7ACCA),
+            TagHash(0x80A7AF21),
+            TagHash(0x80A7B89F),
+        ] {
+            let mut geometries = rustc_hash::FxHashSet::default();
+            for node in descendant_pattern_nodes(&cache, owner, 8) {
+                geometries.extend(pattern_nearest_geometry_tags(&cache, node));
+            }
+            for geometry in geometries.into_iter().sorted() {
+                let Some(entry) = package_manager().get_entry(geometry) else {
+                    continue;
+                };
+                let Some((_source, wireframe)) = parse_model_wireframe(geometry, &entry) else {
+                    continue;
+                };
+                let Some(rigid) = wireframe.rigid_indices.as_ref() else {
+                    continue;
+                };
+                let chain = [7_u16, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+                let centers: Vec<[f32; 3]> = chain
+                    .iter()
+                    .filter_map(|bone| {
+                        let points = wireframe
+                            .vertices
+                            .iter()
+                            .zip(rigid)
+                            .filter_map(|(position, index)| (*index == *bone).then_some(*position))
+                            .collect_vec();
+                        (!points.is_empty()).then(|| {
+                            std::array::from_fn(|axis| {
+                                points.iter().map(|point| point[axis]).sum::<f32>()
+                                    / points.len() as f32
+                            })
+                        })
+                    })
+                    .collect_vec();
+                if centers.len() == chain.len() {
+                    evidence.push(format!(
+                        "LMG_GEOMETRY_VARIANT owner={owner} geometry={geometry} centers={centers:?}"
+                    ));
+                }
+            }
+        }
+        let package_id = TagHash(0x80A7B9B5).pkg_id();
+        for (index, entry) in package_manager().lookup.tag32_entries_by_pkg[&package_id]
+            .iter()
+            .enumerate()
+        {
+            let tag = TagHash::new(package_id, index as u16);
+            if tag == TagHash(0x80A7B9B5) {
+                continue;
+            }
+            let Ok(bytes) = package_manager().read_tag(tag) else {
+                continue;
+            };
+            let hits = bone_hashes
+                .iter()
+                .flat_map(|hash| {
+                    let needle = hash.to_le_bytes();
+                    bytes
+                        .windows(4)
+                        .enumerate()
+                        .filter_map(move |(offset, window)| {
+                            (window == needle).then_some(format!("{hash:08X}@{offset:X}"))
+                        })
+                })
+                .collect_vec();
+            if !hits.is_empty() {
+                evidence.push(format!(
+                    "LMG_BONE_HASH_OWNER tag={tag} class={:08X} size={} hits={hits:?}",
+                    entry.reference,
+                    bytes.len()
+                ));
+            }
+            let arrays = scan_arrays(&bytes, package_manager().version.endian());
+            for array in arrays
+                .into_iter()
+                .filter(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == 21)
+            {
+                let transforms = array_records(&bytes, array, 0x20)
+                    .into_iter()
+                    .filter_map(|record| {
+                        Some((
+                            read_vec4_f32(record, 0, package_manager().version.endian())?,
+                            read_vec4_f32(record, 0x10, package_manager().version.endian())?,
+                        ))
+                    })
+                    .collect_vec();
+                evidence.push(format!(
+                    "LMG_21_BONE_TRANSFORMS tag={tag} class={:08X} offset={:X} transforms={transforms:?}",
+                    entry.reference, array.data_offset
+                ));
+            }
+        }
+        for selector in (0x80A4C1BD_u32..=0x80A4C1CC).map(TagHash) {
+            let bytes = package_manager()
+                .read_tag(selector)
+                .expect("rounds selector");
+            let scan = &cache.hashes[&selector];
+            evidence.push(format!(
+                "LMG_ROUNDS_SELECTOR tag={selector} size={} bytes={} words={:?} refs={:?}",
+                bytes.len(),
+                bytes.iter().map(|byte| format!("{byte:02X}")).join(" "),
+                scan.wordlist_hashes,
+                scan.file_hashes
+            ));
+        }
+        std::fs::write(output.join("state-records.txt"), evidence.join("\n"))
+            .expect("write LMG evidence");
+    }
 
     #[test]
     #[ignore = "probe: requires installed Marathon packages"]
@@ -11842,11 +17052,23 @@ mod tests {
 
     #[test]
     fn applies_geometry_position_dequantization() {
+        let material_range = WireframeMaterialRange {
+            index_start: 0,
+            index_count: 0,
+            raw_lod_category: None,
+            render_stage: None,
+            technique: None,
+            gear_dye_change_color_index: None,
+            procedural_scale: 1.0,
+            texture: None,
+            textures: WireframeMaterialTextures::default(),
+        };
         let mut wireframe = WireframePreview {
             source: "test".into(),
             position_format: "i16x4.xyz @ +0",
             uv_format: None,
             vertices: vec![[-32767.0, 0.0, 32767.0]],
+            rigid_indices: None,
             normals: None,
             procedural_positions: Some(vec![[-32767.0, 0.0, 32767.0]]),
             procedural_normals: None,
@@ -11855,7 +17077,7 @@ mod tests {
             normal_format: None,
             tangent_format: None,
             indices: vec![],
-            material_ranges: vec![],
+            material_ranges: vec![material_range],
             min: [-32767.0, 0.0, 32767.0],
             max: [-32767.0, 0.0, 32767.0],
             vertex_count_total: 1,
@@ -11871,6 +17093,7 @@ mod tests {
         );
         assert_eq!(wireframe.vertices, vec![[8.0, 20.0, 38.0]]);
         assert_eq!(wireframe.procedural_positions, Some(vec![[-1.0, 0.0, 1.0]]));
+        assert_eq!(wireframe.material_ranges[0].procedural_scale, 0.25);
         assert_eq!(wireframe.min, [8.0, 20.0, 38.0]);
     }
 
@@ -11899,6 +17122,7 @@ mod tests {
             position_format: "f32x3",
             uv_format: None,
             vertices: vec![[1.0, 0.0, 0.0]],
+            rigid_indices: None,
             normals: Some(vec![[1.0, 0.0, 0.0]]),
             procedural_positions: None,
             procedural_normals: None,
@@ -12459,6 +17683,7 @@ mod tests {
             (TagHash(0x80A60313), TagHash(0x80A602FF)),
         ] {
             let mut wear_materials = Vec::new();
+            let mut surface_normals = Vec::new();
             let mut resolved_techniques = Vec::new();
             for geometry in pattern_nearest_geometry_tags(&cache, root) {
                 let entry = package_manager().get_entry(geometry).expect("mod geometry");
@@ -12476,8 +17701,15 @@ mod tests {
                 wear_materials.extend(
                     wireframe
                         .material_ranges
-                        .into_iter()
+                        .iter()
                         .filter_map(|range| range.textures.mod_wear),
+                );
+                surface_normals.extend(
+                    wireframe
+                        .material_ranges
+                        .iter()
+                        .filter(|range| range.textures.mod_wear.is_some())
+                        .filter_map(|range| range.textures.normal),
                 );
             }
 
@@ -12486,6 +17718,16 @@ mod tests {
                 "{root} resolved {resolved_techniques:?}, expected own material {expected_technique}"
             );
             assert!(!wear_materials.is_empty(), "{root} has no wear material");
+            assert!(
+                !surface_normals.is_empty(),
+                "{root} lost authored normal maps"
+            );
+            assert!(
+                surface_normals
+                    .iter()
+                    .all(|normal| !fallback_aux_texture(*normal)),
+                "{root} incorrectly promoted an engine fallback texture to a material normal: {surface_normals:?}"
+            );
             for wear in wear_materials {
                 assert_eq!(wear.scratches_projection, [4.0, -4.0, 0.0, 0.0]);
                 assert_eq!(wear.scratches_remap_base, [0.0, 0.0, 0.0, 1.0]);
@@ -12510,6 +17752,59 @@ mod tests {
                     assert!(projection[0].abs() > 0.05 && projection[1].abs() > 0.05);
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn weapon_mod_helper_cards_and_materials_follow_their_authored_abis() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+
+        for root in [
+            TagHash(0x80A9A7BE),
+            TagHash(0x80A9A7DA),
+            TagHash(0x80A9A7DF),
+        ] {
+            let entry = package_manager().get_entry(root).expect("model container");
+            let geometries = selected_model_geometry_tags(&cache, root, entry.reference);
+            assert!(!geometries.is_empty(), "{root} has no geometry");
+            let mut helper_cards = 0usize;
+            let mut textured_surfaces = 0usize;
+            for geometry in geometries {
+                let geometry_entry = package_manager().get_entry(geometry).expect("geometry");
+                let techniques = find_model_technique_entries(&cache, geometry, &geometry_entry);
+                let textures = find_model_textures(&cache, geometry, &techniques);
+                let (_source, mut wireframe) =
+                    parse_model_wireframe(geometry, &geometry_entry).expect("wireframe");
+                assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
+                for range in &wireframe.material_ranges {
+                    if range.render_stage == Some(17)
+                        && range.technique == Some(TagHash(0x80A60AC2))
+                    {
+                        helper_cards += 1;
+                        assert!(range.textures.color.is_none());
+                        assert!(range.textures.normal.is_none());
+                        assert!(range.textures.control.is_none());
+                    }
+                    if range.render_stage == Some(0)
+                        && range.textures.color.is_some()
+                        && range.textures.normal.is_some()
+                    {
+                        textured_surfaces += 1;
+                        assert!(range.textures.character_surface.is_none());
+                        assert!(range.textures.runner_layered_surface.is_none());
+                    }
+                }
+            }
+            assert!(
+                helper_cards > 0,
+                "{root} lost authored stage-17 helper card"
+            );
+            assert!(
+                textured_surfaces > 0,
+                "{root} lost textured weapon-mod surface"
+            );
         }
     }
 

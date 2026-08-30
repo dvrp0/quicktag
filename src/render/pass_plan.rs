@@ -73,7 +73,20 @@ impl DrawPassPlan {
                 warnings: vec![],
             };
         }
-        if raw_stage == Some(GoliathAdapter::DECAL_STAGE) {
+        if material.family() == MaterialFamily::InvestmentDecal {
+            return Self {
+                evidence: EvidenceLevel::Confirmed,
+                passes: vec![RenderPassKind::InvestmentDecalCompatibility],
+                warnings: (raw_stage != Some(GoliathAdapter::DECAL_STAGE))
+                    .then(|| format!("investment decal observed on raw stage {raw_stage:?}"))
+                    .into_iter()
+                    .collect(),
+            };
+        }
+        if matches!(
+            raw_stage,
+            Some(GoliathAdapter::DECAL_STAGE | GoliathAdapter::INVESTMENT_DECAL_STAGE)
+        ) {
             return Self {
                 evidence: EvidenceLevel::StronglyCorrelated,
                 passes: vec![RenderPassKind::DecalCompatibility],
@@ -84,6 +97,28 @@ impl DrawPassPlan {
             return Self {
                 evidence: EvidenceLevel::StronglyCorrelated,
                 passes: vec![RenderPassKind::ForwardAdditive],
+                warnings: vec![],
+            };
+        }
+        let resource_free_surface = match material {
+            MaterialIR::Unknown(_) => true,
+            MaterialIR::Surface(surface) => {
+                surface.color_texture.is_none()
+                    && surface.normal_texture.is_none()
+                    && surface.emissive_texture.is_none()
+                    && surface.control_texture.is_none()
+                    && surface.solid_color.is_none()
+            }
+            MaterialIR::Decal(_) | MaterialIR::ForwardSpecial(_) => false,
+        };
+        if raw_stage == Some(GoliathAdapter::FORWARD_SPECIAL_STAGE) && resource_free_surface {
+            // Goliath stage 17 includes camera-facing helper payloads whose
+            // shader depends entirely on external engine scopes. Rendering an
+            // unclassified, resource-free payload as an ordinary transparent
+            // surface exposes its authored quad as a white card.
+            return Self {
+                evidence: EvidenceLevel::Confirmed,
+                passes: vec![RenderPassKind::Auxiliary],
                 warnings: vec![],
             };
         }
@@ -104,16 +139,6 @@ impl DrawPassPlan {
                 evidence: EvidenceLevel::Confirmed,
                 passes: vec![RenderPassKind::ForwardTransparent],
                 warnings: vec![],
-            };
-        }
-        if material.family() == MaterialFamily::InvestmentDecal {
-            return Self {
-                evidence: EvidenceLevel::StronglyCorrelated,
-                passes: vec![RenderPassKind::InvestmentDecalCompatibility],
-                warnings: (raw_stage != Some(2))
-                    .then(|| format!("investment decal observed on raw stage {raw_stage:?}"))
-                    .into_iter()
-                    .collect(),
             };
         }
         if material.family() == MaterialFamily::CompactHair {
@@ -191,5 +216,65 @@ mod tests {
                 DrawPassPlan::derive(stage.into(), TechniqueRenderState::default(), &material);
             assert_eq!(plan.passes, [expected]);
         }
+    }
+
+    #[test]
+    fn resource_free_forward_special_payload_is_not_a_visible_white_card() {
+        let material = MaterialIR::classify(&WireframeMaterialTextures::default());
+        let plan = DrawPassPlan::derive(
+            Some(GoliathAdapter::FORWARD_SPECIAL_STAGE),
+            TechniqueRenderState {
+                blend: Some(8),
+                ..Default::default()
+            },
+            &material,
+        );
+        assert_eq!(plan.passes, [RenderPassKind::Auxiliary]);
+
+        let mut palette_contaminated = WireframeMaterialTextures::default();
+        palette_contaminated.gear_dye_palette = Some(
+            [crate::geometry::GearDyeMaterial {
+                color: [1.0; 4],
+                roughness_remap: [0.0; 4],
+                metal_remap: [0.0; 4],
+            }; 6],
+        );
+        let material = MaterialIR::classify(&palette_contaminated);
+        let plan = DrawPassPlan::derive(
+            Some(GoliathAdapter::FORWARD_SPECIAL_STAGE),
+            TechniqueRenderState {
+                blend: Some(8),
+                ..Default::default()
+            },
+            &material,
+        );
+        assert_eq!(plan.passes, [RenderPassKind::Auxiliary]);
+    }
+
+    #[test]
+    fn textured_forward_special_payload_remains_visible() {
+        let mut textures = WireframeMaterialTextures::default();
+        textures.color = Some(tiger_pkg::TagHash(0x80A60058));
+        let material = MaterialIR::classify(&textures);
+        let plan = DrawPassPlan::derive(
+            Some(GoliathAdapter::FORWARD_SPECIAL_STAGE),
+            TechniqueRenderState {
+                blend: Some(8),
+                ..Default::default()
+            },
+            &material,
+        );
+        assert_eq!(plan.passes, [RenderPassKind::ForwardTransparent]);
+    }
+
+    #[test]
+    fn stage_two_non_investment_material_remains_an_authored_decal() {
+        let material = MaterialIR::classify(&WireframeMaterialTextures::default());
+        let plan = DrawPassPlan::derive(
+            Some(GoliathAdapter::INVESTMENT_DECAL_STAGE),
+            TechniqueRenderState::default(),
+            &material,
+        );
+        assert_eq!(plan.passes, [RenderPassKind::DecalCompatibility]);
     }
 }

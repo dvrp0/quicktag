@@ -5,6 +5,7 @@ mod common;
 mod external_file;
 mod gear;
 mod hexview;
+mod implant_stats;
 mod model_renderer;
 mod modellist;
 mod named_tags;
@@ -16,6 +17,7 @@ mod strings;
 mod style;
 mod tag;
 mod texturelist;
+mod weapon_stats;
 
 use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hasher};

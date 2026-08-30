@@ -278,15 +278,19 @@ impl VertexAbiDescriptor {
                 });
             }
         }
+        let has_skinning = wireframe.position_format.contains("CPU bind-pose skinning");
+        let mut unsupported_requirements = vec![
+            "additional UV/color streams not yet preserved".into(),
+            "morph/soft-deformation streams not yet preserved".into(),
+        ];
+        if !has_skinning {
+            unsupported_requirements.push("bone indices/weights not yet preserved".into());
+        }
         Self {
             attributes,
-            has_skinning: false,
+            has_skinning,
             has_morph_or_soft_deformation: false,
-            unsupported_requirements: vec![
-                "additional UV/color streams not yet preserved".into(),
-                "bone indices/weights not yet preserved".into(),
-                "morph/soft-deformation streams not yet preserved".into(),
-            ],
+            unsupported_requirements,
         }
     }
 }

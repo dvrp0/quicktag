@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     ops::Range,
+    path::Path,
     sync::{Arc, LazyLock, Mutex},
     time::Instant,
 };
@@ -18,9 +19,11 @@ use tiger_pkg::{TagHash, package_manager};
 
 use crate::{
     geometry::{
-        GearDyeMaterial, GearPatternMaterial, InvestmentDecalMaskMode, InvestmentDecalMaterial,
-        InvestmentDecalMode, TransmissionMaterial, UvTransformPreview, WeaponModConditionMaterial,
-        WireframeMaterialTextures, WireframePreview,
+        AlphaMaskMaterial, CharacterSurfaceMaterial, GearDyeMaterial, GearPatternMaterial,
+        InvestmentDecalMaskMode, InvestmentDecalMaterial, InvestmentDecalMode,
+        RunnerLayeredSurfaceMaterial, RunnerOcclusionMaterial, SharedAtlasDetailMaterial,
+        TransmissionMaterial, UvTransformPreview, WeaponModConditionMaterial,
+        WeaponSurfaceConditionMaterial, WireframeMaterialTextures, WireframePreview,
     },
     material::{TechniqueRenderState, is_sticker_proxy_technique, render_state_for_technique},
     render::{
@@ -71,6 +74,11 @@ struct ModelDraw {
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
     transmission: Option<TransmissionMaterial>,
+    character_surface: Option<CharacterSurfaceMaterial>,
+    runner_layered_surface: Option<RunnerLayeredSurfaceMaterial>,
+    runner_occlusion: Option<RunnerOcclusionMaterial>,
+    alpha_mask: Option<AlphaMaskMaterial>,
+    shared_atlas_detail: Option<SharedAtlasDetailMaterial>,
     control: Option<TagHash>,
     roughness_channel: u8,
     mask_palette: Option<[[f32; 4]; 2]>,
@@ -78,6 +86,7 @@ struct ModelDraw {
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
     mod_wear: Option<WeaponModConditionMaterial>,
+    surface_condition: Option<WeaponSurfaceConditionMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
     investment_decal: Option<InvestmentDecalMaterial>,
     authored_shared_atlas: bool,
@@ -440,6 +449,11 @@ fn model_draws(
                     == Some(crate::render::adapter::GoliathAdapter::DISTORTION_STAGE))
                 .then_some(range.textures.transmission)
                 .flatten(),
+                character_surface: range.textures.character_surface,
+                runner_layered_surface: range.textures.runner_layered_surface,
+                runner_occlusion: range.textures.runner_occlusion,
+                alpha_mask: range.textures.alpha_mask,
+                shared_atlas_detail: range.textures.shared_atlas_detail,
                 control: range.textures.control,
                 roughness_channel: range.textures.roughness_channel,
                 mask_palette: range.textures.mask_palette,
@@ -447,6 +461,7 @@ fn model_draws(
                 gear_dye_default: range.textures.gear_dye_default,
                 gear_dye_palette: range.textures.gear_dye_palette,
                 mod_wear: range.textures.mod_wear,
+                surface_condition: range.textures.surface_condition,
                 gear_pattern: range.textures.gear_pattern,
                 investment_decal: range.textures.investment_decal,
                 authored_shared_atlas: range.textures.authored_shared_atlas,
@@ -482,6 +497,11 @@ fn model_draws(
             solid_color: None,
             solid_surface: None,
             transmission: None,
+            character_surface: None,
+            runner_layered_surface: None,
+            runner_occlusion: None,
+            alpha_mask: None,
+            shared_atlas_detail: None,
             control: None,
             roughness_channel: 0,
             mask_palette: None,
@@ -489,6 +509,7 @@ fn model_draws(
             gear_dye_default: None,
             gear_dye_palette: None,
             mod_wear: None,
+            surface_condition: None,
             gear_pattern: None,
             investment_decal: None,
             authored_shared_atlas: false,
@@ -865,6 +886,17 @@ struct MaterialUniform {
     transmission_colors: [[f32; 4]; 2],
     transmission_surfaces: [[f32; 4]; 2],
     transmission_params: [f32; 4],
+    character_detail_transform: [f32; 4],
+    character_detail_base: [f32; 4],
+    character_detail_scale: [f32; 4],
+    character_params: [f32; 4],
+    character_extra: [[f32; 4]; 2],
+    character_palette: [[f32; 4]; 2],
+    character_procedural: [[f32; 4]; 11],
+    runner_layered_params: [f32; 4],
+    runner_layered_constants: [[f32; 4]; 24],
+    runner_color_constants: [[f32; 4]; 7],
+    alpha_mask_params: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -884,6 +916,11 @@ struct LoadedMaterial {
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
     transmission: Option<TransmissionMaterial>,
+    character_surface: Option<CharacterSurfaceMaterial>,
+    runner_layered_surface: Option<RunnerLayeredSurfaceMaterial>,
+    runner_occlusion: Option<RunnerOcclusionMaterial>,
+    alpha_mask: Option<AlphaMaskMaterial>,
+    shared_atlas_detail: Option<SharedAtlasDetailMaterial>,
     blend: u8,
     control_tag: Option<TagHash>,
     roughness_channel: u8,
@@ -893,6 +930,7 @@ struct LoadedMaterial {
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
     mod_wear: Option<WeaponModConditionMaterial>,
+    surface_condition: Option<WeaponSurfaceConditionMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
     investment_decal: Option<InvestmentDecalMaterial>,
     sampler_tag: Option<TagHash>,
@@ -905,6 +943,18 @@ struct LoadedMaterial {
     wear_grime: Option<Arc<Texture>>,
     wear_damage: Option<Arc<Texture>>,
     pattern_field: Option<Arc<Texture>>,
+    character_surface_map: Option<Arc<Texture>>,
+    character_detail_color: Option<Arc<Texture>>,
+    character_procedural_map: Option<Arc<Texture>>,
+    runner_surface_map: Option<Arc<Texture>>,
+    runner_material_response_map: Option<Arc<Texture>>,
+    runner_procedural_map: Option<Arc<Texture>>,
+    runner_color_overlay_map: Option<Arc<Texture>>,
+    runner_occlusion_map: Option<Arc<Texture>>,
+    runner_detail_normal_a: Option<Arc<Texture>>,
+    runner_detail_normal_b: Option<Arc<Texture>>,
+    runner_detail_normal_c: Option<Arc<Texture>>,
+    runner_detail_normal_d: Option<Arc<Texture>>,
     procedural_scale: f32,
 }
 
@@ -922,6 +972,7 @@ pub(crate) struct ModelPaintCallback {
     target_format: wgpu::TextureFormat,
     target_size: [u32; 2],
     scene: SceneUniform,
+    export_camera: Option<ModelExportCamera>,
     materials: Vec<LoadedMaterial>,
     draws: Vec<PreparedDraw>,
     cubemap: Option<Arc<Texture>>,
@@ -932,6 +983,50 @@ pub(crate) struct ModelPaintCallback {
 pub(crate) struct ModelCameraFrame {
     pub(crate) center: [f32; 3],
     pub(crate) radius: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ModelExportCamera {
+    frame: ModelCameraFrame,
+    zoom: f32,
+    pan: [f32; 2],
+}
+
+impl ModelExportCamera {
+    pub(crate) fn from_wireframes(
+        base: &WireframePreview,
+        envelope: &WireframePreview,
+        aspect: f32,
+        yaw: f32,
+        pitch: f32,
+    ) -> Self {
+        const FRAME_FILL: f32 = 0.88;
+        let frame = ModelCameraFrame::from_wireframe(base);
+        let base_bounds = projected_export_bounds(
+            base.vertices.iter().copied(),
+            frame.center,
+            aspect,
+            yaw,
+            pitch,
+        );
+        let projected_center = [
+            (base_bounds[0] + base_bounds[2]) * 0.5,
+            (base_bounds[1] + base_bounds[3]) * 0.5,
+        ];
+        let zoom = fitted_export_zoom_for_positions_around(
+            envelope.vertices.iter().copied(),
+            frame.center,
+            frame.radius,
+            aspect,
+            yaw,
+            pitch,
+            FRAME_FILL,
+            projected_center,
+        );
+        let scale = 0.84 * zoom / frame.radius;
+        let pan = [projected_center[0] * scale, -projected_center[1] * scale];
+        Self { frame, zoom, pan }
+    }
 }
 
 impl ModelCameraFrame {
@@ -1010,12 +1105,38 @@ impl ModelPaintCallback {
 
         let mut materials = Vec::<LoadedMaterial>::new();
         let mut draws = Vec::with_capacity(preview.draws.len());
+        #[cfg(test)]
+        let probe_draw_range = std::env::var("QUICKTAG_PROBE_DRAW_RANGE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
         for (stable_index, draw) in preview.draws.iter().enumerate() {
+            #[cfg(test)]
+            if probe_draw_range.is_some() {
+                eprintln!(
+                    "PROBE_DRAW index={stable_index} indices={:?} color={:?} shared={} pipeline={:?}",
+                    draw.indices,
+                    draw.material.map(|material| material.color),
+                    draw.authored_shared_atlas,
+                    draw.pipeline,
+                );
+            }
+            #[cfg(test)]
+            if probe_draw_range.is_some_and(|requested| requested != stable_index) {
+                continue;
+            }
             if draw.sticker_proxy && !show_stickers {
                 continue;
             }
+            // Shared engine/debug atlases are bound by many material scopes but
+            // are not visible model surfaces. The runner pass accidentally
+            // removed this rejection, exposing those ranges as flat neon cards.
+            // Explicit runner/character ABIs and shader-proven shared atlases
+            // remain visible because their use is authored and decoded.
             if draw.material.is_some_and(|material| {
                 !draw.authored_shared_atlas
+                    && draw.character_surface.is_none()
+                    && draw.runner_layered_surface.is_none()
+                    && draw.investment_decal.is_none()
                     && is_debug_placeholder_texture(texture_cache, material.color)
             }) {
                 continue;
@@ -1028,6 +1149,11 @@ impl ModelPaintCallback {
                         && material.solid_color == solid_color
                         && material.solid_surface == draw.solid_surface
                         && material.transmission == draw.transmission
+                        && material.character_surface == draw.character_surface
+                        && material.runner_layered_surface == draw.runner_layered_surface
+                        && material.runner_occlusion == draw.runner_occlusion
+                        && material.alpha_mask == draw.alpha_mask
+                        && material.shared_atlas_detail == draw.shared_atlas_detail
                         && material.blend == draw.pipeline.blend
                         && material.control_tag == draw.control
                         && material.roughness_channel == draw.roughness_channel
@@ -1037,6 +1163,7 @@ impl ModelPaintCallback {
                         && material.gear_dye_default == draw.gear_dye_default
                         && material.gear_dye_palette == draw.gear_dye_palette
                         && material.mod_wear == draw.mod_wear
+                        && material.surface_condition == draw.surface_condition
                         && material.gear_pattern == draw.gear_pattern
                         && material.investment_decal == draw.investment_decal
                         && material.sampler_tag == draw.sampler
@@ -1061,6 +1188,11 @@ impl ModelPaintCallback {
                         .and_then(usable_2d_texture);
                     let control = draw
                         .control
+                        .or_else(|| {
+                            draw.character_surface
+                                .filter(|surface| surface.mode == 2)
+                                .map(|surface| surface.selector)
+                        })
                         .and_then(|tag| texture_cache.get_or_load(tag))
                         .map(|loaded| loaded.0)
                         .and_then(usable_2d_texture);
@@ -1070,18 +1202,91 @@ impl ModelPaintCallback {
                             .map(|loaded| loaded.0)
                             .and_then(usable_2d_texture)
                     };
-                    let wear_scratches = draw.mod_wear.and_then(|wear| load_wear(wear.scratches));
-                    let wear_grime = draw.mod_wear.and_then(|wear| load_wear(wear.grime));
-                    let wear_damage = draw.mod_wear.and_then(|wear| load_wear(wear.damage));
+                    let runner_procedural_wear = draw
+                        .runner_layered_surface
+                        .and_then(|surface| surface.procedural_wear);
+                    let wear_scratches = draw
+                        .mod_wear
+                        .map(|wear| wear.scratches)
+                        .or_else(|| draw.surface_condition.map(|surface| surface.response))
+                        .or_else(|| runner_procedural_wear.map(|wear| wear[0]))
+                        .and_then(load_wear);
+                    let wear_grime = draw
+                        .mod_wear
+                        .map(|wear| wear.grime)
+                        .or_else(|| runner_procedural_wear.map(|wear| wear[1]))
+                        .and_then(load_wear);
+                    let wear_damage = draw
+                        .mod_wear
+                        .map(|wear| wear.damage)
+                        .or_else(|| draw.surface_condition.map(|condition| condition.breakup))
+                        .or_else(|| runner_procedural_wear.map(|wear| wear[2]))
+                        .and_then(load_wear);
                     let pattern_field = draw
                         .gear_pattern
-                        .and_then(|pattern| load_wear(pattern.field));
+                        .and_then(|pattern| load_wear(pattern.field))
+                        .or_else(|| {
+                            draw.shared_atlas_detail
+                                .and_then(|surface| load_wear(surface.detail))
+                        })
+                        .or_else(|| {
+                            draw.surface_condition
+                                .and_then(|surface| load_wear(surface.detail))
+                        });
+                    let character_surface_map = draw
+                        .character_surface
+                        .and_then(|surface| load_wear(surface.surface));
+                    let character_detail_color = draw
+                        .character_surface
+                        .and_then(|surface| load_wear(surface.detail_color));
+                    let character_procedural_map = draw
+                        .character_surface
+                        .and_then(|surface| surface.procedural)
+                        .and_then(load_wear);
+                    let runner_surface_map = draw
+                        .runner_layered_surface
+                        .map(|surface| surface.surface)
+                        .and_then(load_wear);
+                    let runner_material_response_map = draw
+                        .runner_layered_surface
+                        .and_then(|surface| surface.material_response)
+                        .and_then(load_wear);
+                    let runner_procedural_map = draw
+                        .runner_layered_surface
+                        .and_then(|surface| surface.procedural)
+                        .and_then(load_wear);
+                    let runner_color_overlay_map = draw
+                        .runner_layered_surface
+                        .and_then(|surface| surface.color_overlay)
+                        .and_then(load_wear);
+                    let runner_occlusion_map = draw
+                        .runner_occlusion
+                        .and_then(|occlusion| load_wear(occlusion.texture));
+                    let runner_detail_normal_a = draw
+                        .runner_layered_surface
+                        .and_then(|surface| load_wear(surface.detail_normal_a));
+                    let runner_detail_normal_b = draw
+                        .runner_layered_surface
+                        .and_then(|surface| load_wear(surface.detail_normal_b));
+                    let runner_detail_normal_c = draw
+                        .runner_layered_surface
+                        .and_then(|surface| surface.detail_normal_c)
+                        .and_then(load_wear);
+                    let runner_detail_normal_d = draw
+                        .runner_layered_surface
+                        .and_then(|surface| surface.detail_normal_d)
+                        .and_then(load_wear);
                     let dye_palette = draw_dye_palette(draw);
                     materials.push(LoadedMaterial {
                         key: draw.material,
                         solid_color,
                         solid_surface: draw.solid_surface,
                         transmission: draw.transmission,
+                        character_surface: draw.character_surface,
+                        runner_layered_surface: draw.runner_layered_surface,
+                        runner_occlusion: draw.runner_occlusion,
+                        alpha_mask: draw.alpha_mask,
+                        shared_atlas_detail: draw.shared_atlas_detail,
                         blend: draw.pipeline.blend,
                         control_tag: draw.control,
                         roughness_channel: draw.roughness_channel,
@@ -1091,6 +1296,7 @@ impl ModelPaintCallback {
                         gear_dye_default: draw.gear_dye_default,
                         gear_dye_palette: draw.gear_dye_palette,
                         mod_wear: draw.mod_wear,
+                        surface_condition: draw.surface_condition,
                         gear_pattern: draw.gear_pattern,
                         investment_decal: draw.investment_decal,
                         sampler_tag: draw.sampler,
@@ -1103,6 +1309,18 @@ impl ModelPaintCallback {
                         wear_grime,
                         wear_damage,
                         pattern_field,
+                        character_surface_map,
+                        character_detail_color,
+                        character_procedural_map,
+                        runner_surface_map,
+                        runner_material_response_map,
+                        runner_procedural_map,
+                        runner_color_overlay_map,
+                        runner_occlusion_map,
+                        runner_detail_normal_a,
+                        runner_detail_normal_b,
+                        runner_detail_normal_c,
+                        runner_detail_normal_d,
                         procedural_scale: draw.procedural_scale,
                     });
                     materials.len() - 1
@@ -1177,6 +1395,7 @@ impl ModelPaintCallback {
             preview,
             target_format: texture_cache.render_state.target_format,
             target_size,
+            export_camera: None,
             scene: SceneUniform {
                 // center.w is the rotation-invariant bounding-sphere radius
                 // used by the directional-light orthographic projection.
@@ -1254,6 +1473,190 @@ impl ModelPaintCallback {
         }
     }
 
+    /// Export current assembled model with deterministic framing. Interactive
+    /// pan/zoom never leak into the file. Weapon callers provide a camera fitted
+    /// to the base weapon plus its complete compatible-mod envelope, so changing
+    /// the equipped mod cannot move or rescale the weapon.
+    pub(crate) fn with_export_camera(mut self, camera: Option<ModelExportCamera>) -> Self {
+        self.export_camera = camera;
+        self
+    }
+
+    pub(crate) fn export_png(
+        mut self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        const FRAME_FILL: f32 = 0.88;
+        if let Some(camera) = self.export_camera {
+            self.apply_export_camera(camera);
+        } else {
+            self.fit_export_camera(FRAME_FILL);
+        }
+        self.target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        self.scene.postprocess4[0] = 0.0;
+        self.scene.postprocess4[1] = if self.scene.postprocess4[1] > 0.5 {
+            2.0
+        } else {
+            -1.0
+        };
+
+        let mut resources = CallbackResources::default();
+        let descriptor = ScreenDescriptor {
+            size_in_pixels: self.target_size,
+            pixels_per_point: 1.0,
+        };
+        let mut prepare_encoder =
+            render_state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("quicktag_model_png_prepare"),
+                });
+        self.prepare(
+            &render_state.device,
+            &render_state.queue,
+            &descriptor,
+            &mut prepare_encoder,
+            &mut resources,
+        );
+        render_state.queue.submit(Some(prepare_encoder.finish()));
+
+        let pipelines = resources
+            .get::<ModelPipelineResources>()
+            .ok_or_else(|| anyhow::anyhow!("model export pipeline was not prepared"))?;
+        let frame = resources
+            .get::<ModelFrameResources>()
+            .ok_or_else(|| anyhow::anyhow!("model export frame was not prepared"))?;
+        let size = self.target_size;
+        let output = render_state
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("quicktag_model_png_output"),
+                size: wgpu::Extent3d {
+                    width: size[0],
+                    height: size[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+        let output_view = output.create_view(&Default::default());
+        let unpadded_bytes_per_row = size[0] * 4;
+        let bytes_per_row = unpadded_bytes_per_row.div_ceil(256) * 256;
+        let readback = render_state.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quicktag_model_png_readback"),
+            size: u64::from(bytes_per_row) * u64::from(size[1]),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder =
+            render_state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("quicktag_model_png_copy"),
+                });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quicktag_model_png_present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipelines.present_pipeline);
+            pass.set_bind_group(0, &frame.present_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            output.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(size[1]),
+                },
+            },
+            wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        render_state.queue.submit(Some(encoder.finish()));
+        render_state.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })?;
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        render_state.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })?;
+        receiver
+            .recv()
+            .map_err(|error| anyhow::anyhow!("PNG readback callback failed: {error}"))??;
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+        for row in mapped.chunks_exact(bytes_per_row as usize) {
+            pixels.extend_from_slice(&row[..unpadded_bytes_per_row as usize]);
+        }
+        drop(mapped);
+        readback.unmap();
+        image::RgbaImage::from_raw(size[0], size[1], pixels)
+            .ok_or_else(|| anyhow::anyhow!("invalid PNG readback dimensions"))?
+            .save(path)?;
+        Ok(())
+    }
+
+    fn fit_export_camera(&mut self, frame_fill: f32) {
+        self.scene.params0[3] = fitted_export_zoom(
+            &self.preview.vertices,
+            self.scene.center,
+            self.scene.params0[0],
+            self.scene.params1[0],
+            self.scene.params0[1],
+            self.scene.params0[2],
+            frame_fill,
+        );
+        self.scene.params1[1] = 0.0;
+        self.scene.params1[2] = 0.0;
+    }
+
+    fn apply_export_camera(&mut self, camera: ModelExportCamera) {
+        let shadow_radius = shadow_bounding_radius(
+            &self.preview.vertices,
+            camera.frame.center,
+            camera.frame.radius,
+        );
+        self.scene.center = [
+            camera.frame.center[0],
+            camera.frame.center[1],
+            camera.frame.center[2],
+            shadow_radius,
+        ];
+        self.scene.params0[0] = camera.frame.radius;
+        self.scene.params0[3] = camera.zoom;
+        self.scene.params1[1] = camera.pan[0];
+        self.scene.params1[2] = camera.pan[1];
+    }
+
     fn frame_resource_key(&self) -> FrameResourceKey {
         let materials = self
             .materials
@@ -1275,6 +1678,9 @@ impl ModelPaintCallback {
                     u64::from(tint),
                     key.map_or(0, |key| u64::from(key.emissive_strength)),
                     material.control_tag.map_or(0, |tag| u64::from(tag.0)),
+                    material
+                        .runner_occlusion
+                        .map_or(0, |occlusion| u64::from(occlusion.texture.0)),
                     material.sampler_tag.map_or(0, |tag| u64::from(tag.0)),
                     u64::from(material.blend),
                     u64::from(material.roughness_channel),
@@ -1286,7 +1692,75 @@ impl ModelPaintCallback {
                     texture_id(&material.wear_grime),
                     texture_id(&material.wear_damage),
                     texture_id(&material.pattern_field),
+                    texture_id(&material.character_surface_map),
+                    texture_id(&material.character_detail_color),
+                    texture_id(&material.character_procedural_map),
+                    texture_id(&material.runner_surface_map),
+                    texture_id(&material.runner_material_response_map),
+                    texture_id(&material.runner_procedural_map),
+                    texture_id(&material.runner_color_overlay_map),
+                    texture_id(&material.runner_occlusion_map),
+                    texture_id(&material.runner_detail_normal_a),
+                    texture_id(&material.runner_detail_normal_b),
+                    texture_id(&material.runner_detail_normal_c),
+                    texture_id(&material.runner_detail_normal_d),
                 ];
+                if let Some(surface) = material.character_surface {
+                    values.extend([
+                        u64::from(surface.mode),
+                        u64::from(surface.surface.0),
+                        u64::from(surface.selector.0),
+                        u64::from(surface.detail_color.0),
+                        u64::from(surface.detail_normal.0),
+                    ]);
+                    values.extend(
+                        surface
+                            .detail_transform
+                            .into_iter()
+                            .chain(surface.detail_base)
+                            .chain(surface.detail_scale)
+                            .chain([surface.detail_gate])
+                            .chain(surface.extra.into_iter().flatten())
+                            .chain(surface.palette.into_iter().flatten())
+                            .map(|value| u64::from(value.to_bits())),
+                    );
+                }
+                if let Some(alpha) = material.alpha_mask {
+                    values.extend([
+                        u64::from(alpha.texture.0),
+                        u64::from(alpha.threshold.to_bits()),
+                    ]);
+                }
+                if let Some(detail) = material.shared_atlas_detail {
+                    values.push(u64::from(detail.detail.0));
+                    values.extend(
+                        detail
+                            .projection
+                            .into_iter()
+                            .chain([detail.exponent])
+                            .chain(detail.base)
+                            .chain(detail.scale)
+                            .map(|value| u64::from(value.to_bits())),
+                    );
+                }
+                if let Some(surface) = material.runner_layered_surface {
+                    values.extend([
+                        u64::from(surface.surface.0),
+                        u64::from(surface.detail_normal_a.0),
+                        u64::from(surface.detail_normal_b.0),
+                        surface.detail_normal_c.map_or(0, |tag| u64::from(tag.0)),
+                        surface.detail_normal_d.map_or(0, |tag| u64::from(tag.0)),
+                        surface.material_response.map_or(0, |tag| u64::from(tag.0)),
+                        u64::from(surface.mode),
+                    ]);
+                    values.extend(
+                        surface
+                            .constants
+                            .into_iter()
+                            .flatten()
+                            .map(|value| u64::from(value.to_bits())),
+                    );
+                }
                 if let Some(decal) = material.investment_decal {
                     values.extend([
                         u64::from(decal.color.0),
@@ -1337,6 +1811,29 @@ impl ModelPaintCallback {
                             .chain(wear.scratches_remap_scale)
                             .chain([wear.unique_id, wear.condition_blend])
                             .chain(wear.condition_controls.into_iter().flatten())
+                            .map(|value| u64::from(value.to_bits())),
+                    );
+                }
+                if let Some(condition) = material.surface_condition {
+                    values.push(u64::from(condition.response.0));
+                    values.push(u64::from(condition.detail.0));
+                    values.push(u64::from(condition.breakup.0));
+                    values.extend(
+                        condition
+                            .detail_projection
+                            .into_iter()
+                            .chain([
+                                condition.detail_exponent,
+                                condition.detail_roughness,
+                                condition.detail_remap[0],
+                                condition.detail_remap[1],
+                            ])
+                            .chain(condition.projection)
+                            .chain([condition.phase])
+                            .chain(condition.triangle)
+                            .chain(condition.orientation)
+                            .chain(condition.albedo)
+                            .chain([condition.roughness, condition.normal_flatten])
                             .map(|value| u64::from(value.to_bits())),
                     );
                 }
@@ -1412,6 +1909,114 @@ impl ModelPaintCallback {
                 .as_ref()
                 .map_or(0, |texture| Arc::as_ptr(texture) as usize),
         }
+    }
+}
+
+fn fitted_export_zoom(
+    vertices: &[ModelVertex],
+    center: [f32; 4],
+    radius: f32,
+    aspect: f32,
+    yaw: f32,
+    pitch: f32,
+    frame_fill: f32,
+) -> f32 {
+    fitted_export_zoom_for_positions(
+        vertices.iter().map(|vertex| vertex.position),
+        [center[0], center[1], center[2]],
+        radius,
+        aspect,
+        yaw,
+        pitch,
+        frame_fill,
+    )
+}
+
+fn fitted_export_zoom_for_positions(
+    positions: impl IntoIterator<Item = [f32; 3]>,
+    center: [f32; 3],
+    radius: f32,
+    aspect: f32,
+    yaw: f32,
+    pitch: f32,
+    frame_fill: f32,
+) -> f32 {
+    fitted_export_zoom_for_positions_around(
+        positions, center, radius, aspect, yaw, pitch, frame_fill, [0.0; 2],
+    )
+}
+
+fn fitted_export_zoom_for_positions_around(
+    positions: impl IntoIterator<Item = [f32; 3]>,
+    center: [f32; 3],
+    radius: f32,
+    aspect: f32,
+    yaw: f32,
+    pitch: f32,
+    frame_fill: f32,
+    projected_center: [f32; 2],
+) -> f32 {
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let mut max_x = 0.0_f32;
+    let mut max_y = 0.0_f32;
+    for position in positions {
+        let value = [
+            position[0] - center[0],
+            position[2] - center[2],
+            position[1] - center[1],
+        ];
+        let yawed = [
+            value[0] * cos_yaw + value[2] * sin_yaw,
+            value[1],
+            -value[0] * sin_yaw + value[2] * cos_yaw,
+        ];
+        let view_x = yawed[0];
+        let view_y = yawed[1] * cos_pitch - yawed[2] * sin_pitch;
+        max_x = max_x.max((view_x * aspect - projected_center[0]).abs());
+        max_y = max_y.max((view_y - projected_center[1]).abs());
+    }
+    let extent = max_x.max(max_y).max(0.0001);
+    frame_fill.clamp(0.1, 0.98) * radius / (0.84 * extent)
+}
+
+fn projected_export_bounds(
+    positions: impl IntoIterator<Item = [f32; 3]>,
+    center: [f32; 3],
+    aspect: f32,
+    yaw: f32,
+    pitch: f32,
+) -> [f32; 4] {
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let mut bounds = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for position in positions {
+        let value = [
+            position[0] - center[0],
+            position[2] - center[2],
+            position[1] - center[1],
+        ];
+        let yawed = [
+            value[0] * cos_yaw + value[2] * sin_yaw,
+            value[1],
+            -value[0] * sin_yaw + value[2] * cos_yaw,
+        ];
+        let x = yawed[0] * aspect;
+        let y = yawed[1] * cos_pitch - yawed[2] * sin_pitch;
+        bounds[0] = bounds[0].min(x);
+        bounds[1] = bounds[1].min(y);
+        bounds[2] = bounds[2].max(x);
+        bounds[3] = bounds[3].max(y);
+    }
+    if bounds.iter().all(|value| value.is_finite()) {
+        bounds
+    } else {
+        [0.0; 4]
     }
 }
 
@@ -1557,12 +2162,12 @@ fn texture_luminance(texture_cache: &TextureCache, tag: TagHash) -> Option<Mater
     value
 }
 
-static DEBUG_PLACEHOLDER_TEXTURES: LazyLock<Mutex<HashMap<TagHash, bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 fn draw_dye_palette(draw: &ModelDraw) -> Option<[[f32; 4]; 3]> {
     draw.gear_dye.map(|dye| [dye.color; 3])
 }
+
+static DEBUG_PLACEHOLDER_TEXTURES: LazyLock<Mutex<HashMap<TagHash, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn is_debug_placeholder_texture(texture_cache: &TextureCache, tag: TagHash) -> bool {
     if let Some(value) = DEBUG_PLACEHOLDER_TEXTURES
@@ -1652,8 +2257,19 @@ fn project_hiz_vertex(
     [
         clip[0] * 0.5 + 0.5,
         0.5 - clip[1] * 0.5,
-        (0.5 - view[2] * scale * 0.25).clamp(0.0, 1.0),
+        model_orthographic_depth(view[2], radius),
     ]
+}
+
+/// Keep model depth independent from image magnification. Zoom is an
+/// orthographic projection scale, not camera dolly: applying it to depth drove
+/// vertices into the 0/1 clamps and made surfaces disappear in layers.
+fn model_orthographic_depth(view_depth: f32, radius: f32) -> f32 {
+    (0.5 - view_depth * 0.21 / radius.max(0.0001)).clamp(0.0, 1.0)
+}
+
+fn model_orthographic_view_depth(encoded_depth: f32, radius: f32) -> f32 {
+    (0.5 - encoded_depth) * radius.max(0.0001) / 0.21
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2212,7 +2828,7 @@ impl CallbackTrait for ModelPaintCallback {
                     blend: [
                         material.blend as f32,
                         material.roughness_channel as f32,
-                        material.control.is_some() as u8 as f32,
+                        (material.control.is_some() && material.alpha_mask.is_none()) as u8 as f32,
                         material.mask_palette.is_some() as u8 as f32,
                     ],
                     solid_surface: material
@@ -2257,10 +2873,21 @@ impl CallbackTrait for ModelPaintCallback {
                                     as u8 as f32,
                             ])
                         })
+                        .or_else(|| material.surface_condition.map(|_| [0.0, 0.0, 0.0, 2.0]))
                         .unwrap_or_default(),
                     wear_scratches_projection: material
                         .mod_wear
                         .map(|wear| wear.scratches_projection)
+                        .or_else(|| {
+                            material.surface_condition.map(|condition| {
+                                [
+                                    condition.phase,
+                                    condition.orientation[0],
+                                    condition.orientation[1],
+                                    condition.normal_flatten,
+                                ]
+                            })
+                        })
                         .unwrap_or([1.0, 1.0, 0.0, 0.0]),
                     wear_grime_projection: material
                         .mod_wear
@@ -2269,6 +2896,11 @@ impl CallbackTrait for ModelPaintCallback {
                                 wear.grime_projection[axis]
                                     + wear.grime_projection_unique_delta[axis] * wear.unique_id
                             })
+                        })
+                        .or_else(|| {
+                            material
+                                .surface_condition
+                                .map(|condition| condition.triangle)
                         })
                         .unwrap_or([1.0, 1.0, 0.0, 0.0]),
                     wear_damage_projection: material
@@ -2279,18 +2911,48 @@ impl CallbackTrait for ModelPaintCallback {
                                     + wear.damage_projection_unique_delta[axis] * wear.unique_id
                             })
                         })
+                        .or_else(|| {
+                            material
+                                .surface_condition
+                                .map(|condition| condition.projection)
+                        })
                         .unwrap_or([1.0, 1.0, 0.0, 0.0]),
                     wear_scratches_remap_base: material
                         .mod_wear
                         .map(|wear| wear.scratches_remap_base)
+                        .or_else(|| {
+                            material
+                                .surface_condition
+                                .map(|surface| surface.detail_projection)
+                        })
                         .unwrap_or_default(),
                     wear_scratches_remap_scale: material
                         .mod_wear
                         .map(|wear| wear.scratches_remap_scale)
+                        .or_else(|| {
+                            material.surface_condition.map(|surface| {
+                                [
+                                    surface.detail_exponent,
+                                    surface.detail_roughness,
+                                    surface.detail_remap[0],
+                                    surface.detail_remap[1],
+                                ]
+                            })
+                        })
                         .unwrap_or([1.0; 4]),
                     wear_surface_params: material
                         .mod_wear
                         .map(|wear| [wear.condition_blend, 4.5947933, 0.0, 0.0])
+                        .or_else(|| {
+                            material.surface_condition.map(|condition| {
+                                [
+                                    condition.albedo[0],
+                                    condition.albedo[1],
+                                    condition.albedo[2],
+                                    condition.roughness,
+                                ]
+                            })
+                        })
                         .unwrap_or_default(),
                     gear_palette_default: material.gear_dye_default.unwrap_or_default(),
                     gear_palette_colors: material
@@ -2371,13 +3033,14 @@ impl CallbackTrait for ModelPaintCallback {
                             .filter(|bias| bias.is_finite())
                             .unwrap_or(-0.5)
                             .clamp(-16.0, 15.99),
-                        0.0,
-                        0.0,
+                        material.procedural_scale,
+                        material.shared_atlas_detail.is_some() as u8 as f32,
                         0.0,
                     ],
                     pattern_projection: material
                         .gear_pattern
                         .map(|pattern| pattern.projection)
+                        .or_else(|| material.shared_atlas_detail.map(|detail| detail.projection))
                         .unwrap_or([1.0, 1.0, 0.0, 0.0]),
                     pattern_params: material
                         .gear_pattern
@@ -2389,10 +3052,20 @@ impl CallbackTrait for ModelPaintCallback {
                                 pattern.warp[0],
                             ]
                         })
+                        .or_else(|| {
+                            material
+                                .shared_atlas_detail
+                                .map(|detail| [0.0, detail.exponent, 0.0, 0.0])
+                        })
                         .unwrap_or_default(),
                     pattern_stripe: material
                         .gear_pattern
                         .map(|pattern| pattern.stripe)
+                        .or_else(|| {
+                            material
+                                .shared_atlas_detail
+                                .map(|detail| [detail.base[0], detail.base[1], detail.base[2], 0.0])
+                        })
                         .unwrap_or_default(),
                     pattern_contour: material
                         .gear_pattern
@@ -2400,6 +3073,11 @@ impl CallbackTrait for ModelPaintCallback {
                             let mut contour = pattern.contour;
                             contour[3] = pattern.warp[1];
                             contour
+                        })
+                        .or_else(|| {
+                            material.shared_atlas_detail.map(|detail| {
+                                [detail.scale[0], detail.scale[1], detail.scale[2], 0.0]
+                            })
                         })
                         .unwrap_or_default(),
                     pattern_contour_remap: material
@@ -2427,6 +3105,66 @@ impl CallbackTrait for ModelPaintCallback {
                         0.0,
                         0.0,
                     ],
+                    character_detail_transform: material
+                        .character_surface
+                        .map(|surface| surface.detail_transform)
+                        .unwrap_or([1.0, 1.0, 0.0, 0.0]),
+                    character_detail_base: material
+                        .character_surface
+                        .map(|surface| surface.detail_base)
+                        .unwrap_or([1.0; 4]),
+                    character_detail_scale: material
+                        .character_surface
+                        .map(|surface| surface.detail_scale)
+                        .unwrap_or_default(),
+                    character_params: [
+                        material.character_surface.is_some() as u8 as f32,
+                        material
+                            .character_surface
+                            .map(|surface| surface.detail_gate)
+                            .unwrap_or(0.0),
+                        4.5947933,
+                        material
+                            .character_surface
+                            .map(|surface| f32::from(surface.mode))
+                            .unwrap_or(0.0),
+                    ],
+                    character_extra: material
+                        .character_surface
+                        .map(|surface| surface.extra)
+                        .unwrap_or_default(),
+                    character_palette: material
+                        .character_surface
+                        .map(|surface| surface.palette)
+                        .unwrap_or([[1.0; 4]; 2]),
+                    character_procedural: material
+                        .character_surface
+                        .map(|surface| surface.procedural_constants)
+                        .unwrap_or([[0.0; 4]; 11]),
+                    runner_layered_params: [
+                        material.runner_layered_surface.is_some() as u8 as f32,
+                        material
+                            .runner_layered_surface
+                            .map(|surface| f32::from(surface.mode))
+                            .unwrap_or(0.0),
+                        material.runner_occlusion.is_some() as u8 as f32,
+                        material
+                            .runner_occlusion
+                            .map(|occlusion| f32::from(occlusion.channel))
+                            .unwrap_or(0.0),
+                    ],
+                    runner_layered_constants: material
+                        .runner_layered_surface
+                        .map(|surface| surface.constants)
+                        .unwrap_or([[0.0; 4]; 24]),
+                    runner_color_constants: material
+                        .runner_layered_surface
+                        .map(|surface| surface.color_overlay_constants)
+                        .unwrap_or([[0.0; 4]; 7]),
+                    alpha_mask_params: material
+                        .alpha_mask
+                        .map(|alpha| [1.0, alpha.threshold, alpha.remap[0], alpha.remap[1]])
+                        .unwrap_or_default(),
                 };
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("quicktag_model_material_uniform"),
@@ -2473,6 +3211,50 @@ impl CallbackTrait for ModelPaintCallback {
                     .unwrap_or_else(|| fallback_color_view.clone());
                 let pattern_field_view = material
                     .pattern_field
+                    .as_ref()
+                    .or(material.runner_procedural_map.as_ref())
+                    .map(|texture| material_texture_view(texture, false))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let character_surface_view = material
+                    .character_surface_map
+                    .as_ref()
+                    .map(|texture| material_texture_view(texture, false))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let character_detail_color_view = material
+                    .character_detail_color
+                    .as_ref()
+                    .or(material.runner_color_overlay_map.as_ref())
+                    .map(|texture| material_texture_view(texture, true))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let character_procedural_view = material
+                    .character_procedural_map
+                    .as_ref()
+                    .or(material.runner_material_response_map.as_ref())
+                    .or(material.runner_occlusion_map.as_ref())
+                    .map(|texture| material_texture_view(texture, false))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let runner_surface_view = material
+                    .runner_surface_map
+                    .as_ref()
+                    .map(|texture| material_texture_view(texture, false))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let runner_detail_normal_a_view = material
+                    .runner_detail_normal_a
+                    .as_ref()
+                    .map(|texture| material_texture_view(texture, false))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let runner_detail_normal_b_view = material
+                    .runner_detail_normal_b
+                    .as_ref()
+                    .map(|texture| material_texture_view(texture, false))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let runner_detail_normal_c_view = material
+                    .runner_detail_normal_c
+                    .as_ref()
+                    .map(|texture| material_texture_view(texture, false))
+                    .unwrap_or_else(|| fallback_color_view.clone());
+                let runner_detail_normal_d_view = material
+                    .runner_detail_normal_d
                     .as_ref()
                     .map(|texture| material_texture_view(texture, false))
                     .unwrap_or_else(|| fallback_color_view.clone());
@@ -2523,6 +3305,50 @@ impl CallbackTrait for ModelPaintCallback {
                         wgpu::BindGroupEntry {
                             binding: 9,
                             resource: wgpu::BindingResource::TextureView(&pattern_field_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: wgpu::BindingResource::TextureView(&character_surface_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 11,
+                            resource: wgpu::BindingResource::TextureView(
+                                &character_detail_color_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 12,
+                            resource: wgpu::BindingResource::TextureView(
+                                &character_procedural_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 13,
+                            resource: wgpu::BindingResource::TextureView(&runner_surface_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 14,
+                            resource: wgpu::BindingResource::TextureView(
+                                &runner_detail_normal_a_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 15,
+                            resource: wgpu::BindingResource::TextureView(
+                                &runner_detail_normal_b_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 16,
+                            resource: wgpu::BindingResource::TextureView(
+                                &runner_detail_normal_c_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 17,
+                            resource: wgpu::BindingResource::TextureView(
+                                &runner_detail_normal_d_view,
+                            ),
                         },
                     ],
                 });
@@ -3389,6 +4215,14 @@ fn create_pipeline_resources(
             texture_entry(7),
             texture_entry(8),
             texture_entry(9),
+            texture_entry(10),
+            texture_entry(11),
+            texture_entry(12),
+            texture_entry(13),
+            texture_entry(14),
+            texture_entry(15),
+            texture_entry(16),
+            texture_entry(17),
         ],
     });
     let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -4396,7 +5230,7 @@ fn reconstruct_object_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let view_position = vec3<f32>(
         -(clip.x - scene.params1.y) / max(scale * scene.params1.x, 0.0001),
         (clip.y - scene.params1.z) / max(scale, 0.0001),
-        (0.5 - depth) / max(scale * 0.25, 0.0001),
+        (0.5 - depth) * max(scene.params0.x, 0.0001) / 0.21,
     );
     return scene.center.xyz + view_direction_to_world(view_position);
 }
@@ -4687,6 +5521,17 @@ struct MaterialUniform {
     transmission_colors: array<vec4<f32>, 2>,
     transmission_surfaces: array<vec4<f32>, 2>,
     transmission_params: vec4<f32>,
+    character_detail_transform: vec4<f32>,
+    character_detail_base: vec4<f32>,
+    character_detail_scale: vec4<f32>,
+    character_params: vec4<f32>,
+    character_extra: array<vec4<f32>, 2>,
+    character_palette: array<vec4<f32>, 2>,
+    character_procedural: array<vec4<f32>, 11>,
+    runner_layered_params: vec4<f32>,
+    runner_layered_constants: array<vec4<f32>, 24>,
+    runner_color_constants: array<vec4<f32>, 7>,
+    alpha_mask_params: vec4<f32>,
 }
 @group(1) @binding(0) var color_texture: texture_2d<f32>;
 @group(1) @binding(3) var control_texture: texture_2d<f32>;
@@ -4750,6 +5595,20 @@ fn fs_main(input: ShadowVertexOutput) {
         input.uv,
         material.sampler_params.x,
     );
+    if material.alpha_mask_params.x > 0.5 {
+        let coverage_sample = textureSampleBias(
+            control_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        ).r;
+        let coverage = coverage_sample * material.alpha_mask_params.w
+            + material.alpha_mask_params.z;
+        if coverage < material.alpha_mask_params.y {
+            discard;
+        }
+        return;
+    }
     if material.decal_params.x > 0.5 {
         let raw_mask = textureSampleBias(
             control_texture,
@@ -4841,6 +5700,17 @@ struct MaterialUniform {
     transmission_colors: array<vec4<f32>, 2>,
     transmission_surfaces: array<vec4<f32>, 2>,
     transmission_params: vec4<f32>,
+    character_detail_transform: vec4<f32>,
+    character_detail_base: vec4<f32>,
+    character_detail_scale: vec4<f32>,
+    character_params: vec4<f32>,
+    character_extra: array<vec4<f32>, 2>,
+    character_palette: array<vec4<f32>, 2>,
+    character_procedural: array<vec4<f32>, 11>,
+    runner_layered_params: vec4<f32>,
+    runner_layered_constants: array<vec4<f32>, 24>,
+    runner_color_constants: array<vec4<f32>, 7>,
+    alpha_mask_params: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
@@ -4857,7 +5727,19 @@ struct MaterialUniform {
 @group(1) @binding(6) var wear_scratches_texture: texture_2d<f32>;
 @group(1) @binding(7) var wear_grime_texture: texture_2d<f32>;
 @group(1) @binding(8) var wear_damage_texture: texture_2d<f32>;
-@group(1) @binding(9) var pattern_field_texture: texture_2d<f32>;
+// Weapon gear patterns and runner object-space procedural fields are mutually
+// exclusive draw ABIs and therefore share Tiger's sixteenth texture binding.
+@group(1) @binding(9) var pattern_or_runner_procedural_texture: texture_2d<f32>;
+@group(1) @binding(10) var character_surface_texture: texture_2d<f32>;
+@group(1) @binding(11) var character_detail_color_texture: texture_2d<f32>;
+// Character procedural fields and runner response/AO are mutually exclusive
+// material ABIs. Tiger's runner response stores normal response in R and AO in G.
+@group(1) @binding(12) var procedural_or_response_texture: texture_2d<f32>;
+@group(1) @binding(13) var runner_surface_texture: texture_2d<f32>;
+@group(1) @binding(14) var runner_detail_normal_a_texture: texture_2d<f32>;
+@group(1) @binding(15) var runner_detail_normal_b_texture: texture_2d<f32>;
+@group(1) @binding(16) var runner_detail_normal_c_texture: texture_2d<f32>;
+@group(1) @binding(17) var runner_detail_normal_d_texture: texture_2d<f32>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -4934,7 +5816,14 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let view_position = rotate_view(input.position - scene.center.xyz);
     let view_normal = normalize(rotate_view(input.normal));
     let scale = 0.84 * scene.params0.w / max(scene.params0.x, 0.0001);
-    let depth = clamp(0.5 - view_position.z * scale * 0.25, 0.0, 1.0);
+    // Orthographic zoom changes only screen-space magnification. Depth must
+    // retain the fitted-model range or close zoom collapses surfaces onto the
+    // clip planes and produces progressive disappearance/z-fighting.
+    let depth = clamp(
+        0.5 - view_position.z * 0.21 / max(scene.params0.x, 0.0001),
+        0.0,
+        1.0,
+    );
 
     var output: VertexOutput;
     output.clip_position = vec4<f32>(
@@ -4989,9 +5878,81 @@ fn triplanar_surface(
     return x * weights.x + y * weights.y + z * weights.z;
 }
 
+fn runner_triplanar_scalar(
+    texture: texture_2d<f32>,
+    position: vec3<f32>,
+    normal: vec3<f32>,
+    projection: vec4<f32>,
+    exponent: f32,
+) -> f32 {
+    var weights = pow(abs(normalize(normal)), vec3<f32>(exponent));
+    weights /= max(weights.x + weights.y + weights.z, 0.0001);
+    let x = textureSampleBias(
+        texture, material_sampler,
+        position.yz * projection.xy + projection.zw,
+        material.sampler_params.x,
+    ).r;
+    let y = textureSampleBias(
+        texture, material_sampler,
+        position.xz * projection.xy + projection.zw,
+        material.sampler_params.x,
+    ).r;
+    let z = textureSampleBias(
+        texture, material_sampler,
+        position.xy * projection.xy + projection.zw,
+        material.sampler_params.x,
+    ).r;
+    return dot(vec3<f32>(x, y, z), weights);
+}
+
+fn runner_e4db_condition(input: VertexOutput) -> f32 {
+    // 80A9E4DB t9/t11 share three authored UV transforms. t10 supplies the
+    // low-amplitude RG distortion used before the six powered t11 samples.
+    let warp_uv = input.procedural_position.xy * 5.0;
+    let warp = (textureSampleBias(
+        wear_grime_texture, material_sampler, warp_uv,
+        material.sampler_params.x).rg - vec2<f32>(0.5))
+        * material.runner_layered_constants[22].z;
+    let uv0 = input.uv * material.runner_layered_constants[18].xy
+        + material.runner_layered_constants[18].zw + warp;
+    let uv1 = input.uv * material.runner_layered_constants[19].xy
+        + material.runner_layered_constants[19].zw + warp;
+    let uv2 = input.uv * material.runner_layered_constants[20].xy
+        + material.runner_layered_constants[20].zw + warp;
+    let scratch = clamp(2.0 * (
+        textureSampleBias(wear_scratches_texture, material_sampler, uv0,
+            material.sampler_params.x).r
+        + textureSampleBias(wear_scratches_texture, material_sampler, uv1,
+            material.sampler_params.x).r
+        + textureSampleBias(wear_scratches_texture, material_sampler, uv2,
+            material.sampler_params.x).r), 0.0, 1.0);
+    let breakup0 = max(textureSampleBias(
+        wear_damage_texture, material_sampler, uv0,
+        material.sampler_params.x).r, 0.000001);
+    let breakup1 = max(textureSampleBias(
+        wear_damage_texture, material_sampler, uv1,
+        material.sampler_params.x).r, 0.000001);
+    let breakup2 = max(textureSampleBias(
+        wear_damage_texture, material_sampler, uv2,
+        material.sampler_params.x).r, 0.000001);
+    let exponents = material.runner_layered_constants[21]
+        + vec4<f32>(material.runner_layered_constants[22].xy, 0.0, 0.0);
+    let breakup = clamp(
+        pow(breakup0, exponents.x + exponents.y)
+        * pow(breakup1, exponents.z + exponents.w)
+        * pow(breakup2, material.runner_layered_constants[22].x
+            + material.runner_layered_constants[22].y),
+        0.0, 1.0);
+    let authored = clamp(max(scratch, breakup), 0.0, 1.0);
+    let first = material.runner_layered_constants[23].x
+        + material.runner_layered_constants[23].y * authored;
+    return clamp(material.runner_layered_constants[23].z
+        + material.runner_layered_constants[23].w * first, 0.0, 1.0);
+}
+
 fn gear_pattern_plane(axis_position: f32, field_uv: vec2<f32>, warp: f32) -> f32 {
     let field = textureSampleBias(
-        pattern_field_texture,
+        pattern_or_runner_procedural_texture,
         material_sampler,
         field_uv,
         material.sampler_params.x,
@@ -5034,7 +5995,9 @@ fn apply_gear_pattern(albedo: vec3<f32>, input: VertexOutput) -> vec3<f32> {
         material.pattern_params.w,
         selector_two,
     );
-    let position = input.procedural_position;
+    // scope_skinning[5].w is an authored procedural-coordinate multiplier,
+    // independent from the XYZ dequantization used for raster position.
+    let position = input.procedural_position * material.sampler_params.y;
     let projection = material.pattern_projection;
     let line_x = gear_pattern_plane(
         position.y,
@@ -5144,6 +6107,84 @@ fn apply_weapon_mod_condition(albedo: vec3<f32>, input: VertexOutput) -> vec3<f3
     return clamp(conditioned, vec3<f32>(0.0), vec3<f32>(4.0));
 }
 
+fn weapon_surface_condition_mask(input: VertexOutput) -> f32 {
+    if material.wear_params.w < 1.5 || material.wear_params.w > 2.5 {
+        return 0.0;
+    }
+    let uv = input.procedural_position.xy * material.wear_damage_projection.xy
+        + material.wear_damage_projection.zw;
+    let packed = textureSampleBias(
+        wear_damage_texture,
+        material_sampler,
+        uv,
+        material.sampler_params.x,
+    );
+    let phase = fract(packed.b + material.wear_scratches_projection.x);
+    let triangle_phase = material.wear_grime_projection.x
+        * (phase - 1.0 + packed.a)
+        / max(material.wear_grime_projection.y, 0.0001);
+    let triangle = 1.0 - abs(fract(triangle_phase) * 2.0 - 1.0);
+    let breakup = clamp(
+        (triangle * material.wear_grime_projection.z
+            + material.wear_grime_projection.w)
+            * (1.0 - phase),
+        0.0,
+        1.0,
+    );
+    let normal_z = normalize(input.procedural_normal).z;
+    let facing = clamp(
+        material.wear_scratches_projection.y
+            + material.wear_scratches_projection.z * normal_z,
+        0.0,
+        1.0,
+    );
+    // Inventory preview drives common condition at one quarter. Gameplay's
+    // full response crushes neutral weapon paint almost black.
+    return 0.25 * clamp(1.0 - breakup * facing * 0.35, 0.0, 1.0);
+}
+
+fn apply_weapon_surface_condition(albedo: vec3<f32>, input: VertexOutput) -> vec3<f32> {
+    let mask = weapon_surface_condition_mask(input);
+    if material.wear_params.w < 1.5 || material.wear_params.w > 2.5 {
+        return albedo;
+    }
+    let response = material.wear_surface_params;
+    let conditioned_surface = pow(
+        max(albedo * response.y, vec3<f32>(0.00001)),
+        vec3<f32>(response.x),
+    );
+    let blend = pow(max(mask, 0.00001), response.z) * response.y;
+    return mix(albedo, conditioned_surface, clamp(blend, 0.0, 1.0));
+}
+
+fn runner_detail_normal(
+    texture_value: texture_2d<f32>,
+    input_uv: vec2<f32>,
+    row_a: vec4<f32>,
+    row_b: vec4<f32>,
+    remap: vec4<f32>,
+) -> vec3<f32> {
+    let detail_uv = vec2<f32>(
+        dot(row_a.xy, input_uv) + row_a.z,
+        dot(row_b.xy, input_uv) + row_b.z,
+    );
+    let detail_sample = textureSampleBias(
+        texture_value,
+        material_sampler,
+        detail_uv,
+        material.sampler_params.x,
+    );
+    let detail_xy = detail_sample.xy * remap.x + vec2<f32>(remap.y);
+    return normalize(vec3<f32>(
+        detail_xy,
+        sqrt(max(1.0 - dot(detail_xy, detail_xy), 0.0)),
+    ));
+}
+
+fn blend_runner_normal(base: vec3<f32>, detail: vec3<f32>) -> vec3<f32> {
+    return normalize(vec3<f32>(base.xy + detail.xy, base.z * detail.z));
+}
+
 fn mapped_normal(input: VertexOutput) -> vec3<f32> {
     let base_normal = normalize(input.view_normal);
     if material.params.x < 0.5 {
@@ -5172,14 +6213,1451 @@ fn mapped_normal(input: VertexOutput) -> vec3<f32> {
     // Marathon's material shaders remap normal-map RG, then reconstruct positive Z.
     // Inventory reference is driven by silhouette and authored hard edges, not
     // full-amplitude compressed micro-normal noise.
+    let normal_strength = select(0.35, 1.0, material.runner_layered_params.x > 0.5);
     let sampled_xy = (textureSampleBias(
         normal_texture,
         material_sampler,
         input.uv,
         material.sampler_params.x,
-    ).xy * 2.0 - 1.0) * 0.35;
+    ).xy * 2.0 - 1.0) * normal_strength;
     let sampled_z = sqrt(max(1.0 - dot(sampled_xy, sampled_xy), 0.0));
-    let sampled = normalize(vec3<f32>(sampled_xy, sampled_z));
+    var sampled = normalize(vec3<f32>(sampled_xy, sampled_z));
+    if material.runner_layered_params.x > 0.5 {
+        var selector = textureSampleBias(
+            control_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        );
+        if material.runner_layered_params.y > 2.5 {
+            selector = textureSampleBias(
+                runner_surface_texture,
+                material_sampler,
+                input.uv,
+                material.sampler_params.x,
+            );
+        }
+        if material.runner_layered_params.y > 2.5
+            && material.runner_layered_params.y < 3.5 {
+            // Full10 ABI (80A9C244): t4 is unconditional; t5/t6/t7 are
+            // selected by packed t2 G/B/R bands. t6 has two authored UV
+            // transforms selected by literal c10.x.
+            let detail_a = runner_detail_normal(
+                runner_detail_normal_a_texture,
+                input.uv,
+                material.runner_layered_constants[1],
+                material.runner_layered_constants[2],
+                material.runner_layered_constants[3],
+            );
+            sampled = blend_runner_normal(sampled, detail_a);
+
+            if selector.g > material.runner_layered_constants[7].x
+                && selector.g < material.runner_layered_constants[8].x {
+                let detail_b = runner_detail_normal(
+                    runner_detail_normal_b_texture,
+                    input.uv,
+                    material.runner_layered_constants[4],
+                    material.runner_layered_constants[5],
+                    material.runner_layered_constants[6],
+                );
+                sampled = blend_runner_normal(sampled, detail_b);
+            }
+
+            if selector.b > material.runner_layered_constants[15].x
+                && selector.b < material.runner_layered_constants[16].x {
+                let use_alternate = material.runner_layered_constants[0].x < 0.0;
+                let c_offset = select(9u, 12u, use_alternate);
+                let detail_c = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[c_offset],
+                    material.runner_layered_constants[c_offset + 1u],
+                    material.runner_layered_constants[c_offset + 2u],
+                );
+                sampled = blend_runner_normal(sampled, detail_c);
+            }
+
+            if selector.r > material.runner_layered_constants[20].x
+                && selector.r < material.runner_layered_constants[21].x {
+                let detail_d = runner_detail_normal(
+                    runner_detail_normal_d_texture,
+                    input.uv,
+                    material.runner_layered_constants[17],
+                    material.runner_layered_constants[18],
+                    material.runner_layered_constants[19],
+                );
+                sampled = blend_runner_normal(sampled, detail_d);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if (material.runner_layered_params.y > 5.5
+                && material.runner_layered_params.y < 6.5)
+            || (material.runner_layered_params.y > 22.5
+                && material.runner_layered_params.y < 23.5) {
+            // Local full9 ABI: t1 G gates t3, t1 B selects t4,
+            // then t1 R selects either t5 transform.
+            let detail_a = runner_detail_normal(
+                runner_detail_normal_a_texture,
+                input.uv,
+                material.runner_layered_constants[1],
+                material.runner_layered_constants[2],
+                material.runner_layered_constants[3],
+            );
+            let detail_b = runner_detail_normal(
+                runner_detail_normal_b_texture,
+                input.uv,
+                material.runner_layered_constants[5],
+                material.runner_layered_constants[6],
+                material.runner_layered_constants[7],
+            );
+            var selected_r = false;
+            if selector.r > material.runner_layered_constants[16].x
+                && selector.r < material.runner_layered_constants[17].x {
+                let detail_c = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[10],
+                    material.runner_layered_constants[11],
+                    material.runner_layered_constants[12],
+                );
+                sampled = blend_runner_normal(sampled, detail_c);
+                selected_r = true;
+            }
+            if !selected_r && selector.r >= material.runner_layered_constants[17].x {
+                let detail_d = runner_detail_normal(
+                    runner_detail_normal_d_texture,
+                    input.uv,
+                    material.runner_layered_constants[13],
+                    material.runner_layered_constants[14],
+                    material.runner_layered_constants[15],
+                );
+                sampled = blend_runner_normal(sampled, detail_d);
+            }
+            if selector.b > material.runner_layered_constants[8].x
+                && selector.b < material.runner_layered_constants[9].x {
+                sampled = blend_runner_normal(sampled, detail_b);
+            }
+            if abs(round(selector.g - material.runner_layered_constants[4].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, detail_a);
+            }
+            if material.runner_layered_params.y > 22.5 {
+                let response = textureSampleBias(
+                    procedural_or_response_texture, material_sampler, input.uv,
+                    material.sampler_params.x);
+                var response_strength = mix(0.9, 1.0, response.r);
+                // E4DB extends mode 23 with its t9/t10/t11 procedural
+                // condition stack. Non-E4DB mode-23 rows stay zero.
+                if material.runner_layered_constants[18].x != 0.0 {
+                    response_strength = min(
+                        response_strength,
+                        mix(0.9, 1.0, runner_e4db_condition(input)),
+                    );
+                }
+                sampled = normalize(vec3<f32>(sampled.xy * response_strength, sampled.z));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if (material.runner_layered_params.y > 8.5
+                && material.runner_layered_params.y < 9.5)
+            || (material.runner_layered_params.y > 24.5
+                && material.runner_layered_params.y < 25.5) {
+            // 80A9C3F6: t7 base; t6 R-band, t5 B-band, t4 G-gate.
+            if selector.r > material.runner_layered_constants[13].x
+                && selector.r < material.runner_layered_constants[14].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[10],
+                    material.runner_layered_constants[11],
+                    material.runner_layered_constants[12],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if selector.b > material.runner_layered_constants[8].x
+                && selector.b < material.runner_layered_constants[9].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_b_texture,
+                    input.uv,
+                    material.runner_layered_constants[5],
+                    material.runner_layered_constants[6],
+                    material.runner_layered_constants[7],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if abs(round(selector.g - material.runner_layered_constants[4].x)) > 0.5 {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_a_texture,
+                    input.uv,
+                    material.runner_layered_constants[1],
+                    material.runner_layered_constants[2],
+                    material.runner_layered_constants[3],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if material.runner_layered_params.y > 24.5 {
+                let response = textureSampleBias(
+                    procedural_or_response_texture, material_sampler, input.uv,
+                    material.sampler_params.x);
+                sampled = normalize(vec3<f32>(sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 9.5
+            && material.runner_layered_params.y < 10.5 {
+            // Full11 ABI (80A9A9AD/80A9A9B1): t4 G/B/R select four
+            // independently transformed normals over the remapped t9 base.
+            let base_texel = textureSampleBias(
+                normal_texture,
+                material_sampler,
+                input.uv,
+                material.sampler_params.x,
+            );
+            let base_xy = base_texel.xy * material.runner_layered_constants[23].x
+                + vec2<f32>(material.runner_layered_constants[23].y);
+            sampled = normalize(vec3<f32>(
+                base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0)),
+            ));
+
+            if selector.g > material.runner_layered_constants[6].x
+                && selector.g < material.runner_layered_constants[7].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_a_texture,
+                    input.uv,
+                    material.runner_layered_constants[0],
+                    material.runner_layered_constants[1],
+                    material.runner_layered_constants[2],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            } else if selector.g >= material.runner_layered_constants[7].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_b_texture,
+                    input.uv,
+                    material.runner_layered_constants[3],
+                    material.runner_layered_constants[4],
+                    material.runner_layered_constants[5],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+
+            if selector.b > material.runner_layered_constants[14].x
+                && selector.b < material.runner_layered_constants[15].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[8],
+                    material.runner_layered_constants[9],
+                    material.runner_layered_constants[10],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            } else if selector.b >= material.runner_layered_constants[15].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[11],
+                    material.runner_layered_constants[12],
+                    material.runner_layered_constants[13],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+
+            if selector.r > material.runner_layered_constants[19].x
+                && selector.r < material.runner_layered_constants[20].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_d_texture,
+                    input.uv,
+                    material.runner_layered_constants[16],
+                    material.runner_layered_constants[17],
+                    material.runner_layered_constants[18],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if (material.runner_layered_params.y > 10.5
+                && material.runner_layered_params.y < 11.5)
+            || (material.runner_layered_params.y > 27.5
+                && material.runner_layered_params.y < 28.5) {
+            // 80A9B065: t1 A/G gate t3, B selects t4, R selects t5.
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5
+                || abs(round(selector.g - material.runner_layered_constants[5].x)) > 0.5 {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_a_texture,
+                    input.uv,
+                    material.runner_layered_constants[2],
+                    material.runner_layered_constants[3],
+                    material.runner_layered_constants[4],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_b_texture,
+                    input.uv,
+                    material.runner_layered_constants[6],
+                    material.runner_layered_constants[7],
+                    material.runner_layered_constants[8],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if selector.r > material.runner_layered_constants[14].x
+                && selector.r < material.runner_layered_constants[15].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[11],
+                    material.runner_layered_constants[12],
+                    material.runner_layered_constants[13],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if material.runner_layered_params.y > 27.5 {
+                let response = textureSampleBias(
+                    procedural_or_response_texture, material_sampler, input.uv,
+                    material.sampler_params.x);
+                sampled = normalize(vec3<f32>(
+                    sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 11.5
+            && material.runner_layered_params.y < 12.5 {
+            // 80A9DB9A: t2 A/G control t4, B selects t5, R gates t6.
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5
+                || abs(round(selector.g - material.runner_layered_constants[2].x)) > 0.5 {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_a_texture,
+                    input.uv,
+                    material.runner_layered_constants[3],
+                    material.runner_layered_constants[4],
+                    material.runner_layered_constants[5],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_b_texture,
+                    input.uv,
+                    material.runner_layered_constants[6],
+                    material.runner_layered_constants[7],
+                    material.runner_layered_constants[8],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            if selector.r > material.runner_layered_constants[14].x
+                && selector.r < material.runner_layered_constants[15].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[11],
+                    material.runner_layered_constants[12],
+                    material.runner_layered_constants[13],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 12.5
+            && material.runner_layered_params.y < 13.5 {
+            // 80A9C27C: t1 A/B/R selects t3/t4/t5 over t6.
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if selector.b > material.runner_layered_constants[8].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            }
+            if selector.r > material.runner_layered_constants[13].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[10], material.runner_layered_constants[11],
+                    material.runner_layered_constants[12]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 13.5
+            && material.runner_layered_params.y < 14.5 {
+            // 80A9DAC9: t2 G/B/R selects t4/t5/t6 over t7.
+            if abs(round(selector.g - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if selector.b > material.runner_layered_constants[8].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            }
+            if selector.r > material.runner_layered_constants[13].x
+                && selector.r < material.runner_layered_constants[14].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[10], material.runner_layered_constants[11],
+                    material.runner_layered_constants[12]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 14.5
+            && material.runner_layered_params.y < 15.5 {
+            // 80A9AFBF: t2 A gates t4; B/G/R jointly select t5.
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if abs(round(selector.b - material.runner_layered_constants[5].x)) > 0.5
+                && selector.g >= material.runner_layered_constants[6].x
+                && selector.r > material.runner_layered_constants[11].x
+                && selector.r < material.runner_layered_constants[12].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[8], material.runner_layered_constants[9],
+                    material.runner_layered_constants[10]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 15.5
+            && material.runner_layered_params.y < 16.5 {
+            // 80AA0261/80AA0263: t1 A gates t3 while B selects t4.
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if selector.b > material.runner_layered_constants[8].x
+                && selector.b < material.runner_layered_constants[9].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            }
+            // Engine t2.r is the authored material-response field. The DXIL
+            // remaps it into the final tangent-normal amplitude.
+            let response = textureSampleBias(
+                procedural_or_response_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            sampled = normalize(vec3<f32>(sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 16.5
+            && material.runner_layered_params.y < 17.5 {
+            // 80A9B86A: t6 packs A/G/B/R selectors. The B and R bands
+            // choose authored detail variants before A/G gate the stack.
+            var b_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.b > material.runner_layered_constants[12].x
+                && selector.b < material.runner_layered_constants[13].x {
+                b_detail = runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]);
+            } else if selector.b >= material.runner_layered_constants[13].x {
+                b_detail = runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[9], material.runner_layered_constants[10],
+                    material.runner_layered_constants[11]);
+            }
+            var r_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.r > material.runner_layered_constants[20].x
+                && selector.r < material.runner_layered_constants[21].x {
+                r_detail = runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[14], material.runner_layered_constants[15],
+                    material.runner_layered_constants[16]);
+            } else if selector.r >= material.runner_layered_constants[21].x {
+                r_detail = runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[17], material.runner_layered_constants[18],
+                    material.runner_layered_constants[19]);
+            }
+            var authored = blend_runner_normal(b_detail, r_detail);
+            if abs(round(selector.g - material.runner_layered_constants[5].x)) > 0.5 {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, authored);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 17.5
+            && material.runner_layered_params.y < 18.5 {
+            // 80A9D952: t3 G selects t5; B/R select three transformed
+            // variants of the shared t6 detail field over the t7 base.
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.g > material.runner_layered_constants[4].x
+                && selector.g < material.runner_layered_constants[5].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[1], material.runner_layered_constants[2],
+                    material.runner_layered_constants[3]));
+            }
+            var shared_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.b > material.runner_layered_constants[12].x
+                && selector.b < material.runner_layered_constants[13].x {
+                shared_detail = runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]);
+            } else if selector.b >= material.runner_layered_constants[13].x {
+                shared_detail = runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[9], material.runner_layered_constants[10],
+                    material.runner_layered_constants[11]);
+            }
+            if selector.r > material.runner_layered_constants[17].x
+                && selector.r < material.runner_layered_constants[18].x {
+                shared_detail = blend_runner_normal(shared_detail, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[14], material.runner_layered_constants[15],
+                    material.runner_layered_constants[16]));
+            }
+            sampled = blend_runner_normal(sampled, blend_runner_normal(authored, shared_detail));
+            // Engine t4.r owns the same normal-response output in this larger
+            // generated permutation.
+            let response = textureSampleBias(
+                procedural_or_response_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            sampled = normalize(vec3<f32>(sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 18.5
+            && material.runner_layered_params.y < 19.5 {
+            // AFB8/AFBA: t9 is the base tangent normal. t8 is transformed by
+            // c94/c95, remapped by c96, and selected by t2.r's c97/c98 band.
+            let detail = runner_detail_normal(
+                runner_detail_normal_a_texture,
+                input.uv,
+                material.runner_layered_constants[1],
+                material.runner_layered_constants[2],
+                material.runner_layered_constants[3],
+            );
+            let gate = select(
+                0.0,
+                1.0,
+                selector.r > material.runner_layered_constants[14].x
+                    && selector.r < material.runner_layered_constants[15].x,
+            );
+            sampled = normalize(mix(sampled, blend_runner_normal(sampled, detail), gate));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if (material.runner_layered_params.y > 19.5
+                && material.runner_layered_params.y < 20.5)
+            || (material.runner_layered_params.y > 26.5
+                && material.runner_layered_params.y < 27.5) {
+            // 80A9BD17/80A9DA29: t2 G/B choose t4/t5. R selects one of
+            // two authored transforms of t6 before the t7 base normal.
+            var r_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.r > material.runner_layered_constants[16].x
+                && selector.r < material.runner_layered_constants[17].x {
+                if material.runner_layered_constants[0].x < 0.0 {
+                    r_detail = runner_detail_normal(
+                        runner_detail_normal_d_texture, input.uv,
+                        material.runner_layered_constants[13], material.runner_layered_constants[14],
+                        material.runner_layered_constants[15]);
+                } else {
+                    r_detail = runner_detail_normal(
+                        runner_detail_normal_c_texture, input.uv,
+                        material.runner_layered_constants[10], material.runner_layered_constants[11],
+                        material.runner_layered_constants[12]);
+                }
+            } else if selector.r >= material.runner_layered_constants[17].x {
+                r_detail = runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[13], material.runner_layered_constants[14],
+                    material.runner_layered_constants[15]);
+            }
+            sampled = blend_runner_normal(sampled, r_detail);
+            if selector.b > material.runner_layered_constants[8].x
+                && selector.b < material.runner_layered_constants[9].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            }
+            if abs(round(selector.g - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if material.runner_layered_params.y > 26.5 {
+                // 80A9C96F uses t4.r as authored normal response after the
+                // same G/B/dual-R stack. t4.g also owns AO in material pass.
+                let response = textureSampleBias(
+                    procedural_or_response_texture, material_sampler, input.uv,
+                    material.sampler_params.x);
+                sampled = normalize(vec3<f32>(
+                    sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 20.5
+            && material.runner_layered_params.y < 21.5 {
+            // 80A9E64F adds the A gate to the same dual-R generated ABI.
+            var r_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.r > material.runner_layered_constants[17].x
+                && selector.r < material.runner_layered_constants[18].x {
+                if material.runner_layered_constants[0].x < 0.0 {
+                    r_detail = runner_detail_normal(
+                        runner_detail_normal_d_texture, input.uv,
+                        material.runner_layered_constants[14], material.runner_layered_constants[15],
+                        material.runner_layered_constants[16]);
+                } else {
+                    r_detail = runner_detail_normal(
+                        runner_detail_normal_c_texture, input.uv,
+                        material.runner_layered_constants[11], material.runner_layered_constants[12],
+                        material.runner_layered_constants[13]);
+                }
+            } else if selector.r >= material.runner_layered_constants[18].x {
+                r_detail = runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[14], material.runner_layered_constants[15],
+                    material.runner_layered_constants[16]);
+            }
+            sampled = blend_runner_normal(sampled, r_detail);
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5
+                || abs(round(selector.g - material.runner_layered_constants[2].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[3], material.runner_layered_constants[4],
+                    material.runner_layered_constants[5]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 21.5
+            && material.runner_layered_params.y < 22.5 {
+            // 80A9C31E: t1.b selects t4; t1.g adds t3; t1.a gates the
+            // resulting authored stack over the t5 base normal.
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                authored = runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]);
+            } else if selector.b >= material.runner_layered_constants[10].x {
+                authored = runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]);
+            }
+            if abs(round(selector.g - material.runner_layered_constants[5].x)) > 0.5 {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, authored);
+            }
+            let response = textureSampleBias(
+                procedural_or_response_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            sampled = normalize(vec3<f32>(sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 25.5
+            && material.runner_layered_params.y < 26.5 {
+            // 80A9DCF8: selector B/R choose t4/t5. A/G gate authored stack.
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.b > material.runner_layered_constants[6].x
+                && selector.b < material.runner_layered_constants[7].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[3], material.runner_layered_constants[4],
+                    material.runner_layered_constants[5]));
+            }
+            if selector.r > material.runner_layered_constants[11].x
+                && selector.r < material.runner_layered_constants[12].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[8], material.runner_layered_constants[9],
+                    material.runner_layered_constants[10]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5
+                || abs(round(selector.g - material.runner_layered_constants[2].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, authored);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 28.5
+            && material.runner_layered_params.y < 29.5 {
+            // 80A9D2D7: B switches t4/t5, R switches t6/t7, then A/G gate
+            // their authored composite over t8 base.
+            var b_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                b_detail = runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]);
+            } else if selector.b >= material.runner_layered_constants[10].x {
+                b_detail = runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[3], material.runner_layered_constants[4],
+                    material.runner_layered_constants[5]);
+            }
+            var r_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.r > material.runner_layered_constants[17].x
+                && selector.r < material.runner_layered_constants[18].x {
+                r_detail = runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[11], material.runner_layered_constants[12],
+                    material.runner_layered_constants[13]);
+            } else if selector.r >= material.runner_layered_constants[18].x {
+                r_detail = runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[14], material.runner_layered_constants[15],
+                    material.runner_layered_constants[16]);
+            }
+            let authored = blend_runner_normal(b_detail, r_detail);
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5
+                || abs(round(selector.g - material.runner_layered_constants[2].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, authored);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 29.5
+            && material.runner_layered_params.y < 30.5 {
+            // 80A9D569: independent A/G details plus B/R-gated t8.
+            if abs(round(selector.a - material.runner_layered_constants[4].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[1], material.runner_layered_constants[2],
+                    material.runner_layered_constants[3]));
+            }
+            if abs(round(selector.g - material.runner_layered_constants[8].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            }
+            if selector.b >= material.runner_layered_constants[9].x
+                && selector.r > material.runner_layered_constants[14].x
+                && selector.r < material.runner_layered_constants[15].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[11], material.runner_layered_constants[12],
+                    material.runner_layered_constants[13]));
+            }
+            let response = textureSampleBias(
+                procedural_or_response_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            sampled = normalize(vec3<f32>(
+                sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 30.5
+            && material.runner_layered_params.y < 31.5 {
+            // Emerald full character surface (80A9F4E5). Engine remaps t7
+            // with c32, then composes t4 from the t2 A gate, t5 from its B
+            // band, and t6 from its R band.
+            let base_texel = textureSampleBias(
+                normal_texture,
+                material_sampler,
+                input.uv,
+                material.sampler_params.x,
+            );
+            let base_xy = base_texel.xy * material.runner_layered_constants[13].x
+                + vec2<f32>(material.runner_layered_constants[13].y);
+            sampled = normalize(vec3<f32>(
+                base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0)),
+            ));
+
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.b > material.runner_layered_constants[6].x
+                && selector.b < material.runner_layered_constants[7].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[3],
+                    material.runner_layered_constants[4],
+                    material.runner_layered_constants[5]));
+            }
+            if selector.r > material.runner_layered_constants[11].x
+                && selector.r < material.runner_layered_constants[12].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[8],
+                    material.runner_layered_constants[9],
+                    material.runner_layered_constants[10]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[2].x)) > 0.5 {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[0],
+                    material.runner_layered_constants[14],
+                    material.runner_layered_constants[1]));
+            }
+            sampled = blend_runner_normal(sampled, authored);
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 31.5
+            && material.runner_layered_params.y < 32.5 {
+            // Emerald full13 sibling (80A9F500): t4/t5/t6/t7 are selected
+            // by t2 A/G/B/R and composed over remapped t8.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[16].x
+                + vec2<f32>(material.runner_layered_constants[16].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            if abs(round(selector.a - material.runner_layered_constants[3].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[0], material.runner_layered_constants[1],
+                    material.runner_layered_constants[2]));
+            }
+            if abs(round(selector.g - material.runner_layered_constants[7].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[4], material.runner_layered_constants[5],
+                    material.runner_layered_constants[6]));
+            }
+            if selector.b > material.runner_layered_constants[11].x
+                && selector.b < material.runner_layered_constants[12].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[8], material.runner_layered_constants[9],
+                    material.runner_layered_constants[10]));
+            }
+            if selector.r > material.runner_layered_constants[14].x
+                && selector.r < material.runner_layered_constants[15].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[8], material.runner_layered_constants[9],
+                    material.runner_layered_constants[13]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 32.5
+            && material.runner_layered_params.y < 33.5 {
+            // Emerald compact sibling (80A9F518): t4 is A-gated; two t5
+            // transforms are selected by t2 B/R over remapped t7.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[16].x
+                + vec2<f32>(material.runner_layered_constants[16].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            if abs(round(selector.a - material.runner_layered_constants[3].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[0], material.runner_layered_constants[1],
+                    material.runner_layered_constants[2]));
+            }
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[4], material.runner_layered_constants[5],
+                    material.runner_layered_constants[6]));
+            }
+            if selector.r > material.runner_layered_constants[14].x
+                && selector.r < material.runner_layered_constants[15].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[11], material.runner_layered_constants[12],
+                    material.runner_layered_constants[13]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 33.5
+            && material.runner_layered_params.y < 34.5 {
+            // Procedural Emerald sibling (80A9F4B3): A/G/B/R select t4,
+            // t5, t6 and a second t4 transform over remapped t7.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[21].x
+                + vec2<f32>(material.runner_layered_constants[21].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            if abs(round(selector.a - material.runner_layered_constants[3].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[0], material.runner_layered_constants[1],
+                    material.runner_layered_constants[2]));
+            }
+            if abs(round(selector.g - material.runner_layered_constants[7].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[4], material.runner_layered_constants[5],
+                    material.runner_layered_constants[6]));
+            }
+            if selector.b > material.runner_layered_constants[14].x
+                && selector.b < material.runner_layered_constants[15].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[8], material.runner_layered_constants[9],
+                    material.runner_layered_constants[10]));
+            }
+            if selector.r > material.runner_layered_constants[19].x
+                && selector.r < material.runner_layered_constants[20].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[16], material.runner_layered_constants[17],
+                    material.runner_layered_constants[18]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 34.5
+            && material.runner_layered_params.y < 35.5 {
+            // Compact character surface (80A9F528): t4 from A and t5 from R
+            // are composed over the remapped t6 base.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[9].x
+                + vec2<f32>(material.runner_layered_constants[9].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            if abs(round(selector.a - material.runner_layered_constants[3].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[0], material.runner_layered_constants[1],
+                    material.runner_layered_constants[2]));
+            }
+            if selector.r > material.runner_layered_constants[7].x
+                && selector.r < material.runner_layered_constants[8].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[4], material.runner_layered_constants[5],
+                    material.runner_layered_constants[6]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 35.5
+            && material.runner_layered_params.y < 36.5 {
+            // Local panel surface (80A9F589): transformed t3 is selected by
+            // t1.r over the remapped t4 base.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[5].x
+                + vec2<f32>(material.runner_layered_constants[5].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            if selector.r > material.runner_layered_constants[3].x
+                && selector.r < material.runner_layered_constants[4].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[0], material.runner_layered_constants[1],
+                    material.runner_layered_constants[2]));
+            }
+            let response = textureSampleBias(
+                procedural_or_response_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            sampled = normalize(vec3<f32>(sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 36.5
+            && material.runner_layered_params.y < 37.5 {
+            // 80B142A5 full13: t3 A/G/B/R selector; t5/t6 A/G;
+            // t7/t8 B variants; t7 R; t9 remapped base.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[21].x
+                + vec2<f32>(material.runner_layered_constants[21].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            if selector.a > material.runner_layered_constants[4].x
+                && selector.a < material.runner_layered_constants[5].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[1], material.runner_layered_constants[2],
+                    material.runner_layered_constants[3]));
+            }
+            if selector.g > material.runner_layered_constants[9].x
+                && selector.g < material.runner_layered_constants[10].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]));
+            }
+            var b_detail = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.b > material.runner_layered_constants[17].x
+                && selector.b < material.runner_layered_constants[18].x {
+                b_detail = select(
+                    runner_detail_normal(runner_detail_normal_c_texture, input.uv,
+                        material.runner_layered_constants[11], material.runner_layered_constants[12],
+                        material.runner_layered_constants[13]),
+                    runner_detail_normal(runner_detail_normal_d_texture, input.uv,
+                        material.runner_layered_constants[14], material.runner_layered_constants[15],
+                        material.runner_layered_constants[16]),
+                    material.runner_layered_constants[0].x < 0.0);
+            } else if selector.b >= material.runner_layered_constants[18].x {
+                b_detail = runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[14], material.runner_layered_constants[15],
+                    material.runner_layered_constants[16]);
+            }
+            sampled = blend_runner_normal(sampled, b_detail);
+            if selector.r > material.runner_layered_constants[19].x
+                && selector.r < material.runner_layered_constants[20].x
+                && material.runner_layered_constants[0].x >= 0.0 {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[11], material.runner_layered_constants[12],
+                    material.runner_layered_constants[13]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 37.5
+            && material.runner_layered_params.y < 38.5 {
+            // 80B143A0: t1 G/B/R builds the authored detail stack and A
+            // gates it over the remapped t6 base normal.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[16].x
+                + vec2<f32>(material.runner_layered_constants[16].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.r > material.runner_layered_constants[14].x
+                && selector.r < material.runner_layered_constants[15].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[11], material.runner_layered_constants[12],
+                    material.runner_layered_constants[13]));
+            }
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[6], material.runner_layered_constants[7],
+                    material.runner_layered_constants[8]));
+            }
+            if abs(round(selector.g - material.runner_layered_constants[5].x)) > 0.5 {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[1].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, authored);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 38.5
+            && material.runner_layered_params.y < 39.5 {
+            // 80B1444E/80B14BF9: t2 B/R selects t5/t6, then G gates t4,
+            // all over the remapped t7 base.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[15].x
+                + vec2<f32>(material.runner_layered_constants[15].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.r > material.runner_layered_constants[13].x
+                && selector.r < material.runner_layered_constants[14].x {
+                authored = runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[10], material.runner_layered_constants[11],
+                    material.runner_layered_constants[12]);
+            } else if selector.r >= material.runner_layered_constants[14].x {
+                authored = runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[10], material.runner_layered_constants[11],
+                    material.runner_layered_constants[12]);
+            }
+            if selector.b > material.runner_layered_constants[8].x
+                && selector.b < material.runner_layered_constants[9].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            } else if selector.b >= material.runner_layered_constants[9].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            }
+            if abs(round(selector.g - material.runner_layered_constants[4].x)) > 0.5 {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[1], material.runner_layered_constants[2],
+                    material.runner_layered_constants[3]));
+            }
+            sampled = blend_runner_normal(sampled, authored);
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 39.5
+            && material.runner_layered_params.y < 40.5 {
+            // 80B14701: t1 G selects t3/t4, B selects transformed t5,
+            // and R gates t6 over the remapped t7 base.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[22].x
+                + vec2<f32>(material.runner_layered_constants[22].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if selector.r > material.runner_layered_constants[20].x
+                && selector.r < material.runner_layered_constants[21].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_d_texture, input.uv,
+                    material.runner_layered_constants[17], material.runner_layered_constants[18],
+                    material.runner_layered_constants[19]));
+            }
+            if selector.b > material.runner_layered_constants[15].x
+                && selector.b < material.runner_layered_constants[16].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[9], material.runner_layered_constants[10],
+                    material.runner_layered_constants[11]));
+            } else if selector.b >= material.runner_layered_constants[16].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[12], material.runner_layered_constants[13],
+                    material.runner_layered_constants[14]));
+            }
+            if selector.g > material.runner_layered_constants[7].x
+                && selector.g < material.runner_layered_constants[8].x {
+                let selected = select(
+                    runner_detail_normal(runner_detail_normal_a_texture, input.uv,
+                        material.runner_layered_constants[1], material.runner_layered_constants[2],
+                        material.runner_layered_constants[3]),
+                    runner_detail_normal(runner_detail_normal_b_texture, input.uv,
+                        material.runner_layered_constants[4], material.runner_layered_constants[5],
+                        material.runner_layered_constants[6]),
+                    material.runner_layered_constants[0].x < 0.0);
+                authored = blend_runner_normal(authored, selected);
+            } else if selector.g >= material.runner_layered_constants[8].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[4], material.runner_layered_constants[5],
+                    material.runner_layered_constants[6]));
+            }
+            sampled = blend_runner_normal(sampled, authored);
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 41.5
+            && material.runner_layered_params.y < 42.5 {
+            // 80A9AD5D: A gates the complete stack, G gates t6, B selects
+            // t7, and R selects t8. t9 is the remapped base normal.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[17].x
+                + vec2<f32>(material.runner_layered_constants[17].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if abs(round(selector.g - material.runner_layered_constants[4].x)) > 0.5 {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[1], material.runner_layered_constants[2],
+                    material.runner_layered_constants[3]));
+            }
+            if selector.b > material.runner_layered_constants[8].x
+                && selector.b < material.runner_layered_constants[9].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[5], material.runner_layered_constants[6],
+                    material.runner_layered_constants[7]));
+            }
+            if selector.r > material.runner_layered_constants[13].x
+                && selector.r < material.runner_layered_constants[14].x {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_c_texture, input.uv,
+                    material.runner_layered_constants[10], material.runner_layered_constants[11],
+                    material.runner_layered_constants[12]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[0].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, authored);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 42.5
+            && material.runner_layered_params.y < 43.5 {
+            // 80A9AD68: A gates the complete stack, G gates t5, while the
+            // generated B/R bands select t6 over the remapped t7 base.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[14].x
+                + vec2<f32>(material.runner_layered_constants[14].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            var authored = vec3<f32>(0.0, 0.0, 1.0);
+            if abs(round(selector.g - material.runner_layered_constants[4].x)) > 0.5 {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[1], material.runner_layered_constants[2],
+                    material.runner_layered_constants[3]));
+            }
+            let b_selected = selector.b > material.runner_layered_constants[5].x
+                && selector.b < material.runner_layered_constants[6].x;
+            let r_selected = selector.r > material.runner_layered_constants[10].x
+                && selector.r < material.runner_layered_constants[11].x;
+            if b_selected || r_selected {
+                authored = blend_runner_normal(authored, runner_detail_normal(
+                    runner_detail_normal_b_texture, input.uv,
+                    material.runner_layered_constants[7], material.runner_layered_constants[8],
+                    material.runner_layered_constants[9]));
+            }
+            if abs(round(selector.a - material.runner_layered_constants[0].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, authored);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 43.5
+            && material.runner_layered_params.y < 44.5 {
+            // 80A9B71C: generated code multiplies the t3 detail by the
+            // authored A/G/B/R selector tests before composing with t4.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[9].x
+                + vec2<f32>(material.runner_layered_constants[9].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            let selected = abs(round(selector.a - material.runner_layered_constants[0].x)) > 0.5
+                && abs(round(selector.g - material.runner_layered_constants[1].x)) > 0.5
+                && selector.b > material.runner_layered_constants[2].x
+                && selector.b < material.runner_layered_constants[3].x
+                && selector.r > material.runner_layered_constants[7].x
+                && selector.r < material.runner_layered_constants[8].x;
+            if selected {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[4], material.runner_layered_constants[5],
+                    material.runner_layered_constants[6]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 44.5
+            && material.runner_layered_params.y < 45.5 {
+            // 80A9C430 woven fabric. t5 is the remapped base normal; t3 is
+            // selected by the authored t1.g band, and tiled t4 supplies the
+            // fine weave relief visible across the cloth panels.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[9].x
+                + vec2<f32>(material.runner_layered_constants[9].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            if selector.g > material.runner_layered_constants[4].x
+                && selector.g < material.runner_layered_constants[5].x {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[1], material.runner_layered_constants[2],
+                    material.runner_layered_constants[3]));
+            }
+            sampled = blend_runner_normal(sampled, runner_detail_normal(
+                runner_detail_normal_b_texture, input.uv,
+                material.runner_layered_constants[6], material.runner_layered_constants[7],
+                material.runner_layered_constants[8]));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 45.5
+            && material.runner_layered_params.y < 46.5 {
+            // 80A9C65C compact woven fabric: authored t4 base plus the
+            // transformed fine t3 weave normal.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[4].x
+                + vec2<f32>(material.runner_layered_constants[4].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            sampled = blend_runner_normal(sampled, runner_detail_normal(
+                runner_detail_normal_a_texture, input.uv,
+                material.runner_layered_constants[1], material.runner_layered_constants[2],
+                material.runner_layered_constants[3]));
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 46.5
+            && material.runner_layered_params.y < 47.5 {
+            // 80A9CBEE: t2 alpha and green gates multiply the transformed
+            // t4 armor relief before it is composed over t5.
+            let base_texel = textureSampleBias(normal_texture, material_sampler, input.uv,
+                material.sampler_params.x);
+            let base_xy = base_texel.xy * material.runner_layered_constants[5].x
+                + vec2<f32>(material.runner_layered_constants[5].y);
+            sampled = normalize(vec3<f32>(base_xy,
+                sqrt(max(1.0 - dot(base_xy, base_xy), 0.0))));
+            let enabled = abs(round(selector.a - material.runner_layered_constants[0].x)) > 0.5
+                && abs(round(selector.g - material.runner_layered_constants[1].x)) > 0.5;
+            if enabled {
+                sampled = blend_runner_normal(sampled, runner_detail_normal(
+                    runner_detail_normal_a_texture, input.uv,
+                    material.runner_layered_constants[2], material.runner_layered_constants[3],
+                    material.runner_layered_constants[4]));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 7.5
+            && material.runner_layered_params.y < 8.5 {
+            // 80A9AFB6: t4 base normal already sampled above. Engine applies
+            // transformed t3 only inside the authored t1.r selector band.
+            if selector.r > material.runner_layered_constants[4].x
+                && selector.r < material.runner_layered_constants[5].x {
+                let detail = runner_detail_normal(
+                    runner_detail_normal_a_texture,
+                    input.uv,
+                    material.runner_layered_constants[1],
+                    material.runner_layered_constants[2],
+                    material.runner_layered_constants[3],
+                );
+                sampled = blend_runner_normal(sampled, detail);
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        if material.runner_layered_params.y > 6.5 {
+            // Expanded local full9 ABI (80A9D6FD). Engine order is R-selected
+            // t5, B-selected t3, G-gated t4, then A-gated t3.
+            let detail_a = runner_detail_normal(
+                runner_detail_normal_a_texture,
+                input.uv,
+                material.runner_layered_constants[1],
+                material.runner_layered_constants[2],
+                material.runner_layered_constants[3],
+            );
+            let detail_b = runner_detail_normal(
+                runner_detail_normal_b_texture,
+                input.uv,
+                material.runner_layered_constants[5],
+                material.runner_layered_constants[6],
+                material.runner_layered_constants[7],
+            );
+            var selected_r = false;
+            if selector.r > material.runner_layered_constants[17].x
+                && selector.r < material.runner_layered_constants[18].x {
+                let detail_c = runner_detail_normal(
+                    runner_detail_normal_c_texture,
+                    input.uv,
+                    material.runner_layered_constants[11],
+                    material.runner_layered_constants[12],
+                    material.runner_layered_constants[13],
+                );
+                sampled = blend_runner_normal(sampled, detail_c);
+                selected_r = true;
+            }
+            if !selected_r && selector.r >= material.runner_layered_constants[18].x {
+                let detail_d = runner_detail_normal(
+                    runner_detail_normal_d_texture,
+                    input.uv,
+                    material.runner_layered_constants[14],
+                    material.runner_layered_constants[15],
+                    material.runner_layered_constants[16],
+                );
+                sampled = blend_runner_normal(sampled, detail_d);
+            }
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                sampled = blend_runner_normal(sampled, detail_a);
+            }
+            if abs(round(selector.g - material.runner_layered_constants[8].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, detail_b);
+            }
+            if abs(round(selector.a - material.runner_layered_constants[4].x)) > 0.5 {
+                sampled = blend_runner_normal(sampled, detail_a);
+            }
+            if material.runner_layered_params.y > 23.5 {
+                let response = textureSampleBias(
+                    procedural_or_response_texture, material_sampler, input.uv,
+                    material.sampler_params.x);
+                sampled = normalize(vec3<f32>(sampled.xy * mix(0.9, 1.0, response.r), sampled.z));
+            }
+            return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
+        }
+        let row_a = material.runner_layered_constants[1];
+        let row_b = material.runner_layered_constants[2];
+        let remap_a = material.runner_layered_constants[3];
+        let uv_a = vec2<f32>(
+            dot(row_a.xy, input.uv) + row_a.z,
+            dot(row_b.xy, input.uv) + row_b.z,
+        );
+        let detail_a_sample = textureSampleBias(
+            runner_detail_normal_a_texture,
+            material_sampler,
+            uv_a,
+            material.sampler_params.x,
+        );
+        let detail_a_xy = detail_a_sample.xy * remap_a.x + vec2<f32>(remap_a.y);
+        let detail_a = normalize(vec3<f32>(
+            detail_a_xy,
+            sqrt(max(1.0 - dot(detail_a_xy, detail_a_xy), 0.0)),
+        ));
+        let second_offset = select(6u, 4u, material.runner_layered_params.y > 1.5);
+        let second_row_a = material.runner_layered_constants[second_offset];
+        let second_row_b = material.runner_layered_constants[second_offset + 1u];
+        let remap_b = material.runner_layered_constants[second_offset + 2u];
+        let uv_b = vec2<f32>(
+            dot(second_row_a.xy, input.uv) + second_row_a.z,
+            dot(second_row_b.xy, input.uv) + second_row_b.z,
+        );
+        let detail_b_sample = textureSampleBias(
+            runner_detail_normal_b_texture,
+            material_sampler,
+            uv_b,
+            material.sampler_params.x,
+        );
+        let detail_b_xy = detail_b_sample.xy * remap_b.x + vec2<f32>(remap_b.y);
+        let detail_b = normalize(vec3<f32>(
+            detail_b_xy,
+            sqrt(max(1.0 - dot(detail_b_xy, detail_b_xy), 0.0)),
+        ));
+        if material.runner_layered_params.y < 1.5 {
+            // Full9: c29/c30 and c34/c35, gated by t1.b/t1.r bounds.
+            let lower_a = material.runner_layered_constants[4].x;
+            let upper_a = material.runner_layered_constants[5].x;
+            if selector.b > lower_a && selector.b < upper_a {
+                sampled = normalize(vec3<f32>(
+                    sampled.xy + detail_a.xy,
+                    sampled.z * detail_a.z,
+                ));
+            }
+            let lower_b = material.runner_layered_constants[9].x;
+            let upper_b = material.runner_layered_constants[10].x;
+            if selector.r > lower_b && selector.r < upper_b {
+                sampled = normalize(vec3<f32>(
+                    sampled.xy + detail_b.xy,
+                    sampled.z * detail_b.z,
+                ));
+            }
+        } else if material.runner_layered_params.y > 3.5
+            && material.runner_layered_params.y < 4.5 {
+            // Procedural full9 ABI (80A9AFB4): t2 G/B select t4/t5.
+            if selector.g > material.runner_layered_constants[4].x
+                && selector.g < material.runner_layered_constants[5].x {
+                sampled = blend_runner_normal(sampled, detail_a);
+            }
+            if selector.b > material.runner_layered_constants[9].x
+                && selector.b < material.runner_layered_constants[10].x {
+                sampled = blend_runner_normal(sampled, detail_b);
+            }
+        } else if material.runner_layered_params.y > 4.5
+            && material.runner_layered_params.y < 5.5 {
+            // Sibling switched ABI: t1.r below c15 enables the sole t2 detail.
+            if selector.r < material.runner_layered_constants[0].x {
+                sampled = blend_runner_normal(sampled, detail_a);
+            }
+        } else {
+            // Switched dual-layer ABI: t1.r < c83 chooses t2, otherwise t3.
+            let chosen = select(detail_b, detail_a, selector.r < material.runner_layered_constants[0].x);
+            sampled = normalize(vec3<f32>(
+                sampled.xy + chosen.xy,
+                sampled.z * chosen.z,
+            ));
+        }
+    }
     return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
 }
 
@@ -5220,9 +7698,51 @@ fn gear_palette_index(control: vec3<f32>) -> i32 {
     return -1;
 }
 
-fn material_surface(uv: vec2<f32>, albedo: vec3<f32>) -> vec2<f32> {
+fn material_surface(input: VertexOutput, albedo: vec3<f32>) -> vec2<f32> {
+    let uv = input.uv;
     if material.solid_surface.z > 0.5 {
         return material.solid_surface.xy;
+    }
+    if material.character_params.x > 0.5 {
+        // Exact MRT contract shared by audited Goliath character permutations:
+        // RT1.a = 0.67 roughness; RT2.r = 0 metalness.
+        return vec2<f32>(0.67, 0.0);
+    }
+    if (material.runner_layered_params.y > 15.5
+            && material.runner_layered_params.y < 16.5)
+        || (material.runner_layered_params.y > 17.5
+            && material.runner_layered_params.y < 18.5) {
+        // AA0261/AA0263 t2.g and D952 t4.g feed the final roughness output.
+        // The generated shaders average it with their accumulated base
+        // response; retain Quicktag's decoded class metalness unchanged.
+        let response = textureSampleBias(
+            procedural_or_response_texture,
+            material_sampler,
+            uv,
+            material.sampler_params.x,
+        );
+        let class_surface = fallback_surface(albedo);
+        return vec2<f32>(
+            clamp((class_surface.x + clamp(response.g, 0.0, 1.0)) * 0.5, 0.04, 1.0),
+            class_surface.y,
+        );
+    }
+    if (material.runner_layered_params.y > 41.5
+            && material.runner_layered_params.y < 43.5) {
+        // AD5D/AD68 share the authored 80A613F1 procedural response field.
+        // It is a powered scalar response, not colour or a decal. Preserve
+        // its high-frequency material breakup in the roughness target.
+        let response = textureSampleBias(
+            pattern_or_runner_procedural_texture,
+            material_sampler,
+            uv,
+            material.sampler_params.x,
+        ).r;
+        let class_surface = fallback_surface(albedo);
+        return vec2<f32>(
+            clamp(mix(class_surface.x, class_surface.x * 0.72, response), 0.04, 1.0),
+            class_surface.y,
+        );
     }
     if material.blend.z < 0.5 {
         return fallback_surface(albedo);
@@ -5233,6 +7753,34 @@ fn material_surface(uv: vec2<f32>, albedo: vec3<f32>) -> vec2<f32> {
         uv,
         material.sampler_params.x,
     );
+    if material.wear_params.w > 1.5 && material.wear_params.w < 2.5 {
+        // Common-weapon MRT ABI: projected t4 is a physical-detail field.
+        // DXIL mixes t3.a toward class roughness with that field. It never
+        // multiplies albedo; doing so clips bright skins to white.
+        let detail = runner_triplanar_scalar(
+            pattern_or_runner_procedural_texture,
+            input.procedural_position * material.sampler_params.y,
+            input.procedural_normal,
+            material.wear_scratches_remap_base,
+            material.wear_scratches_remap_scale.x,
+        );
+        let detail_mix = clamp(
+            material.wear_scratches_remap_scale.z
+                + material.wear_scratches_remap_scale.w * detail,
+            0.0,
+            1.0,
+        );
+        let response = textureSampleBias(
+            wear_scratches_texture,
+            material_sampler,
+            uv,
+            material.sampler_params.x,
+        ).r;
+        return vec2<f32>(
+            clamp(mix(control.a, material.wear_scratches_remap_scale.y, detail_mix), 0.04, 1.0),
+            clamp(response, 0.0, 1.0),
+        );
+    }
     var authored = control.r;
     if material.blend.y > 1.5 {
         authored = control.g;
@@ -5372,7 +7920,7 @@ fn directional_shadow(input: VertexOutput) -> f32 {
         // a false shadow along the light-frustum boundary.
         if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
             visibility += 1.0;
-        } else {
+        } else if material.character_params.w < 2.5 {
             visibility += textureSampleCompare(
                 sun_shadow,
                 sun_shadow_sampler,
@@ -5450,6 +7998,100 @@ struct FragmentOutput {
     @location(3) albedo: vec4<f32>,
 }
 
+fn character_palette_procedural_mask(
+    input: VertexOutput,
+    uv_a: vec2<f32>,
+    uv_b: vec2<f32>,
+) -> f32 {
+    // Arata palette-mask DXIL c6/c10..c15/c20/c22..c24. t3 supplies two
+    // transformed mark samples; t2 supplies the object-space tri-planar field.
+    let mark_a = max(textureSampleBias(
+        control_texture, material_sampler, uv_a, material.sampler_params.x,
+    ).r, 0.0);
+    let mark_b = max(textureSampleBias(
+        control_texture, material_sampler, uv_b, material.sampler_params.x,
+    ).r, 0.0);
+    let paired = clamp(
+        pow(mark_a, material.character_procedural[8].x)
+            * pow(mark_b, material.character_procedural[9].x),
+        0.0,
+        1.0,
+    );
+
+    let position = input.procedural_position;
+    var weights = pow(
+        abs(normalize(input.procedural_normal)),
+        vec3<f32>(material.character_procedural[1].x),
+    );
+    weights /= max(weights.x + weights.y + weights.z, 0.0001);
+    let projection = material.character_procedural[2];
+    let field_x = textureSampleBias(
+        procedural_or_response_texture,
+        material_sampler,
+        vec2<f32>(
+            projection.x * position.y + projection.z,
+            projection.y * position.z + projection.w,
+        ),
+        material.sampler_params.x,
+    ).r;
+    let field_y = textureSampleBias(
+        procedural_or_response_texture,
+        material_sampler,
+        vec2<f32>(
+            projection.x * position.x + projection.z,
+            projection.y * position.z + projection.w,
+        ),
+        material.sampler_params.x,
+    ).r;
+    let field_z = textureSampleBias(
+        procedural_or_response_texture,
+        material_sampler,
+        vec2<f32>(
+            projection.x * position.x + projection.z,
+            projection.y * position.y + projection.w,
+        ),
+        material.sampler_params.x,
+    ).r;
+    let field_scale = material.character_procedural[3].x;
+    let field_base = material.character_procedural[4].x;
+    let frequency = material.character_procedural[5].x;
+    let phase = material.character_procedural[5].z;
+    let stripe_remap = material.character_procedural[6];
+    let stripe_scale = material.character_procedural[7].x;
+    let stripe_x = clamp(
+        stripe_remap.x
+            + abs(fract((field_x - field_base) * field_scale + position.y)
+                * frequency + phase) * stripe_remap.y,
+        0.0,
+        1.0,
+    ) * stripe_scale;
+    let stripe_y = clamp(
+        stripe_remap.x
+            + abs(fract((field_y - field_base) * field_scale + position.x)
+                * frequency + phase) * stripe_remap.y,
+        0.0,
+        1.0,
+    ) * stripe_scale;
+    let stripe_z = clamp(
+        stripe_remap.x
+            + abs(fract((field_z - field_base) * field_scale + position.x)
+                * frequency + phase) * stripe_remap.y,
+        0.0,
+        1.0,
+    ) * stripe_scale;
+    let field = dot(vec3<f32>(stripe_x, stripe_y, stripe_z), weights);
+    let contour_position = fract(
+        round(paired)
+            * (field - 1.0 + paired * material.character_procedural[10].x),
+    );
+    let contour = material.character_procedural[0];
+    return clamp(
+        contour.x + abs(contour_position + contour.z) * contour.y,
+        0.0,
+        1.0,
+    );
+}
+
 fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     let base_color = textureSampleBias(
         color_texture,
@@ -5457,6 +8099,19 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         input.uv,
         material.sampler_params.x,
     );
+    if !investment_decal && material.alpha_mask_params.x > 0.5 {
+        let coverage_sample = textureSampleBias(
+            control_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        ).r;
+        let coverage = coverage_sample * material.alpha_mask_params.w
+            + material.alpha_mask_params.z;
+        if coverage < material.alpha_mask_params.y {
+            discard;
+        }
+    }
     let mask_material = material.params.w < -0.5;
     var material_alpha = select(base_color.a, base_color.r, mask_material);
     if !investment_decal && ((!mask_material && base_color.a < material.params.w)
@@ -5489,6 +8144,293 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
                 + material.decal_detail_scale.rgb * detail_sample;
             sampled_albedo *= detail * 4.5947933;
         }
+    }
+    if !investment_decal && material.character_params.x > 0.5 {
+        let surface_sample = textureSampleBias(
+            character_surface_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        );
+        if material.character_params.w < 1.5 {
+            // Literal common-character DXIL path: t1 detail is transformed by
+            // c0, remapped by c3/c4, multiplied with t0, then selected by
+            // round(t2.a - c5.x).
+            let detail_uv = input.uv * material.character_detail_transform.xy
+                + material.character_detail_transform.zw;
+            let detail_sample = textureSampleBias(
+                character_detail_color_texture,
+                material_sampler,
+                detail_uv,
+                material.sampler_params.x,
+            ).r;
+            let detail = clamp(
+                material.character_detail_base.rgb
+                    + material.character_detail_scale.rgb * detail_sample,
+                vec3<f32>(0.0),
+                vec3<f32>(1.0),
+            );
+            let detail_gate = clamp(
+                round(surface_sample.a - material.character_params.y),
+                0.0,
+                1.0,
+            );
+            sampled_albedo = mix(
+                sampled_albedo,
+                sampled_albedo * detail * material.character_params.z,
+                detail_gate,
+            );
+        } else {
+            // Palette-mask family: c2/c3 and c4/c5 are two affine UV rows.
+            // t1 and t3 build the authored mark; t4.g gates c0/c1 palette over
+            // local t0. This retains Arata-family logos and panel colors that
+            // were previously discarded with the auxiliary texture list.
+            let uv_a = vec2<f32>(
+                dot(material.character_detail_transform.xy, input.uv)
+                    + material.character_detail_transform.z,
+                dot(material.character_detail_base.xy, input.uv)
+                    + material.character_detail_base.z,
+            );
+            let uv_b = vec2<f32>(
+                dot(material.character_detail_scale.xy, input.uv)
+                    + material.character_detail_scale.z,
+                dot(material.character_extra[0].xy, input.uv)
+                    + material.character_extra[0].z,
+            );
+            let mark_a = textureSampleBias(
+                character_detail_color_texture,
+                material_sampler,
+                uv_a,
+                material.sampler_params.x,
+            ).r;
+            let mark_b = textureSampleBias(
+                character_detail_color_texture,
+                material_sampler,
+                uv_b,
+                material.sampler_params.x,
+            ).r;
+            // DXIL %295..%519: transformed t1 marks plus the independent
+            // t3/t2 object-space contour branch form the final palette mask.
+            let procedural_mark = character_palette_procedural_mask(input, uv_a, uv_b);
+            let palette_mask = clamp(mark_a + mark_b + procedural_mark, 0.0, 1.0);
+            let palette_color = mix(
+                material.character_palette[0].rgb,
+                material.character_palette[1].rgb,
+                palette_mask,
+            );
+            let palette_gate = clamp(
+                round(surface_sample.g - material.character_params.y),
+                0.0,
+                1.0,
+            );
+            sampled_albedo = mix(sampled_albedo, palette_color, palette_gate);
+        }
+    }
+    if !investment_decal
+        && material.runner_layered_params.y > 18.5
+        && material.runner_layered_params.y < 19.5 {
+        // AFB8/AFBA procedural panel: t4 is sampled as a scalar pattern,
+        // t5 supplies its RG modulation, and t6 is the local panel mask.
+        let row_u = material.runner_layered_constants[4];
+        let row_v = material.runner_layered_constants[5];
+        let pattern_uv = vec2<f32>(
+            dot(row_u.xy, input.uv) + row_u.z,
+            dot(row_v.xy, input.uv) + row_v.z,
+        );
+        let pattern = textureSampleBias(
+            runner_detail_normal_b_texture,
+            material_sampler,
+            pattern_uv,
+            material.sampler_params.x,
+        ).r;
+        let procedural = textureSampleBias(
+            procedural_or_response_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        ).r;
+        let panel_mask = textureSampleBias(
+            runner_detail_normal_c_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        ).r;
+        let pattern_color = material.runner_layered_constants[9].rgb;
+        sampled_albedo = mix(
+            sampled_albedo,
+            sampled_albedo * mix(vec3<f32>(1.0), pattern_color, pattern),
+            clamp(panel_mask * procedural, 0.0, 1.0),
+        );
+    }
+    if !investment_decal
+        && material.runner_layered_params.y > 26.5
+        && material.runner_layered_params.y < 27.5 {
+        // 80A9C96F DXIL: t2 is an object-space tri-planar scalar field. It
+        // modulates t0 albedo only in the authored high B selector band (or
+        // the middle band when c14 selects the procedural alternative).
+        let selector = textureSampleBias(
+            runner_surface_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        );
+        let middle_band = selector.b > material.runner_layered_constants[18].x
+            && selector.b < material.runner_layered_constants[19].x;
+        let procedural_selected = selector.b >= material.runner_layered_constants[19].x
+            || (middle_band && material.runner_layered_constants[0].x < 0.0);
+        if procedural_selected {
+            let field = runner_triplanar_scalar(
+                pattern_or_runner_procedural_texture,
+                input.procedural_position,
+                input.procedural_normal,
+                material.runner_layered_constants[21],
+                material.runner_layered_constants[20].x,
+            );
+            let field_color = material.runner_layered_constants[22].rgb
+                + material.runner_layered_constants[23].rgb * field;
+            sampled_albedo *= field_color * 4.5947933;
+        }
+    }
+    if !investment_decal
+        && material.runner_layered_params.y > 27.5
+        && material.runner_layered_params.y < 28.5 {
+        // 80A9D3FC DXIL: t0 is an unconditional object-space tri-planar
+        // scalar field. c4 + c5 * field multiplies t1 albedo by Tiger's
+        // authored linear-colour scale.
+        let field = runner_triplanar_scalar(
+            pattern_or_runner_procedural_texture,
+            input.procedural_position,
+            input.procedural_normal,
+            material.runner_layered_constants[17],
+            material.runner_layered_constants[16].x,
+        );
+        let field_color = material.runner_layered_constants[18].rgb
+            + material.runner_layered_constants[19].rgb * field;
+        sampled_albedo *= field_color * 4.5947933;
+    }
+    if !investment_decal
+        && material.runner_layered_params.y > 29.5
+        && material.runner_layered_params.y < 30.5 {
+        // 80A9D569 DXIL: t1.r is an authored repeating colour mask. c1/c2
+        // transform its UV, while round(t4.a - c3.x) gates the layer. This is
+        // a colour operation; treating t1 as an unused auxiliary texture
+        // removes runner emblems and fabric marks entirely.
+        let selector = textureSampleBias(
+            runner_surface_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        );
+        let row_u = material.runner_color_constants[1];
+        let row_v = material.runner_color_constants[2];
+        let overlay_uv = vec2<f32>(
+            dot(row_u.xy, input.uv) + row_u.z,
+            dot(row_v.xy, input.uv) + row_v.z,
+        );
+        let overlay = textureSampleBias(
+            character_detail_color_texture,
+            material_sampler,
+            overlay_uv,
+            material.sampler_params.x,
+        ).r;
+        let gate = clamp(
+            round(selector.a - material.runner_color_constants[3].x),
+            0.0,
+            1.0,
+        );
+        sampled_albedo = mix(
+            sampled_albedo,
+            material.runner_color_constants[0].rgb,
+            clamp(overlay * gate, 0.0, 1.0),
+        );
+    }
+    if !investment_decal
+        && material.runner_layered_params.y > 36.5
+        && material.runner_layered_params.y < 37.5 {
+        // 80B142A5 DXIL colour branch. t2.r is the authored relief/pattern
+        // field; c24/c25 transform it, c28+c29*t2 remaps its colour, and
+        // round(t3.g-c30.x) selects the result over local t0 albedo.
+        let selector = textureSampleBias(
+            runner_surface_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        );
+        let row_u = material.runner_color_constants[0];
+        let row_v = material.runner_color_constants[1];
+        let overlay_uv = vec2<f32>(
+            dot(row_u.xy, input.uv) + row_u.z,
+            dot(row_v.xy, input.uv) + row_v.z,
+        );
+        let relief = clamp(textureSampleBias(
+            character_detail_color_texture,
+            material_sampler,
+            overlay_uv,
+            material.sampler_params.x,
+        ).r, 0.0, 1.0);
+        let remapped = clamp(
+            material.runner_color_constants[2].rgb
+                + material.runner_color_constants[3].rgb * relief,
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        let layer = sampled_albedo * remapped * 4.5947933;
+        let gate = clamp(
+            round(selector.g - material.runner_color_constants[4].x),
+            0.0,
+            1.0,
+        );
+        sampled_albedo = mix(sampled_albedo, layer, gate);
+    }
+    if !investment_decal
+        && material.runner_layered_params.y > 40.5
+        && material.runner_layered_params.y < 41.5 {
+        // 80A9B860 runner skin ABI. t1 is a shared cellular response LUT and
+        // must never appear as albedo. Tiger derives skin colour from
+        // c121/c122/c123 while t0 supplies local pore/recess information.
+        let feature = clamp(textureSampleBias(
+            runner_surface_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        ).r, 0.0, 1.0);
+        let cellular = textureSampleBias(
+            pattern_or_runner_procedural_texture,
+            material_sampler,
+            input.uv * material.runner_layered_constants[9].xy,
+            material.sampler_params.x,
+        ).r;
+        let primary = clamp(
+            material.runner_layered_constants[0].rgb
+                + material.runner_layered_constants[1].rgb
+                    * clamp(feature + (cellular - 0.5) * 0.08, 0.0, 1.0),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        let recessed = clamp(
+            material.runner_layered_constants[2].rgb,
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        let recessed_mask = pow(1.0 - feature, 2.0);
+        sampled_albedo = mix(primary, recessed, recessed_mask);
+    }
+    if !investment_decal && material.sampler_params.z > 0.5 {
+        // Shared-atlas detail ABI: compiled PS multiplies direct t0 RGB by a
+        // triplanar linear t1 response after its c5/c6 affine remap.
+        let detail = runner_triplanar_scalar(
+            pattern_or_runner_procedural_texture,
+            input.procedural_position,
+            input.procedural_normal,
+            material.pattern_projection,
+            material.pattern_params.y,
+        );
+        let response = clamp(
+            material.pattern_stripe.rgb + material.pattern_contour.rgb * detail,
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        sampled_albedo *= response * 4.5947933;
     }
     sampled_albedo = apply_gear_pattern(sampled_albedo, input);
     if material.blend.w > 0.5 {
@@ -5533,12 +8475,24 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         sampled_albedo = dye * detail;
     }
     sampled_albedo = apply_weapon_mod_condition(sampled_albedo, input);
+    sampled_albedo = apply_weapon_surface_condition(sampled_albedo, input);
     let albedo = sampled_albedo * material.tint.rgb;
-    let normal = mapped_normal(input);
+    let condition_mask = weapon_surface_condition_mask(input);
+    let mapped = mapped_normal(input);
+    let normal = normalize(mix(
+        mapped,
+        normalize(input.view_normal),
+        condition_mask * material.wear_scratches_projection.w,
+    ));
     let light = normalize(scene.light_direction.xyz);
     let view_direction = vec3<f32>(0.0, 0.0, 1.0);
-    let surface = material_surface(input.uv, albedo);
-    let roughness = surface.x;
+    let surface = material_surface(input, albedo);
+    let roughness = clamp(
+        surface.x
+            + (1.0 - surface.x) * material.wear_surface_params.w * condition_mask,
+        0.02,
+        1.0,
+    );
     let metalness = surface.y;
     let f0 = mix(vec3<f32>(0.03), albedo, metalness);
     let key_specular = ggx_specular(normal, light, view_direction, roughness, f0);
@@ -5552,7 +8506,23 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         * vec3<f32>(1.0, 1.0, 0.97);
     let n_dot_v = max(dot(normal, view_direction), 0.0);
     let environment_fresnel = fresnel_schlick(n_dot_v, f0);
-    let vertex_ao = mix(1.0, input.ambient_occlusion, scene.postprocess1.w);
+    var vertex_ao = mix(1.0, input.ambient_occlusion, scene.postprocess1.w);
+    if material.runner_layered_params.z > 0.5 {
+        // 80A9A9D3 writes RT2.g as the mean of its independent t2 scalar AO
+        // and the geometry/procedural occlusion term.
+        let runner_ao_sample = textureSampleBias(
+            procedural_or_response_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        );
+        let runner_ao = select(
+            runner_ao_sample.r,
+            runner_ao_sample.g,
+            material.runner_layered_params.w > 0.5,
+        );
+        vertex_ao = 0.5 * (vertex_ao + clamp(runner_ao, 0.0, 1.0));
+    }
     let sun_visibility = mix(1.0, directional_shadow(input), scene.light_direction.w);
     let n_dot_l = max(dot(normal, light), 0.0);
     // Near-neutral 5400–5900 K source. Diffuse establishes the form; there is
@@ -5810,7 +8780,7 @@ fn reconstruct_view_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return vec3<f32>(
         -(clip.x - scene.params1.y) / max(scale * scene.params1.x, 0.0001),
         (clip.y - scene.params1.z) / max(scale, 0.0001),
-        (0.5 - depth) / max(scale * 0.25, 0.0001),
+        (0.5 - depth) * max(scene.params0.x, 0.0001) / 0.21,
     );
 }
 
@@ -6028,7 +8998,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if scene.postprocess4.x > 0.5 {
         color = linear_to_srgb(color);
     }
-    return vec4<f32>(color, 1.0);
+    let export_transparent = scene.postprocess4.y < -0.5 || scene.postprocess4.y > 1.5;
+    let covered = textureLoad(scene_depth, final_pixel, 0) < 0.9999;
+    return vec4<f32>(color, select(1.0, select(0.0, 1.0, covered), export_transparent));
 }
 "#;
 
@@ -6040,14 +9012,17 @@ mod tests {
         ModelPipelineKey, ModelPipelineResources, PRESENT_SHADER, SHADOW_SHADER, adapt_exposure,
         alpha_mode, blend_enabled, blend_state, bounded_target_size, create_model_pipeline,
         create_model_sampler, create_pipeline_resources, create_target_resources,
-        decode_model_sampler_desc, exposure_target, first_person_key_light, hiz_draw_visible,
-        model_draws, model_view_depth, rasterizer_cull_mode, shadow_pipeline_index, smooth_normals,
-        vertex_ambient_occlusion,
+        decode_model_sampler_desc, exposure_target, first_person_key_light, fitted_export_zoom,
+        fitted_export_zoom_for_positions, fitted_export_zoom_for_positions_around,
+        hiz_draw_visible, model_draws, model_orthographic_depth, model_orthographic_view_depth,
+        model_view_depth, project_hiz_vertex, projected_export_bounds, rasterizer_cull_mode,
+        shadow_pipeline_index, smooth_normals, vertex_ambient_occlusion,
     };
     use crate::{
         geometry::{
-            GeometryPreviewKind, GeometryTagPreview, WeaponModPreviewAttachment, WeaponModRarity,
-            WireframeMaterialRange, WireframeMaterialTextures, WireframePreview,
+            GeometryPreviewKind, GeometryTagPreview, RunnerShellCombination,
+            WeaponModPreviewAttachment, WeaponModRarity, WireframeMaterialRange,
+            WireframeMaterialTextures, WireframePreview,
         },
         render::{evidence::FidelityMode, pass_plan::RenderPassKind},
         texture::{Texture, cache::TextureCache},
@@ -6057,6 +9032,7 @@ mod tests {
         egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor, wgpu},
     };
     use either::Either::Left;
+    use image::GenericImageView;
     use itertools::Itertools;
     use serde::Serialize;
     use std::{
@@ -6064,6 +9040,157 @@ mod tests {
         sync::Arc,
     };
     use tiger_pkg::{GameVersion, MarathonVersion, PackageManager, TagHash, package_manager};
+
+    #[test]
+    fn export_fit_keeps_rotated_geometry_inside_margin() {
+        let positions = [
+            [-12.0, -1.5, -2.0],
+            [-12.0, 1.5, 2.0],
+            [12.0, -1.5, -2.0],
+            [12.0, 1.5, 2.0],
+        ];
+        let vertices = positions.map(|position| super::ModelVertex {
+            position,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0; 2],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+            ambient_occlusion: 1.0,
+            procedural_position: position,
+            procedural_normal: [0.0, 1.0, 0.0],
+        });
+        let center = [0.0, 0.0, 0.0, 12.0];
+        let yaw = -24.0_f32.to_radians();
+        let pitch = 14.0_f32.to_radians();
+        let zoom = fitted_export_zoom(&vertices, center, 24.0, 0.5, yaw, pitch, 0.88);
+        for vertex in vertices {
+            let projected = project_hiz_vertex(
+                vertex.position,
+                [center[0], center[1], center[2]],
+                24.0,
+                0.5,
+                yaw,
+                pitch,
+                [0.0; 2],
+                zoom,
+            );
+            assert!((0.06..=0.94).contains(&projected[0]));
+            assert!((0.06..=0.94).contains(&projected[1]));
+        }
+    }
+
+    #[test]
+    fn weapon_export_fit_is_independent_of_selected_mod_bounds() {
+        let base = [
+            [-5.0, -2.0, -1.0],
+            [-5.0, 2.0, 1.0],
+            [5.0, -2.0, -1.0],
+            [5.0, 2.0, 1.0],
+        ];
+        let long_mod = [[-12.0, -1.0, -1.0], [-12.0, 1.0, 1.0]];
+        let short_mod = [[-8.0, -1.0, -1.0], [-8.0, 1.0, 1.0]];
+        let center = [0.0, 0.0, 0.0];
+        let radius = 10.0;
+        let aspect = 0.5;
+        let yaw = -24.0_f32.to_radians();
+        let pitch = 14.0_f32.to_radians();
+        let dynamic_long = fitted_export_zoom_for_positions(
+            base.into_iter().chain(long_mod),
+            center,
+            radius,
+            aspect,
+            yaw,
+            pitch,
+            0.88,
+        );
+        let dynamic_short = fitted_export_zoom_for_positions(
+            base.into_iter().chain(short_mod),
+            center,
+            radius,
+            aspect,
+            yaw,
+            pitch,
+            0.88,
+        );
+        assert!((dynamic_long - dynamic_short).abs() > 0.1);
+
+        let fixed = fitted_export_zoom_for_positions(
+            base.into_iter().chain(long_mod).chain(short_mod),
+            center,
+            radius,
+            aspect,
+            yaw,
+            pitch,
+            0.88,
+        );
+        for position in base.into_iter().chain(long_mod).chain(short_mod) {
+            let projected = project_hiz_vertex(
+                position, center, radius, aspect, yaw, pitch, [0.0; 2], fixed,
+            );
+            assert!((0.06..=0.94).contains(&projected[0]));
+            assert!((0.06..=0.94).contains(&projected[1]));
+        }
+    }
+
+    #[test]
+    fn weapon_export_pan_centers_rotated_base_silhouette() {
+        let base = [
+            [-7.0, -1.0, -2.0],
+            [-6.0, 4.0, -1.0],
+            [5.0, -2.0, 1.0],
+            [3.0, 1.0, 3.0],
+        ];
+        let envelope = base
+            .into_iter()
+            .chain([[-11.0, -3.0, -2.0], [7.0, 5.0, 2.0]]);
+        let center = [-1.0, 1.0, 0.5];
+        let radius = 12.0;
+        let aspect = 20.0 / 41.0;
+        let yaw = -24.0_f32.to_radians();
+        let pitch = 14.0_f32.to_radians();
+        let bounds = projected_export_bounds(base, center, aspect, yaw, pitch);
+        let projected_center = [(bounds[0] + bounds[2]) * 0.5, (bounds[1] + bounds[3]) * 0.5];
+        let zoom = fitted_export_zoom_for_positions_around(
+            envelope,
+            center,
+            radius,
+            aspect,
+            yaw,
+            pitch,
+            0.88,
+            projected_center,
+        );
+        let scale = 0.84 * zoom / radius;
+        let pan = [projected_center[0] * scale, -projected_center[1] * scale];
+        let projected = base.map(|position| {
+            project_hiz_vertex(position, center, radius, aspect, yaw, pitch, pan, zoom)
+        });
+        let min_x = projected
+            .iter()
+            .map(|value| value[0])
+            .fold(f32::INFINITY, f32::min);
+        let max_x = projected
+            .iter()
+            .map(|value| value[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = projected
+            .iter()
+            .map(|value| value[1])
+            .fold(f32::INFINITY, f32::min);
+        let max_y = projected
+            .iter()
+            .map(|value| value[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(((min_x + max_x) * 0.5 - 0.5).abs() < 0.0001);
+        assert!(((min_y + max_y) * 0.5 - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn present_shader_exports_depth_coverage_alpha() {
+        assert!(
+            PRESENT_SHADER.contains("select(1.0, select(0.0, 1.0, covered), export_transparent)")
+        );
+        assert!(PRESENT_SHADER.contains("textureLoad(scene_depth, final_pixel, 0) < 0.9999"));
+    }
 
     #[derive(Serialize)]
     struct VisualBaselineMetrics {
@@ -6208,19 +9335,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_neon_wip_texture_without_rejecting_colored_albedo() {
-        let mut wip = image::RgbaImage::from_pixel(32, 32, image::Rgba([45, 45, 45, 255]));
-        for x in 0..16 {
-            wip.put_pixel(x, 8, image::Rgba([255, 0, 255, 255]));
-            wip.put_pixel(x, 16, image::Rgba([0, 0, 255, 255]));
-        }
-        assert!(super::debug_placeholder_pixels(&wip));
-
-        let purple = image::RgbaImage::from_pixel(32, 32, image::Rgba([180, 30, 220, 255]));
-        assert!(!super::debug_placeholder_pixels(&purple));
-    }
-
-    #[test]
     fn ignores_invalid_triangle_indices() {
         let normals = smooth_normals(&[[0.0, 0.0, 0.0]], &[0, 1, 2]);
         assert_eq!(normals, vec![[0.0, 0.0, 1.0]]);
@@ -6328,6 +9442,7 @@ mod tests {
     #[test]
     fn does_not_treat_investment_decal_stage_as_user_sticker() {
         let preview = |stage| WireframePreview {
+            rigid_indices: None,
             source: "test".into(),
             position_format: "f32x3 @ +0",
             uv_format: None,
@@ -6370,6 +9485,7 @@ mod tests {
         runtime.solid_color = Some([0.7, 0.3, 0.1, 1.0]);
         runtime.solid_surface = Some([0.5, 0.25]);
         let wireframe = WireframePreview {
+            rigid_indices: None,
             source: "runtime surface".into(),
             position_format: "f32x3 @ +0",
             uv_format: None,
@@ -6421,6 +9537,7 @@ mod tests {
     #[test]
     fn does_not_render_unselected_material_range_gaps() {
         let wireframe = WireframePreview {
+            rigid_indices: None,
             source: "selected material ranges".into(),
             position_format: "f32x3 @ +0",
             uv_format: None,
@@ -6634,6 +9751,29 @@ mod tests {
             "background coverage must conservatively keep a partially visible range"
         );
         assert!(!ModelEnvironment::default().hiz_culling);
+    }
+
+    #[test]
+    fn orthographic_zoom_does_not_change_or_clip_model_depth() {
+        let position = [0.25, -0.5, 0.75];
+        let center = [0.0, 0.0, 0.0];
+        let normal_zoom =
+            project_hiz_vertex(position, center, 1.0, 1.0, 0.3, -0.2, [0.0, 0.0], 1.0);
+        let close_zoom =
+            project_hiz_vertex(position, center, 1.0, 1.0, 0.3, -0.2, [0.0, 0.0], 50.0);
+
+        assert_eq!(normal_zoom[2], close_zoom[2]);
+        for view_depth in [-1.0, -0.25, 0.0, 0.4, 1.0] {
+            let encoded = model_orthographic_depth(view_depth, 1.0);
+            assert!((0.0..=1.0).contains(&encoded));
+            assert!((model_orthographic_view_depth(encoded, 1.0) - view_depth).abs() < 0.000001);
+        }
+        assert!(MODEL_SHADER.contains("view_position.z * 0.21 / max(scene.params0.x"));
+        let inverse = "(0.5 - depth) * max(scene.params0.x, 0.0001) / 0.21";
+        assert!(LIGHTING_SHADER.contains(inverse));
+        assert!(PRESENT_SHADER.contains(inverse));
+        assert!(!LIGHTING_SHADER.contains("(0.5 - depth) / max(scale * 0.25"));
+        assert!(!PRESENT_SHADER.contains("(0.5 - depth) / max(scale * 0.25"));
     }
 
     #[test]
@@ -7067,7 +10207,8 @@ mod tests {
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .expect("GPU adapter");
         let adapter_info = adapter.get_info();
-        let required_features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
+        let required_features = adapter.features()
+            & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features,
             ..Default::default()
@@ -7096,6 +10237,7 @@ mod tests {
         let mut renders = Vec::new();
         let mut visual_failures = Vec::new();
         let requested_case = std::env::var("QUICKTAG_MODEL_PROBE_CASE").ok();
+        let isolated_draw = std::env::var("QUICKTAG_PROBE_DRAW_RANGE").ok();
         let diagnostic_name = std::env::var("QUICKTAG_PROBE_PASS")
             .unwrap_or_else(|_| "final".into())
             .to_ascii_lowercase();
@@ -7109,9 +10251,9 @@ mod tests {
             "specular" | "specular-only" => (4, LightingModel::TigerGgxCompatibility),
             "pre-tone" | "pre_tone" | "hdr" => (5, LightingModel::TigerGgxCompatibility),
             "normal" | "normals" => (6, LightingModel::TigerGgxCompatibility),
-            "mrt-albedo" => (0, LightingModel::SurfaceAlbedo),
-            "mrt-normal" => (0, LightingModel::SurfaceNormals),
-            "mrt-properties" => (0, LightingModel::SurfaceProperties),
+            "mrt-albedo" => (9, LightingModel::SurfaceAlbedo),
+            "mrt-normal" => (10, LightingModel::SurfaceNormals),
+            "mrt-properties" => (11, LightingModel::SurfaceProperties),
             "mrt-emissive" => (7, LightingModel::TigerGgxCompatibility),
             "mrt-flags" => (8, LightingModel::TigerGgxCompatibility),
             value => panic!("unknown QUICKTAG_PROBE_PASS {value}"),
@@ -7120,8 +10262,31 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<u8>().ok())
             .is_some_and(|value| value != 0);
-
         for (name, weapon, weapon_owner, mods, expected_dye_colors, yaw) in [
+            (
+                "d54-default-optic",
+                TagHash(0x80B7CAE9),
+                TagHash(0x80A7C982),
+                vec![TagHash(0x80A9B332), TagHash(0x80A9AB43)],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
+            (
+                "conquest-lmg-belt-side",
+                TagHash(0x80B7C031),
+                TagHash(0x80A7ACCA),
+                vec![],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
+            (
+                "conquest-lmg-belt-endpoints",
+                TagHash(0x80B7C031),
+                TagHash(0x80A7ACCA),
+                vec![],
+                vec![],
+                -70.0_f32.to_radians(),
+            ),
             (
                 "yokais-claw-misriah-full",
                 TagHash(0x80B6CC5D),
@@ -7380,6 +10545,30 @@ mod tests {
                 -23.5_f32.to_radians(),
             ),
             (
+                "weapon-mod-helper-card-a7be",
+                TagHash(0x80A9A7BE),
+                TagHash(0x80A9A7BE),
+                vec![],
+                vec![],
+                -11.8_f32.to_radians(),
+            ),
+            (
+                "weapon-mod-helper-card-a7da",
+                TagHash(0x80A9A7DA),
+                TagHash(0x80A9A7DA),
+                vec![],
+                vec![],
+                -11.8_f32.to_radians(),
+            ),
+            (
+                "weapon-mod-helper-card-a7df",
+                TagHash(0x80A9A7DF),
+                TagHash(0x80A9A7DF),
+                vec![],
+                vec![],
+                -11.8_f32.to_radians(),
+            ),
+            (
                 "runner-achromatic-rush-decal",
                 TagHash(0x80B141C0),
                 TagHash(0x80B141C0),
@@ -7394,6 +10583,278 @@ mod tests {
                 vec![],
                 vec![],
                 0.0,
+            ),
+            (
+                "runner-destroyer-emerald-impact-combined",
+                TagHash(0x80A9F542),
+                TagHash(0x80A9F542),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-arata-vectus-assassin-combined",
+                TagHash(0x80B14135),
+                TagHash(0x80B14135),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-neo-cortex-combined",
+                TagHash(0x80A9D5DE),
+                TagHash(0x80A9D5DE),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-destroyer-base-combined",
+                TagHash(0x80AA055F),
+                TagHash(0x80AA055F),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full9-layered-combined",
+                TagHash(0x80A9C3D2),
+                TagHash(0x80A9C3D2),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-switched-layered-combined",
+                TagHash(0x80A9CEB9),
+                TagHash(0x80A9CEB9),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full10-layered-combined",
+                TagHash(0x80B146C9),
+                TagHash(0x80B146C9),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-package394-full13-combined",
+                TagHash(0x80B14302),
+                TagHash(0x80B14302),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-package394-full10-agrb-combined",
+                TagHash(0x80B1440A),
+                TagHash(0x80B1440A),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-package394-full10-gbr-combined",
+                TagHash(0x80B144C1),
+                TagHash(0x80B144C1),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-alpha-occlusion-combined",
+                TagHash(0x80A9C426),
+                TagHash(0x80A9C426),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-c96f-response-combined",
+                TagHash(0x80A9CADF),
+                TagHash(0x80A9CADF),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-d3fc-procedural-combined",
+                TagHash(0x80A9D4FE),
+                TagHash(0x80A9D4FE),
+                vec![],
+                vec![],
+                -16.5_f32.to_radians(),
+            ),
+            (
+                "runner-vandal-white-rabbit-body",
+                TagHash(0x80A9D46D),
+                TagHash(0x80A9D46D),
+                vec![],
+                vec![],
+                -16.5_f32.to_radians(),
+            ),
+            (
+                "runner-e4db-condition-combined",
+                TagHash(0x80A9E5B4),
+                TagHash(0x80A9E5B4),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full9-procedural-combined",
+                TagHash(0x80A9CBCD),
+                TagHash(0x80A9CBCD),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full9-local-combined",
+                TagHash(0x80A9DA07),
+                TagHash(0x80A9DA07),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full9-local-expanded-combined",
+                TagHash(0x80A9D7BC),
+                TagHash(0x80A9D7BC),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full8-procedural-combined",
+                TagHash(0x80A9AF87),
+                TagHash(0x80A9AF87),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full10-local-combined",
+                TagHash(0x80A9DCC2),
+                TagHash(0x80A9DCC2),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full11-combined",
+                TagHash(0x80A9E1D1),
+                TagHash(0x80A9E1D1),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-a8cf-full11-combined",
+                TagHash(0x80A9A966),
+                TagHash(0x80A9A966),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-ad5d-ad68-procedural",
+                TagHash(0x80A9AE0F),
+                TagHash(0x80A9AE0F),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-agrb-combined",
+                TagHash(0x80A9C317),
+                TagHash(0x80A9C317),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-local-agrb-combined",
+                TagHash(0x80A9AEC4),
+                TagHash(0x80A9AEC4),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-gbr-combined",
+                TagHash(0x80A9DB54),
+                TagHash(0x80A9DB54),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-agrb-sibling-combined",
+                TagHash(0x80A9DEFE),
+                TagHash(0x80A9DEFE),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-aa0261-combined",
+                TagHash(0x80B15E20),
+                TagHash(0x80B15E20),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-aa0263-combined",
+                TagHash(0x80B15D83),
+                TagHash(0x80B15D83),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-b86a-combined",
+                TagHash(0x80A9BA03),
+                TagHash(0x80A9BA03),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-selector-d952-combined",
+                TagHash(0x80A9D2B5),
+                TagHash(0x80A9D2B5),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-full10-b610-combined",
+                TagHash(0x80A9B6F6),
+                TagHash(0x80A9B6F6),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-dual-r-bd17-combined",
+                TagHash(0x80A9BE19),
+                TagHash(0x80A9BE19),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
+            ),
+            (
+                "runner-agr-dual-r-e64f-combined",
+                TagHash(0x80A9E76B),
+                TagHash(0x80A9E76B),
+                vec![],
+                vec![],
+                -106.5_f32.to_radians(),
             ),
         ] {
             if requested_case
@@ -7456,14 +10917,181 @@ mod tests {
                     },
                 })
                 .collect_vec();
-            let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
-                cache.clone(),
-                weapon,
-                &entry,
-                weapon,
-                weapon_socket,
-                &attachments,
-            )
+            let combined_runner = match name {
+                "runner-destroyer-emerald-impact-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9F542),
+                    body: TagHash(0x80A9F5AD),
+                    additional_parts: vec![TagHash(0x80A9F541)],
+                }),
+                "runner-arata-vectus-assassin-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80B14135),
+                    body: TagHash(0x80B140CE),
+                    additional_parts: vec![],
+                }),
+                "runner-neo-cortex-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9D5DE),
+                    body: TagHash(0x80A9D5DF),
+                    additional_parts: vec![TagHash(0x80A9D693)],
+                }),
+                "runner-destroyer-base-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80AA055F),
+                    body: TagHash(0x80AA053A),
+                    additional_parts: vec![],
+                }),
+                "runner-full9-layered-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9C3D2),
+                    body: TagHash(0x80A9C387),
+                    additional_parts: vec![],
+                }),
+                "runner-switched-layered-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9CEB9),
+                    body: TagHash(0x80A9CD5E),
+                    additional_parts: vec![TagHash(0x80A9CE0C)],
+                }),
+                "runner-full10-layered-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80B146C9),
+                    body: TagHash(0x80B14666),
+                    additional_parts: vec![TagHash(0x80B14700)],
+                }),
+                "runner-package394-full13-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80B14302),
+                    body: TagHash(0x80B14303),
+                    additional_parts: vec![TagHash(0x80B143A9)],
+                }),
+                "runner-package394-full10-agrb-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80B1440A),
+                    body: TagHash(0x80B143C3),
+                    additional_parts: vec![TagHash(0x80B1459B)],
+                }),
+                "runner-package394-full10-gbr-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80B144C1),
+                    body: TagHash(0x80B14470),
+                    additional_parts: vec![],
+                }),
+                "runner-alpha-occlusion-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9C426),
+                    body: TagHash(0x80A9C2C4),
+                    additional_parts: vec![TagHash(0x80A9C366)],
+                }),
+                "runner-c96f-response-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9CADF),
+                    body: TagHash(0x80A9CA45),
+                    additional_parts: vec![TagHash(0x80A9CB46)],
+                }),
+                "runner-d3fc-procedural-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9D4FE),
+                    body: TagHash(0x80A9D46D),
+                    additional_parts: vec![TagHash(0x80A9D530)],
+                }),
+                "runner-e4db-condition-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9E5B4),
+                    body: TagHash(0x80A9E522),
+                    additional_parts: vec![TagHash(0x80A9E56D)],
+                }),
+                "runner-full9-procedural-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9CBCD),
+                    body: TagHash(0x80A9CB76),
+                    additional_parts: vec![],
+                }),
+                "runner-full9-local-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9DA07),
+                    body: TagHash(0x80A9D9C1),
+                    additional_parts: vec![TagHash(0x80A9D9EC)],
+                }),
+                "runner-full9-local-expanded-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9D7BC),
+                    body: TagHash(0x80A9D77B),
+                    additional_parts: vec![TagHash(0x80A9D7DE)],
+                }),
+                "runner-full8-procedural-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9AF87),
+                    body: TagHash(0x80A9AF3C),
+                    additional_parts: vec![],
+                }),
+                "runner-full10-local-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9DCC2),
+                    body: TagHash(0x80A9DC79),
+                    additional_parts: vec![],
+                }),
+                "runner-full11-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9E1D1),
+                    body: TagHash(0x80A9E17E),
+                    additional_parts: vec![TagHash(0x80A9E1F4)],
+                }),
+                "runner-a8cf-full11-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9A966),
+                    body: TagHash(0x80A9A915),
+                    additional_parts: vec![TagHash(0x80A9A997)],
+                }),
+                "runner-selector-agrb-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9C317),
+                    body: TagHash(0x80A9C2C8),
+                    additional_parts: vec![],
+                }),
+                "runner-selector-local-agrb-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9AEC4),
+                    body: TagHash(0x80A9AE71),
+                    additional_parts: vec![],
+                }),
+                "runner-selector-gbr-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9DB54),
+                    body: TagHash(0x80A9DB07),
+                    additional_parts: vec![],
+                }),
+                "runner-selector-agrb-sibling-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9DEFE),
+                    body: TagHash(0x80A9DEA9),
+                    additional_parts: vec![],
+                }),
+                "runner-selector-aa0261-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80B15E20),
+                    body: TagHash(0x80B15E21),
+                    additional_parts: vec![TagHash(0x80B15E58)],
+                }),
+                "runner-selector-aa0263-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80B15D83),
+                    body: TagHash(0x80B15D84),
+                    additional_parts: vec![TagHash(0x80B15DBB)],
+                }),
+                "runner-selector-b86a-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9BA03),
+                    body: TagHash(0x80A9B9B8),
+                    additional_parts: vec![TagHash(0x80A9B9E8)],
+                }),
+                "runner-selector-d952-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9D2B5),
+                    body: TagHash(0x80A9D230),
+                    additional_parts: vec![TagHash(0x80A9D279)],
+                }),
+                "runner-full10-b610-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9B6F6),
+                    body: TagHash(0x80A9B695),
+                    additional_parts: vec![],
+                }),
+                "runner-dual-r-bd17-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9BE19),
+                    body: TagHash(0x80A9BDA1),
+                    additional_parts: vec![TagHash(0x80A9BDCC)],
+                }),
+                "runner-agr-dual-r-e64f-combined" => Some(RunnerShellCombination {
+                    head: TagHash(0x80A9E76B),
+                    body: TagHash(0x80A9E6F9),
+                    additional_parts: vec![TagHash(0x80A9E730)],
+                }),
+                _ => None,
+            };
+            let preview = if let Some(combination) = combined_runner {
+                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
+            } else {
+                GeometryTagPreview::load_model_with_weapon_mod_attachments(
+                    cache.clone(),
+                    weapon,
+                    &entry,
+                    weapon,
+                    weapon_socket,
+                    &attachments,
+                )
+            }
             .expect("model preview");
             let GeometryPreviewKind::Model(model) = preview.kind else {
                 panic!("weapon preview must be model");
@@ -7706,10 +11334,12 @@ mod tests {
             for tag in &texture_tags {
                 let texture = Texture::load(&render_state, *tag, true)
                     .unwrap_or_else(|error| panic!("texture {tag}: {error}"));
-                if name.starts_with("atrax-sting")
+                if name == "d54-default-optic"
+                    || name.starts_with("atrax-sting")
                     || name == "syntax-disrupt-v75-decal"
                     || name == "arata-vectus-v66-detail"
                     || name == "bully-smg-transmit-engine"
+                    || name == "runner-destroyer-emerald-impact-combined"
                     || matches!(
                         tag.0,
                         0x80AA0ED7
@@ -7747,6 +11377,26 @@ mod tests {
                 GpuModelPreview::create(&render_state.device, wireframe, fallback)
                     .expect("GPU model"),
             );
+            if name.starts_with("weapon-mod-helper-card-") {
+                let helper_draws = gpu
+                    .draws
+                    .iter()
+                    .filter(|draw| {
+                        draw.packet.raw_render_stage
+                            == Some(crate::render::adapter::GoliathAdapter::FORWARD_SPECIAL_STAGE)
+                    })
+                    .collect_vec();
+                assert!(
+                    !helper_draws.is_empty(),
+                    "fixture lost stage-17 helper card"
+                );
+                assert!(
+                    helper_draws.iter().all(|draw| {
+                        draw.packet.pass_plan.passes == [RenderPassKind::Auxiliary]
+                    }),
+                    "stage-17 engine helper card must never enter a visible pass"
+                );
+            }
             if name == "bully-smg-transmit-engine" {
                 let distortion_indices = gpu
                     .draws
@@ -8109,9 +11759,191 @@ mod tests {
                         material.gear_pattern.is_some()
                             && material.pattern_field.is_some()
                             && material.control.is_some()
+                            && (material.procedural_scale - 0.39934266).abs() < 0.000001
                     }),
-                    "Arata Vectus must decode control-map-selected procedural gear pattern"
+                    "Arata Vectus must preserve its package-authored procedural scale"
                 );
+            }
+            if name == "runner-ad5d-ad68-procedural" {
+                assert!(
+                    callback.materials.iter().any(|material| {
+                        material.runner_layered_surface.is_some_and(|surface| {
+                            surface.mode == 42
+                                && surface.material_response.is_some()
+                                && surface.procedural.is_some()
+                        }) && material.runner_surface_map.is_some()
+                            && material.runner_material_response_map.is_some()
+                            && material.runner_procedural_map.is_some()
+                            && material.normal.is_some()
+                    }),
+                    "AD5D inventory LOD must expose mode 42 and its complete resources"
+                );
+            }
+            if name.ends_with("-combined") && name.starts_with("runner-") {
+                let runner_surfaces = callback
+                    .materials
+                    .iter()
+                    .filter(|material| material.character_surface.is_some())
+                    .collect_vec();
+                if matches!(
+                    name,
+                    "runner-full9-layered-combined"
+                        | "runner-switched-layered-combined"
+                        | "runner-full10-layered-combined"
+                        | "runner-package394-full13-combined"
+                        | "runner-package394-full10-agrb-combined"
+                        | "runner-package394-full10-gbr-combined"
+                        | "runner-c96f-response-combined"
+                        | "runner-d3fc-procedural-combined"
+                        | "runner-neo-cortex-combined"
+                        | "runner-e4db-condition-combined"
+                        | "runner-full9-procedural-combined"
+                        | "runner-full9-local-combined"
+                        | "runner-full9-local-expanded-combined"
+                        | "runner-full8-procedural-combined"
+                        | "runner-full10-local-combined"
+                        | "runner-full11-combined"
+                        | "runner-a8cf-full11-combined"
+                        | "runner-selector-agrb-combined"
+                        | "runner-selector-local-agrb-combined"
+                        | "runner-selector-gbr-combined"
+                        | "runner-selector-agrb-sibling-combined"
+                        | "runner-selector-aa0261-combined"
+                        | "runner-selector-aa0263-combined"
+                        | "runner-selector-b86a-combined"
+                        | "runner-selector-d952-combined"
+                        | "runner-full10-b610-combined"
+                        | "runner-dual-r-bd17-combined"
+                        | "runner-agr-dual-r-e64f-combined"
+                ) {
+                    assert!(
+                        callback.materials.iter().any(|material| {
+                            material.runner_layered_surface.is_some()
+                                && material.runner_surface_map.is_some()
+                                && material.runner_detail_normal_a.is_some()
+                                && material.runner_detail_normal_b.is_some()
+                                && material.normal.is_some()
+                                && (material
+                                    .runner_layered_surface
+                                    .is_some_and(|surface| surface.mode > 2)
+                                    || material.control.is_some())
+                                && (name != "runner-full10-layered-combined"
+                                    || (material.runner_detail_normal_c.is_some()
+                                        && material.runner_detail_normal_d.is_some()))
+                                && (name != "runner-full9-local-combined"
+                                    || (material.runner_detail_normal_c.is_some()
+                                        && material.runner_detail_normal_d.is_some()))
+                                && (name != "runner-full9-local-expanded-combined"
+                                    || (material.runner_detail_normal_c.is_some()
+                                        && material.runner_detail_normal_d.is_some()))
+                                && (name != "runner-full10-local-combined"
+                                    || material.runner_detail_normal_c.is_some())
+                                && (name != "runner-full11-combined"
+                                    || (material.runner_detail_normal_c.is_some()
+                                        && material.runner_detail_normal_d.is_some()))
+                                && (name != "runner-a8cf-full11-combined"
+                                    || (material.runner_layered_surface.is_some_and(|surface| {
+                                        surface.mode == 10 && surface.material_response.is_some()
+                                    }) && material.runner_detail_normal_c.is_some()
+                                        && material.runner_detail_normal_d.is_some()
+                                        && material.runner_material_response_map.is_some()
+                                        && material.runner_occlusion_map.is_some()))
+                                && (name != "runner-c96f-response-combined"
+                                    || (material.runner_detail_normal_d.is_some()
+                                        && material.runner_material_response_map.is_some()
+                                        && material.runner_procedural_map.is_some()))
+                                && (name != "runner-d3fc-procedural-combined"
+                                    || (material
+                                        .runner_layered_surface
+                                        .is_some_and(|surface| surface.mode == 28)
+                                        && material.runner_procedural_map.is_some()))
+                                && (name != "runner-package394-full13-combined"
+                                    || (material.runner_layered_surface.is_some_and(|surface| {
+                                        surface.mode == 37
+                                            && surface.color_overlay.is_some()
+                                            && surface.color_overlay_constants[4][0].is_finite()
+                                    }) && material.runner_color_overlay_map.is_some()))
+                                && (name != "runner-e4db-condition-combined"
+                                    || (material.runner_layered_surface.is_some_and(|surface| {
+                                        surface.mode == 23 && surface.procedural_wear.is_some()
+                                    }) && material.wear_scratches.is_some()
+                                        && material.wear_grime.is_some()
+                                        && material.wear_damage.is_some()))
+                        }),
+                        "decoded layered runner lost authored packed/detail/base-normal resources"
+                    );
+                    if name == "runner-switched-layered-combined" {
+                        assert!(
+                            callback.materials.iter().any(|material| {
+                                material
+                                    .runner_layered_surface
+                                    .is_some_and(|surface| surface.mode == 5)
+                                    && material.runner_surface_map.is_some()
+                                    && material.runner_detail_normal_a.is_some()
+                                    && material.normal.is_some()
+                            }),
+                            "switched runner lost its t1-gated single-detail sibling ABI"
+                        );
+                    }
+                    if name == "runner-selector-b86a-combined" {
+                        assert!(
+                            callback.materials.iter().any(|material| {
+                                material.runner_layered_surface.is_some_and(|surface| {
+                                    surface.mode == 41
+                                        && surface.material_response.is_some()
+                                        && surface.procedural.is_some()
+                                        && surface.constants[0][3] > 0.5
+                                }) && material.runner_surface_map.is_some()
+                                    && material.runner_material_response_map.is_some()
+                                    && material.runner_procedural_map.is_some()
+                                    && material.runner_occlusion_map.is_some()
+                                    && material.normal.is_some()
+                            }),
+                            "B860 runner skin lost pore, AO, normal, or authored colour ABI"
+                        );
+                    }
+                } else if name == "runner-alpha-occlusion-combined" {
+                    assert!(
+                        callback.materials.iter().any(|material| {
+                            material.runner_occlusion.is_some()
+                                && material.runner_occlusion_map.is_some()
+                                && material.alpha_mask.is_some()
+                        }),
+                        "decoded alpha runner lost independent t1 coverage or t2 AO"
+                    );
+                } else if name != "runner-destroyer-base-combined" {
+                    assert!(
+                        !runner_surfaces.is_empty(),
+                        "decoded combined runner lost authored character-surface resources"
+                    );
+                    assert!(
+                        runner_surfaces.iter().all(|material| {
+                            (material.character_surface.unwrap().mode != 2
+                                || material.control.is_some())
+                                && material.normal.is_some()
+                                && material.character_surface_map.is_some()
+                                && material.character_detail_color.is_some()
+                        }),
+                        "decoded runner character surfaces require all ABI resources"
+                    );
+                }
+                if wireframe
+                    .material_ranges
+                    .iter()
+                    .any(|range| range.render_stage == Some(2))
+                {
+                    assert!(
+                        callback
+                            .draws
+                            .iter()
+                            .any(|draw| draw.passes.iter().any(|pass| matches!(
+                                pass,
+                                RenderPassKind::DecalCompatibility
+                                    | RenderPassKind::InvestmentDecalCompatibility
+                            ))),
+                        "combined runner must retain authored decal stages"
+                    );
+                }
             }
             let dye_palettes = callback
                 .materials
@@ -8311,7 +12143,140 @@ mod tests {
                         .any(|(value, background)| value.abs_diff(*background) > 8)
                 })
                 .count();
-            assert!(visible > 5_000, "render must be nonblank");
+            if isolated_draw.is_none() {
+                assert!(visible > 5_000, "render must be nonblank");
+            }
+            if isolated_draw.is_none() && name == "d54-default-optic" && diagnostic_pass == 0 {
+                let mut neutral_surface = 0usize;
+                let mut light_detail = 0usize;
+                let mut optic_foreground = 0usize;
+                for y in 0..110 {
+                    for x in 620..790 {
+                        let [red, green, blue, _alpha] = image.get_pixel(x, y).0;
+                        let distance = red.abs_diff(background[0]) as u16
+                            + green.abs_diff(background[1]) as u16
+                            + blue.abs_diff(background[2]) as u16;
+                        if distance <= 30 {
+                            continue;
+                        }
+                        optic_foreground += 1;
+                        let max = red.max(green).max(blue);
+                        let min = red.min(green).min(blue);
+                        if (36..190).contains(&max) && max - min < 40 {
+                            neutral_surface += 1;
+                        }
+                        if max > 105 && max - min < 50 {
+                            light_detail += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "D54 optic: foreground={optic_foreground}, neutral={neutral_surface}, light detail={light_detail}"
+                );
+                assert!(
+                    optic_foreground > 8_000 && neutral_surface > 6_000 && light_detail > 500,
+                    "D54 optic must retain its package-gray surface and authored light decals"
+                );
+
+                let mut body_luma = Vec::new();
+                let mut neighbor_delta = 0_u64;
+                let mut neighbor_count = 0_u64;
+                for y in 105..385 {
+                    for x in 130..465 {
+                        let [red, green, blue, _] = image.get_pixel(x, y).0;
+                        let max = red.max(green).max(blue);
+                        let min = red.min(green).min(blue);
+                        if !(24..118).contains(&max) || max - min > 24 {
+                            continue;
+                        }
+                        let luma =
+                            (u16::from(red) * 54 + u16::from(green) * 183 + u16::from(blue) * 19)
+                                / 256;
+                        body_luma.push(f32::from(luma));
+                        if x > 130 {
+                            let left = image.get_pixel(x - 1, y).0;
+                            let left_luma = (u16::from(left[0]) * 54
+                                + u16::from(left[1]) * 183
+                                + u16::from(left[2]) * 19)
+                                / 256;
+                            neighbor_delta += u64::from(luma.abs_diff(left_luma));
+                            neighbor_count += 1;
+                        }
+                    }
+                }
+                let mean = body_luma.iter().sum::<f32>() / body_luma.len() as f32;
+                let deviation = (body_luma
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f32>()
+                    / body_luma.len() as f32)
+                    .sqrt();
+                let local_delta = neighbor_delta as f32 / neighbor_count as f32;
+                eprintln!(
+                    "D54 body condition: samples={} deviation={deviation:.2} local_delta={local_delta:.2}",
+                    body_luma.len()
+                );
+                assert!(
+                    body_luma.len() > 25_000 && deviation > 7.0 && local_delta > 0.35,
+                    "D54 body condition crop must retain broad breakup and fine roughness variation"
+                );
+
+                // Four separate meshes sample the dark square-ring glyph from
+                // the shared t0 atlas. The sampled atlas swatch is RGB 50, then
+                // the package-authored linear t1 response darkens it further.
+                // If either resource is decoded as generic auxiliary data, the
+                // white fallback or an unmodulated gray surface replaces it.
+                for (x, y) in [(328_u32, 232_u32), (759, 263), (886, 263), (455, 375)] {
+                    let crop = image
+                        .view(x - 9, y - 9, 18, 18)
+                        .pixels()
+                        .map(|(_, _, pixel)| {
+                            let [red, green, blue, _] = pixel.0;
+                            (u16::from(red) * 54 + u16::from(green) * 183 + u16::from(blue) * 19)
+                                / 256
+                        })
+                        .collect::<Vec<_>>();
+                    let mean_luma = crop.iter().copied().sum::<u16>() as f32 / crop.len() as f32;
+                    assert!(
+                        mean_luma < 80.0,
+                        "shared-atlas glyph at ({x}, {y}) must remain package-black, got mean luma {mean_luma:.1}"
+                    );
+                }
+            }
+            if isolated_draw.is_none()
+                && name == "d54-default-optic"
+                && diagnostic_name == "mrt-properties"
+            {
+                let mut roughness = Vec::new();
+                let mut neighbor_delta = 0_u64;
+                for y in 105..385 {
+                    for x in 130..465 {
+                        let pixel = image.get_pixel(x, y).0;
+                        if pixel[..3].iter().copied().max().unwrap_or_default() < 20 {
+                            continue;
+                        }
+                        roughness.push(f32::from(pixel[2]));
+                        neighbor_delta +=
+                            u64::from(pixel[2].abs_diff(image.get_pixel(x - 1, y).0[2]));
+                    }
+                }
+                let mean = roughness.iter().sum::<f32>() / roughness.len() as f32;
+                let deviation = (roughness
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f32>()
+                    / roughness.len() as f32)
+                    .sqrt();
+                let local_delta = neighbor_delta as f32 / roughness.len() as f32;
+                eprintln!(
+                    "D54 packed surface: samples={} roughness_deviation={deviation:.2} local_delta={local_delta:.2}",
+                    roughness.len()
+                );
+                assert!(
+                    roughness.len() > 80_000 && deviation > 15.0 && local_delta > 2.5,
+                    "D54 t3 alpha roughness/splatter detail was flattened or sampled from wrong channel"
+                );
+            }
             if lighting_reference_case {
                 let suffix = std::env::var("QUICKTAG_PROBE_OUTPUT_SUFFIX")
                     .ok()
@@ -8603,9 +12568,9 @@ mod tests {
                         0u8
                     }
                 };
-                // Front red receiver only. Authored contour alternates red and
-                // pale strokes densely; missing shader branch leaves nearly
-                // the whole crop red except sparse ordinary decals/struts.
+                // Front red receiver only. Package scale 0.39934266 produces
+                // broad contours; the discarded-scale regression used 1.0
+                // and nearly doubled this transition count.
                 for y in 245..435 {
                     let mut previous = 0u8;
                     for x in 155..395 {
@@ -8621,8 +12586,8 @@ mod tests {
                     "Arata procedural contour: red={red}, pale={contour}, transitions={transitions}"
                 );
                 assert!(
-                    red > 4_000 && contour > 2_000 && transitions > 250,
-                    "Arata front receiver must retain dense pale contour strokes over red base"
+                    red > 4_000 && contour > 2_000 && (2_500..=4_000).contains(&transitions),
+                    "Arata front receiver must retain package-scaled pale contours over red base"
                 );
             }
             if matches!(
@@ -8656,6 +12621,12 @@ mod tests {
             };
             let output_path = output.join(format!("{output_stem}{suffix}.png"));
             image.save(&output_path).expect("save render");
+            if name == "conquest-lmg-belt-endpoints" {
+                let crop = image::imageops::crop_imm(&image, 470, 100, 280, 300).to_image();
+                image::imageops::resize(&crop, 840, 900, image::imageops::FilterType::Nearest)
+                    .save(output.join(format!("conquest-lmg-belt-endpoints-crop{suffix}.png")))
+                    .expect("save LMG endpoint crop");
+            }
             if let Some(baseline_path) = std::env::var_os("QUICKTAG_PROBE_BASELINE") {
                 let report_path = output.join(format!("{output_stem}{suffix}.metrics.json"));
                 verify_visual_baseline(&image, Path::new(&baseline_path), &report_path);
