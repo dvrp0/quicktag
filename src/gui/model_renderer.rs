@@ -19,8 +19,8 @@ use tiger_pkg::{TagHash, package_manager};
 
 use crate::{
     geometry::{
-        AlphaMaskMaterial, CharacterSurfaceMaterial, GearDyeMaterial, GearPatternMaterial,
-        InvestmentDecalMaskMode, InvestmentDecalMaterial, InvestmentDecalMode,
+        AlphaMaskMaterial, CharacterSurfaceMaterial, ForwardCoatingMaterial, GearDyeMaterial,
+        GearPatternMaterial, InvestmentDecalMaskMode, InvestmentDecalMaterial, InvestmentDecalMode,
         RunnerLayeredSurfaceMaterial, RunnerOcclusionMaterial, SharedAtlasDetailMaterial,
         TransmissionMaterial, UvTransformPreview, WeaponModConditionMaterial,
         WeaponSurfaceConditionMaterial, WireframeMaterialTextures, WireframePreview,
@@ -48,7 +48,7 @@ const DISTORTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 // RGBA8 keeps five logical targets under WebGPU's portable 32-byte/sample cap.
 // These are research/debug contracts; compatibility HDR remains RGBA16F.
 const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const SURFACE_PROPERTIES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+const SURFACE_PROPERTIES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SURFACE_EMISSIVE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SURFACE_FLAGS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -73,7 +73,9 @@ struct ModelDraw {
     material: Option<MaterialTextureKey>,
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
+    iridescence_id: Option<f32>,
     transmission: Option<TransmissionMaterial>,
+    forward_coating: Option<ForwardCoatingMaterial>,
     character_surface: Option<CharacterSurfaceMaterial>,
     runner_layered_surface: Option<RunnerLayeredSurfaceMaterial>,
     runner_occlusion: Option<RunnerOcclusionMaterial>,
@@ -85,6 +87,8 @@ struct ModelDraw {
     gear_dye: Option<GearDyeMaterial>,
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
+    gear_worn_dye_palette: Option<[[f32; 4]; 6]>,
+    gear_dye_detail_palette: Option<[[f32; 4]; 6]>,
     mod_wear: Option<WeaponModConditionMaterial>,
     surface_condition: Option<WeaponSurfaceConditionMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
@@ -163,7 +167,10 @@ impl ModelPipelineKey {
             .copied()
             .find(|pass| *pass != RenderPassKind::Shadow)
             .unwrap_or(RenderPassKind::UnknownCompatibility);
-        if key.pass == RenderPassKind::Distortion {
+        if matches!(
+            key.pass,
+            RenderPassKind::Distortion | RenderPassKind::ForwardCoating
+        ) {
             // Tiger stage 8 writes a transmission/distortion target. Preview
             // composites it after deferred lighting without replacing depth.
             key.blend = 8;
@@ -386,16 +393,19 @@ fn model_draws(
             .index_start
             .saturating_add(range.index_count)
             .min(index_len);
-        let color = range
-            .textures
-            .color
+        let material_ir = MaterialIR::classify(&range.textures);
+        let material_inputs = material_ir.inputs().clone();
+        let color = material_inputs
+            .forward_coating
+            .map(|coating| coating.detail)
+            .or(material_inputs.color)
             .or_else(|| {
                 (range.render_stage == Some(8))
                     // Stage-8 direct resources are collected in material-role
                     // order. The first auxiliary texture is the authored,
                     // model-specific surface map; later entries are shared
                     // shader utility resources.
-                    .then(|| range.textures.aux.first().copied())
+                    .then(|| material_inputs.aux.first().copied())
                     .flatten()
             })
             .or(range.texture);
@@ -416,7 +426,6 @@ fn model_draws(
                         .map(render_state_for_technique)
                         .unwrap_or_default()
                 });
-            let material_ir = MaterialIR::classify(&range.textures);
             let pass_plan = DrawPassPlan::derive(range.render_stage, render_state, &material_ir);
             let pipeline = ModelPipelineKey::select_for_draw(
                 render_state,
@@ -438,34 +447,38 @@ fn model_draws(
                 },
                 material: color.map(|color| MaterialTextureKey {
                     color,
-                    normal: range.textures.normal,
-                    emissive: range.textures.emissive,
-                    color_tint: range.textures.color_tint,
-                    emissive_strength: range.textures.emissive_strength,
+                    normal: material_inputs.normal,
+                    emissive: material_inputs.emissive,
+                    color_tint: material_inputs.color_tint,
+                    emissive_strength: material_inputs.emissive_strength,
                 }),
-                solid_color: range.textures.solid_color,
-                solid_surface: range.textures.solid_surface,
+                solid_color: material_inputs.solid_color,
+                solid_surface: material_inputs.solid_surface,
+                iridescence_id: material_inputs.iridescence_id,
                 transmission: (range.render_stage
                     == Some(crate::render::adapter::GoliathAdapter::DISTORTION_STAGE))
-                .then_some(range.textures.transmission)
+                .then_some(material_inputs.transmission)
                 .flatten(),
-                character_surface: range.textures.character_surface,
-                runner_layered_surface: range.textures.runner_layered_surface,
-                runner_occlusion: range.textures.runner_occlusion,
-                alpha_mask: range.textures.alpha_mask,
-                shared_atlas_detail: range.textures.shared_atlas_detail,
-                control: range.textures.control,
-                roughness_channel: range.textures.roughness_channel,
-                mask_palette: range.textures.mask_palette,
-                gear_dye: range.textures.gear_dye,
-                gear_dye_default: range.textures.gear_dye_default,
-                gear_dye_palette: range.textures.gear_dye_palette,
-                mod_wear: range.textures.mod_wear,
-                surface_condition: range.textures.surface_condition,
-                gear_pattern: range.textures.gear_pattern,
-                investment_decal: range.textures.investment_decal,
-                authored_shared_atlas: range.textures.authored_shared_atlas,
-                sampler: range.textures.sampler,
+                forward_coating: material_inputs.forward_coating,
+                character_surface: material_inputs.character_surface,
+                runner_layered_surface: material_inputs.runner_layered_surface,
+                runner_occlusion: material_inputs.runner_occlusion,
+                alpha_mask: material_inputs.alpha_mask,
+                shared_atlas_detail: material_inputs.shared_atlas_detail,
+                control: material_inputs.control,
+                roughness_channel: material_inputs.roughness_channel,
+                mask_palette: material_inputs.mask_palette,
+                gear_dye: material_inputs.gear_dye,
+                gear_dye_default: material_inputs.gear_dye_default,
+                gear_dye_palette: material_inputs.gear_dye_palette,
+                gear_worn_dye_palette: material_inputs.gear_worn_dye_palette,
+                gear_dye_detail_palette: material_inputs.gear_dye_detail_palette,
+                mod_wear: material_inputs.mod_wear,
+                surface_condition: material_inputs.surface_condition,
+                gear_pattern: material_inputs.gear_pattern,
+                investment_decal: material_inputs.investment_decal,
+                authored_shared_atlas: material_inputs.authored_shared_atlas,
+                sampler: material_inputs.sampler,
                 sticker_proxy: range.technique.is_some_and(is_sticker_proxy_technique),
                 pipeline,
                 center: draw_range_center(wireframe, start, end),
@@ -496,7 +509,9 @@ fn model_draws(
             material: fallback_color.map(default_material),
             solid_color: None,
             solid_surface: None,
+            iridescence_id: None,
             transmission: None,
+            forward_coating: None,
             character_surface: None,
             runner_layered_surface: None,
             runner_occlusion: None,
@@ -508,6 +523,8 @@ fn model_draws(
             gear_dye: None,
             gear_dye_default: None,
             gear_dye_palette: None,
+            gear_worn_dye_palette: None,
+            gear_dye_detail_palette: None,
             mod_wear: None,
             surface_condition: None,
             gear_pattern: None,
@@ -757,8 +774,8 @@ pub(crate) struct ModelEnvironment {
     pub contrast: f32,
     pub saturation: f32,
     pub gamma: f32,
-    /// 0 final, 1 base colour, 2 diffuse, 3 AO, 4 specular, 5 pre-tone HDR,
-    /// 6 mapped view normal.
+    /// Semantic/debug channel selector. 0 final; 1..8 legacy lighting/MRT;
+    /// 9..20 package material layers; 21..35 forward-coating channels.
     pub diagnostic_pass: u8,
 }
 
@@ -778,13 +795,13 @@ pub(crate) enum LightingModel {
 impl Default for ModelEnvironment {
     fn default() -> Self {
         Self {
-            fidelity_mode: FidelityMode::PrettyPreview,
+            fidelity_mode: FidelityMode::StrictTiger,
             lighting_model: LightingModel::TigerGgxApproximation,
             tfx_time_seconds: 0.0,
             tfx_paused: true,
             tfx_speed: 1.0,
             time_of_day: 0.35,
-            sun_intensity: 3.0,
+            sun_intensity: 5.0,
             fog_density: 0.0,
             bloom_strength: 0.0,
             exposure: 1.0,
@@ -803,16 +820,16 @@ impl Default for ModelEnvironment {
             tone_mapping: true,
             ambient_intensity: 0.2,
             specular_ibl_intensity: 0.3,
-            light_position: [0.061, 0.711, 0.701],
-            light_orbit_radius: -1.0,
+            light_position: [-0.276, 0.728, 0.627], // -0.276 0.728 0.627
+            light_orbit_radius: 1.0,
             light_size: 5.0,
             light_gizmo: false,
             shadow_strength: 1.0,
             shadow_softness: 0.5,
-            brightness: 1.5,
-            contrast: 1.015,
-            saturation: 1.35,
-            gamma: 1.0,
+            brightness: 1.3,
+            contrast: 1.0,
+            saturation: 1.2,
+            gamma: 0.76,
             diagnostic_pass: 0,
         }
     }
@@ -846,6 +863,18 @@ fn first_person_key_light(
     )
 }
 
+fn physical_light_controls(orbit_radius: f32, light_size: f32, shadow_softness: f32) -> (f32, f32) {
+    // Distance and emitter radius share model-radius units. Preserve the
+    // established default render (radius 1, size 5), while making both UI
+    // controls affect the image instead of only resizing the gizmo.
+    let distance = orbit_radius.abs().clamp(0.25, 10.0);
+    let intensity_attenuation = (1.0 / (distance * distance)).clamp(0.04, 16.0);
+    let angular_size = light_size.clamp(0.0, 10.0) / distance;
+    let effective_shadow_softness =
+        (shadow_softness.clamp(0.0, 1.0) + (angular_size - 5.0) * 0.08).clamp(0.0, 1.0);
+    (intensity_attenuation, effective_shadow_softness)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialUniform {
@@ -867,6 +896,8 @@ struct MaterialUniform {
     wear_surface_params: [f32; 4],
     gear_palette_default: [f32; 4],
     gear_palette_colors: [[f32; 4]; 6],
+    gear_worn_dye_colors: [[f32; 4]; 6],
+    gear_dye_detail_colors: [[f32; 4]; 6],
     gear_palette_roughness: [[f32; 4]; 6],
     gear_palette_metal: [[f32; 4]; 6],
     decal_params: [f32; 4],
@@ -886,6 +917,14 @@ struct MaterialUniform {
     transmission_colors: [[f32; 4]; 2],
     transmission_surfaces: [[f32; 4]; 2],
     transmission_params: [f32; 4],
+    coating_colors: [[f32; 4]; 2],
+    coating_projection: [f32; 4],
+    coating_params0: [f32; 4],
+    coating_params1: [f32; 4],
+    coating_environment_params: [f32; 4],
+    coating_environment_extra: [f32; 4],
+    coating_specular_colors: [[f32; 4]; 2],
+    coating_specular_params: [[f32; 4]; 2],
     character_detail_transform: [f32; 4],
     character_detail_base: [f32; 4],
     character_detail_scale: [f32; 4],
@@ -915,7 +954,9 @@ struct LoadedMaterial {
     key: Option<MaterialTextureKey>,
     solid_color: Option<[f32; 4]>,
     solid_surface: Option<[f32; 2]>,
+    iridescence_id: Option<f32>,
     transmission: Option<TransmissionMaterial>,
+    forward_coating: Option<ForwardCoatingMaterial>,
     character_surface: Option<CharacterSurfaceMaterial>,
     runner_layered_surface: Option<RunnerLayeredSurfaceMaterial>,
     runner_occlusion: Option<RunnerOcclusionMaterial>,
@@ -929,6 +970,8 @@ struct LoadedMaterial {
     gear_dye: Option<GearDyeMaterial>,
     gear_dye_default: Option<[f32; 4]>,
     gear_dye_palette: Option<[GearDyeMaterial; 6]>,
+    gear_worn_dye_palette: Option<[[f32; 4]; 6]>,
+    gear_dye_detail_palette: Option<[[f32; 4]; 6]>,
     mod_wear: Option<WeaponModConditionMaterial>,
     surface_condition: Option<WeaponSurfaceConditionMaterial>,
     gear_pattern: Option<GearPatternMaterial>,
@@ -955,6 +998,8 @@ struct LoadedMaterial {
     runner_detail_normal_b: Option<Arc<Texture>>,
     runner_detail_normal_c: Option<Arc<Texture>>,
     runner_detail_normal_d: Option<Arc<Texture>>,
+    coating_environment_map: Option<Arc<Texture>>,
+    coating_environment_sampler: Option<ModelSamplerDesc>,
     procedural_scale: f32,
 }
 
@@ -1137,6 +1182,7 @@ impl ModelPaintCallback {
                     && draw.character_surface.is_none()
                     && draw.runner_layered_surface.is_none()
                     && draw.investment_decal.is_none()
+                    && draw.forward_coating.is_none()
                     && is_debug_placeholder_texture(texture_cache, material.color)
             }) {
                 continue;
@@ -1148,7 +1194,9 @@ impl ModelPaintCallback {
                     material.key == draw.material
                         && material.solid_color == solid_color
                         && material.solid_surface == draw.solid_surface
+                        && material.iridescence_id == draw.iridescence_id
                         && material.transmission == draw.transmission
+                        && material.forward_coating == draw.forward_coating
                         && material.character_surface == draw.character_surface
                         && material.runner_layered_surface == draw.runner_layered_surface
                         && material.runner_occlusion == draw.runner_occlusion
@@ -1162,6 +1210,8 @@ impl ModelPaintCallback {
                         && material.gear_dye == draw.gear_dye
                         && material.gear_dye_default == draw.gear_dye_default
                         && material.gear_dye_palette == draw.gear_dye_palette
+                        && material.gear_worn_dye_palette == draw.gear_worn_dye_palette
+                        && material.gear_dye_detail_palette == draw.gear_dye_detail_palette
                         && material.mod_wear == draw.mod_wear
                         && material.surface_condition == draw.surface_condition
                         && material.gear_pattern == draw.gear_pattern
@@ -1171,8 +1221,10 @@ impl ModelPaintCallback {
                 })
                 .unwrap_or_else(|| {
                     let color = draw
-                        .material
-                        .map(|material| texture_cache.get_or_default(material.color).0)
+                        .forward_coating
+                        .map(|coating| coating.detail)
+                        .or_else(|| draw.material.map(|material| material.color))
+                        .map(|tag| texture_cache.get_or_default(tag).0)
                         .and_then(usable_2d_texture);
                     let normal = draw
                         .material
@@ -1276,12 +1328,22 @@ impl ModelPaintCallback {
                         .runner_layered_surface
                         .and_then(|surface| surface.detail_normal_d)
                         .and_then(load_wear);
+                    let coating_environment_map = draw
+                        .forward_coating
+                        .and_then(|coating| texture_cache.get_or_load(coating.environment))
+                        .map(|loaded| loaded.0)
+                        .filter(|texture| texture.desc.kind() == TextureType::TextureCube);
+                    let coating_environment_sampler = draw
+                        .forward_coating
+                        .and_then(|coating| load_model_sampler_desc(coating.environment_sampler));
                     let dye_palette = draw_dye_palette(draw);
                     materials.push(LoadedMaterial {
                         key: draw.material,
                         solid_color,
                         solid_surface: draw.solid_surface,
+                        iridescence_id: draw.iridescence_id,
                         transmission: draw.transmission,
+                        forward_coating: draw.forward_coating,
                         character_surface: draw.character_surface,
                         runner_layered_surface: draw.runner_layered_surface,
                         runner_occlusion: draw.runner_occlusion,
@@ -1295,6 +1357,8 @@ impl ModelPaintCallback {
                         gear_dye: draw.gear_dye,
                         gear_dye_default: draw.gear_dye_default,
                         gear_dye_palette: draw.gear_dye_palette,
+                        gear_worn_dye_palette: draw.gear_worn_dye_palette,
+                        gear_dye_detail_palette: draw.gear_dye_detail_palette,
                         mod_wear: draw.mod_wear,
                         surface_condition: draw.surface_condition,
                         gear_pattern: draw.gear_pattern,
@@ -1321,6 +1385,8 @@ impl ModelPaintCallback {
                         runner_detail_normal_b,
                         runner_detail_normal_c,
                         runner_detail_normal_d,
+                        coating_environment_map,
+                        coating_environment_sampler,
                         procedural_scale: draw.procedural_scale,
                     });
                     materials.len() - 1
@@ -1391,6 +1457,11 @@ impl ModelPaintCallback {
             environment.light_position,
             environment.shadow_strength,
         );
+        let (light_attenuation, effective_shadow_softness) = physical_light_controls(
+            environment.light_orbit_radius,
+            environment.light_size,
+            environment.shadow_softness,
+        );
         Self {
             preview,
             target_format: texture_cache.render_state.target_format,
@@ -1405,7 +1476,7 @@ impl ModelPaintCallback {
                     aspect,
                     pan.x * 2.0 / rect.width().max(1.0),
                     -pan.y * 2.0 / rect.height().max(1.0),
-                    environment.shadow_softness.clamp(0.0, 1.0),
+                    effective_shadow_softness,
                 ],
                 uv_transform: [
                     transform.scale[0],
@@ -1418,7 +1489,7 @@ impl ModelPaintCallback {
                     exposure,
                     environment.bloom_strength,
                     environment.fog_density,
-                    environment.sun_intensity,
+                    environment.sun_intensity * light_attenuation,
                 ],
                 postprocess1: [
                     target_size[0] as f32,
@@ -1486,8 +1557,23 @@ impl ModelPaintCallback {
         mut self,
         render_state: &eframe::egui_wgpu::RenderState,
         path: &Path,
+        output_size: [u32; 2],
     ) -> anyhow::Result<()> {
         const FRAME_FILL: f32 = 0.88;
+        anyhow::ensure!(
+            output_size.into_iter().all(|dimension| dimension > 0),
+            "model export dimensions must be non-zero"
+        );
+        let max_dimension = render_state.device.limits().max_texture_dimension_2d;
+        anyhow::ensure!(
+            output_size
+                .into_iter()
+                .all(|dimension| dimension <= max_dimension),
+            "model export {}x{} exceeds GPU texture limit {max_dimension}",
+            output_size[0],
+            output_size[1]
+        );
+        self.target_size = output_size;
         if let Some(camera) = self.export_camera {
             self.apply_export_camera(camera);
         } else {
@@ -1857,6 +1943,9 @@ impl ModelPaintCallback {
                 }
                 if let Some(surface) = material.solid_surface {
                     values.extend(surface.map(|value| u64::from(value.to_bits())));
+                }
+                if let Some(iridescence_id) = material.iridescence_id {
+                    values.push(u64::from(iridescence_id.to_bits()));
                 }
                 if let Some(palette) = material.mask_palette {
                     values.extend(
@@ -2470,6 +2559,7 @@ struct ModelPipelineResources {
     scene_layout: wgpu::BindGroupLayout,
     shadow_scene_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
+    coating_deferred_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
     bloom_layout: wgpu::BindGroupLayout,
     lighting_layout: wgpu::BindGroupLayout,
@@ -2537,6 +2627,8 @@ struct ModelFrameResources {
     scene_bind_group: wgpu::BindGroup,
     _material_buffers: Vec<wgpu::Buffer>,
     material_bind_groups: Vec<wgpu::BindGroup>,
+    _coating_deferred_bind_group: wgpu::BindGroup,
+    _coating_fallback_bind_group: wgpu::BindGroup,
     bloom_half_bind_group: wgpu::BindGroup,
     bloom_quarter_bind_group: wgpu::BindGroup,
     bloom_blur_horizontal_bind_group: wgpu::BindGroup,
@@ -2548,6 +2640,7 @@ struct ModelFrameResources {
     decal_bundles: Vec<wgpu::RenderBundle>,
     additive_bundles: Vec<wgpu::RenderBundle>,
     transparent_bundles: Vec<wgpu::RenderBundle>,
+    coating_bundles: Vec<wgpu::RenderBundle>,
     distortion_bundles: Vec<wgpu::RenderBundle>,
 }
 
@@ -2565,6 +2658,7 @@ fn create_model_render_bundles(
     pipelines: &ModelPipelineResources,
     scene_bind_group: &wgpu::BindGroup,
     material_bind_groups: &[wgpu::BindGroup],
+    coating_deferred_bind_group: &wgpu::BindGroup,
     preview: &GpuModelPreview,
     draws: &[PreparedDraw],
     accepted_passes: &[RenderPassKind],
@@ -2583,8 +2677,12 @@ fn create_model_render_bundles(
                 .iter()
                 .find(|(key, _)| *key == pipeline_key)?;
             let material = material_bind_groups.get(draw.material_index)?;
-            let distortion = accepted_passes == [RenderPassKind::Distortion];
+            let distortion = accepted_passes
+                .iter()
+                .copied()
+                .all(is_distortion_payload_pass);
             let transparent = accepted_passes.iter().copied().all(is_forward_pass);
+            let depth_read_only = accepted_passes == [RenderPassKind::ForwardCoating];
             let color_formats = if distortion {
                 vec![Some(DISTORTION_FORMAT)]
             } else if transparent {
@@ -2603,7 +2701,7 @@ fn create_model_render_bundles(
                     color_formats: &color_formats,
                     depth_stencil: Some(wgpu::RenderBundleDepthStencil {
                         format: DEPTH_FORMAT,
-                        depth_read_only: false,
+                        depth_read_only,
                         stencil_read_only: true,
                     }),
                     sample_count: 1,
@@ -2612,6 +2710,7 @@ fn create_model_render_bundles(
             bundle.set_pipeline(pipeline);
             bundle.set_bind_group(0, scene_bind_group, &[]);
             bundle.set_bind_group(1, material, &[]);
+            bundle.set_bind_group(2, coating_deferred_bind_group, &[]);
             bundle.set_vertex_buffer(0, preview.vertex_buffer.slice(..));
             bundle.set_index_buffer(preview.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             bundle.draw_indexed(draw.indices.clone(), 0, 0..1);
@@ -2765,7 +2864,7 @@ impl CallbackTrait for ModelPaintCallback {
                         })
                     })
                 })
-                .unwrap_or(fallback_cubemap_view);
+                .unwrap_or_else(|| fallback_cubemap_view.clone());
             let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("quicktag_model_scene_bind_group"),
                 layout: &scene_layout,
@@ -2833,8 +2932,15 @@ impl CallbackTrait for ModelPaintCallback {
                     ],
                     solid_surface: material
                         .solid_surface
-                        .map(|surface| [surface[0], surface[1], 1.0, 0.0])
-                        .unwrap_or_default(),
+                        .map(|surface| {
+                            [
+                                surface[0],
+                                surface[1],
+                                1.0,
+                                material.iridescence_id.unwrap_or(0.0),
+                            ]
+                        })
+                        .unwrap_or([0.0, 0.0, 0.0, material.iridescence_id.unwrap_or(0.0)]),
                     palette_base: material
                         .dye_palette
                         .map(|palette| palette[0])
@@ -2959,6 +3065,8 @@ impl CallbackTrait for ModelPaintCallback {
                         .gear_dye_palette
                         .map(|palette| palette.map(|dye| dye.color))
                         .unwrap_or_default(),
+                    gear_worn_dye_colors: material.gear_worn_dye_palette.unwrap_or_default(),
+                    gear_dye_detail_colors: material.gear_dye_detail_palette.unwrap_or_default(),
                     gear_palette_roughness: material
                         .gear_dye_palette
                         .map(|palette| palette.map(|dye| dye.roughness_remap))
@@ -3035,7 +3143,10 @@ impl CallbackTrait for ModelPaintCallback {
                             .clamp(-16.0, 15.99),
                         material.procedural_scale,
                         material.shared_atlas_detail.is_some() as u8 as f32,
-                        0.0,
+                        material
+                            .shared_atlas_detail
+                            .map(|detail| detail.ambient_occlusion)
+                            .unwrap_or(0.0),
                     ],
                     pattern_projection: material
                         .gear_pattern
@@ -3105,6 +3216,81 @@ impl CallbackTrait for ModelPaintCallback {
                         0.0,
                         0.0,
                     ],
+                    coating_colors: material
+                        .forward_coating
+                        .map(|coating| coating.colors)
+                        .unwrap_or_default(),
+                    coating_projection: material
+                        .forward_coating
+                        .map(|coating| coating.projection)
+                        .unwrap_or_default(),
+                    coating_params0: material
+                        .forward_coating
+                        .map(|coating| {
+                            [
+                                coating.projection_exponent,
+                                coating.incidence_remap[0],
+                                coating.incidence_remap[1],
+                                coating.coverage,
+                            ]
+                        })
+                        .unwrap_or_default(),
+                    coating_params1: material
+                        .forward_coating
+                        .map(|coating| {
+                            [
+                                coating.detail_remap[0],
+                                coating.detail_remap[1],
+                                coating.response_remap[0],
+                                coating.response_remap[1],
+                            ]
+                        })
+                        .unwrap_or_default(),
+                    coating_environment_params: material
+                        .forward_coating
+                        .map(|coating| {
+                            [
+                                coating.environment_remap[0],
+                                coating.environment_remap[1],
+                                coating.environment_strength,
+                                coating.environment_params[0],
+                            ]
+                        })
+                        .unwrap_or_default(),
+                    coating_environment_extra: material
+                        .forward_coating
+                        .map(|coating| {
+                            [
+                                coating.environment_params[1],
+                                coating.environment_lod[0],
+                                coating.environment_lod[1],
+                                0.0,
+                            ]
+                        })
+                        .unwrap_or_default(),
+                    coating_specular_colors: material
+                        .forward_coating
+                        .map(|coating| coating.specular_colors)
+                        .unwrap_or_default(),
+                    coating_specular_params: material
+                        .forward_coating
+                        .map(|coating| {
+                            [
+                                [
+                                    coating.specular_exponents[0],
+                                    coating.specular_strengths[0],
+                                    coating.environment_remap[0],
+                                    coating.environment_remap[1],
+                                ],
+                                [
+                                    coating.specular_exponents[1],
+                                    coating.specular_strengths[1],
+                                    coating.lobe_direction_scales[0],
+                                    coating.lobe_direction_scales[1],
+                                ],
+                            ]
+                        })
+                        .unwrap_or_default(),
                     character_detail_transform: material
                         .character_surface
                         .map(|surface| surface.detail_transform)
@@ -3177,7 +3363,9 @@ impl CallbackTrait for ModelPaintCallback {
                 let color_view = material
                     .color
                     .as_ref()
-                    .map(|texture| material_texture_view(texture, true))
+                    .map(|texture| {
+                        material_texture_view(texture, material.forward_coating.is_none())
+                    })
                     .unwrap_or_else(|| fallback_color_view.clone());
                 let normal_view = material
                     .normal
@@ -3197,17 +3385,32 @@ impl CallbackTrait for ModelPaintCallback {
                 let wear_scratches_view = material
                     .wear_scratches
                     .as_ref()
-                    .map(|texture| material_texture_view(texture, false))
+                    .map(|texture| {
+                        material_texture_view(
+                            texture,
+                            material.mod_wear.is_some() && texture.desc.format.is_srgb(),
+                        )
+                    })
                     .unwrap_or_else(|| fallback_color_view.clone());
                 let wear_grime_view = material
                     .wear_grime
                     .as_ref()
-                    .map(|texture| material_texture_view(texture, true))
+                    .map(|texture| {
+                        material_texture_view(
+                            texture,
+                            material.mod_wear.is_none() || texture.desc.format.is_srgb(),
+                        )
+                    })
                     .unwrap_or_else(|| fallback_color_view.clone());
                 let wear_damage_view = material
                     .wear_damage
                     .as_ref()
-                    .map(|texture| material_texture_view(texture, false))
+                    .map(|texture| {
+                        material_texture_view(
+                            texture,
+                            material.mod_wear.is_some() && texture.desc.format.is_srgb(),
+                        )
+                    })
                     .unwrap_or_else(|| fallback_color_view.clone());
                 let pattern_field_view = material
                     .pattern_field
@@ -3258,10 +3461,30 @@ impl CallbackTrait for ModelPaintCallback {
                     .as_ref()
                     .map(|texture| material_texture_view(texture, false))
                     .unwrap_or_else(|| fallback_color_view.clone());
+                let coating_environment_view = material
+                    .coating_environment_map
+                    .as_ref()
+                    .and_then(|texture| {
+                        texture.full_cubemap_texture.as_ref().map(|handle| {
+                            handle.create_view(&wgpu::TextureViewDescriptor {
+                                format: Some(srgb_texture_format(texture.desc.format)),
+                                dimension: Some(wgpu::TextureViewDimension::Cube),
+                                array_layer_count: Some(6),
+                                ..Default::default()
+                            })
+                        })
+                    })
+                    .unwrap_or_else(|| fallback_cubemap_view.clone());
                 let authored_sampler = material
                     .sampler
                     .map(|desc| create_model_sampler(device, desc));
                 let sampler = authored_sampler.as_ref().unwrap_or(&material_sampler);
+                let authored_coating_environment_sampler = material
+                    .coating_environment_sampler
+                    .map(|desc| create_model_sampler(device, desc));
+                let coating_environment_sampler = authored_coating_environment_sampler
+                    .as_ref()
+                    .unwrap_or(&material_sampler);
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("quicktag_model_material_bind_group"),
                     layout: &material_layout,
@@ -3349,6 +3572,14 @@ impl CallbackTrait for ModelPaintCallback {
                             resource: wgpu::BindingResource::TextureView(
                                 &runner_detail_normal_d_view,
                             ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 18,
+                            resource: wgpu::BindingResource::TextureView(&coating_environment_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 19,
+                            resource: wgpu::BindingResource::Sampler(coating_environment_sampler),
                         },
                     ],
                 });
@@ -3560,7 +3791,31 @@ impl CallbackTrait for ModelPaintCallback {
                         },
                     ],
                 });
-            let make_bundles = |passes: &[RenderPassKind]| {
+            let coating_deferred_bind_group =
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_coating_deferred_bind_group"),
+                    layout: &callback_resources
+                        .get::<ModelPipelineResources>()
+                        .expect("model pipelines exist while preparing frame resources")
+                        .coating_deferred_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&depth_view),
+                    }],
+                });
+            let coating_fallback_bind_group =
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_coating_deferred_fallback_bind_group"),
+                    layout: &callback_resources
+                        .get::<ModelPipelineResources>()
+                        .expect("model pipelines exist while preparing frame resources")
+                        .coating_deferred_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
+                    }],
+                });
+            let make_bundles = |passes: &[RenderPassKind], coating_deferred| {
                 callback_resources
                     .get::<ModelPipelineResources>()
                     .map(|pipelines| {
@@ -3569,6 +3824,7 @@ impl CallbackTrait for ModelPaintCallback {
                             pipelines,
                             &scene_bind_group,
                             &material_bind_groups,
+                            coating_deferred,
                             &self.preview,
                             &self.draws,
                             passes,
@@ -3576,18 +3832,35 @@ impl CallbackTrait for ModelPaintCallback {
                     })
                     .unwrap_or_default()
             };
-            let opaque_bundles = make_bundles(&[
-                RenderPassKind::OpaqueCompatibility,
-                RenderPassKind::AlphaTestedCompatibility,
-                RenderPassKind::UnknownCompatibility,
-            ]);
-            let decal_bundles = make_bundles(&[
-                RenderPassKind::DecalCompatibility,
-                RenderPassKind::InvestmentDecalCompatibility,
-            ]);
-            let additive_bundles = make_bundles(&[RenderPassKind::ForwardAdditive]);
-            let transparent_bundles = make_bundles(&[RenderPassKind::ForwardTransparent]);
-            let distortion_bundles = make_bundles(&[RenderPassKind::Distortion]);
+            let opaque_bundles = make_bundles(
+                &[
+                    RenderPassKind::OpaqueCompatibility,
+                    RenderPassKind::AlphaTestedCompatibility,
+                    RenderPassKind::UnknownCompatibility,
+                ],
+                &coating_fallback_bind_group,
+            );
+            let decal_bundles = make_bundles(
+                &[
+                    RenderPassKind::DecalCompatibility,
+                    RenderPassKind::InvestmentDecalCompatibility,
+                ],
+                &coating_fallback_bind_group,
+            );
+            let additive_bundles = make_bundles(
+                &[RenderPassKind::ForwardAdditive],
+                &coating_fallback_bind_group,
+            );
+            let transparent_bundles = make_bundles(
+                &[RenderPassKind::ForwardTransparent],
+                &coating_fallback_bind_group,
+            );
+            let coating_bundles = make_bundles(
+                &[RenderPassKind::ForwardCoating],
+                &coating_deferred_bind_group,
+            );
+            let distortion_bundles =
+                make_bundles(&[RenderPassKind::Distortion], &coating_fallback_bind_group);
             callback_resources.insert(ModelFrameResources {
                 key: frame_key,
                 scene_buffer,
@@ -3595,6 +3868,8 @@ impl CallbackTrait for ModelPaintCallback {
                 scene_bind_group,
                 _material_buffers: material_buffers,
                 material_bind_groups,
+                _coating_deferred_bind_group: coating_deferred_bind_group,
+                _coating_fallback_bind_group: coating_fallback_bind_group,
                 bloom_half_bind_group,
                 bloom_quarter_bind_group,
                 bloom_blur_horizontal_bind_group,
@@ -3606,6 +3881,7 @@ impl CallbackTrait for ModelPaintCallback {
                 decal_bundles,
                 additive_bundles,
                 transparent_bundles,
+                coating_bundles,
                 distortion_bundles,
             });
         }
@@ -3678,6 +3954,7 @@ impl CallbackTrait for ModelPaintCallback {
                 occlusion_query_set: None,
             });
             depth_pass.set_bind_group(0, &frame.scene_bind_group, &[]);
+            depth_pass.set_bind_group(2, &frame._coating_fallback_bind_group, &[]);
             depth_pass.set_vertex_buffer(0, self.preview.vertex_buffer.slice(..));
             depth_pass.set_index_buffer(
                 self.preview.index_buffer.slice(..),
@@ -3805,6 +4082,7 @@ impl CallbackTrait for ModelPaintCallback {
                     &frame.material_bind_groups[draw.material_index],
                     &[],
                 );
+                emissive_pass.set_bind_group(2, &frame._coating_fallback_bind_group, &[]);
                 emissive_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
             }
         }
@@ -3845,6 +4123,7 @@ impl CallbackTrait for ModelPaintCallback {
                 flags_pass.set_pipeline(pipeline);
                 flags_pass.set_bind_group(0, &frame.scene_bind_group, &[]);
                 flags_pass.set_bind_group(1, &frame.material_bind_groups[draw.material_index], &[]);
+                flags_pass.set_bind_group(2, &frame._coating_fallback_bind_group, &[]);
                 flags_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
             }
         }
@@ -3872,6 +4151,10 @@ impl CallbackTrait for ModelPaintCallback {
 
         for (label, bundles) in [
             (
+                "quicktag_model_forward_coating_pass",
+                frame.coating_bundles.as_slice(),
+            ),
+            (
                 "quicktag_model_forward_additive_pass",
                 frame.additive_bundles.as_slice(),
             ),
@@ -3883,13 +4166,16 @@ impl CallbackTrait for ModelPaintCallback {
             if bundles.is_empty() {
                 continue;
             }
+            let samples_attached_depth = label == "quicktag_model_forward_coating_pass";
             let mut transparent_pass =
                 egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some(label),
                     color_attachments: &[Some(load_surface_attachment(&target.lit_color_view))],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &target.depth_view,
-                        depth_ops: Some(wgpu::Operations {
+                        // WebGPU permits the coating pass to sample a depth
+                        // attachment only while the attachment is read-only.
+                        depth_ops: (!samples_attached_depth).then_some(wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
@@ -4223,8 +4509,41 @@ fn create_pipeline_resources(
             texture_entry(15),
             texture_entry(16),
             texture_entry(17),
+            wgpu::BindGroupLayoutEntry {
+                binding: 18,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::Cube,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 19,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     });
+    // Stage-8 coating reads the already-populated deferred scene depth.
+    // Keep that feedback input isolated from ordinary material bindings: the
+    // source texture is also an opaque-pass color attachment earlier in-frame.
+    let coating_deferred_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("quicktag_model_coating_deferred_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
     let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("quicktag_model_present_layout"),
         entries: &[
@@ -4426,7 +4745,7 @@ fn create_pipeline_resources(
     });
     let model_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("quicktag_model_pipeline_layout"),
-        bind_group_layouts: &[&scene_layout, &material_layout],
+        bind_group_layouts: &[&scene_layout, &material_layout, &coating_deferred_layout],
         push_constant_ranges: &[],
     });
     let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -4649,6 +4968,7 @@ fn create_pipeline_resources(
         scene_layout,
         shadow_scene_layout,
         material_layout,
+        coating_deferred_layout,
         present_layout,
         bloom_layout,
         lighting_layout,
@@ -4718,7 +5038,7 @@ fn create_model_pipeline(
     let transparent = is_forward_pass(key.pass);
     let emissive_only = key.pass == RenderPassKind::MaterialEmissive;
     let flags_only = key.pass == RenderPassKind::MaterialFlags;
-    let targets = if key.pass == RenderPassKind::Distortion {
+    let targets = if is_distortion_payload_pass(key.pass) {
         vec![Some(wgpu::ColorTargetState {
             format: DISTORTION_FORMAT,
             blend: blend_state(key.blend),
@@ -4823,6 +5143,7 @@ fn create_model_pipeline(
                 RenderPassKind::InvestmentDecalCompatibility => "fs_investment_decal",
                 RenderPassKind::ForwardAdditive => "fs_forward_transparent",
                 RenderPassKind::ForwardTransparent => "fs_forward_transparent",
+                RenderPassKind::ForwardCoating => "fs_forward_coating",
                 RenderPassKind::Distortion => "fs_distortion",
                 RenderPassKind::MaterialEmissive => "fs_material_emissive",
                 RenderPassKind::MaterialFlags => "fs_material_flags",
@@ -4914,8 +5235,13 @@ fn is_forward_pass(pass: RenderPassKind) -> bool {
         pass,
         RenderPassKind::ForwardAdditive
             | RenderPassKind::ForwardTransparent
+            | RenderPassKind::ForwardCoating
             | RenderPassKind::Distortion
     )
+}
+
+fn is_distortion_payload_pass(pass: RenderPassKind) -> bool {
+    pass == RenderPassKind::Distortion
 }
 
 fn depth_stencil_state(index: u8, depth_bias: u8) -> Option<wgpu::DepthStencilState> {
@@ -5276,6 +5602,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     );
     let emissive = textureLoad(surface_emissive, emissive_pixel, 0).rgb;
     let surface = textureSample(surface_albedo, surface_sampler, input.uv);
+    if u32(scene.postprocess2.x + 0.5) != 0u {
+        return compatibility;
+    }
     let model = u32(scene.fidelity.y + 0.5);
     if model == 1u {
         if surface.a <= 0.0 {
@@ -5502,6 +5831,8 @@ struct MaterialUniform {
     wear_surface_params: vec4<f32>,
     gear_palette_default: vec4<f32>,
     gear_palette_colors: array<vec4<f32>, 6>,
+    gear_worn_dye_colors: array<vec4<f32>, 6>,
+    gear_dye_detail_colors: array<vec4<f32>, 6>,
     gear_palette_roughness: array<vec4<f32>, 6>,
     gear_palette_metal: array<vec4<f32>, 6>,
     decal_params: vec4<f32>,
@@ -5521,6 +5852,14 @@ struct MaterialUniform {
     transmission_colors: array<vec4<f32>, 2>,
     transmission_surfaces: array<vec4<f32>, 2>,
     transmission_params: vec4<f32>,
+    coating_colors: array<vec4<f32>, 2>,
+    coating_projection: vec4<f32>,
+    coating_params0: vec4<f32>,
+    coating_params1: vec4<f32>,
+    coating_environment_params: vec4<f32>,
+    coating_environment_extra: vec4<f32>,
+    coating_specular_colors: array<vec4<f32>, 2>,
+    coating_specular_params: array<vec4<f32>, 2>,
     character_detail_transform: vec4<f32>,
     character_detail_base: vec4<f32>,
     character_detail_scale: vec4<f32>,
@@ -5681,6 +6020,8 @@ struct MaterialUniform {
     wear_surface_params: vec4<f32>,
     gear_palette_default: vec4<f32>,
     gear_palette_colors: array<vec4<f32>, 6>,
+    gear_worn_dye_colors: array<vec4<f32>, 6>,
+    gear_dye_detail_colors: array<vec4<f32>, 6>,
     gear_palette_roughness: array<vec4<f32>, 6>,
     gear_palette_metal: array<vec4<f32>, 6>,
     decal_params: vec4<f32>,
@@ -5700,6 +6041,14 @@ struct MaterialUniform {
     transmission_colors: array<vec4<f32>, 2>,
     transmission_surfaces: array<vec4<f32>, 2>,
     transmission_params: vec4<f32>,
+    coating_colors: array<vec4<f32>, 2>,
+    coating_projection: vec4<f32>,
+    coating_params0: vec4<f32>,
+    coating_params1: vec4<f32>,
+    coating_environment_params: vec4<f32>,
+    coating_environment_extra: vec4<f32>,
+    coating_specular_colors: array<vec4<f32>, 2>,
+    coating_specular_params: array<vec4<f32>, 2>,
     character_detail_transform: vec4<f32>,
     character_detail_base: vec4<f32>,
     character_detail_scale: vec4<f32>,
@@ -5740,6 +6089,11 @@ struct MaterialUniform {
 @group(1) @binding(15) var runner_detail_normal_b_texture: texture_2d<f32>;
 @group(1) @binding(16) var runner_detail_normal_c_texture: texture_2d<f32>;
 @group(1) @binding(17) var runner_detail_normal_d_texture: texture_2d<f32>;
+@group(1) @binding(18) var coating_environment_texture: texture_cube<f32>;
+@group(1) @binding(19) var coating_environment_sampler: sampler;
+// Tiger stage-8 coating PS t0: deferred RT2 produced by the opaque surface
+// pass. This is screen-space material data, not another authored 2D texture.
+@group(2) @binding(0) var coating_scene_depth: texture_depth_2d;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -5852,15 +6206,14 @@ fn triplanar_surface(
     normal: vec3<f32>,
     projection: vec4<f32>,
 ) -> vec3<f32> {
-    // Match the compiled shader's object-space tri-planar projection. The XY
-    // scale/offset comes from TFX output 40; using it also prevents camera-angle
-    // shimmer and the incorrect high-frequency 40x tiling.
+    // Match compiled common-surface PS: TEXCOORD5 planes are YZ, XZ, XY;
+    // TEXCOORD6 supplies normalized blend weights.
     var weights = pow(abs(normalize(normal)), vec3<f32>(4.0));
     weights /= max(weights.x + weights.y + weights.z, 0.0001);
     let x = textureSampleBias(
         texture,
         material_sampler,
-        position.zy * projection.xy + projection.zw,
+        position.yz * projection.xy + projection.zw,
         material.sampler_params.x,
     ).rgb;
     let y = textureSampleBias(
@@ -6044,29 +6397,34 @@ fn apply_gear_pattern(albedo: vec3<f32>, input: VertexOutput) -> vec3<f32> {
 
 
 
-fn apply_weapon_mod_condition(albedo: vec3<f32>, input: VertexOutput) -> vec3<f32> {
+fn apply_weapon_mod_condition(albedo: vec3<f32>, input: VertexOutput) -> vec4<f32> {
     // wear_params = TFX outputs [24, 42, 49, resources-present]. Game data
     // evaluates these to Enhanced [1,1,1], Deluxe [0,0,1], Superior [0,0,0].
     // No rarity-wide brightness scalar exists.
     if material.wear_params.w < 0.5 {
-        return albedo;
+        return vec4<f32>(albedo, 0.0);
     }
 
+    // Common-surface VS multiplies raw packed POSITION by
+    // scope_skinning[5].w before forwarding TEXCOORD5. This draw-local value
+    // differs per geometry; omitting it turns authored broad wear into dense
+    // tiling (for example 0.05579831 on Precision Barrel).
+    let position = input.procedural_position * material.sampler_params.y;
     let scratches = triplanar_surface(
         wear_scratches_texture,
-        input.procedural_position,
+        position,
         input.procedural_normal,
         material.wear_scratches_projection,
     ).r;
     let grime = triplanar_surface(
         wear_grime_texture,
-        input.procedural_position,
+        position,
         input.procedural_normal,
         material.wear_grime_projection,
     );
     let damage = triplanar_surface(
         wear_damage_texture,
-        input.procedural_position,
+        position,
         input.procedural_normal,
         material.wear_damage_projection,
     ).r;
@@ -6104,7 +6462,13 @@ fn apply_weapon_mod_condition(albedo: vec3<f32>, input: VertexOutput) -> vec3<f3
         condition_surface,
         material.wear_surface_params.x,
     );
-    return clamp(conditioned, vec3<f32>(0.0), vec3<f32>(4.0));
+    let wear_mask = clamp(
+        max(damage_mask * material.wear_params.z, scratches * material.wear_params.x)
+            * material.wear_surface_params.x,
+        0.0,
+        1.0,
+    );
+    return vec4<f32>(clamp(conditioned, vec3<f32>(0.0), vec3<f32>(4.0)), wear_mask);
 }
 
 fn weapon_surface_condition_mask(input: VertexOutput) -> f32 {
@@ -8124,6 +8488,10 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         select(vec3<f32>(base_color.r), vec3<f32>(1.0), decal_blend),
         mask_material,
     );
+    var semantic_dye = vec3<f32>(0.0);
+    var semantic_worn_dye = vec3<f32>(0.0);
+    var semantic_dye_detail = vec3<f32>(0.0);
+    var semantic_dye_mask = vec3<f32>(0.0);
     if investment_decal {
         let decal_mask = investment_decal_mask(input.uv);
         material_alpha = decal_mask * material.decal_params.w;
@@ -8432,7 +8800,14 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         );
         sampled_albedo *= response * 4.5947933;
     }
+    let pre_pattern_albedo = sampled_albedo;
     sampled_albedo = apply_gear_pattern(sampled_albedo, input);
+    if material.pattern_params.x > 0.5 {
+        semantic_dye_detail = sampled_albedo;
+        semantic_dye_mask = vec3<f32>(
+            clamp(length(sampled_albedo - pre_pattern_albedo) * 4.0, 0.0, 1.0)
+        );
+    }
     if material.blend.w > 0.5 {
         let mask = dot(base_color.rgb, vec3<f32>(0.299, 0.587, 0.114));
         // Compact hair shaders use t0 as a strand/micro-shadow mask. Their
@@ -8459,25 +8834,54 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         let low_g = control.g <= 0.5;
         let low_b = control.b <= 0.5;
         var dye = material.gear_palette_default.rgb;
+        var worn_dye = vec3<f32>(0.0);
+        var dye_detail = vec3<f32>(0.0);
         if !low_r && low_g && low_b {
             dye = material.gear_palette_colors[0].rgb;
+            worn_dye = material.gear_worn_dye_colors[0].rgb;
+            dye_detail = material.gear_dye_detail_colors[0].rgb;
         } else if low_r && low_g && !low_b {
             dye = material.gear_palette_colors[2].rgb;
+            worn_dye = material.gear_worn_dye_colors[2].rgb;
+            dye_detail = material.gear_dye_detail_colors[2].rgb;
         } else if !low_r && !low_g && low_b {
             dye = material.gear_palette_colors[3].rgb;
+            worn_dye = material.gear_worn_dye_colors[3].rgb;
+            dye_detail = material.gear_dye_detail_colors[3].rgb;
         } else if low_r && !low_g && low_b {
             dye = material.gear_palette_colors[1].rgb;
+            worn_dye = material.gear_worn_dye_colors[1].rgb;
+            dye_detail = material.gear_dye_detail_colors[1].rgb;
         } else if low_r && !low_g && !low_b {
             dye = material.gear_palette_colors[4].rgb;
+            worn_dye = material.gear_worn_dye_colors[4].rgb;
+            dye_detail = material.gear_dye_detail_colors[4].rgb;
         } else if !(low_r && low_g && low_b) {
             dye = material.gear_palette_colors[5].rgb;
+            worn_dye = material.gear_worn_dye_colors[5].rgb;
+            dye_detail = material.gear_dye_detail_colors[5].rgb;
         }
-        sampled_albedo = dye * detail;
+        sampled_albedo = (dye + worn_dye + dye_detail) * detail;
+        semantic_dye = dye;
+        semantic_worn_dye = worn_dye;
+        semantic_dye_detail = dye_detail;
+        semantic_dye_mask = control.rgb;
     }
-    sampled_albedo = apply_weapon_mod_condition(sampled_albedo, input);
+    let conditioned_dye = apply_weapon_mod_condition(sampled_albedo, input);
+    sampled_albedo = conditioned_dye.rgb;
+    // The user-facing Worn Dye view isolates the resolved worn surface for
+    // rarity-conditioned mods. Materials without that physical ABI still show
+    // their authored Worn Dye object-channel contribution.
+    semantic_worn_dye = select(
+        semantic_worn_dye,
+        conditioned_dye.rgb,
+        material.wear_params.w > 0.5 && material.wear_params.w < 1.5,
+    );
+    var semantic_wear_mask = conditioned_dye.a;
     sampled_albedo = apply_weapon_surface_condition(sampled_albedo, input);
     let albedo = sampled_albedo * material.tint.rgb;
     let condition_mask = weapon_surface_condition_mask(input);
+    semantic_wear_mask = max(semantic_wear_mask, condition_mask);
     let mapped = mapped_normal(input);
     let normal = normalize(mix(
         mapped,
@@ -8507,6 +8911,11 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     let n_dot_v = max(dot(normal, view_direction), 0.0);
     let environment_fresnel = fresnel_schlick(n_dot_v, f0);
     var vertex_ao = mix(1.0, input.ambient_occlusion, scene.postprocess1.w);
+    if material.sampler_params.w > 0.0 {
+        // Some opaque shared-atlas shaders author RT2.g directly. Preserve
+        // that MRT value instead of replacing it with Quicktag geometry AO.
+        vertex_ao = material.sampler_params.w;
+    }
     if material.runner_layered_params.z > 0.5 {
         // 80A9A9D3 writes RT2.g as the mean of its independent t2 scalar AO
         // and the geometry/procedural occlusion term.
@@ -8573,6 +8982,19 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         0.14,
     );
 
+    var emissive_sample = vec3<f32>(0.0);
+    var emission_intensity = 0.0;
+    var emissive_output = vec3<f32>(0.0);
+    if material.params.y > 0.5 {
+        emissive_sample = textureSampleBias(
+            emissive_texture,
+            material_sampler,
+            input.uv,
+            material.sampler_params.x,
+        ).rgb;
+        emission_intensity = select(1.0, material.params.z, material.params.z > 0.0);
+        emissive_output = emissive_sample * emission_intensity;
+    }
 
     let diagnostic_mode = u32(scene.postprocess2.x + 0.5);
     var color = direct_diffuse + indirect_diffuse + direct_specular + indirect_specular;
@@ -8586,20 +9008,41 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         color = direct_specular + indirect_specular;
     } else if diagnostic_mode == 6u {
         color = normal * 0.5 + vec3<f32>(0.5);
+    } else if diagnostic_mode == 9u {
+        color = semantic_dye;
+    } else if diagnostic_mode == 10u {
+        color = semantic_worn_dye;
+    } else if diagnostic_mode == 11u {
+        color = semantic_dye_detail;
+    } else if diagnostic_mode == 12u {
+        color = vec3<f32>(roughness);
+    } else if diagnostic_mode == 13u {
+        color = vec3<f32>(1.0 - roughness);
+    } else if diagnostic_mode == 14u {
+        color = vec3<f32>(emission_intensity);
+    } else if diagnostic_mode == 15u {
+        color = vec3<f32>(1.0 - material_alpha * material.tint.a);
+    } else if diagnostic_mode == 16u {
+        color = vec3<f32>(metalness);
+    } else if diagnostic_mode == 17u {
+        color = vec3<f32>(select(0.0, 1.0, material.transmission_params.x > 0.5));
+    } else if diagnostic_mode == 18u {
+        // No decoded iridescence payload means ID 0, never a guessed value.
+        color = vec3<f32>(material.solid_surface.w);
+    } else if diagnostic_mode == 19u {
+        color = semantic_dye_mask;
+    } else if diagnostic_mode == 20u {
+        color = vec3<f32>(semantic_wear_mask);
     }
-    var emissive_output = vec3<f32>(0.0);
     if material.params.y > 0.5 {
-        emissive_output = textureSampleBias(
-            emissive_texture,
-            material_sampler,
-            input.uv,
-            material.sampler_params.x,
-        ).rgb
-            * min(material.params.z, 0.01);
         if diagnostic_mode == 0u || diagnostic_mode == 5u {
             color += emissive_output;
         }
     }
+    let raw_channel_view = diagnostic_mode == 1u
+        || diagnostic_mode == 3u
+        || diagnostic_mode == 6u
+        || diagnostic_mode >= 7u;
     // 0.6-style environment approximation for the asset viewer. Keep it in
     // linear space so translucent/decal state remains authored.
     let scene_radius = max(scene.params0.x, 0.0001);
@@ -8619,15 +9062,14 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     let daylight = clamp(scene.postprocess1.z * 0.5 + 0.5, 0.0, 1.0);
     let sun_scatter = vec3<f32>(1.0, 0.58, 0.28) * phase * 2.8 * daylight;
     let fog_color = mix(horizon_color, zenith_color, height_mix) + sun_scatter;
-    color = mix(color, fog_color, clamp(fog_amount, 0.0, 0.96));
-    if diagnostic_mode != 1u
-        && diagnostic_mode != 3u
-        && diagnostic_mode != 6u
-    {
+    if !raw_channel_view {
+        color = mix(color, fog_color, clamp(fog_amount, 0.0, 0.96));
+    }
+    if !raw_channel_view {
         color *= scene.postprocess0.x;
     }
     if diagnostic_mode == 7u {
-        color = emissive_output;
+        color = emissive_sample;
     } else if diagnostic_mode == 8u {
         let investment_decal = material.decal_params.x > 0.5;
         let mask_material = material.params.w < -0.5;
@@ -8654,7 +9096,12 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     var output: FragmentOutput;
     output.compatibility_hdr = compatibility_hdr;
     output.normal_roughness = vec4<f32>(normal * 0.5 + vec3<f32>(0.5), roughness);
-    output.material_properties = vec4<f32>(metalness, vertex_ao, 0.0, output_alpha);
+    output.material_properties = vec4<f32>(
+        metalness,
+        vertex_ao,
+        select(0.0, 1.0, material.transmission_params.x > 0.5),
+        material.solid_surface.w,
+    );
     output.albedo = vec4<f32>(albedo, output_alpha);
     return output;
 }
@@ -8672,6 +9119,234 @@ fn fs_investment_decal(input: VertexOutput) -> FragmentOutput {
 @fragment
 fn fs_forward_transparent(input: VertexOutput) -> @location(0) vec4<f32> {
     return shade_model(input, false).compatibility_hdr;
+}
+
+@fragment
+fn fs_forward_coating(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Dedicated stage-8 coating ABI. Deferred t0 is scene depth. The compiled
+    // shader linearizes it and subtracts the coating fragment's view depth;
+    // c24 remaps that shell-to-surface separation into the c22/c23 colour mix.
+    // t1 is linear object-space detail, and coverage is the authored TFX object
+    // channel rather than either texture.
+    let normal = normalize(input.view_normal);
+    let view_direction = vec3<f32>(0.0, 0.0, 1.0);
+    let raw_scene_depth = textureLoad(
+        coating_scene_depth,
+        vec2<i32>(input.clip_position.xy),
+        0,
+    );
+    let scene_view_depth = (0.5 - raw_scene_depth)
+        * max(scene.params0.x, 0.0001) / 0.21;
+    // Quicktag's orthographic view z grows toward the camera; Tiger's decoded
+    // positive view depth grows away from it. Reverse the subtraction while
+    // preserving the same shell-to-surface distance.
+    let depth_separation = input.view_position.z - scene_view_depth;
+    let depth_incidence = clamp(
+        material.coating_params0.y * depth_separation + material.coating_params0.z,
+        0.0,
+        1.0,
+    );
+    let incidence = depth_incidence;
+    let authored_base_color = mix(
+        material.coating_colors[0].rgb,
+        material.coating_colors[1].rgb,
+        incidence,
+    );
+    let base_color = select(
+        authored_base_color / vec3<f32>(12.92),
+        pow(
+            (authored_base_color + vec3<f32>(0.055)) / vec3<f32>(1.055),
+            vec3<f32>(2.4),
+        ),
+        authored_base_color > vec3<f32>(0.04045),
+    );
+    let detail_sample = runner_triplanar_scalar(
+        color_texture,
+        input.procedural_position * material.sampler_params.y,
+        input.procedural_normal,
+        material.coating_projection,
+        material.coating_params0.x,
+    );
+    let detail = clamp(
+        material.coating_params1.x + material.coating_params1.y * detail_sample,
+        0.0,
+        1.0,
+    );
+    let response = clamp(
+        material.coating_params1.z + material.coating_params1.w * detail,
+        0.0,
+        1.0,
+    );
+
+    let light = normalize(scene.light_direction.xyz);
+    let n_dot_l = max(dot(normal, light), 0.0);
+    let sun_visibility = mix(1.0, directional_shadow(input), scene.light_direction.w);
+    // The coating PS is a narrow light-responsive lobe, not Lambert diffuse.
+    // Its package response is sharply angular: preserve the lit face while
+    // preventing an oblique inset face from receiving comparable irradiance.
+    let coating_key_response = n_dot_l * smoothstep(0.40, 0.60, n_dot_l);
+    // The generated coating shader has a narrow visibility response after its
+    // player-centred lighting-grid lookup. Preserve that separation with the
+    // renderer's stable PCF visibility: partially occluded rail faces must not
+    // receive nearly the same ambient/key energy as their exposed neighbour.
+    let coating_shadow_grid = smoothstep(0.74, 0.81, sun_visibility);
+    let coating_shadow_sensitivity = smoothstep(0.68, 0.695, n_dot_l)
+        * (1.0 - smoothstep(0.71, 0.725, n_dot_l));
+    let coating_shadow_response = mix(
+        1.0,
+        coating_shadow_grid,
+        coating_shadow_sensitivity,
+    );
+    let coating_visibility = mix(0.08, 1.0, coating_shadow_response);
+    let ambient_illumination = 0.18 * scene.postprocess4.z * coating_visibility;
+    let key_illumination = coating_key_response
+        * sun_visibility
+        * coating_visibility
+        * scene.postprocess0.w
+        * 0.82;
+    let coating_key_color = mix(
+        vec3<f32>(0.67, 1.14, 0.94),
+        vec3<f32>(0.66, 1.05, 2.30),
+        coating_shadow_sensitivity,
+    );
+    let shadow_response = 1.0 - smoothstep(0.40, 0.55, n_dot_l);
+    let coating_shadow_fill = shadow_response
+        * coating_visibility
+        * scene.postprocess4.z
+        * vec3<f32>(0.045, 0.083, 0.080)
+        + (1.0 - coating_shadow_response)
+            * scene.postprocess4.z
+            * vec3<f32>(0.035, 0.065, 0.069);
+    let base_illumination = ambient_illumination + key_illumination;
+    let lit_base = base_color
+        * (vec3<f32>(ambient_illumination) + coating_key_color * key_illumination)
+        + coating_shadow_fill;
+
+    let reflection_direction = reflect(-view_direction, normal);
+    // PS c31 chooses a lower mip floor from the detail response. The audited
+    // coating permutations currently author c29=c30=0, so implicit derivative
+    // LOD is the exact max(calculatedLOD, 0) operation used by the DXIL.
+    let authored_lod_floor = mix(
+        material.coating_environment_extra.y,
+        material.coating_environment_extra.z,
+        response,
+    );
+    let environment_sample = textureSampleBias(
+        coating_environment_texture,
+        coating_environment_sampler,
+        reflection_direction,
+        max(authored_lod_floor, 0.0),
+    ).rgb;
+    let environment_detail = material.coating_environment_params.x
+        + material.coating_environment_params.y * detail;
+    let environment_base = lit_base * material.coating_environment_params.w
+        + vec3<f32>(material.coating_environment_extra.x);
+    let environment = environment_sample
+        * environment_detail
+        * material.coating_environment_params.z
+        * environment_base;
+
+    // c39/c43 bend the interpolated bitangent toward the normal. The compiled
+    // shader evaluates two coloured grazing lobes against the view vector; the
+    // constants are not conventional roughness or metalness.
+    let tangent = normalize(input.view_tangent.xyz);
+    let bitangent = normalize(cross(normal, tangent) * input.view_tangent.w);
+    let lobe_axis0 = normalize(
+        bitangent + normal * material.coating_specular_params[1].z,
+    );
+    let lobe_axis1 = normalize(
+        bitangent + normal * material.coating_specular_params[1].w,
+    );
+    let lobe_basis0 = sqrt(max(1.0 - pow(dot(lobe_axis0, view_direction), 2.0), 0.0));
+    let lobe_basis1 = sqrt(max(1.0 - pow(dot(lobe_axis1, view_direction), 2.0), 0.0));
+    let lobe0 = clamp(
+        material.coating_specular_colors[0].rgb
+            * pow(lobe_basis0, material.coating_specular_params[0].x)
+            * material.coating_specular_params[0].y,
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    let lobe1 = clamp(
+        material.coating_specular_colors[1].rgb
+            * pow(lobe_basis1, material.coating_specular_params[1].x)
+            * material.coating_specular_params[1].y,
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    let surface_color = lit_base + environment + lobe0 + lobe1;
+    let coverage = clamp(material.coating_params0.w, 0.0, 1.0);
+
+    let diagnostic_mode = u32(scene.postprocess2.x + 0.5);
+    if diagnostic_mode == 1u || diagnostic_mode == 21u {
+        return vec4<f32>(select(base_color, material.coating_colors[0].rgb, diagnostic_mode == 21u), 1.0);
+    }
+    if diagnostic_mode == 4u {
+        return vec4<f32>(lobe0 + lobe1 + environment, 1.0);
+    }
+    if diagnostic_mode == 6u {
+        return vec4<f32>(normal * 0.5 + vec3<f32>(0.5), 1.0);
+    }
+    if diagnostic_mode == 12u {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    if diagnostic_mode == 13u {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    if diagnostic_mode == 15u {
+        return vec4<f32>(vec3<f32>(1.0 - coverage), 1.0);
+    }
+    if diagnostic_mode == 16u {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    if diagnostic_mode == 17u {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    if diagnostic_mode == 22u {
+        return vec4<f32>(material.coating_colors[1].rgb, 1.0);
+    }
+    if diagnostic_mode == 23u {
+        return vec4<f32>(vec3<f32>(incidence), 1.0);
+    }
+    if diagnostic_mode == 24u {
+        return vec4<f32>(vec3<f32>(coverage), 1.0);
+    }
+    if diagnostic_mode == 25u {
+        return vec4<f32>(vec3<f32>(response), 1.0);
+    }
+    if diagnostic_mode == 26u {
+        return vec4<f32>(lobe0, 1.0);
+    }
+    if diagnostic_mode == 27u {
+        return vec4<f32>(lobe1, 1.0);
+    }
+    if diagnostic_mode == 28u {
+        return vec4<f32>(environment, 1.0);
+    }
+    if diagnostic_mode == 29u {
+        return vec4<f32>(surface_color * coverage, coverage);
+    }
+    if diagnostic_mode == 30u {
+        return vec4<f32>(vec3<f32>(n_dot_l), 1.0);
+    }
+    if diagnostic_mode == 31u {
+        return vec4<f32>(vec3<f32>(base_illumination), 1.0);
+    }
+    if diagnostic_mode == 32u {
+        return vec4<f32>(vec3<f32>(sun_visibility), 1.0);
+    }
+    if diagnostic_mode == 33u {
+        return vec4<f32>(surface_color, 1.0);
+    }
+    if diagnostic_mode == 34u {
+        return vec4<f32>(lit_base, 1.0);
+    }
+    if diagnostic_mode == 35u {
+        return vec4<f32>(vec3<f32>(0.5 + depth_separation * 8.0), 1.0);
+    }
+    if diagnostic_mode >= 7u {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return vec4<f32>(surface_color * coverage, coverage);
 }
 
 @fragment
@@ -8698,6 +9373,28 @@ fn fs_distortion(input: VertexOutput) -> @location(0) vec4<f32> {
         material.transmission_surfaces[1],
         authored_signal,
     );
+    let diagnostic_mode = u32(scene.postprocess2.x + 0.5);
+    if diagnostic_mode == 1u {
+        return vec4<f32>(authored_color, 1.0);
+    }
+    if diagnostic_mode == 12u {
+        return vec4<f32>(vec3<f32>(authored_surface.x), 1.0);
+    }
+    if diagnostic_mode == 13u {
+        return vec4<f32>(vec3<f32>(1.0 - authored_surface.x), 1.0);
+    }
+    if diagnostic_mode == 15u {
+        return vec4<f32>(vec3<f32>(1.0 - authored_signal), 1.0);
+    }
+    if diagnostic_mode == 16u {
+        return vec4<f32>(vec3<f32>(authored_surface.y), 1.0);
+    }
+    if diagnostic_mode == 17u {
+        return vec4<f32>(vec3<f32>(authored_signal), 1.0);
+    }
+    if diagnostic_mode >= 9u {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     var base_color = select(
         vec3<f32>(0.055, 0.060, 0.070),
         authored_color,
@@ -8735,12 +9432,13 @@ fn fs_distortion(input: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_material_emissive(input: VertexOutput) -> @location(0) vec4<f32> {
     if material.params.y > 0.5 {
+        let intensity = select(1.0, material.params.z, material.params.z > 0.0);
         return vec4<f32>(textureSampleBias(
             emissive_texture,
             material_sampler,
             input.uv,
             material.sampler_params.x,
-        ).rgb * min(material.params.z, 0.01), 1.0);
+        ).rgb * intensity, intensity);
     }
     return vec4<f32>(0.0);
 }
@@ -8832,6 +9530,22 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let diagnostic_mode = u32(scene.postprocess2.x + 0.5);
+    if diagnostic_mode != 0u {
+        // Semantic views are data inspection, not beauty renders. Present the
+        // composed channel literally: no FXAA, bloom, SSAO, scene distortion,
+        // decals, tone curve, grading, exposure, or display transfer.
+        let depth_size = vec2<i32>(textureDimensions(scene_depth));
+        let pixel = clamp(
+            vec2<i32>(input.uv * vec2<f32>(depth_size)),
+            vec2<i32>(0),
+            depth_size - vec2<i32>(1),
+        );
+        let covered = textureLoad(scene_depth, pixel, 0) < 0.9999;
+        let export_transparent = scene.postprocess4.y < -0.5 || scene.postprocess4.y > 1.5;
+        let alpha = select(1.0, select(0.0, 1.0, covered), export_transparent);
+        return vec4<f32>(textureSample(source_texture, source_sampler, input.uv).rgb, alpha);
+    }
     let centered = input.uv - vec2<f32>(0.5);
     let radius = length(centered);
     let distortion_envelope = smoothstep(0.72, 0.05, radius);
@@ -9014,9 +9728,10 @@ mod tests {
         create_model_sampler, create_pipeline_resources, create_target_resources,
         decode_model_sampler_desc, exposure_target, first_person_key_light, fitted_export_zoom,
         fitted_export_zoom_for_positions, fitted_export_zoom_for_positions_around,
-        hiz_draw_visible, model_draws, model_orthographic_depth, model_orthographic_view_depth,
-        model_view_depth, project_hiz_vertex, projected_export_bounds, rasterizer_cull_mode,
-        shadow_pipeline_index, smooth_normals, vertex_ambient_occlusion,
+        hiz_draw_visible, is_distortion_payload_pass, model_draws, model_orthographic_depth,
+        model_orthographic_view_depth, model_view_depth, physical_light_controls,
+        project_hiz_vertex, projected_export_bounds, rasterizer_cull_mode, shadow_pipeline_index,
+        smooth_normals, vertex_ambient_occlusion,
     };
     use crate::{
         geometry::{
@@ -9378,8 +10093,6 @@ mod tests {
             environment.light_position,
             environment.shadow_strength,
         );
-        assert!(light[0] > 0.0, "configured orbit X remains positive");
-        assert!(light[1] > 0.0, "configured orbit Y remains positive");
         let length = environment
             .light_position
             .into_iter()
@@ -9395,6 +10108,21 @@ mod tests {
     }
 
     #[test]
+    fn light_size_and_orbit_radius_drive_render_controls() {
+        let baseline = physical_light_controls(1.0, 5.0, 0.5);
+        let nearer = physical_light_controls(0.5, 5.0, 0.5);
+        let farther = physical_light_controls(2.0, 5.0, 0.5);
+        let larger = physical_light_controls(1.0, 10.0, 0.5);
+        let smaller = physical_light_controls(1.0, 0.0, 0.5);
+
+        assert_eq!(baseline, (1.0, 0.5));
+        assert!(nearer.0 > baseline.0 && nearer.1 > baseline.1);
+        assert!(farther.0 < baseline.0 && farther.1 < baseline.1);
+        assert!(larger.1 > baseline.1);
+        assert!(smaller.1 < baseline.1);
+    }
+
+    #[test]
     fn uses_diffuse_dominant_matte_inventory_brdf() {
         assert!(MODEL_SHADER.contains("var roughness_remap = material.roughness_remap"));
         assert!(MODEL_SHADER.contains("var metal_remap = material.metal_remap"));
@@ -9405,6 +10133,7 @@ mod tests {
         assert!(MODEL_SHADER.contains("key_specular"));
         assert!(MODEL_SHADER.contains("* 0.24"));
         assert!(MODEL_SHADER.contains("let specular_occlusion"));
+        assert!(MODEL_SHADER.contains("vertex_ao = material.sampler_params.w"));
         assert!(MODEL_SHADER.contains("directional_shadow(input)"));
         assert!(!MODEL_SHADER.contains("rim_"));
     }
@@ -9432,11 +10161,11 @@ mod tests {
 
     #[test]
     fn exposes_required_render_diagnostics() {
-        for mode in 1..=6 {
+        for mode in 1..=20 {
             assert!(MODEL_SHADER.contains(&format!("diagnostic_mode == {mode}u")));
         }
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 5u"));
-        assert!(PRESENT_SHADER.contains("diagnostic_mode != 6u"));
+        assert!(PRESENT_SHADER.contains("if diagnostic_mode != 0u"));
+        assert!(PRESENT_SHADER.contains("Semantic views are data inspection"));
     }
 
     #[test]
@@ -9484,6 +10213,7 @@ mod tests {
         let mut runtime = WireframeMaterialTextures::default();
         runtime.solid_color = Some([0.7, 0.3, 0.1, 1.0]);
         runtime.solid_surface = Some([0.5, 0.25]);
+        runtime.iridescence_id = Some(0.375);
         let wireframe = WireframePreview {
             rigid_indices: None,
             source: "runtime surface".into(),
@@ -9532,6 +10262,15 @@ mod tests {
         assert_eq!(draws[0].indices, 0..3);
         assert_eq!(draws[0].solid_color, Some([0.7, 0.3, 0.1, 1.0]));
         assert_eq!(draws[0].solid_surface, Some([0.5, 0.25]));
+        assert_eq!(draws[0].iridescence_id, Some(0.375));
+    }
+
+    #[test]
+    fn package_fidelity_is_the_default_material_policy() {
+        assert_eq!(
+            ModelEnvironment::default().fidelity_mode,
+            super::FidelityMode::StrictTiger
+        );
     }
 
     #[test]
@@ -9580,9 +10319,13 @@ mod tests {
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .expect("GPU adapter required for model pipeline smoke test");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("GPU device required for model pipeline smoke test");
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_sampled_textures_per_shader_stage = 18;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits,
+            ..Default::default()
+        }))
+        .expect("GPU device required for model pipeline smoke test");
 
         let resources =
             create_pipeline_resources(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
@@ -9679,6 +10422,12 @@ mod tests {
         assert!(blend_state(57).is_none());
         assert!(blend_state(27).is_some());
         assert!(blend_state(76).is_some());
+    }
+
+    #[test]
+    fn coating_uses_hdr_forward_target_not_distortion_payload() {
+        assert!(is_distortion_payload_pass(RenderPassKind::Distortion));
+        assert!(!is_distortion_payload_pass(RenderPassKind::ForwardCoating));
     }
 
     #[test]
@@ -9967,12 +10716,14 @@ mod tests {
         y: std::ops::Range<u32>,
     ) -> ([f32; 3], usize) {
         let mut bins = std::collections::BTreeMap::<[u8; 3], (usize, [u64; 3])>::new();
+        let mut orange_pixels = 0usize;
         for row in y {
             for column in x.clone() {
                 let [red, green, blue, _alpha] = image.get_pixel(column, row).0;
                 if red < 70 || red < green.saturating_add(30) || green < blue.saturating_add(15) {
                     continue;
                 }
+                orange_pixels += 1;
                 let entry = bins
                     .entry([red / 8, green / 8, blue / 8])
                     .or_insert((0, [0; 3]));
@@ -9986,7 +10737,10 @@ mod tests {
             .into_iter()
             .max_by_key(|(_bin, (count, _sum))| *count)
             .expect("orange color sample");
-        (sum.map(|channel| channel as f32 / count as f32), count)
+        (
+            sum.map(|channel| channel as f32 / count as f32),
+            orange_pixels,
+        )
     }
 
     #[derive(Debug)]
@@ -10209,8 +10963,11 @@ mod tests {
         let adapter_info = adapter.get_info();
         let required_features = adapter.features()
             & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_sampled_textures_per_shader_stage = 18;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features,
+            required_limits,
             ..Default::default()
         }))
         .expect("GPU device");
@@ -10232,6 +10989,7 @@ mod tests {
             renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
         };
         let texture_cache = TextureCache::new(render_state.clone());
+        let weapon_socket_index = crate::geometry::WeaponModSocketIndex::new();
         let output = std::path::Path::new("target/quicktag-model-probe");
         std::fs::create_dir_all(output).expect("probe directory");
         let mut renders = Vec::new();
@@ -10251,11 +11009,40 @@ mod tests {
             "specular" | "specular-only" => (4, LightingModel::TigerGgxCompatibility),
             "pre-tone" | "pre_tone" | "hdr" => (5, LightingModel::TigerGgxCompatibility),
             "normal" | "normals" => (6, LightingModel::TigerGgxCompatibility),
-            "mrt-albedo" => (9, LightingModel::SurfaceAlbedo),
-            "mrt-normal" => (10, LightingModel::SurfaceNormals),
-            "mrt-properties" => (11, LightingModel::SurfaceProperties),
-            "mrt-emissive" => (7, LightingModel::TigerGgxCompatibility),
-            "mrt-flags" => (8, LightingModel::TigerGgxCompatibility),
+            "emission" => (7, LightingModel::TigerGgxCompatibility),
+            "flags" => (8, LightingModel::TigerGgxCompatibility),
+            "dye" => (9, LightingModel::TigerGgxCompatibility),
+            "worn-dye" => (10, LightingModel::TigerGgxCompatibility),
+            "dye-detail" => (11, LightingModel::TigerGgxCompatibility),
+            "roughness" => (12, LightingModel::TigerGgxCompatibility),
+            "smoothness" => (13, LightingModel::TigerGgxCompatibility),
+            "emission-intensity" => (14, LightingModel::TigerGgxCompatibility),
+            "transparency" => (15, LightingModel::TigerGgxCompatibility),
+            "metalness" => (16, LightingModel::TigerGgxCompatibility),
+            "transmission" => (17, LightingModel::TigerGgxCompatibility),
+            "iridescence" | "iridescence-id" => (18, LightingModel::TigerGgxCompatibility),
+            "dye-mask" => (19, LightingModel::TigerGgxCompatibility),
+            "wear-mask" => (20, LightingModel::TigerGgxCompatibility),
+            "coating-face" => (21, LightingModel::TigerGgxCompatibility),
+            "coating-grazing" => (22, LightingModel::TigerGgxCompatibility),
+            "coating-incidence" => (23, LightingModel::TigerGgxCompatibility),
+            "coating-coverage" => (24, LightingModel::TigerGgxCompatibility),
+            "coating-detail" => (25, LightingModel::TigerGgxCompatibility),
+            "coating-sharp-specular" => (26, LightingModel::TigerGgxCompatibility),
+            "coating-broad-specular" => (27, LightingModel::TigerGgxCompatibility),
+            "coating-environment" => (28, LightingModel::TigerGgxCompatibility),
+            "coating-premultiplied" => (29, LightingModel::TigerGgxCompatibility),
+            "coating-key-light" => (30, LightingModel::TigerGgxCompatibility),
+            "coating-illumination" => (31, LightingModel::TigerGgxCompatibility),
+            "coating-shadow" => (32, LightingModel::TigerGgxCompatibility),
+            "coating-surface" => (33, LightingModel::TigerGgxCompatibility),
+            "coating-lit-base" => (34, LightingModel::TigerGgxCompatibility),
+            "coating-depth-separation" => (35, LightingModel::TigerGgxCompatibility),
+            "mrt-albedo" => (0, LightingModel::SurfaceAlbedo),
+            "mrt-normal" => (0, LightingModel::SurfaceNormals),
+            "mrt-properties" => (0, LightingModel::SurfaceProperties),
+            "mrt-emissive" => (0, LightingModel::SurfaceEmissive),
+            "mrt-flags" => (0, LightingModel::SurfaceFlags),
             value => panic!("unknown QUICKTAG_PROBE_PASS {value}"),
         };
         let tuning_probe = std::env::var("QUICKTAG_PROBE_TUNE")
@@ -10268,6 +11055,14 @@ mod tests {
                 TagHash(0x80B7CAE9),
                 TagHash(0x80A7C982),
                 vec![TagHash(0x80A9B332), TagHash(0x80A9AB43)],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
+            (
+                "d54-precision-balanced-enhanced",
+                TagHash(0x80B7CAE9),
+                TagHash(0x80A7C982),
+                vec![TagHash(0x80A6071A), TagHash(0x80A61008)],
                 vec![],
                 -24.0_f32.to_radians(),
             ),
@@ -10479,6 +11274,14 @@ mod tests {
                 vec![],
                 vec![],
                 -36.0_f32.to_radians(),
+            ),
+            (
+                "vox-nocturna-copperhead-forward-coating",
+                TagHash(0x80B7DB07),
+                TagHash(0x80B7DB07),
+                vec![],
+                vec![],
+                -24.0_f32.to_radians(),
             ),
             (
                 "m77-investment-decal",
@@ -10865,6 +11668,7 @@ mod tests {
             }
             let lighting_reference_case = name == "vox-nocturna-misriah-ingame-lighting";
             let flat_panel_reference_case = name.starts_with("vox-nocturna-v85-flat-panel");
+            let coating_reference_case = name == "vox-nocturna-copperhead-forward-coating";
             let investment_decal_reference_case = name == "m77-investment-decal";
             let revamp_baseline_case = name == "revamp-br33-vibrant-sport-deluxe";
             let probe_f32 = |key: &str, fallback: f32| {
@@ -10888,20 +11692,17 @@ mod tests {
                 None
             };
             let expects_attached_dyes = !expected_dye_colors.is_empty();
-            let weapon_socket = if name == "bully-smg-transmit-engine" {
-                crate::geometry::WeaponModSocketIndex::new()
-                    .owner_for(
-                        &cache,
-                        weapon_owner,
-                        if mods.is_empty() {
-                            &[TagHash(0x80A60874)]
-                        } else {
-                            &mods
-                        },
-                    )
-                    .unwrap_or(weapon_owner)
+            let socket_probe_mods = if name == "bully-smg-transmit-engine" && mods.is_empty() {
+                vec![TagHash(0x80A60874)]
             } else {
+                mods.clone()
+            };
+            let weapon_socket = if socket_probe_mods.is_empty() {
                 weapon_owner
+            } else {
+                weapon_socket_index
+                    .owner_for(&cache, weapon_owner, &socket_probe_mods)
+                    .unwrap_or(weapon_owner)
             };
             let attachments = mods
                 .iter()
@@ -10909,12 +11710,16 @@ mod tests {
                 .map(|model_tag| WeaponModPreviewAttachment {
                     model_tag,
                     rarity,
-                    unique_id: match rarity {
-                        Some(WeaponModRarity::Enhanced) => 0.137,
-                        Some(WeaponModRarity::Deluxe) => 0.619,
-                        Some(WeaponModRarity::Superior) => 0.853,
-                        None => 0.5,
-                    },
+                    unique_id: probe_f32(
+                        "QUICKTAG_PROBE_UNIQUE_ID",
+                        match rarity {
+                            Some(WeaponModRarity::Enhanced) => 0.137,
+                            Some(WeaponModRarity::Deluxe) => 0.619,
+                            Some(WeaponModRarity::Superior) => 0.853,
+                            None => 0.5,
+                        },
+                    )
+                    .clamp(0.0, 1.0),
                 })
                 .collect_vec();
             let combined_runner = match name {
@@ -11377,6 +12182,26 @@ mod tests {
                 GpuModelPreview::create(&render_state.device, wireframe, fallback)
                     .expect("GPU model"),
             );
+            if name.starts_with("vox-nocturna-v85-flat-panel")
+                || name == "vox-nocturna-copperhead-forward-coating"
+            {
+                let coating_draws = gpu
+                    .draws
+                    .iter()
+                    .filter(|draw| draw.forward_coating.is_some())
+                    .collect_vec();
+                assert!(
+                    !coating_draws.is_empty(),
+                    "fixture lost shader-authored forward coating"
+                );
+                assert!(coating_draws.iter().all(|draw| {
+                    draw.packet.raw_render_stage
+                        == Some(crate::render::adapter::GoliathAdapter::DISTORTION_STAGE)
+                        && draw.packet.material.family()
+                            == crate::render::material::MaterialFamily::ForwardCoating
+                        && draw.packet.pass_plan.passes == [RenderPassKind::ForwardCoating]
+                }));
+            }
             if name.starts_with("weapon-mod-helper-card-") {
                 let helper_draws = gpu
                     .draws
@@ -11562,6 +12387,11 @@ mod tests {
                     diagnostic_pass,
                     ..ModelEnvironment::default()
                 }
+            } else if coating_reference_case {
+                ModelEnvironment {
+                    diagnostic_pass,
+                    ..ModelEnvironment::default()
+                }
             } else {
                 ModelEnvironment {
                     sun_intensity: 0.0,
@@ -11578,6 +12408,12 @@ mod tests {
                     ..ModelEnvironment::default()
                 }
             };
+            if let Ok(value) = std::env::var("QUICKTAG_PROBE_TONEMAP") {
+                verification_environment.tone_mapping = value
+                    .parse::<u8>()
+                    .expect("QUICKTAG_PROBE_TONEMAP must be 0 or 1")
+                    != 0;
+            }
             verification_environment.fidelity_mode = match std::env::var("QUICKTAG_PROBE_FIDELITY")
                 .unwrap_or_else(|_| "strict".into())
                 .to_ascii_lowercase()
@@ -11594,7 +12430,7 @@ mod tests {
                 wireframe,
                 model.preview_uv_transform(),
                 None,
-                yaw,
+                if coating_reference_case { 0.0 } else { yaw },
                 if lighting_reference_case {
                     probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 16.2).to_radians()
                 } else if revamp_baseline_case {
@@ -11605,8 +12441,10 @@ mod tests {
                     } else {
                         probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 14.8).to_radians()
                     }
+                } else if coating_reference_case {
+                    0.0
                 } else {
-                    0.05
+                    probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 0.05_f32.to_degrees()).to_radians()
                 },
                 probe_f32("QUICKTAG_PROBE_ZOOM", 3.1),
                 egui::Vec2::ZERO,
@@ -11752,6 +12590,22 @@ mod tests {
                     }),
                     "{name} did not carry authored projections and three-tier TFX controls into the wear material"
                 );
+                if name == "d54-precision-balanced-enhanced" {
+                    let scales = callback
+                        .materials
+                        .iter()
+                        .filter(|material| material.mod_wear.is_some())
+                        .map(|material| material.procedural_scale)
+                        .collect_vec();
+                    assert!(
+                        [0.05579831, 0.13407558].into_iter().all(|expected| {
+                            scales
+                                .iter()
+                                .any(|actual| (actual - expected).abs() < 0.000001)
+                        }),
+                        "D54 fixture did not render both package-authored mod coordinate scales: {scales:?}"
+                    );
+                }
             }
             if name == "arata-vectus-v66-detail" {
                 assert!(
@@ -12146,7 +13000,8 @@ mod tests {
             if isolated_draw.is_none() {
                 assert!(visible > 5_000, "render must be nonblank");
             }
-            if isolated_draw.is_none() && name == "d54-default-optic" && diagnostic_pass == 0 {
+            if isolated_draw.is_none() && name == "d54-default-optic" && diagnostic_name == "final"
+            {
                 let mut neutral_surface = 0usize;
                 let mut light_detail = 0usize;
                 let mut optic_foreground = 0usize;
@@ -12224,8 +13079,8 @@ mod tests {
                 // Four separate meshes sample the dark square-ring glyph from
                 // the shared t0 atlas. The sampled atlas swatch is RGB 50, then
                 // the package-authored linear t1 response darkens it further.
-                // If either resource is decoded as generic auxiliary data, the
-                // white fallback or an unmodulated gray surface replaces it.
+                // Its compiled MRT also writes AO=0.5. Dropping that channel
+                // lifts the black glyphs into gray even when albedo is correct.
                 for (x, y) in [(328_u32, 232_u32), (759, 263), (886, 263), (455, 375)] {
                     let crop = image
                         .view(x - 9, y - 9, 18, 18)
@@ -12237,9 +13092,12 @@ mod tests {
                         })
                         .collect::<Vec<_>>();
                     let mean_luma = crop.iter().copied().sum::<u16>() as f32 / crop.len() as f32;
+                    let [red, green, blue, _] = image.get_pixel(x, y).0;
+                    let center_luma =
+                        (u16::from(red) * 54 + u16::from(green) * 183 + u16::from(blue) * 19) / 256;
                     assert!(
-                        mean_luma < 80.0,
-                        "shared-atlas glyph at ({x}, {y}) must remain package-black, got mean luma {mean_luma:.1}"
+                        mean_luma < 58.0 && center_luma < 48,
+                        "shared-atlas glyph at ({x}, {y}) must remain package-black, got mean {mean_luma:.1}, center {center_luma}"
                     );
                 }
             }
@@ -12292,7 +13150,7 @@ mod tests {
                     .save(output.join(format!("{name}-preassert.png")))
                     .expect("save procedural-surface render before acceptance checks");
             }
-            if lighting_reference_case && diagnostic_pass == 0 {
+            if lighting_reference_case && diagnostic_name == "final" {
                 let profile = implementation_material_bands(&image);
                 eprintln!("Vox Nocturna material bands: {profile:?}");
                 if !tuning_probe {
@@ -12326,7 +13184,7 @@ mod tests {
                     );
                 }
             }
-            if name == "dont-let-up-brrt-darksight-precision" && diagnostic_pass == 0 {
+            if name == "dont-let-up-brrt-darksight-precision" && diagnostic_name == "final" {
                 let (mut dark, mut yellow) = (0usize, 0usize);
                 for y in 130..230 {
                     for x in 120..270 {
@@ -12353,7 +13211,7 @@ mod tests {
                     ));
                 }
             }
-            if name == "atrax-sting-v11-rangefinder-suppression" {
+            if name == "atrax-sting-v11-rangefinder-suppression" && diagnostic_name == "final" {
                 let (mut neutral, mut green) = (0usize, 0usize);
                 // Fixed-camera crop containing only the two attached mods. The
                 // engine's packed material-ID map must preserve their neutral
@@ -12391,7 +13249,9 @@ mod tests {
                     "Atrax neutral similarity: barrel={barrel:?}, optic={optic:?}, body={body:?}, distances=({barrel_distance:.2}, {optic_distance:.2})"
                 );
             }
-            if name == "midnight-decay-misriah-precision-quickdraw-slick" {
+            if name == "midnight-decay-misriah-precision-quickdraw-slick"
+                && diagnostic_name == "final"
+            {
                 // The supplied in-game reference has nearly identical neutral
                 // front-body/front-choke samples (#171A18 and #181818), while
                 // the rear choke sits about 27 luma levels above the body. Use
@@ -12417,7 +13277,7 @@ mod tests {
                     ));
                 }
             }
-            if flat_panel_reference_case {
+            if flat_panel_reference_case && diagnostic_name == "final" {
                 let crop_x = 260..510;
                 let crop_y = 205..380;
                 let (orange, orange_count) =
@@ -12445,7 +13305,33 @@ mod tests {
                     "procedural panel regressed to broad white fallback"
                 );
             }
-            if investment_decal_reference_case {
+            if coating_reference_case && diagnostic_name == "final" {
+                // Fixed-camera, exact-pixel oracle from the supplied in-game
+                // reference. These points lie inside the dark inset face and
+                // adjacent normal face, away from edges, glyphs, and highlights.
+                const COATING_PIXELS: [(&str, u32, u32, [u8; 3]); 2] = [
+                    ("dark", 297, 157, [0x2d, 0x1b, 0x12]),
+                    ("normal", 500, 157, [0x96, 0x4d, 0x21]),
+                ];
+                for (label, x, y, target) in COATING_PIXELS {
+                    let rendered: [u8; 3] =
+                        image.get_pixel(x, y).0[..3].try_into().expect("RGB pixel");
+                    let delta = std::array::from_fn::<_, 3, _>(|channel| {
+                        i16::from(rendered[channel]) - i16::from(target[channel])
+                    });
+                    eprintln!(
+                        "Copperhead coating {label} ({x},{y}): rendered=#{:02X}{:02X}{:02X}, target=#{:02X}{:02X}{:02X}, delta={delta:?}",
+                        rendered[0], rendered[1], rendered[2], target[0], target[1], target[2],
+                    );
+                    if delta.into_iter().any(|component| component.abs() > 4) {
+                        visual_failures.push(format!(
+                            "Copperhead coating {label} pixel ({x},{y}) is #{:02X}{:02X}{:02X}; expected #{:02X}{:02X}{:02X} within 4/channel",
+                            rendered[0], rendered[1], rendered[2], target[0], target[1], target[2],
+                        ));
+                    }
+                }
+            }
+            if investment_decal_reference_case && diagnostic_name == "final" {
                 let mut stencil_pixels = 0usize;
                 let mut dark_panel_pixels = 0usize;
                 // Fixed-camera crop around the M77 lower-frame decal. The
@@ -12472,7 +13358,7 @@ mod tests {
                     "M77 decal must remain a sparse stencil over the dark frame, not a solid white fallback"
                 );
             }
-            if name == "bully-smg-transmit-engine" {
+            if name == "bully-smg-transmit-engine" && diagnostic_name == "final" {
                 let mut coated_blue = 0usize;
                 // Fixed-camera masks cover the winding and circular stage-8
                 // body. Package-authored blue must cover the surface instead
@@ -12502,7 +13388,7 @@ mod tests {
                     "stage-8 material must remain an opaque authored-color coating, not scene-color transparency"
                 );
             }
-            if name == "syntax-disrupt-v75-decal" {
+            if name == "syntax-disrupt-v75-decal" && diagnostic_name == "final" {
                 let mut authored_blue = 0usize;
                 let mut white_fallback = 0usize;
                 // Fixed-camera crop over the textureless TFX panel. Its
@@ -12549,7 +13435,7 @@ mod tests {
                     "opaque sole-atlas lettering must stay dark instead of falling back to white"
                 );
             }
-            if name == "arata-vectus-v66-detail" {
+            if name == "arata-vectus-v66-detail" && diagnostic_name == "final" {
                 let mut red = 0usize;
                 let mut contour = 0usize;
                 let mut transitions = 0usize;
@@ -12593,7 +13479,8 @@ mod tests {
             if matches!(
                 name,
                 "runner-achromatic-rush-decal" | "runner-detail-selector-decal"
-            ) {
+            ) && diagnostic_name == "final"
+            {
                 let (bright_pixels, largest_component) = bright_component_profile(&image);
                 eprintln!(
                     "Runner investment decals: bright={bright_pixels}, largest component={largest_component}"
@@ -12644,7 +13531,8 @@ mod tests {
             rarity_render("enhanced"),
             rarity_render("deluxe"),
             rarity_render("superior"),
-        ) {
+        ) && diagnostic_name == "final"
+        {
             let mean_pixel_delta = |left: &image::RgbaImage, right: &image::RgbaImage| {
                 left.pixels()
                     .zip(right.pixels())
@@ -12740,7 +13628,7 @@ mod tests {
             ),
         ] {
             if render_name == "vox-nocturna-misriah-ingame-lighting"
-                && (diagnostic_pass != 0 || tuning_probe)
+                && (diagnostic_name != "final" || tuning_probe)
             {
                 continue;
             }

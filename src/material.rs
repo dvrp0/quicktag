@@ -320,6 +320,40 @@ pub fn primary_sampler_for_technique(entry: &UEntryHeader, data: &[u8]) -> Optio
         .or_else(|| sampler_header_tag(sampler.raw32))
 }
 
+pub fn sampler_for_technique_slot(
+    entry: &UEntryHeader,
+    data: &[u8],
+    shader_stage: &str,
+    slot: u8,
+) -> Option<TagHash> {
+    if !is_technique_entry(entry) {
+        return None;
+    }
+
+    let technique = parse_technique(data)?;
+    let stage = technique
+        .stages
+        .into_iter()
+        .find(|stage| stage.stage == shader_stage)?;
+    let sampler_index = stage
+        .bytecode
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.kind == "sampler" && binding.stage == shader_stage && binding.slot == slot
+        })?
+        .source
+        .strip_prefix("sampler[")?
+        .strip_suffix(']')?
+        .parse::<usize>()
+        .ok()?;
+    let sampler = stage.samplers.get(sampler_index)?;
+    sampler
+        .resolved
+        .and_then(sampler_header_tag)
+        .or_else(|| sampler_header_tag(sampler.raw32))
+}
+
 pub fn tfx_texture_bindings_for_technique(
     entry: &UEntryHeader,
     data: &[u8],

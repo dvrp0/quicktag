@@ -167,6 +167,20 @@ impl GearRarity {
         }
     }
 
+    fn export_code(self) -> &'static str {
+        match self {
+            Self::Standard => "STD",
+            Self::Enhanced => "E",
+            Self::Deluxe => "D",
+            Self::Superior => "S",
+            Self::Prestige => "P",
+            Self::Contraband => "C",
+            Self::Dynamic => "DYN",
+            Self::Quest => "Q",
+            Self::Unique => "U",
+        }
+    }
+
     fn color(self) -> Color32 {
         match self {
             Self::Standard => Color32::from_rgb(158, 165, 174),
@@ -267,6 +281,7 @@ pub(super) struct ModelModSlot {
 pub(super) struct ModelModEntry {
     pub(super) name: String,
     pub(super) rarity: String,
+    pub(super) rarity_code: &'static str,
     pub(super) color: Color32,
     pub(super) model_tag: TagHash,
     pub(super) preview_rarity: Option<WeaponModRarity>,
@@ -416,6 +431,7 @@ impl GearView {
                                 Some(ModelModEntry {
                                     name: item.name.clone(),
                                     rarity: rarity.label().to_owned(),
+                                    rarity_code: rarity.export_code(),
                                     color: rarity.color(),
                                     model_tag: item.model_tag?,
                                     preview_rarity: match rarity {
@@ -4627,6 +4643,58 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+
+    #[test]
+    #[ignore = "probe: requires current Marathon packages"]
+    fn audits_d54_enhanced_precision_barrel_and_balanced_mag() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let weapon = catalog
+            .weapons
+            .iter()
+            .find(|weapon| weapon.name == "D54 Battle Pistol")
+            .expect("D54 Battle Pistol");
+        let mods = weapon
+            .slots
+            .iter()
+            .flat_map(|slot| slot.mods.iter().map(move |item| (slot.name.as_str(), item)))
+            .filter(|(_, item)| {
+                matches!(item.name.as_str(), "Precision Barrel" | "Balanced Mag")
+                    && item.preview_rarity == Some(WeaponModRarity::Enhanced)
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "D54 owner={} socket_owner={:?} mods={:#?}",
+            weapon.owner_tag,
+            weapon.socket_owner,
+            mods.iter()
+                .map(|(slot, item)| (
+                    *slot,
+                    item.name.as_str(),
+                    item.model_tag,
+                    item.preview_rarity
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(mods.len(), 2);
+    }
 
     #[test]
     #[ignore = "requires current Marathon packages"]

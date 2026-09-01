@@ -91,13 +91,19 @@ fn main() -> eframe::Result<()> {
                     backends: wgpu::Backends::PRIMARY,
                     ..Default::default()
                 },
-                device_descriptor: Arc::new(|_adapter| wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
-                        | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
-                        | wgpu::Features::TEXTURE_BINDING_ARRAY
-                        | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
-                    required_limits: wgpu::Limits::default(),
-                    ..Default::default()
+                device_descriptor: Arc::new(|_adapter| {
+                    let mut required_limits = wgpu::Limits::default();
+                    // The material ABI binds sixteen 2D inputs plus a local
+                    // coating cube; the scene contributes one more cube.
+                    required_limits.max_sampled_textures_per_shader_stage = 18;
+                    wgpu::DeviceDescriptor {
+                        required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
+                            | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
+                            | wgpu::Features::TEXTURE_BINDING_ARRAY
+                            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+                        required_limits,
+                        ..Default::default()
+                    }
                 }),
                 ..Default::default()
             }),

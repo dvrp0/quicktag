@@ -35,9 +35,21 @@ use super::{View, ViewAction};
 pub(super) const DEFAULT_MODEL_YAW: f32 = -std::f32::consts::FRAC_PI_2;
 const DEFAULT_WEAPON_YAW: f32 = -24.0_f32.to_radians();
 const DEFAULT_WEAPON_PITCH: f32 = 14.0_f32.to_radians();
-const MODEL_EXPORT_WIDTH: f32 = 512.5;
-const MODEL_EXPORT_HEIGHT: f32 = 250.0;
+const MODEL_EXPORT_WIDTH: u32 = 4198;
+const MODEL_EXPORT_HEIGHT: u32 = 2048;
 const MODEL_PARAMETER_RANGE: std::ops::RangeInclusive<f32> = -10.0..=10.0;
+
+fn model_export_filename(model: TagHash, modifications: &[(TagHash, &'static str)]) -> String {
+    let suffix = modifications
+        .iter()
+        .map(|(tag, rarity)| format!("{tag}-{rarity}"))
+        .join("_");
+    if suffix.is_empty() {
+        format!("{model}.png")
+    } else {
+        format!("{model}_{suffix}.png")
+    }
+}
 
 pub struct ModelsView {
     cache: Arc<TagCache>,
@@ -371,6 +383,24 @@ impl ModelsView {
             .collect()
     }
 
+    fn selected_mod_export_descriptors(&self) -> Vec<(TagHash, &'static str)> {
+        let Some(weapon) = self
+            .active_weapon
+            .and_then(|index| self.weapon_catalog.weapons.get(index))
+        else {
+            return vec![];
+        };
+        weapon
+            .slots
+            .iter()
+            .zip(&self.selected_mods)
+            .filter_map(|(slot, selected)| {
+                let item = selected.and_then(|index| slot.mods.get(index))?;
+                Some((item.model_tag, item.rarity_code))
+            })
+            .collect()
+    }
+
     fn selected_mod_attachments(&self) -> Vec<WeaponModPreviewAttachment> {
         let Some(weapon) = self
             .active_weapon
@@ -491,7 +521,7 @@ impl ModelsView {
         self.weapon_export_camera = Some(ModelExportCamera::from_wireframes(
             base_wireframe,
             envelope_wireframe,
-            MODEL_EXPORT_HEIGHT / MODEL_EXPORT_WIDTH,
+            MODEL_EXPORT_HEIGHT as f32 / MODEL_EXPORT_WIDTH as f32,
             DEFAULT_WEAPON_YAW,
             DEFAULT_WEAPON_PITCH,
         ));
@@ -785,11 +815,7 @@ impl View for ModelsView {
         let gpu_model_preview = self.gpu_model_preview.as_ref();
         let preview_camera_frame = self.preview_camera_frame;
         let weapon_export_camera = self.weapon_export_camera;
-        let selected_mod_tags = self
-            .selected_mod_tags()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let selected_mod_export_descriptors = self.selected_mod_export_descriptors();
         let preview_yaw = &mut self.preview_yaw;
         let preview_pitch = &mut self.preview_pitch;
         let preview_zoom = &mut self.preview_zoom;
@@ -827,12 +853,7 @@ impl View for ModelsView {
                 if let Some(tag) = selected_model
                     && ui.button("Export PNG").clicked()
                 {
-                    let mod_suffix = selected_mod_tags.iter().join("_");
-                    let filename = if mod_suffix.is_empty() {
-                        format!("{tag}.png")
-                    } else {
-                        format!("{tag}_{mod_suffix}.png")
-                    };
+                    let filename = model_export_filename(tag, &selected_mod_export_descriptors);
                     match native_dialog::FileDialog::new()
                         .add_filter("PNG image", &["png"])
                         .set_filename(&filename)
@@ -850,7 +871,7 @@ impl View for ModelsView {
                             {
                                 let export_rect = egui::Rect::from_min_size(
                                     egui::Pos2::ZERO,
-                                    vec2(MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT),
+                                    vec2(MODEL_EXPORT_WIDTH as f32, MODEL_EXPORT_HEIGHT as f32),
                                 );
                                 let callback = ModelPaintCallback::new(
                                     gpu_preview.clone(),
@@ -858,8 +879,8 @@ impl View for ModelsView {
                                     wireframe,
                                     model.preview_uv_transform(),
                                     None,
-                                    *preview_yaw,
-                                    *preview_pitch,
+                                    DEFAULT_WEAPON_YAW,
+                                    DEFAULT_WEAPON_PITCH,
                                     1.0,
                                     egui::Vec2::ZERO,
                                     *preview_show_stickers,
@@ -870,7 +891,11 @@ impl View for ModelsView {
                                 .with_export_camera(weapon_export_camera);
                                 export_result = Some(
                                     callback
-                                        .export_png(&texture_cache.render_state, &path)
+                                        .export_png(
+                                            &texture_cache.render_state,
+                                            &path,
+                                            [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
+                                        )
                                         .map(|()| path),
                                 );
                             } else {
@@ -1689,6 +1714,80 @@ pub(super) fn model_wireframe_ui(
                     environment.specular_ibl_intensity = defaults.specular_ibl_intensity;
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Material channel");
+                let channel_name = match environment.diagnostic_pass {
+                    0 => "Final",
+                    1 => "Albedo",
+                    2 => "Diffuse",
+                    3 => "Ambient Occlusion",
+                    4 => "Specular",
+                    5 => "Pre-tone HDR",
+                    6 => "Normal",
+                    7 => "Emission",
+                    8 => "Flags",
+                    9 => "Dye",
+                    10 => "Worn Dye",
+                    11 => "Dye Detail",
+                    12 => "Roughness",
+                    13 => "Smoothness",
+                    14 => "Emission Intensity",
+                    15 => "Transparency",
+                    16 => "Metalness",
+                    17 => "Transmission",
+                    18 => "Iridescence ID",
+                    19 => "Dye Mask",
+                    20 => "Wear Mask",
+                    21 => "Coating Face Color",
+                    22 => "Coating Grazing Color",
+                    23 => "Coating Incidence",
+                    24 => "Coating Coverage",
+                    25 => "Coating Detail Response",
+                    26 => "Coating Sharp Specular",
+                    27 => "Coating Broad Specular",
+                    28 => "Coating Environment",
+                    29 => "Coating Premultiplied Output",
+                    _ => "Unknown",
+                };
+                egui::ComboBox::from_id_salt("model_material_channel")
+                    .selected_text(channel_name)
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            (0, "Final"),
+                            (1, "Albedo"),
+                            (9, "Dye"),
+                            (10, "Worn Dye"),
+                            (11, "Dye Detail"),
+                            (19, "Dye Mask"),
+                            (20, "Wear Mask"),
+                            (21, "Coating Face Color"),
+                            (22, "Coating Grazing Color"),
+                            (23, "Coating Incidence"),
+                            (24, "Coating Coverage"),
+                            (25, "Coating Detail Response"),
+                            (26, "Coating Sharp Specular"),
+                            (27, "Coating Broad Specular"),
+                            (28, "Coating Environment"),
+                            (29, "Coating Premultiplied Output"),
+                            (3, "Ambient Occlusion"),
+                            (12, "Roughness"),
+                            (13, "Smoothness"),
+                            (7, "Emission"),
+                            (14, "Emission Intensity"),
+                            (15, "Transparency"),
+                            (16, "Metalness"),
+                            (17, "Transmission"),
+                            (18, "Iridescence ID"),
+                            (6, "Normal"),
+                            (8, "Flags"),
+                            (2, "Diffuse"),
+                            (4, "Specular"),
+                            (5, "Pre-tone HDR"),
+                        ] {
+                            ui.selectable_value(&mut environment.diagnostic_pass, value, label);
+                        }
+                    });
+            });
             ui.label("Drag the yellow light on the orbit sphere, or edit its axes.");
             ui.add(
                 egui::Slider::new(
@@ -1712,16 +1811,10 @@ pub(super) fn model_wireframe_ui(
                 .text("Orbit Z"),
             );
             ui.add(
-                egui::Slider::new(
-                    &mut environment.light_orbit_radius,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit radius"),
+                egui::Slider::new(&mut environment.light_orbit_radius, 0.25..=10.0)
+                    .text("Orbit radius"),
             );
-            ui.add(
-                egui::Slider::new(&mut environment.light_size, MODEL_PARAMETER_RANGE.clone())
-                    .text("Light size"),
-            );
+            ui.add(egui::Slider::new(&mut environment.light_size, 0.0..=10.0).text("Light size"));
             ui.add(
                 egui::Slider::new(
                     &mut environment.sun_intensity,
@@ -1837,14 +1930,14 @@ pub(super) fn model_wireframe_ui(
     let gizmo_radius = rect
         .width()
         .min(rect.height())
-        .mul_add(0.32 * environment.light_orbit_radius.abs(), 0.0)
+        .mul_add(0.32 * environment.light_orbit_radius, 0.0)
         .max(24.0);
     let light_handle = gizmo_center
         + vec2(
             -gizmo_light_position[0] * gizmo_radius,
             -gizmo_light_position[1] * gizmo_radius,
         );
-    let light_handle_radius = (6.0 * environment.light_size.abs().sqrt()).clamp(5.0, 12.0);
+    let light_handle_radius = (6.0 * environment.light_size.sqrt()).clamp(5.0, 12.0);
     let light_gizmo_response = environment.light_gizmo.then(|| {
         ui.interact(
             egui::Rect::from_center_size(light_handle, vec2(32.0, 32.0)),
@@ -2463,6 +2556,37 @@ fn model_textures_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_filename_distinguishes_mod_rarity_concisely() {
+        let model = TagHash(0x80B7CAE9);
+        let mod_tag = TagHash(0x80A6071A);
+        assert_eq!(model_export_filename(model, &[]), "80B7CAE9.png");
+        assert_eq!(
+            model_export_filename(model, &[(mod_tag, "E")]),
+            "80B7CAE9_80A6071A-E.png"
+        );
+        assert_eq!(
+            model_export_filename(model, &[(mod_tag, "D")]),
+            "80B7CAE9_80A6071A-D.png"
+        );
+        assert_eq!(
+            model_export_filename(model, &[(mod_tag, "S")]),
+            "80B7CAE9_80A6071A-S.png"
+        );
+        assert_eq!(
+            model_export_filename(model, &[(mod_tag, "P")]),
+            "80B7CAE9_80A6071A-P.png"
+        );
+        assert_eq!(
+            model_export_filename(model, &[(mod_tag, "C")]),
+            "80B7CAE9_80A6071A-C.png"
+        );
+        assert_eq!(
+            model_export_filename(model, &[(mod_tag, "E"), (TagHash(0x80A61008), "D"),],),
+            "80B7CAE9_80A6071A-E_80A61008-D.png"
+        );
+    }
 
     #[test]
     #[ignore = "requires current installed Marathon packages"]

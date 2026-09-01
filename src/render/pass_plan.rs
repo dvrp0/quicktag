@@ -17,6 +17,7 @@ pub enum RenderPassKind {
     InvestmentDecalCompatibility,
     ForwardAdditive,
     ForwardTransparent,
+    ForwardCoating,
     Distortion,
     Auxiliary,
     UnknownCompatibility,
@@ -69,7 +70,11 @@ impl DrawPassPlan {
         if raw_stage == Some(GoliathAdapter::DISTORTION_STAGE) {
             return Self {
                 evidence: EvidenceLevel::Confirmed,
-                passes: vec![RenderPassKind::Distortion],
+                passes: vec![if material.family() == MaterialFamily::ForwardCoating {
+                    RenderPassKind::ForwardCoating
+                } else {
+                    RenderPassKind::Distortion
+                }],
                 warnings: vec![],
             };
         }
@@ -103,13 +108,15 @@ impl DrawPassPlan {
         let resource_free_surface = match material {
             MaterialIR::Unknown(_) => true,
             MaterialIR::Surface(surface) => {
-                surface.color_texture.is_none()
-                    && surface.normal_texture.is_none()
-                    && surface.emissive_texture.is_none()
-                    && surface.control_texture.is_none()
-                    && surface.solid_color.is_none()
+                surface.inputs.color.is_none()
+                    && surface.inputs.normal.is_none()
+                    && surface.inputs.emissive.is_none()
+                    && surface.inputs.control.is_none()
+                    && surface.inputs.solid_color.is_none()
             }
-            MaterialIR::Decal(_) | MaterialIR::ForwardSpecial(_) => false,
+            MaterialIR::Decal(_)
+            | MaterialIR::ForwardCoating(_)
+            | MaterialIR::ForwardSpecial(_) => false,
         };
         if raw_stage == Some(GoliathAdapter::FORWARD_SPECIAL_STAGE) && resource_free_surface {
             // Goliath stage 17 includes camera-facing helper payloads whose

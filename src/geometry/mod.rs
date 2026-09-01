@@ -12,7 +12,8 @@ use wgpu::util::DeviceExt;
 use crate::material::{
     MaterialPreviewKind, MaterialTagPreview, TechniqueMaterialConstants, TechniqueTextureBinding,
     interpret_tfx_stack_with_object_channels, is_technique_entry, material_constants_for_technique,
-    primary_sampler_for_technique, render_state_for_technique, texture_bindings_for_technique,
+    primary_sampler_for_technique, render_state_for_technique, sampler_for_technique_slot,
+    texture_bindings_for_technique,
 };
 use crate::texture::Texture;
 
@@ -410,6 +411,8 @@ pub struct SharedAtlasDetailMaterial {
     pub exponent: f32,
     pub base: [f32; 3],
     pub scale: [f32; 3],
+    /// Constant RT2.g written by this audited material ABI.
+    pub ambient_occlusion: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -437,6 +440,12 @@ pub struct WireframeMaterialTextures {
     pub gear_dye: Option<GearDyeMaterial>,
     pub gear_dye_default: Option<[f32; 4]>,
     pub gear_dye_palette: Option<[GearDyeMaterial; 6]>,
+    /// Inherited GearDye `Worn Dye` object-channel contribution. Compiled
+    /// shaders add this to the selected Dye channel before sampling t0.
+    pub gear_worn_dye_palette: Option<[[f32; 4]; 6]>,
+    /// Mod-local GearDye `Dye Detail` contribution. This is independent from
+    /// the physical t5/t6/t7 rarity wear maps.
+    pub gear_dye_detail_palette: Option<[[f32; 4]; 6]>,
     pub mod_wear: Option<WeaponModConditionMaterial>,
     pub surface_condition: Option<WeaponSurfaceConditionMaterial>,
     /// Object-space contour/detail layer decoded from the common gear surface
@@ -458,10 +467,16 @@ pub struct WireframeMaterialTextures {
     pub solid_color: Option<[f32; 4]>,
     /// Authored `(roughness, metalness)` for a decoded textureless material.
     pub solid_surface: Option<[f32; 2]>,
+    /// Authored discrete iridescence/material-response selector. `None` means
+    /// shader ABI exposes no such channel; renderer must display ID 0.
+    pub iridescence_id: Option<f32>,
     /// Authored colour filters used by stage-8 transmission/distortion
     /// shaders. Colours come from compiled pixel-shader material blocks;
     /// stage 8 itself stores displacement, not a universal blue surface.
     pub transmission: Option<TransmissionMaterial>,
+    /// Shader-proven stage-8 forward coating. Presence comes from compiled
+    /// PS/TFX ABI and resource shape, never weapon or skin identity.
+    pub forward_coating: Option<ForwardCoatingMaterial>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -470,6 +485,35 @@ pub struct TransmissionMaterial {
     /// `(roughness, metalness, _, _)` paired with each decoded colour.
     pub surfaces: [[f32; 4]; 2],
     pub color_count: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForwardCoatingMaterial {
+    /// Linear PS t1 procedural response sampled with object-space triplanar UVs.
+    pub detail: TagHash,
+    /// PS t2 authored environment cubemap. Quicktag uses scene IBL for preview
+    /// lighting but retains this dependency as part of material evidence.
+    pub environment: TagHash,
+    /// Authored PS sampler bound to the local environment cubemap at s2.
+    pub environment_sampler: TagHash,
+    pub colors: [[f32; 4]; 2],
+    pub incidence_remap: [f32; 2],
+    pub coverage: f32,
+    pub projection: [f32; 4],
+    pub projection_exponent: f32,
+    pub detail_remap: [f32; 2],
+    pub response_remap: [f32; 2],
+    /// Minimum/maximum authored mip floor selected by the detail response.
+    pub environment_lod: [f32; 2],
+    pub environment_remap: [f32; 2],
+    pub environment_strength: f32,
+    /// `(base scale, base bias, _, _)` applied before the local cubemap term.
+    pub environment_params: [f32; 4],
+    pub specular_colors: [[f32; 4]; 2],
+    pub specular_exponents: [f32; 2],
+    pub specular_strengths: [f32; 2],
+    /// Normal-direction scales used by the two authored grazing lobes.
+    pub lobe_direction_scales: [f32; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +668,8 @@ impl Default for WireframeMaterialTextures {
             gear_dye: None,
             gear_dye_default: None,
             gear_dye_palette: None,
+            gear_worn_dye_palette: None,
+            gear_dye_detail_palette: None,
             mod_wear: None,
             surface_condition: None,
             gear_pattern: None,
@@ -632,7 +678,9 @@ impl Default for WireframeMaterialTextures {
             emissive_strength: 0,
             solid_color: None,
             solid_surface: None,
+            iridescence_id: None,
             transmission: None,
+            forward_coating: None,
         }
     }
 }
@@ -950,7 +998,8 @@ impl GeometryTagPreview {
         let attachment_poses = explicit_geometry_by_attachment
             .iter()
             .map(
-                |(_attachment, geometry, pose, rarity, unique_id)| ResolvedWeaponModAttachment {
+                |(attachment, geometry, pose, rarity, unique_id)| ResolvedWeaponModAttachment {
+                    pattern: *attachment,
                     geometry: *geometry,
                     pose: *pose,
                     rarity: *rarity,
@@ -987,6 +1036,12 @@ const PATTERN_LOCAL_SCOPE_HASH: u32 = 0x811C9DC5;
 const GEAR_DYE_COLOR_PARAMETERS: [u32; 6] = [
     0x1B3D64F3, 0x1B3D64F6, 0x1B3D64F0, 0x1B3D64F1, 0x1B3D64F7, 0x1B3D64F4,
 ];
+const GEAR_WORN_DYE_COLOR_PARAMETERS: [u32; 6] = [
+    0xC8939EBF, 0xC8939EBA, 0xC8939EBC, 0xC8939EBD, 0xC8939EBB, 0xC8939EB8,
+];
+const GEAR_DYE_DETAIL_COLOR_PARAMETERS: [u32; 6] = [
+    0x3CC0E32F, 0x3CC0E32A, 0x3CC0E32C, 0x3CC0E32D, 0x3CC0E32B, 0x3CC0E328,
+];
 const GEAR_DYE_ROUGHNESS_PARAMETERS: [u32; 6] = [
     0xBF1554A8, 0xBF1554AA, 0xBF1554AB, 0xBF1554AD, 0xBF1554AC, 0xBF1554AF,
 ];
@@ -996,6 +1051,7 @@ const GEAR_DYE_METAL_PARAMETERS: [u32; 6] = [
 
 #[derive(Debug, Clone, Copy)]
 struct ResolvedWeaponModAttachment {
+    pattern: TagHash,
     geometry: TagHash,
     pose: WeaponModAttachmentPose,
     rarity: Option<WeaponModRarity>,
@@ -2864,16 +2920,19 @@ fn load_model_preview_from_tags(
         .map(|attachment| {
             (
                 attachment.geometry,
-                (attachment.rarity, attachment.unique_id),
+                (attachment.pattern, attachment.rarity, attachment.unique_id),
             )
         })
         .collect::<rustc_hash::FxHashMap<_, _>>();
     let gear_dye_palette = (!attached_geometry.is_empty())
         .then(|| weapon_skin_gear_dye_palette(&cache, tag))
         .flatten();
+    let gear_worn_dye_palette = (!attached_geometry.is_empty())
+        .then(|| pattern_gear_dye_color_contribution(&cache, tag, GEAR_WORN_DYE_COLOR_PARAMETERS))
+        .flatten();
     for (model_tag, _source, wireframe) in &mut parsed {
         assign_wireframe_material_textures(wireframe, &cache, &textures);
-        if let Some((rarity, unique_id)) = attached_geometry.get(model_tag).copied() {
+        if let Some((_pattern, rarity, unique_id)) = attached_geometry.get(model_tag).copied() {
             for range in &mut wireframe.material_ranges {
                 if let Some(wear) = &mut range.textures.mod_wear {
                     wear.rarity = rarity;
@@ -2884,10 +2943,20 @@ fn load_model_preview_from_tags(
         if attached_geometry.contains_key(model_tag)
             && let Some(palette) = gear_dye_palette
         {
-            // A selected skin supplies all six GearDye object channels. Mod
-            // Patterns consume those exact materials; their other local
-            // vectors are fallback/category data and must not be promoted to
-            // a color offset.
+            let detail_palette =
+                attached_geometry
+                    .get(model_tag)
+                    .and_then(|(pattern, _rarity, _unique_id)| {
+                        pattern_gear_dye_color_contribution(
+                            &cache,
+                            *pattern,
+                            GEAR_DYE_DETAIL_COLOR_PARAMETERS,
+                        )
+                    });
+            // The compiled GearDye outputs are the exact sum of three
+            // independently-authored channels. Base Dye is inherited from the
+            // selected skin, Worn Dye may also be inherited, and Dye Detail is
+            // local to the attached mod Pattern.
             let attachment_palette = palette;
             for range in &mut wireframe.material_ranges {
                 let Some(default) = range.technique.and_then(technique_default_gear_dye_color)
@@ -2901,6 +2970,8 @@ fn load_model_preview_from_tags(
                     range.textures.gear_dye = Some(dye);
                     range.textures.gear_dye_default = Some(default);
                     range.textures.gear_dye_palette = Some(attachment_palette);
+                    range.textures.gear_worn_dye_palette = gear_worn_dye_palette;
+                    range.textures.gear_dye_detail_palette = detail_palette;
                 }
             }
         }
@@ -4590,6 +4661,75 @@ fn weapon_skin_gear_dye_palette_with_source(
     None
 }
 
+/// Resolves one six-channel GearDye contribution from authored Pattern object
+/// channels. Worn Dye may be inherited from the selected skin; Dye Detail is
+/// normally local to the attached mod. The compiled material selects these by
+/// parameter hash, never by serialized vector position.
+fn pattern_gear_dye_color_contribution(
+    cache: &TagCache,
+    root: TagHash,
+    parameters: [u32; 6],
+) -> Option<[[f32; 4]; 6]> {
+    let endian = package_manager().version.endian();
+    let mut values = [None; 6];
+    for (node, _depth) in descendant_pattern_nodes_with_depth(cache, root, 8) {
+        let Ok(data) = package_manager().read_tag(node) else {
+            continue;
+        };
+        for channel_array in scan_arrays(&data, endian)
+            .into_iter()
+            .filter(|array| array.class == CLASS_PATTERN_OBJECT_CHANNELS)
+        {
+            for (index, record) in array_records(&data, channel_array, 0x70)
+                .into_iter()
+                .enumerate()
+            {
+                let Some(parameter) = read_u32_at(record, 0, endian) else {
+                    continue;
+                };
+                let Some(slot) = parameters
+                    .iter()
+                    .position(|candidate| *candidate == parameter)
+                else {
+                    continue;
+                };
+                if values[slot].is_some() {
+                    continue;
+                }
+                let record_offset = channel_array.data_offset + index * 0x70;
+                let Some(constants) = read_array(&data, record_offset + 0x18, 0x10, endian) else {
+                    continue;
+                };
+                // These contribution records are constant TFX expressions.
+                // Reject compound expressions instead of treating an arbitrary
+                // literal pool entry as the channel output.
+                if constants.len() != 0x10
+                    || read_array(&data, record_offset + 0x08, 1, endian)
+                        .is_none_or(|bytecode| bytecode.is_empty())
+                {
+                    continue;
+                }
+                let Some(mut value) = read_vec4_f32(constants, 0, endian) else {
+                    continue;
+                };
+                if value[..3]
+                    .iter()
+                    .any(|component| !component.is_finite() || !(-4.0..=4.0).contains(component))
+                {
+                    continue;
+                }
+                value[3] = 0.0;
+                values[slot] = Some(value);
+            }
+        }
+    }
+    values
+        .into_iter()
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()
+}
+
 fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 6]> {
     decode_weapon_skin_gear_dye_palette_with_source(data).map(|(palette, _object_channels)| palette)
 }
@@ -5641,7 +5781,12 @@ fn material_textures_for_technique(
     }
 
     promote_auxiliary_preview_color(&mut material, technique);
-    material.transmission = transmission_material_for_technique(technique);
+    material.forward_coating = forward_coating_material_for_technique(technique);
+    material.transmission = material
+        .forward_coating
+        .is_none()
+        .then(|| transmission_material_for_technique(technique))
+        .flatten();
 
     if material.color.is_none()
         && let Some(flat) = textureless_flat_material_for_technique(technique)
@@ -5656,6 +5801,120 @@ fn material_textures_for_technique(
     }
 
     material
+}
+
+/// Decode Tiger's authored forward-coating ABI.
+///
+/// Signature is deliberately narrow: dedicated PS, premultiplied stage state,
+/// direct linear-detail/cubemap resources, fixed material block, and TFX
+/// coverage driven by object channel 0x37CD36CF. Only material ranges that
+/// author this shader contract receive coating.
+fn forward_coating_material_for_technique(technique: TagHash) -> Option<ForwardCoatingMaterial> {
+    const FORWARD_COATING_PS: TagHash = TagHash(0x80A9FBAC);
+    const COVERAGE_OBJECT_CHANNEL: u32 = 0x37CD36CF;
+
+    if render_state_for_technique(technique).blend != Some(8) {
+        return None;
+    }
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    if pixel.shader != Some(FORWARD_COATING_PS) || pixel.inline_constants.len() < 44 {
+        return None;
+    }
+
+    let bindings = texture_bindings_for_technique(&entry, &data)
+        .into_iter()
+        .filter(|binding| binding.stage == "PS")
+        .collect_vec();
+    let detail = bindings.iter().find(|binding| binding.slot == 1)?.tag;
+    let environment = bindings.iter().find(|binding| binding.slot == 2)?.tag;
+    let environment_sampler = sampler_for_technique_slot(&entry, &data, "PS", 2)?;
+    if Texture::load_desc(detail).ok()?.kind() != crate::texture::TextureType::Texture2D
+        || Texture::load_desc(environment).ok()?.kind() != crate::texture::TextureType::TextureCube
+    {
+        return None;
+    }
+
+    let constants = &pixel.inline_constants;
+    let finite = |value: &[f32; 4]| value.iter().all(|component| component.is_finite());
+    for index in [
+        15, 16, 17, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 41, 42, 43,
+    ] {
+        if !finite(constants.get(index)?) {
+            return None;
+        }
+    }
+    let projection_exponent = constants[15][0];
+    let incidence_remap = [constants[24][0], constants[24][1]];
+    let authored_coverage = constants[25][0];
+    let lobe_direction_scales = [constants[39][0], constants[43][0]];
+    if !(1.0..=128.0).contains(&projection_exponent)
+        || constants[16][0].abs() <= 0.0001
+        || constants[16][1].abs() <= 0.0001
+        || !(0.0..=4.0).contains(&incidence_remap[0])
+        || !(0.0..=1.0).contains(&authored_coverage)
+        || !(0.0..=4.0).contains(&lobe_direction_scales[0])
+        || !(0.0..=4.0).contains(&lobe_direction_scales[1])
+    {
+        return None;
+    }
+
+    let channel = format!("0x{COVERAGE_OBJECT_CHANNEL:08X}");
+    let coverage_channel = pixel
+        .bytecode
+        .ops
+        .iter()
+        .any(|op| op.name == "push_object_channel" && op.detail == channel);
+    let coverage_output = pixel.bytecode.expressions.iter().any(|expression| {
+        expression.target == "output[131]"
+            && expression.expression.contains("spline4_const")
+            && expression
+                .expression
+                .contains(&format!("object_channel({channel})"))
+    });
+    if !coverage_channel || !coverage_output {
+        return None;
+    }
+    let object_channels = std::collections::HashMap::from([(COVERAGE_OBJECT_CHANNEL, [1.0; 4])]);
+    let (_, expressions) = interpret_tfx_stack_with_object_channels(
+        &pixel.bytecode.ops,
+        &pixel.constants,
+        &object_channels,
+    );
+    let coverage_input = expressions
+        .iter()
+        .find(|expression| expression.target == "output[131]")
+        .and_then(|expression| expression.value)?[0];
+    if !coverage_input.is_finite() {
+        return None;
+    }
+
+    Some(ForwardCoatingMaterial {
+        detail,
+        environment,
+        environment_sampler,
+        colors: [
+            [constants[22][0], constants[22][1], constants[22][2], 1.0],
+            [constants[23][0], constants[23][1], constants[23][2], 1.0],
+        ],
+        incidence_remap,
+        coverage: (authored_coverage * coverage_input).clamp(0.0, 1.0),
+        projection: constants[16],
+        projection_exponent,
+        detail_remap: [constants[17][0], constants[17][1]],
+        response_remap: [constants[31][0], constants[31][1]],
+        environment_lod: [constants[29][0], constants[30][0]],
+        environment_remap: [constants[32][0], constants[32][1]],
+        environment_strength: constants[33][0],
+        environment_params: constants[34],
+        specular_colors: [constants[36], constants[40]],
+        specular_exponents: [constants[37][0], constants[41][0]],
+        specular_strengths: [constants[38][0], constants[42][0]],
+        lobe_direction_scales,
+    })
 }
 
 /// Decode common stage-8 transmission material block.
@@ -5887,8 +6146,9 @@ fn direct_shared_color_atlas_for_technique(
 
 /// Decode the common two-texture shared-atlas surface ABI.
 ///
-/// Its compiled pixel shader writes `t0.rgb * (base + scale * triplanar(t1))`
-/// to RT0. Recognize the binding/constant shape, never a weapon or tag hash.
+/// Its compiled pixel shader writes
+/// `t0.rgb * saturate(base + scale * triplanar(t1)) * 4.5947933` to RT0.
+/// Recognize the binding/constant shape, never a weapon or tag hash.
 fn shared_atlas_detail_material(
     technique: TagHash,
     bindings: &[TechniqueTextureBinding],
@@ -5924,6 +6184,7 @@ fn shared_atlas_detail_material(
             exponent,
             base: [base[0], base[1], base[2]],
             scale: [scale[0], scale[1], scale[2]],
+            ambient_occlusion: 0.5,
         })
 }
 
@@ -10508,14 +10769,23 @@ mod tests {
             supplemental.textures.solid_color,
             Some([0.44368514, 0.18800727, 0.035853356, 1.0])
         );
+        assert_eq!(supplemental.textures.transmission, None);
+        let coating = supplemental
+            .textures
+            .forward_coating
+            .expect("shader-proven forward coating");
+        assert_eq!(coating.detail, TagHash(0x80A60055));
         assert_eq!(
-            supplemental.textures.transmission,
-            Some(TransmissionMaterial {
-                colors: [[0.44368514, 0.18800727, 0.035853356, 1.0]; 2],
-                surfaces: [[0.54, 0.08, 0.0, 0.0]; 2],
-                color_count: 1,
-            })
+            coating.colors[0],
+            [0.44368514, 0.18800727, 0.035853356, 1.0]
         );
+        assert_eq!(coating.colors[1], [0.8570913, 0.21592966, 0.0, 1.0]);
+        assert_eq!(coating.incidence_remap, [1.3333334, 0.0]);
+        assert!((coating.coverage - 0.95).abs() < 0.000001);
+        assert_eq!(coating.projection, [40.0, 40.0, 0.0, 0.0]);
+        assert_eq!(coating.detail_remap, [0.32, 0.68]);
+        assert_eq!(coating.response_remap, [-1.3, 2.3]);
+        assert_eq!(coating.lobe_direction_scales, [0.08, 0.54]);
         assert_eq!(supplemental.textures.solid_surface, Some([0.54, 0.08]));
         assert_eq!(supplemental.textures.gear_dye, None);
         let dark = material_textures_for_technique(TagHash(0x80A9F5CD), &cache, &textures);
@@ -10568,6 +10838,7 @@ mod tests {
         assert_eq!(detail.detail, TagHash(0x80A60055));
         assert_eq!(detail.projection, [15.0, 15.0, 0.0, 0.0]);
         assert_eq!(detail.exponent, 40.0);
+        assert_eq!(detail.ambient_occlusion, 0.5);
     }
 
     #[test]
@@ -13965,6 +14236,9 @@ mod tests {
         std::fs::create_dir_all("target/quicktag-runner-audit").unwrap();
         let requested = std::env::var("QUICKTAG_RUNNER_ABI_CASE").ok();
         for (name, technique) in [
+            ("forward-coating", TagHash(0x80A9FBB1)),
+            ("copperhead-underlay-a", TagHash::new(446, 6867)),
+            ("copperhead-underlay-b", TagHash::new(446, 6877)),
             ("shared-color-atlas", TagHash::new(445, 4734)),
             ("shared-color-atlas-detail", TagHash::new(333, 6350)),
             ("emerald-character", TagHash(0x80A9F4F2)),
@@ -14127,6 +14401,22 @@ mod tests {
                     .filter(|(_, value)| value.iter().any(|channel| channel.abs() > 0.000001))
                     .collect_vec(),
             );
+            if name == "forward-coating" {
+                eprintln!(
+                    "FORWARD_COATING_TFX constants={:?} texture_bindings={:?} expressions={:?}",
+                    pixel.constants,
+                    crate::material::tfx_texture_bindings_for_technique(&entry, &data),
+                    pixel
+                        .bytecode
+                        .expressions
+                        .iter()
+                        .filter(|expression| matches!(
+                            expression.target.as_str(),
+                            "output[2]" | "output[129]" | "output[130]" | "output[131]"
+                        ))
+                        .collect_vec(),
+                );
+            }
             if let Some(vertex) = preview.stages.iter().find(|stage| stage.stage == "VS") {
                 eprintln!(
                     "RUNNER_VS name={name} shader={:?} bindings={:?} constants={:?}",
@@ -17139,6 +17429,7 @@ mod tests {
         };
         let half_sqrt = std::f32::consts::FRAC_1_SQRT_2;
         let attachment = ResolvedWeaponModAttachment {
+            pattern: TagHash(0x80800001),
             geometry,
             pose: WeaponModAttachmentPose {
                 family_id: 0,
@@ -17678,11 +17969,45 @@ mod tests {
         init_goliath_test_package_manager();
         let cache = Arc::new(quicktag_scanner::load_tag_cache());
 
-        for (root, expected_technique) in [
-            (TagHash(0x80A601B6), TagHash(0x80A601A2)),
-            (TagHash(0x80A60313), TagHash(0x80A602FF)),
+        for (root, expected_technique, expected_procedural_scale) in [
+            (TagHash(0x80A601B6), TagHash(0x80A601A2), None),
+            (TagHash(0x80A60313), TagHash(0x80A602FF), None),
+            (
+                TagHash(0x80A6071A),
+                TagHash(0x80A60706),
+                Some(0.05579831_f32),
+            ),
+            (
+                TagHash(0x80A61008),
+                TagHash(0x80A60FF2),
+                Some(0.13407558_f32),
+            ),
         ] {
+            let technique_entry = package_manager()
+                .get_entry(expected_technique)
+                .expect("wear technique");
+            let technique_data = package_manager()
+                .read_tag(expected_technique)
+                .expect("wear technique data");
+            let preview =
+                MaterialTagPreview::load(&technique_entry, &technique_data).expect("wear preview");
+            let MaterialPreviewKind::Technique(preview) = preview.kind;
+            let pixel = preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .expect("wear PS");
+            // Common shader also binds t8, but its contribution is multiplied
+            // by c101*c102*c103. Audited wear techniques author a zero gate;
+            // t8 is therefore not a hidden fourth wear/color layer.
+            assert!(
+                [101_usize, 102, 103]
+                    .into_iter()
+                    .any(|index| pixel.inline_constants[index][0].abs() <= f32::EPSILON),
+                "{root} activates an additional common-surface layer; decode it before rendering"
+            );
             let mut wear_materials = Vec::new();
+            let mut procedural_scales = Vec::new();
             let mut surface_normals = Vec::new();
             let mut resolved_techniques = Vec::new();
             for geometry in pattern_nearest_geometry_tags(&cache, root) {
@@ -17704,6 +18029,13 @@ mod tests {
                         .iter()
                         .filter_map(|range| range.textures.mod_wear),
                 );
+                procedural_scales.extend(
+                    wireframe
+                        .material_ranges
+                        .iter()
+                        .filter(|range| range.textures.mod_wear.is_some())
+                        .map(|range| range.procedural_scale),
+                );
                 surface_normals.extend(
                     wireframe
                         .material_ranges
@@ -17719,6 +18051,20 @@ mod tests {
             );
             assert!(!wear_materials.is_empty(), "{root} has no wear material");
             assert!(
+                procedural_scales
+                    .iter()
+                    .all(|scale| scale.is_finite() && *scale > 0.0),
+                "{root} lost scope_skinning[5].w: {procedural_scales:?}"
+            );
+            if let Some(expected) = expected_procedural_scale {
+                assert!(
+                    procedural_scales
+                        .iter()
+                        .any(|actual| (*actual - expected).abs() < 0.000_001),
+                    "{root} procedural scales {procedural_scales:?}, expected {expected}"
+                );
+            }
+            assert!(
                 !surface_normals.is_empty(),
                 "{root} lost authored normal maps"
             );
@@ -17729,6 +18075,12 @@ mod tests {
                 "{root} incorrectly promoted an engine fallback texture to a material normal: {surface_normals:?}"
             );
             for wear in wear_materials {
+                assert!(
+                    [wear.scratches, wear.grime, wear.damage]
+                        .into_iter()
+                        .all(texture_is_srgb),
+                    "{root} common wear maps must retain their package-authored sRGB views"
+                );
                 assert_eq!(wear.scratches_projection, [4.0, -4.0, 0.0, 0.0]);
                 assert_eq!(wear.scratches_remap_base, [0.0, 0.0, 0.0, 1.0]);
                 assert_eq!(
@@ -17751,6 +18103,38 @@ mod tests {
                     assert!(projection.iter().all(|value| value.is_finite()));
                     assert!(projection[0].abs() > 0.05 && projection[1].abs() > 0.05);
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages"]
+    fn resolves_mod_local_gear_dye_detail_channels_by_parameter_hash() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let expected = [
+            [0.057606, 0.057606, 0.057606, 0.0],
+            [0.044002, 0.044544, 0.052406, 0.0],
+            [0.166145, 0.182873, 0.200284, 0.0],
+            [0.032233, 0.032233, 0.032233, 0.0],
+            [0.088628, 0.084530, 0.092983, 0.0],
+            [0.245272, 0.245272, 0.245272, 0.0],
+        ];
+        for pattern in [TagHash(0x80A6071A), TagHash(0x80A61008)] {
+            let actual = pattern_gear_dye_color_contribution(
+                &cache,
+                pattern,
+                GEAR_DYE_DETAIL_COLOR_PARAMETERS,
+            )
+            .expect("compiled GearDye mod must expose all six Dye Detail channels");
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!(
+                    actual
+                        .into_iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| (actual - expected).abs() < 0.000_01),
+                    "{pattern} resolved {actual:?}, expected {expected:?}"
+                );
             }
         }
     }
