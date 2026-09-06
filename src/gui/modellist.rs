@@ -28,7 +28,7 @@ use super::gear::{
 };
 use super::model_renderer::{
     GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelExportCamera,
-    ModelPaintCallback,
+    ModelPaintCallback, model_direction_to_view, view_direction_to_model,
 };
 use super::{View, ViewAction};
 
@@ -1560,16 +1560,16 @@ fn mod_option_button(ui: &mut egui::Ui, modification: &ModelModEntry) -> egui::R
     )
 }
 
-fn normalize_light_position(position: &mut [f32; 3]) {
-    let length = position
+fn normalize_direction(direction: &mut [f32; 3], fallback: [f32; 3]) {
+    let length = direction
         .iter()
         .map(|value| value * value)
         .sum::<f32>()
         .sqrt();
     if length <= 0.0001 {
-        *position = ModelEnvironment::default().light_position;
+        *direction = fallback;
     } else {
-        position.iter_mut().for_each(|value| *value /= length);
+        direction.iter_mut().for_each(|value| *value /= length);
     }
 }
 
@@ -1705,10 +1705,13 @@ pub(super) fn model_wireframe_ui(
                 ui.checkbox(&mut environment.light_gizmo, "Orbit gizmo");
                 if ui.button("Reset lighting").clicked() {
                     let defaults = ModelEnvironment::default();
-                    environment.light_position = defaults.light_position;
+                    environment.light_target = defaults.light_target;
+                    environment.light_orbit_position = defaults.light_orbit_position;
+                    environment.light_orbit_center = defaults.light_orbit_center;
                     environment.light_orbit_radius = defaults.light_orbit_radius;
                     environment.light_size = defaults.light_size;
                     environment.shadow_strength = defaults.shadow_strength;
+                    environment.shadow_softness = defaults.shadow_softness;
                     environment.sun_intensity = defaults.sun_intensity;
                     environment.ambient_intensity = defaults.ambient_intensity;
                     environment.specular_ibl_intensity = defaults.specular_ibl_intensity;
@@ -1788,28 +1791,35 @@ pub(super) fn model_wireframe_ui(
                         }
                     });
             });
-            ui.label("Drag the yellow light on the orbit sphere, or edit its axes.");
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.light_position[0],
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit X"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.light_position[1],
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit Y"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.light_position[2],
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit Z"),
-            );
+            ui.label("Directional light target (world space)");
+            for axis in 0..3 {
+                ui.add(
+                    egui::Slider::new(
+                        &mut environment.light_target[axis],
+                        MODEL_PARAMETER_RANGE.clone(),
+                    )
+                    .text(["Target X", "Target Y", "Target Z"][axis]),
+                );
+            }
+            ui.separator();
+            ui.label("Orbit transform");
+            ui.label("Point on sphere");
+            for axis in 0..3 {
+                ui.add(
+                    egui::Slider::new(&mut environment.light_orbit_position[axis], -1.0..=1.0)
+                        .text(["Point X", "Point Y", "Point Z"][axis]),
+                );
+            }
+            ui.label("Sphere center");
+            for axis in 0..3 {
+                ui.add(
+                    egui::Slider::new(
+                        &mut environment.light_orbit_center[axis],
+                        MODEL_PARAMETER_RANGE.clone(),
+                    )
+                    .text(["Center X", "Center Y", "Center Z"][axis]),
+                );
+            }
             ui.add(
                 egui::Slider::new(&mut environment.light_orbit_radius, 0.25..=10.0)
                     .text("Orbit radius"),
@@ -1924,29 +1934,62 @@ pub(super) fn model_wireframe_ui(
     let size = vec2(available.x.max(320.0), available.y.clamp(320.0, 620.0));
     let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
 
-    let mut gizmo_light_position = environment.light_position;
-    normalize_light_position(&mut gizmo_light_position);
-    let gizmo_center = rect.center() + *pan;
-    let gizmo_radius = rect
-        .width()
-        .min(rect.height())
-        .mul_add(0.32 * environment.light_orbit_radius, 0.0)
-        .max(24.0);
-    let light_handle = gizmo_center
+    let defaults = ModelEnvironment::default();
+    let mut orbit_position = environment.light_orbit_position;
+    normalize_direction(&mut orbit_position, defaults.light_orbit_position);
+    let orbit_view = model_direction_to_view(orbit_position, *yaw, *pitch);
+    let center_view = model_direction_to_view(environment.light_orbit_center, *yaw, *pitch);
+    let light_world_position: [f32; 3] = std::array::from_fn(|axis| {
+        environment.light_orbit_center[axis] + orbit_position[axis] * environment.light_orbit_radius
+    });
+    let mut cast_direction =
+        std::array::from_fn(|axis| environment.light_target[axis] - light_world_position[axis]);
+    let cast_length = cast_direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    normalize_direction(&mut cast_direction, [0.276, -0.627, -0.728]);
+    let cast_view = model_direction_to_view(cast_direction, *yaw, *pitch);
+    let viewport_center = rect.center() + *pan;
+    let world_scale = rect.width().min(rect.height()) * 0.24;
+    let gizmo_center =
+        viewport_center + vec2(-center_view[0] * world_scale, -center_view[1] * world_scale);
+    let gizmo_radius = (world_scale * environment.light_orbit_radius).max(24.0);
+    let light_handle =
+        gizmo_center + vec2(-orbit_view[0] * gizmo_radius, -orbit_view[1] * gizmo_radius);
+    let direction_length = (gizmo_radius * 0.65).clamp(42.0, 140.0);
+    let direction_handle = light_handle
         + vec2(
-            -gizmo_light_position[0] * gizmo_radius,
-            -gizmo_light_position[1] * gizmo_radius,
+            -cast_view[0] * direction_length,
+            -cast_view[1] * direction_length,
         );
     let light_handle_radius = (6.0 * environment.light_size.sqrt()).clamp(5.0, 12.0);
-    let light_gizmo_response = environment.light_gizmo.then(|| {
+    let orbit_gizmo_response = environment.light_gizmo.then(|| {
         ui.interact(
             egui::Rect::from_center_size(light_handle, vec2(32.0, 32.0)),
-            ui.id().with("model_light_orbit_gizmo"),
+            ui.id().with("model_light_orbit_point"),
             Sense::drag(),
         )
-        .on_hover_text("Drag light around mesh")
+        .on_hover_text("Move light transform on orbit sphere")
     });
-    if let Some(gizmo) = &light_gizmo_response
+    let direction_gizmo_response = environment.light_gizmo.then(|| {
+        ui.interact(
+            egui::Rect::from_center_size(direction_handle, vec2(28.0, 28.0)),
+            ui.id().with("model_light_direction"),
+            Sense::drag(),
+        )
+        .on_hover_text("Move directional-light target")
+    });
+    let center_gizmo_response = environment.light_gizmo.then(|| {
+        ui.interact(
+            egui::Rect::from_center_size(gizmo_center, vec2(26.0, 26.0)),
+            ui.id().with("model_light_orbit_center"),
+            Sense::drag(),
+        )
+        .on_hover_text("Move orbit-sphere center")
+    });
+    if let Some(gizmo) = &orbit_gizmo_response
         && gizmo.dragged()
         && let Some(pointer) = gizmo.interact_pointer_pos()
     {
@@ -1959,19 +2002,65 @@ pub(super) fn model_wireframe_ui(
         } else {
             (x, y)
         };
-        let z_sign = if environment.light_position[2] < 0.0 {
-            -1.0
+        let z_sign = if orbit_view[2] < 0.0 { -1.0 } else { 1.0 };
+        environment.light_orbit_position = view_direction_to_model(
+            [x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign],
+            *yaw,
+            *pitch,
+        );
+        ui.ctx().request_repaint();
+    }
+    if let Some(gizmo) = &direction_gizmo_response
+        && gizmo.dragged()
+        && let Some(pointer) = gizmo.interact_pointer_pos()
+    {
+        let offset = pointer - light_handle;
+        let x = (-offset.x / direction_length).clamp(-1.0, 1.0);
+        let y = (-offset.y / direction_length).clamp(-1.0, 1.0);
+        let planar_length = (x * x + y * y).sqrt();
+        let (x, y) = if planar_length > 1.0 {
+            (x / planar_length, y / planar_length)
         } else {
-            1.0
+            (x, y)
         };
-        environment.light_position = [x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign];
+        let z_sign = if cast_view[2] < 0.0 { -1.0 } else { 1.0 };
+        let cast_direction = view_direction_to_model(
+            [x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign],
+            *yaw,
+            *pitch,
+        );
+        let target_distance = cast_length.max(0.25);
+        environment.light_target = std::array::from_fn(|axis| {
+            light_world_position[axis] + cast_direction[axis] * target_distance
+        });
+        ui.ctx().request_repaint();
+    }
+    if let Some(gizmo) = &center_gizmo_response
+        && gizmo.dragged()
+        && let Some(pointer) = gizmo.interact_pointer_pos()
+    {
+        let offset = pointer - viewport_center;
+        environment.light_orbit_center = view_direction_to_model(
+            [
+                -offset.x / world_scale,
+                -offset.y / world_scale,
+                center_view[2],
+            ],
+            *yaw,
+            *pitch,
+        );
         ui.ctx().request_repaint();
     }
 
     let pointer_delta = ui.input(|i| i.pointer.delta());
-    let dragging_light = light_gizmo_response
-        .as_ref()
-        .is_some_and(|gizmo| gizmo.dragged() || gizmo.hovered());
+    let dragging_light = [
+        orbit_gizmo_response.as_ref(),
+        direction_gizmo_response.as_ref(),
+        center_gizmo_response.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|gizmo| gizmo.dragged() || gizmo.hovered());
 
     if response.dragged_by(egui::PointerButton::Primary) && !dragging_light {
         // Left mouse button: horizontal rotation only
@@ -2061,6 +2150,14 @@ pub(super) fn model_wireframe_ui(
             [gizmo_center, light_handle],
             Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 220, 105, 170)),
         );
+        painter.line_segment(
+            [gizmo_center - vec2(7.0, 0.0), gizmo_center + vec2(7.0, 0.0)],
+            Stroke::new(1.5, Color32::from_rgb(115, 210, 255)),
+        );
+        painter.line_segment(
+            [gizmo_center - vec2(0.0, 7.0), gizmo_center + vec2(0.0, 7.0)],
+            Stroke::new(1.5, Color32::from_rgb(115, 210, 255)),
+        );
         painter.circle_filled(
             light_handle,
             light_handle_radius,
@@ -2071,6 +2168,12 @@ pub(super) fn model_wireframe_ui(
             light_handle_radius,
             Stroke::new(1.5, Color32::WHITE),
         );
+        painter.arrow(
+            light_handle,
+            direction_handle - light_handle,
+            Stroke::new(2.0, Color32::from_rgb(255, 126, 82)),
+        );
+        painter.circle_filled(direction_handle, 4.5, Color32::from_rgb(255, 126, 82));
     }
 
     let Some(projected) =

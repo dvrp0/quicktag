@@ -727,6 +727,7 @@ struct SceneUniform {
     params1: [f32; 4],
     uv_transform: [f32; 4],
     light_direction: [f32; 4],
+    light_parameters: [f32; 4],
     postprocess0: [f32; 4],
     postprocess1: [f32; 4],
     postprocess2: [f32; 4],
@@ -763,7 +764,12 @@ pub(crate) struct ModelEnvironment {
     pub tone_mapping: bool,
     pub ambient_intensity: f32,
     pub specular_ibl_intensity: f32,
-    pub light_position: [f32; 3],
+    /// World-space point toward which the directional-light transform faces.
+    pub light_target: [f32; 3],
+    /// Unit world-space offset locating the light transform on its orbit sphere.
+    pub light_orbit_position: [f32; 3],
+    /// World-space center of the light transform's orbit sphere.
+    pub light_orbit_center: [f32; 3],
     pub light_orbit_radius: f32,
     pub light_size: f32,
     pub light_gizmo: bool,
@@ -820,7 +826,11 @@ impl Default for ModelEnvironment {
             tone_mapping: true,
             ambient_intensity: 0.2,
             specular_ibl_intensity: 0.3,
-            light_position: [-0.276, 0.728, 0.627], // -0.276 0.728 0.627
+            // The default orbit point faces the world origin, preserving the
+            // historical directional-light orientation.
+            light_target: [0.0; 3],
+            light_orbit_position: [-0.276, 0.627, 0.728],
+            light_orbit_center: [0.0; 3],
             light_orbit_radius: 1.0,
             light_size: 5.0,
             light_gizmo: false,
@@ -837,18 +847,18 @@ impl Default for ModelEnvironment {
 
 fn first_person_key_light(
     time_of_day: f32,
-    position: [f32; 3],
+    cast_direction: [f32; 3],
     shadow_strength: f32,
 ) -> ([f32; 4], f32) {
     let sun_angle = time_of_day.rem_euclid(1.0) * std::f32::consts::TAU;
     let sun_height = (sun_angle - std::f32::consts::FRAC_PI_2).sin();
-    let length = position
+    let length = cast_direction
         .into_iter()
         .map(|value| value * value)
         .sum::<f32>()
         .sqrt();
     let direction = if length > 0.0001 {
-        position.map(|value| value / length)
+        cast_direction.map(|value| -value / length)
     } else {
         [0.42, 0.89, 0.16]
     };
@@ -863,16 +873,51 @@ fn first_person_key_light(
     )
 }
 
-fn physical_light_controls(orbit_radius: f32, light_size: f32, shadow_softness: f32) -> (f32, f32) {
-    // Distance and emitter radius share model-radius units. Preserve the
-    // established default render (radius 1, size 5), while making both UI
-    // controls affect the image instead of only resizing the gizmo.
-    let distance = orbit_radius.abs().clamp(0.25, 10.0);
-    let intensity_attenuation = (1.0 / (distance * distance)).clamp(0.04, 16.0);
-    let angular_size = light_size.clamp(0.0, 10.0) / distance;
-    let effective_shadow_softness =
-        (shadow_softness.clamp(0.0, 1.0) + (angular_size - 5.0) * 0.08).clamp(0.0, 1.0);
-    (intensity_attenuation, effective_shadow_softness)
+fn directional_light_softness(light_size: f32, shadow_softness: f32) -> f32 {
+    // Directional lights have angular size, never physical distance. Keep the
+    // established size-5 render while allowing size to widen/narrow penumbrae.
+    (shadow_softness.clamp(0.0, 1.0) + (light_size.clamp(0.0, 10.0) - 5.0) * 0.08).clamp(0.0, 1.0)
+}
+
+fn directional_light_cast_direction(environment: &ModelEnvironment) -> [f32; 3] {
+    let mut orbit_direction = environment.light_orbit_position;
+    let orbit_length = orbit_direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if orbit_length <= 0.0001 {
+        orbit_direction = ModelEnvironment::default().light_orbit_position;
+    } else {
+        orbit_direction
+            .iter_mut()
+            .for_each(|value| *value /= orbit_length);
+    }
+    let light_position: [f32; 3] = std::array::from_fn(|axis| {
+        environment.light_orbit_center[axis]
+            + orbit_direction[axis] * environment.light_orbit_radius.max(0.0)
+    });
+    std::array::from_fn(|axis| environment.light_target[axis] - light_position[axis])
+}
+
+pub(crate) fn model_direction_to_view(direction: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let xz = direction[0] * cy + direction[1] * sy;
+    let zz = -direction[0] * sy + direction[1] * cy;
+    [xz, direction[2] * cp - zz * sp, direction[2] * sp + zz * cp]
+}
+
+pub(crate) fn view_direction_to_model(direction: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let z_up_y = direction[1] * cp + direction[2] * sp;
+    let yawed_z = -direction[1] * sp + direction[2] * cp;
+    [
+        direction[0] * cy - yawed_z * sy,
+        direction[0] * sy + yawed_z * cy,
+        z_up_y,
+    ]
 }
 
 #[repr(C)]
@@ -1454,14 +1499,20 @@ impl ModelPaintCallback {
 
         let (light_direction, sun_height) = first_person_key_light(
             environment.time_of_day,
-            environment.light_position,
+            directional_light_cast_direction(&environment),
             environment.shadow_strength,
         );
-        let (light_attenuation, effective_shadow_softness) = physical_light_controls(
-            environment.light_orbit_radius,
-            environment.light_size,
-            environment.shadow_softness,
-        );
+        let mut light_direction = light_direction;
+        let world_light_direction = light_direction[..3]
+            .try_into()
+            .expect("light direction xyz");
+        light_direction[..3].copy_from_slice(&model_direction_to_view(
+            world_light_direction,
+            yaw,
+            pitch,
+        ));
+        let effective_shadow_softness =
+            directional_light_softness(environment.light_size, environment.shadow_softness);
         Self {
             preview,
             target_format: texture_cache.render_state.target_format,
@@ -1485,11 +1536,12 @@ impl ModelPaintCallback {
                     transform.offset[1],
                 ],
                 light_direction,
+                light_parameters: [environment.light_size.clamp(0.0, 10.0), 0.0, 0.0, 0.0],
                 postprocess0: [
                     exposure,
                     environment.bloom_strength,
                     environment.fog_density,
-                    environment.sun_intensity * light_attenuation,
+                    environment.sun_intensity,
                 ],
                 postprocess1: [
                     target_size[0] as f32,
@@ -5510,7 +5562,7 @@ const LIGHTING_SHADER: &str = r#"
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 
 struct VertexOutput {
@@ -5612,6 +5664,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
         let albedo = surface.rgb;
         let roughness = clamp(packed_normal.a, 0.045, 1.0);
+        let key_roughness = clamp(
+            roughness + (scene.light_parameters.x - 5.0) * 0.025,
+            0.02,
+            1.0,
+        );
         let metalness = clamp(properties.r, 0.0, 1.0);
         let ao = clamp(properties.g, 0.0, 1.0);
         let light = normalize(scene.light_direction.xyz);
@@ -5621,11 +5678,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let n_dot_v = max(dot(normal, view), 0.001);
         let n_dot_h = max(dot(normal, halfway), 0.0);
         let v_dot_h = max(dot(view, halfway), 0.0);
-        let alpha = roughness * roughness;
+        let alpha = key_roughness * key_roughness;
         let alpha2 = alpha * alpha;
         let denominator = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0;
         let distribution = alpha2 / max(3.14159265 * denominator * denominator, 0.0001);
-        let k = (roughness + 1.0) * (roughness + 1.0) * 0.125;
+        let k = (key_roughness + 1.0) * (key_roughness + 1.0) * 0.125;
         let visibility_l = n_dot_l / max(n_dot_l * (1.0 - k) + k, 0.0001);
         let visibility_v = n_dot_v / max(n_dot_v * (1.0 - k) + k, 0.0001);
         let f0 = mix(vec3<f32>(0.04), albedo, metalness);
@@ -5812,7 +5869,7 @@ fn fs_blur_vertical(input: VertexOutput) -> @location(0) vec4<f32> {
 const SHADOW_SHADER: &str = r#"
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
 
@@ -5992,6 +6049,7 @@ struct SceneUniform {
     params1: vec4<f32>,
     uv_transform: vec4<f32>,
     light_direction: vec4<f32>,
+    light_parameters: vec4<f32>,
     postprocess0: vec4<f32>,
     postprocess1: vec4<f32>,
     postprocess2: vec4<f32>,
@@ -8899,7 +8957,12 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     );
     let metalness = surface.y;
     let f0 = mix(vec3<f32>(0.03), albedo, metalness);
-    let key_specular = ggx_specular(normal, light, view_direction, roughness, f0);
+    let key_roughness = clamp(
+        roughness + (scene.light_parameters.x - 5.0) * 0.025,
+        0.02,
+        1.0,
+    );
+    let key_specular = ggx_specular(normal, light, view_direction, key_roughness, f0);
     let reflection_direction = reflect(-view_direction, normal);
     let sampled_environment = textureSample(environment_cubemap, environment_sampler, reflection_direction).rgb;
     let environment_luma = dot(sampled_environment, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -9469,7 +9532,7 @@ const PRESENT_SHADER: &str = r#"
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 
 fn reconstruct_view_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -9726,12 +9789,13 @@ mod tests {
         ModelPipelineKey, ModelPipelineResources, PRESENT_SHADER, SHADOW_SHADER, adapt_exposure,
         alpha_mode, blend_enabled, blend_state, bounded_target_size, create_model_pipeline,
         create_model_sampler, create_pipeline_resources, create_target_resources,
-        decode_model_sampler_desc, exposure_target, first_person_key_light, fitted_export_zoom,
+        decode_model_sampler_desc, directional_light_cast_direction, directional_light_softness,
+        exposure_target, first_person_key_light, fitted_export_zoom,
         fitted_export_zoom_for_positions, fitted_export_zoom_for_positions_around,
-        hiz_draw_visible, is_distortion_payload_pass, model_draws, model_orthographic_depth,
-        model_orthographic_view_depth, model_view_depth, physical_light_controls,
+        hiz_draw_visible, is_distortion_payload_pass, model_direction_to_view, model_draws,
+        model_orthographic_depth, model_orthographic_view_depth, model_view_depth,
         project_hiz_vertex, projected_export_bounds, rasterizer_cull_mode, shadow_pipeline_index,
-        smooth_normals, vertex_ambient_occlusion,
+        smooth_normals, vertex_ambient_occlusion, view_direction_to_model,
     };
     use crate::{
         geometry::{
@@ -10088,19 +10152,19 @@ mod tests {
     #[test]
     fn preserves_configured_default_key_light_direction() {
         let environment = ModelEnvironment::default();
+        let cast_direction = directional_light_cast_direction(&environment);
         let (light, _height) = first_person_key_light(
             environment.time_of_day,
-            environment.light_position,
+            cast_direction,
             environment.shadow_strength,
         );
-        let length = environment
-            .light_position
+        let length = cast_direction
             .into_iter()
             .map(|value| value * value)
             .sum::<f32>()
             .sqrt();
         for axis in 0..3 {
-            assert!((light[axis] - environment.light_position[axis] / length).abs() < 0.001);
+            assert!((light[axis] + cast_direction[axis] / length).abs() < 0.001);
         }
         assert_eq!(light[3], 1.0);
         assert!(MODEL_SHADER.contains("view_direction_to_world(scene.light_direction.xyz)"));
@@ -10108,18 +10172,35 @@ mod tests {
     }
 
     #[test]
-    fn light_size_and_orbit_radius_drive_render_controls() {
-        let baseline = physical_light_controls(1.0, 5.0, 0.5);
-        let nearer = physical_light_controls(0.5, 5.0, 0.5);
-        let farther = physical_light_controls(2.0, 5.0, 0.5);
-        let larger = physical_light_controls(1.0, 10.0, 0.5);
-        let smaller = physical_light_controls(1.0, 0.0, 0.5);
+    fn directional_light_transform_is_world_space_and_orbit_aimed() {
+        let direction = [0.276, -0.627, -0.728];
+        for (yaw, pitch) in [(0.0, 0.0), (-0.7, 0.3), (1.2, -0.8)] {
+            let view = model_direction_to_view(direction, yaw, pitch);
+            let restored = view_direction_to_model(view, yaw, pitch);
+            for axis in 0..3 {
+                assert!((restored[axis] - direction[axis]).abs() < 0.000_01);
+            }
+        }
 
-        assert_eq!(baseline, (1.0, 0.5));
-        assert!(nearer.0 > baseline.0 && nearer.1 > baseline.1);
-        assert!(farther.0 < baseline.0 && farther.1 < baseline.1);
-        assert!(larger.1 > baseline.1);
-        assert!(smaller.1 < baseline.1);
+        assert_eq!(directional_light_softness(5.0, 0.5), 0.5);
+        assert!(directional_light_softness(10.0, 0.5) > 0.5);
+        assert!(directional_light_softness(0.0, 0.5) < 0.5);
+
+        let defaults = ModelEnvironment::default();
+        assert_eq!(defaults.light_orbit_radius, 1.0);
+        assert_eq!(defaults.light_orbit_center, [0.0; 3]);
+        assert_eq!(defaults.light_target, [0.0; 3]);
+
+        let baseline = directional_light_cast_direction(&defaults);
+        let mut moved_point = defaults;
+        moved_point.light_orbit_position = [0.0, 1.0, 0.0];
+        assert_ne!(directional_light_cast_direction(&moved_point), baseline);
+        let mut moved_center = defaults;
+        moved_center.light_orbit_center = [1.0, 0.0, 0.0];
+        assert_ne!(directional_light_cast_direction(&moved_center), baseline);
+        let mut moved_target = defaults;
+        moved_target.light_target = [1.0, 0.0, 0.0];
+        assert_ne!(directional_light_cast_direction(&moved_target), baseline);
     }
 
     #[test]
@@ -12424,6 +12505,52 @@ mod tests {
                 value => panic!("unknown QUICKTAG_PROBE_FIDELITY {value}"),
             };
             verification_environment.lighting_model = probe_lighting_model;
+            for (axis, variable) in [
+                (0, "QUICKTAG_PROBE_LIGHT_TARGET_X"),
+                (1, "QUICKTAG_PROBE_LIGHT_TARGET_Y"),
+                (2, "QUICKTAG_PROBE_LIGHT_TARGET_Z"),
+            ] {
+                verification_environment.light_target[axis] =
+                    probe_f32(variable, verification_environment.light_target[axis]);
+            }
+            for (axis, point_variable, center_variable) in [
+                (
+                    0,
+                    "QUICKTAG_PROBE_LIGHT_ORBIT_POINT_X",
+                    "QUICKTAG_PROBE_LIGHT_ORBIT_CENTER_X",
+                ),
+                (
+                    1,
+                    "QUICKTAG_PROBE_LIGHT_ORBIT_POINT_Y",
+                    "QUICKTAG_PROBE_LIGHT_ORBIT_CENTER_Y",
+                ),
+                (
+                    2,
+                    "QUICKTAG_PROBE_LIGHT_ORBIT_POINT_Z",
+                    "QUICKTAG_PROBE_LIGHT_ORBIT_CENTER_Z",
+                ),
+            ] {
+                verification_environment.light_orbit_position[axis] = probe_f32(
+                    point_variable,
+                    verification_environment.light_orbit_position[axis],
+                );
+                verification_environment.light_orbit_center[axis] = probe_f32(
+                    center_variable,
+                    verification_environment.light_orbit_center[axis],
+                );
+            }
+            verification_environment.light_orbit_radius = probe_f32(
+                "QUICKTAG_PROBE_LIGHT_ORBIT_RADIUS",
+                verification_environment.light_orbit_radius,
+            );
+            verification_environment.light_size = probe_f32(
+                "QUICKTAG_PROBE_LIGHT_SIZE",
+                verification_environment.light_size,
+            );
+            verification_environment.shadow_softness = probe_f32(
+                "QUICKTAG_PROBE_SHADOW_SOFTNESS",
+                verification_environment.shadow_softness,
+            );
             let callback = ModelPaintCallback::new(
                 gpu,
                 &texture_cache,

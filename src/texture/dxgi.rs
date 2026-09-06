@@ -206,7 +206,7 @@ impl DxgiFormat {
             // DxgiFormat::R8G8_SNORM => VkFormat::R8G8_SNORM,
             // DxgiFormat::R8G8_SINT => VkFormat::R8G8_SINT,
             DxgiFormat::R8G8B8A8_TYPELESS => wgpu::TextureFormat::Rgba8Unorm,
-            DxgiFormat::R8G8B8A8_UNORM => wgpu::TextureFormat::Rgba8UnormSrgb, // cohae: Bungie interprets non-sRGB rgba8 as sRGB??
+            DxgiFormat::R8G8B8A8_UNORM => wgpu::TextureFormat::Rgba8Unorm,
             DxgiFormat::R8G8B8A8_UNORM_SRGB => wgpu::TextureFormat::Rgba8UnormSrgb,
             DxgiFormat::R8G8B8A8_UINT => wgpu::TextureFormat::Rgba8Uint,
             DxgiFormat::R8G8B8A8_SNORM => wgpu::TextureFormat::Rgba8Snorm,
@@ -1037,5 +1037,23 @@ impl TryFrom<u8> for GcmSurfaceFormat {
             0x81..=0x9F => unsafe { transmute::<u8, GcmSurfaceFormat>(value) },
             e => return Err(anyhow::anyhow!("GCM format is out of range ({e:x})")),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DxgiFormat;
+    use eframe::wgpu;
+
+    #[test]
+    fn preserves_dxgi_unorm_color_space() {
+        assert_eq!(
+            DxgiFormat::R8G8B8A8_UNORM.to_wgpu().unwrap(),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        assert_eq!(
+            DxgiFormat::R8G8B8A8_UNORM_SRGB.to_wgpu().unwrap(),
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        );
     }
 }

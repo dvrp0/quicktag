@@ -304,9 +304,10 @@ impl TagView {
 
         let texture = if tag_type.is_texture() && tag_type.is_header() {
             Texture::load(&render_state, tag, true).map(|t| {
+                let raw_view = t.raw_view();
                 let egui_handle = render_state.renderer.write().register_native_texture(
                     &render_state.device,
-                    &t.view,
+                    &raw_view,
                     wgpu::FilterMode::Linear,
                 );
 

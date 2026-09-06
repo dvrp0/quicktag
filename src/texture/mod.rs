@@ -162,6 +162,20 @@ fn compatible_view_formats(format: wgpu::TextureFormat) -> Vec<wgpu::TextureForm
     formats
 }
 
+fn compressed_format_with_alpha(format: wgpu::TextureFormat) -> bool {
+    matches!(
+        format,
+        wgpu::TextureFormat::Bc1RgbaUnorm
+            | wgpu::TextureFormat::Bc1RgbaUnormSrgb
+            | wgpu::TextureFormat::Bc2RgbaUnorm
+            | wgpu::TextureFormat::Bc2RgbaUnormSrgb
+            | wgpu::TextureFormat::Bc3RgbaUnorm
+            | wgpu::TextureFormat::Bc3RgbaUnormSrgb
+            | wgpu::TextureFormat::Bc7RgbaUnorm
+            | wgpu::TextureFormat::Bc7RgbaUnormSrgb
+    )
+}
+
 fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32) -> usize {
     let extent = wgpu::Extent3d {
         width: width.max(1),
@@ -225,6 +239,19 @@ impl TextureDesc {
 }
 
 impl Texture {
+    /// Raw texel view for UI presentation and extraction.
+    ///
+    /// Quicktag's Windows UI target is non-sRGB. Sampling an sRGB view there
+    /// decodes the texels without a matching display encode, making previews
+    /// darker and changing saturation. A format-compatible linear view keeps
+    /// the stored channel values identical to a direct package decode.
+    pub(crate) fn raw_view(&self) -> wgpu::TextureView {
+        self.handle.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(linear_texture_format(self.desc.format)),
+            ..Default::default()
+        })
+    }
+
     pub fn load_data_d2(
         hash: TagHash,
         load_full_mip: bool,
@@ -792,7 +819,10 @@ impl Texture {
         if desc.premultiply_alpha
             && matches!(
                 desc.format,
-                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+                wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb
+                    | wgpu::TextureFormat::Bgra8Unorm
+                    | wgpu::TextureFormat::Bgra8UnormSrgb
             )
         {
             for c in data.chunks_exact_mut(4) {
@@ -854,6 +884,18 @@ impl Texture {
             ..Default::default()
         });
 
+        if desc.premultiply_alpha
+            && desc.array_size == 1
+            && desc.depth == 1
+            && compressed_format_with_alpha(desc.format)
+        {
+            let raw_view = handle.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(linear_texture_format(desc.format)),
+                ..Default::default()
+            });
+            return Self::premultiply_compressed_texture(rs, hash, &raw_view, desc, comment);
+        }
+
         let full_texture = if desc.array_size > 1 {
             let handle = rs.device.create_texture_with_data(
                 &rs.queue,
@@ -889,6 +931,184 @@ impl Texture {
         })
     }
 
+    fn premultiply_compressed_texture(
+        rs: &RenderState,
+        hash: TagHash,
+        source_view: &wgpu::TextureView,
+        mut desc: TextureDesc,
+        comment: Option<String>,
+    ) -> anyhow::Result<Texture> {
+        // UI blending happens in its encoded, non-sRGB target. Decode the BC
+        // storage through a linear view and premultiply those stored values,
+        // not gamma-decoded linear-light values.
+        let output_format = wgpu::TextureFormat::Rgba8Unorm;
+        let handle = rs.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("Premultiplied texture {hash}")),
+            size: wgpu::Extent3d {
+                width: desc.width,
+                height: desc.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = handle.create_view(&wgpu::TextureViewDescriptor::default());
+        let shader = rs
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Texture alpha premultiplication"),
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@group(0) @binding(0) var source_texture: texture_2d<f32>;
+@group(0) @binding(1) var source_sampler: sampler;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex: u32) -> VertexOutput {
+    var output: VertexOutput;
+    output.uv = vec2<f32>(select(0.0, 2.0, vertex == 1u), select(0.0, 2.0, vertex == 2u));
+    output.position = vec4<f32>(output.uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(source_texture, source_sampler, input.uv);
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+"#
+                    .into(),
+                ),
+            });
+        let bind_group_layout =
+            rs.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Texture alpha premultiplication bind group layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let pipeline_layout = rs
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Texture alpha premultiplication pipeline layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = rs
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Texture alpha premultiplication pipeline"),
+                layout: Some(&pipeline_layout),
+                cache: None,
+                multiview: None,
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: output_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+            });
+        let sampler = rs.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Texture alpha premultiplication sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let bind_group = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Texture alpha premultiplication bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        let mut encoder = rs
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Texture alpha premultiplication encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Texture alpha premultiplication pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        rs.queue.submit(Some(encoder.finish()));
+
+        desc.format = output_format;
+        Ok(Texture {
+            view,
+            handle,
+            full_cubemap_texture: None,
+            aspect_ratio: desc.width as f32 / desc.height as f32,
+            desc,
+            comment: Some(format!(
+                "{}\nGPU-premultiplied compressed alpha for UI",
+                comment.unwrap_or_default()
+            )),
+        })
+    }
+
     fn load_png(render_state: &RenderState, bytes: &[u8]) -> anyhow::Result<Texture> {
         let img = image::load_from_memory(bytes)?;
         let rgba = img.to_rgba8();
@@ -920,7 +1140,7 @@ impl Texture {
             render_state,
             TagHash::NONE,
             TextureDesc {
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 width,
                 height,
                 array_size: 1,
@@ -950,8 +1170,174 @@ pub enum TextureType {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextureDesc, available_mip_level_count};
+    use super::{
+        Texture, TextureDesc, available_mip_level_count, compressed_format_with_alpha,
+        linear_texture_format,
+    };
     use eframe::wgpu;
+    use std::{path::PathBuf, sync::Arc};
+    use tiger_pkg::{GameVersion, MarathonVersion, TagHash};
+
+    #[test]
+    fn raw_ui_views_disable_srgb_decode_without_changing_storage_family() {
+        assert_eq!(
+            linear_texture_format(wgpu::TextureFormat::Rgba8UnormSrgb),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        assert_eq!(
+            linear_texture_format(wgpu::TextureFormat::Bc7RgbaUnormSrgb),
+            wgpu::TextureFormat::Bc7RgbaUnorm
+        );
+        assert_eq!(
+            linear_texture_format(wgpu::TextureFormat::Bc5RgUnorm),
+            wgpu::TextureFormat::Bc5RgUnorm
+        );
+    }
+
+    #[test]
+    fn identifies_block_compressed_rgba_formats_that_need_ui_premultiplication() {
+        for format in [
+            wgpu::TextureFormat::Bc1RgbaUnorm,
+            wgpu::TextureFormat::Bc2RgbaUnormSrgb,
+            wgpu::TextureFormat::Bc3RgbaUnorm,
+            wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+        ] {
+            assert!(compressed_format_with_alpha(format), "{format:?}");
+        }
+        assert!(!compressed_format_with_alpha(
+            wgpu::TextureFormat::Bc4RUnorm
+        ));
+        assert!(!compressed_format_with_alpha(
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires current Marathon packages and a BC-capable GPU"]
+    fn implant_icon_bc7_alpha_is_preserved_and_premultiplied_for_ui() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let manager = tiger_pkg::PackageManager::new(
+            packages,
+            GameVersion::Marathon(MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(manager));
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("GPU adapter");
+        assert!(
+            adapter
+                .features()
+                .contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            "BC texture support required"
+        );
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let target_format = wgpu::TextureFormat::Bgra8Unorm;
+        let renderer = eframe::egui_wgpu::Renderer::new(
+            &device,
+            target_format,
+            eframe::egui_wgpu::RendererOptions::default(),
+        );
+        let render_state = eframe::egui_wgpu::RenderState {
+            adapter,
+            available_adapters: vec![],
+            device,
+            queue,
+            target_format,
+            renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
+        };
+
+        let source = Texture::load_desc(TagHash(0x80B6_F6EF)).expect("icon texture header");
+        assert_eq!(source.width, 64);
+        assert_eq!(source.height, 64);
+        assert_eq!(source.format, wgpu::TextureFormat::Bc7RgbaUnorm);
+
+        render_state
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let texture = Texture::load(&render_state, TagHash(0x80B6_F6EF), true)
+            .expect("premultiplied icon texture");
+        assert_eq!(texture.desc.format, wgpu::TextureFormat::Rgba8Unorm);
+        assert!(texture.desc.premultiply_alpha);
+        render_state
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("premultiplication submission");
+        if let Some(error) = pollster::block_on(render_state.device.pop_error_scope()) {
+            panic!("GPU premultiplication validation failed: {error}");
+        }
+
+        let buffer = render_state.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("implant icon alpha verification"),
+            size: 64 * 64 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = render_state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture.handle,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(64 * 4),
+                    rows_per_image: Some(64),
+                },
+            },
+            wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+        );
+        render_state.queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        render_state
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("icon readback");
+        let pixels = slice.get_mapped_range();
+        let transparent = pixels.chunks_exact(4).filter(|pixel| pixel[3] <= 4).count();
+        let visible = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] >= 250)
+            .count();
+        assert!(transparent > 64 * 64 / 4, "transparent background lost");
+        assert!(visible > 64, "icon foreground lost");
+        assert!(
+            pixels.chunks_exact(4).all(|pixel| {
+                pixel[0] <= pixel[3].saturating_add(1)
+                    && pixel[1] <= pixel[3].saturating_add(1)
+                    && pixel[2] <= pixel[3].saturating_add(1)
+            }),
+            "RGB is not premultiplied by alpha"
+        );
+    }
 
     #[test]
     fn infers_only_complete_uncompressed_mips() {

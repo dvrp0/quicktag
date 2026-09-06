@@ -129,9 +129,10 @@ impl TextureCache {
             }
         };
 
+        let raw_view = texture.raw_view();
         let id = render_state.renderer.write().register_native_texture(
             &render_state.device,
-            &texture.view,
+            &raw_view,
             wgpu::FilterMode::Linear,
         );
         Some((Arc::new(texture), id))
@@ -232,9 +233,10 @@ impl TextureCache {
             )),
         )
         .ok()?;
+        let raw_view = texture.raw_view();
         let id = self.render_state.renderer.write().register_native_texture(
             &self.render_state.device,
-            &texture.view,
+            &raw_view,
             wgpu::FilterMode::Linear,
         );
 

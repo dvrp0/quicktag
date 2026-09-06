@@ -25,14 +25,14 @@ pub fn capture_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
+        format: TextureFormat::Rgba8Unorm,
         usage: TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[TextureFormat::Rgba8UnormSrgb],
+        view_formats: &[],
     });
 
     let texture_view_wgpu = texture_wgpu.create_view(&TextureViewDescriptor {
         label: None,
-        format: Some(TextureFormat::Rgba8UnormSrgb),
+        format: Some(TextureFormat::Rgba8Unorm),
         dimension: Some(TextureViewDimension::D2),
         aspect: TextureAspect::All,
         base_mip_level: 0,
@@ -83,14 +83,15 @@ pub fn capture_texture(
     });
 
     let view = if let Some(ref full_cubemap) = texture.full_cubemap_texture {
-        &full_cubemap.create_view(&TextureViewDescriptor {
+        full_cubemap.create_view(&TextureViewDescriptor {
+            format: Some(super::linear_texture_format(texture.desc.format)),
             base_array_layer: layer,
             array_layer_count: Some(1),
             dimension: Some(TextureViewDimension::D2),
             ..Default::default()
         })
     } else {
-        &texture.view
+        texture.raw_view()
     };
 
     let bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -99,7 +100,7 @@ pub fn capture_texture(
         entries: &[
             BindGroupEntry {
                 binding: 0,
-                resource: BindingResource::TextureView(view),
+                resource: BindingResource::TextureView(&view),
             },
             BindGroupEntry {
                 binding: 1,
@@ -141,8 +142,8 @@ pub fn capture_texture(
                 module: copy_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
-                    format: TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    format: TextureFormat::Rgba8Unorm,
+                    blend: None,
                     write_mask: ColorWrites::all(),
                 })],
                 compilation_options: Default::default(),

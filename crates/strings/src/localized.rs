@@ -369,7 +369,7 @@ pub struct StringCombination {
 
 #[derive(BinRead, Debug)]
 pub struct StringPart {
-    pub _unk0: u64,
+    pub style_reference_offset: u64,
     pub data: RelPointer,
     pub variable_hash: u32,
 
@@ -567,15 +567,24 @@ pub fn create_stringmap_d2_for_language(
 
 pub type LocalizedStringSet = FxHashMap<u32, String>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalizedStringPart {
+    pub text: String,
+    /// The package assigns this part a non-default presentation style.
+    pub highlighted: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalizedStringContainer {
     pub tag: TagHash,
     pub strings: LocalizedStringSet,
+    pub parts: FxHashMap<u32, Vec<LocalizedStringPart>>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct LocalizedStringResolver {
     containers: FxHashMap<TagHash, LocalizedStringSet>,
+    parts: FxHashMap<TagHash, FxHashMap<u32, Vec<LocalizedStringPart>>>,
     scopes: Vec<Option<TagHash>>,
 }
 
@@ -583,6 +592,11 @@ impl LocalizedStringResolver {
     pub fn get(&self, scope: u32, hash: u32) -> Option<&String> {
         let container = self.scopes.get(scope as usize)?.as_ref()?;
         self.containers.get(container)?.get(&hash)
+    }
+
+    pub fn parts(&self, scope: u32, hash: u32) -> Option<&[LocalizedStringPart]> {
+        let container = self.scopes.get(scope as usize)?.as_ref()?;
+        self.parts.get(container)?.get(&hash).map(Vec::as_slice)
     }
 
     pub fn scope_tag(&self, scope: u32) -> Option<TagHash> {
@@ -645,25 +659,32 @@ pub fn create_stringcontainers_d2_for_language(
         let text_data: StringData = cur.read_le_args((old_format,))?;
 
         let mut string_set = LocalizedStringSet::default();
+        let mut string_parts = FxHashMap::default();
         for (combination, hash) in text_data
             .string_combinations
             .iter()
             .zip(textset_header.string_hashes.iter())
         {
             let mut final_string = String::new();
+            let mut final_parts = vec![];
 
             for ip in 0..combination.part_count {
                 cur.seek(combination.data.into())?;
                 cur.seek(SeekFrom::Current(ip * 0x20))?;
                 let part: StringPart = cur.read_le()?;
-                if part.variable_hash != 0x811c9dc5 {
-                    final_string += &format!("<{:08X}>", part.variable_hash);
+                let text = if part.variable_hash != 0x811c9dc5 {
+                    format!("<{:08X}>", part.variable_hash)
                 } else {
                     cur.seek(part.data.into())?;
                     let mut data = vec![0u8; part.byte_length as usize];
                     cur.read_exact(&mut data)?;
-                    final_string += &decode_text(&data, part.cipher_shift);
-                }
+                    decode_text(&data, part.cipher_shift)
+                };
+                final_string += &text;
+                final_parts.push(LocalizedStringPart {
+                    text,
+                    highlighted: part.style_reference_offset != 0,
+                });
             }
 
             if *hash == FNV1_BASE {
@@ -674,10 +695,12 @@ pub fn create_stringcontainers_d2_for_language(
             }
 
             string_set.insert(*hash, final_string);
+            string_parts.insert(*hash, final_parts);
         }
         containers.push(LocalizedStringContainer {
             tag: t,
             strings: string_set,
+            parts: string_parts,
         });
     }
 
@@ -698,10 +721,13 @@ pub fn create_stringresolver_d2_for_language(
 ) -> anyhow::Result<LocalizedStringResolver> {
     const GOLIATH_SCOPE_TABLE_REFERENCE: u32 = 0x808071C8;
 
-    let containers = create_stringcontainers_d2_for_language(language)?
-        .into_iter()
-        .map(|container| (container.tag, container.strings))
-        .collect::<FxHashMap<_, _>>();
+    let decoded = create_stringcontainers_d2_for_language(language)?;
+    let mut containers = FxHashMap::default();
+    let mut parts = FxHashMap::default();
+    for container in decoded {
+        containers.insert(container.tag, container.strings);
+        parts.insert(container.tag, container.parts);
+    }
     let mut scopes = vec![];
 
     if package_manager().version.engine_version() == tiger_pkg::version::EngineVersion::TigerGoliath
@@ -734,7 +760,11 @@ pub fn create_stringresolver_d2_for_language(
         }
     }
 
-    Ok(LocalizedStringResolver { containers, scopes })
+    Ok(LocalizedStringResolver {
+        containers,
+        parts,
+        scopes,
+    })
 }
 
 fn parse_goliath_scope_wide_hashes(data: &[u8]) -> Option<Vec<u64>> {
