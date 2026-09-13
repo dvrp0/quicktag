@@ -28,6 +28,14 @@ struct Args {
     /// Game version for the specified packages directory
     #[arg(short, value_enum)]
     version: Option<GameVersion>,
+
+    /// Export all resolved Head/Torso/Leg implant icons and exit
+    #[arg(long)]
+    export_implant_icons: bool,
+
+    /// Output directory for --export-implant-icons
+    #[arg(long, default_value = "./implant_icons")]
+    implant_icons_output: std::path::PathBuf,
 }
 
 fn main() -> eframe::Result<()> {
@@ -71,6 +79,21 @@ fn main() -> eframe::Result<()> {
     tiger_pkg::initialize_package_manager(&Arc::new(pm));
 
     quicktag_core::classes::initialize_reference_names();
+
+    if args.export_implant_icons {
+        let render_state = create_headless_render_state()
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        let exported = crate::gui::GearView::export_implant_icons(
+            &args.implant_icons_output,
+            &render_state,
+        )
+        .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        println!(
+            "Exported {exported} implant icons to {}",
+            args.implant_icons_output.display()
+        );
+        return Ok(());
+    }
 
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -116,6 +139,35 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Ok(Box::new(QuickTagApp::new(cc)))),
     )
+}
+
+fn create_headless_render_state() -> Result<eframe::egui_wgpu::RenderState, String> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
+    });
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .map_err(|error| format!("Could not find a GPU adapter: {error}"))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+        ..Default::default()
+    }))
+    .map_err(|error| format!("Could not create a GPU device: {error}"))?;
+    let target_format = wgpu::TextureFormat::Bgra8Unorm;
+    let renderer = eframe::egui_wgpu::Renderer::new(
+        &device,
+        target_format,
+        eframe::egui_wgpu::RendererOptions::default(),
+    );
+    Ok(eframe::egui_wgpu::RenderState {
+        adapter,
+        available_adapters: vec![],
+        device,
+        queue,
+        target_format,
+        renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
+    })
 }
 
 fn find_d2_packages_path() -> Option<String> {

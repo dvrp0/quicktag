@@ -369,6 +369,7 @@ pub struct StringCombination {
 
 #[derive(BinRead, Debug)]
 pub struct StringPart {
+    /// Relative byte offset from this part to its presentation-style record.
     pub style_reference_offset: u64,
     pub data: RelPointer,
     pub variable_hash: u32,
@@ -381,6 +382,40 @@ pub struct StringPart {
 
     pub _unk2: u16,
     pub _unk3: u32,
+}
+
+/// Read the authored color from a modern string style record.
+///
+/// `StringPart::style_reference_offset` is a relative offset from the start
+/// of that part. The target record stores its presentation color at +0x40 as
+/// four little-endian normalized floats. Keep this decoder deliberately
+/// bounds- and range-checked: some legacy containers set the field for a
+/// non-color reference, and those must retain the highlighted fallback.
+fn read_authored_style_color(
+    data: &[u8],
+    part_offset: u64,
+    style_reference_offset: u64,
+) -> Option<[f32; 4]> {
+    if style_reference_offset == 0 {
+        return None;
+    }
+
+    const STYLE_COLOR_OFFSET: usize = 0x40;
+    let style_offset = usize::try_from(part_offset.checked_add(style_reference_offset)?).ok()?;
+    let style_hash = u32::from_le_bytes(data.get(style_offset..style_offset + 4)?.try_into().ok()?);
+    if style_hash != FNV1_BASE {
+        return None;
+    }
+    let color_offset = style_offset.checked_add(STYLE_COLOR_OFFSET)?;
+    let mut color = [0.0; 4];
+    for (channel, value) in color.iter_mut().enumerate() {
+        let start = color_offset.checked_add(channel * 4)?;
+        *value = f32::from_le_bytes(data.get(start..start + 4)?.try_into().ok()?);
+    }
+    color
+        .iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .then_some(color)
 }
 
 #[derive(BinRead, Debug)]
@@ -567,11 +602,19 @@ pub fn create_stringmap_d2_for_language(
 
 pub type LocalizedStringSet = FxHashMap<u32, String>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalizedStringPart {
     pub text: String,
-    /// The package assigns this part a non-default presentation style.
+    /// Raw package presentation-style reference. Zero means the default style.
+    ///
+    /// Keep the authored value instead of collapsing it to a boolean: Goliath
+    /// can assign different style records to different parts of one string.
+    pub style_reference_offset: u64,
+    /// Convenience flag for callers that only need to know whether the part
+    /// differs from the default style.
     pub highlighted: bool,
+    /// Authored RGBA color stored in the referenced Goliath style record.
+    pub authored_color: Option<[f32; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -589,6 +632,44 @@ pub struct LocalizedStringResolver {
 }
 
 impl LocalizedStringResolver {
+    /// Translate a related label set from containers containing every source label.
+    /// Preserve container/hash identity and reject conflicting translations.
+    pub fn translate_group_from(&self, source: &Self, labels: &[&str]) -> Option<Vec<String>> {
+        if labels.is_empty() {
+            return None;
+        }
+        let mut result: Option<Vec<String>> = None;
+        for (container, strings) in &source.containers {
+            if !labels
+                .iter()
+                .all(|label| strings.values().any(|text| text == label))
+            {
+                continue;
+            }
+            let target = self.containers.get(container)?;
+            let mut translations = Vec::with_capacity(labels.len());
+            for label in labels {
+                let mut translated: Option<&String> = None;
+                for (hash, _) in strings.iter().filter(|(_, text)| text.as_str() == *label) {
+                    let value = target.get(hash)?;
+                    if value.is_empty() || translated.is_some_and(|previous| previous != value) {
+                        return None;
+                    }
+                    translated = Some(value);
+                }
+                translations.push(translated?.clone());
+            }
+            if result
+                .as_ref()
+                .is_some_and(|previous| previous != &translations)
+            {
+                return None;
+            }
+            result = Some(translations);
+        }
+        result
+    }
+
     pub fn get(&self, scope: u32, hash: u32) -> Option<&String> {
         let container = self.scopes.get(scope as usize)?.as_ref()?;
         self.containers.get(container)?.get(&hash)
@@ -671,6 +752,7 @@ pub fn create_stringcontainers_d2_for_language(
             for ip in 0..combination.part_count {
                 cur.seek(combination.data.into())?;
                 cur.seek(SeekFrom::Current(ip * 0x20))?;
+                let part_offset = cur.stream_position()?;
                 let part: StringPart = cur.read_le()?;
                 let text = if part.variable_hash != 0x811c9dc5 {
                     format!("<{:08X}>", part.variable_hash)
@@ -684,6 +766,12 @@ pub fn create_stringcontainers_d2_for_language(
                 final_parts.push(LocalizedStringPart {
                     text,
                     highlighted: part.style_reference_offset != 0,
+                    style_reference_offset: part.style_reference_offset,
+                    authored_color: read_authored_style_color(
+                        &data,
+                        part_offset,
+                        part.style_reference_offset,
+                    ),
                 });
             }
 
@@ -803,7 +891,7 @@ fn read_i64_at(data: &[u8], offset: usize) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_goliath_scope_wide_hashes;
+    use super::{FNV1_BASE, parse_goliath_scope_wide_hashes, read_authored_style_color};
 
     #[test]
     fn parses_goliath_localization_scope_table() {
@@ -826,6 +914,43 @@ mod tests {
         data[0x10..0x18].copy_from_slice(&0x10_i64.to_le_bytes());
 
         assert_eq!(parse_goliath_scope_wide_hashes(&data), None);
+    }
+
+    #[test]
+    fn resolves_authored_color_relative_to_string_part() {
+        let mut data = vec![0_u8; 0x180];
+        let color = [0.5_f32, 0.25, 1.0, 1.0];
+        data[0x120..0x124].copy_from_slice(&FNV1_BASE.to_le_bytes());
+        let color_offset = 0x120 + 0x40;
+        for (channel, value) in color.iter().enumerate() {
+            let start = color_offset + channel * 4;
+            data[start..start + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        assert_eq!(read_authored_style_color(&data, 0x20, 0x100), Some(color));
+        assert_eq!(read_authored_style_color(&data, 0x20, 0), None);
+        assert_eq!(read_authored_style_color(&data, 0x20, 0x1000), None);
+    }
+
+    #[test]
+    fn rejects_non_color_style_payloads() {
+        let mut data = vec![0_u8; 0x180];
+        let color_offset = 0x120 + 0x40;
+        data[0x120..0x124].copy_from_slice(&FNV1_BASE.to_le_bytes());
+        data[color_offset..color_offset + 4].copy_from_slice(&1.1_f32.to_le_bytes());
+
+        assert_eq!(read_authored_style_color(&data, 0x20, 0x100), None);
+    }
+
+    #[test]
+    fn rejects_unrecognized_style_reference() {
+        let mut data = vec![0_u8; 0x180];
+        let color_offset = 0x120 + 0x40;
+        data[color_offset..color_offset + 16].copy_from_slice(&[
+            0, 0, 0x80, 0x3f, 0, 0, 0x80, 0x3f, 0, 0, 0x80, 0x3f, 0, 0, 0x80, 0x3f,
+        ]);
+
+        assert_eq!(read_authored_style_color(&data, 0x20, 0x100), None);
     }
 }
 

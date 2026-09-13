@@ -63,6 +63,7 @@ egui-notify = "0.21.0"
 native-dialog = "0.7.0"
 opener = "0.7.0"
 poll-promise = { version = "0.3.0", features = ["tokio"] }
+pollster = "0.4.0"
 rayon = "1.8.0"
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulkan"] }
 
@@ -101,7 +102,6 @@ overflow-checks = false
 
 [dev-dependencies]
 naga = { version = "27.0.3", features = ["wgsl-in"] }
-pollster = "0.4.0"
 
 [profile.release]
 debug = "limited"

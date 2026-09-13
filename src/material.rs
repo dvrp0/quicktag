@@ -720,6 +720,11 @@ fn parse_tfx_bytecode_with_constants_dialect(
     let mut unknown_ops = 0usize;
     let mut undecoded_offset = None;
     let mut undecoded_bytes = vec![];
+    let extern_name = if marathon {
+        tfx_marathon_extern_name as fn(u8) -> &'static str
+    } else {
+        tfx_extern_name
+    };
 
     while cursor < data.len() {
         let offset = cursor;
@@ -727,9 +732,9 @@ fn parse_tfx_bytecode_with_constants_dialect(
         cursor += 1;
 
         let parsed = if marathon {
-            parse_marathon_tfx_bytecode_op(data, &mut cursor, offset, opcode)
+            parse_marathon_tfx_bytecode_op(data, &mut cursor, offset, opcode, extern_name)
         } else {
-            parse_tfx_bytecode_op(data, &mut cursor, offset, opcode)
+            parse_tfx_bytecode_op(data, &mut cursor, offset, opcode, extern_name)
         };
         let Some(mut op) = parsed else {
             unknown_ops += 1;
@@ -791,6 +796,7 @@ fn parse_marathon_tfx_bytecode_op(
     cursor: &mut usize,
     offset: usize,
     opcode: u8,
+    extern_name: fn(u8) -> &'static str,
 ) -> Option<TfxBytecodeOpPreview> {
     let read_u8 = |cursor: &mut usize| {
         let value = *data.get(*cursor)?;
@@ -865,7 +871,7 @@ fn parse_marathon_tfx_bytecode_op(
     }
 
     let legacy_opcode = marathon_tfx_legacy_opcode(opcode)?;
-    parse_tfx_bytecode_op(data, cursor, offset, legacy_opcode).map(|mut op| {
+    parse_tfx_bytecode_op(data, cursor, offset, legacy_opcode, extern_name).map(|mut op| {
         op.opcode = opcode;
         op
     })
@@ -979,6 +985,16 @@ fn tfx_extern_hint(scope: &str, byte_offset: usize) -> &'static str {
         "Generic" => "generic runtime constant",
         _ => "runtime extern",
     }
+}
+
+pub(crate) fn tfx_has_marathon_decal_abi(program: &TfxBytecodePreview) -> bool {
+    let has_normals_read = program.externs.iter().any(|external| {
+        external.scope_id == 45 && external.value_type == "texture" && external.byte_offset == 0x08
+    });
+    let has_resolution_offset = program.externs.iter().any(|external| {
+        external.scope_id == 45 && external.value_type == "vec4" && external.byte_offset == 0x30
+    });
+    has_normals_read && has_resolution_offset
 }
 
 fn interpret_tfx_stack(
@@ -1665,6 +1681,7 @@ fn parse_tfx_bytecode_op(
     cursor: &mut usize,
     offset: usize,
     opcode: u8,
+    extern_name: fn(u8) -> &'static str,
 ) -> Option<TfxBytecodeOpPreview> {
     let mut read_u8 = || {
         let value = *data.get(*cursor)?;
@@ -1732,7 +1749,7 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_float",
-                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 4),
+                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 4),
             )
         }
         0x3d => {
@@ -1740,7 +1757,7 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_vec4",
-                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 16),
+                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 16),
             )
         }
         0x3e => {
@@ -1748,7 +1765,7 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_mat4",
-                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 16),
+                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 16),
             )
         }
         0x3f => {
@@ -1756,7 +1773,7 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_texture",
-                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 8),
+                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 8),
             )
         }
         0x40 => {
@@ -1764,7 +1781,7 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_u32",
-                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 4),
+                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 4),
             )
         }
         0x41 => {
@@ -1772,7 +1789,7 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_uav",
-                format!("{}+0x{:X}", tfx_extern_name(extern_), offset as usize * 8),
+                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 8),
             )
         }
         0x42 => ("unk42", String::new()),
@@ -1968,6 +1985,18 @@ fn tfx_extern_name(value: u8) -> &'static str {
         94 => "UiHdrTransform",
         95 => "PlayerCenteredCascadedGrid",
         96 => "SoftDeform",
+        _ => "Extern",
+    }
+}
+
+/// Marathon inserts `CuiDrawingShader` at extern index 24 and appends
+/// `ParticleMeshEmissionCompute` after the legacy table. Keep Destiny's table
+/// above unchanged; its bytecode uses the legacy numbering.
+fn tfx_marathon_extern_name(value: u8) -> &'static str {
+    match value {
+        24 => "CuiDrawingShader",
+        25..=97 => tfx_extern_name(value - 1),
+        98 => "ParticleMeshEmissionCompute",
         _ => "Extern",
     }
 }
@@ -2374,6 +2403,46 @@ mod tests {
             decoded.externs[1].hint,
             "material texture-set runtime binding"
         );
+    }
+
+    #[test]
+    fn decodes_marathon_extern_indices_after_cui_drawing_shader_insert() {
+        let decoded = parse_tfx_bytecode_with_constants_dialect(
+            &[
+                0x4d, 24, 0, // push_extern_texture CuiDrawingShader+0x0
+                0x4b, 45, 3, // push_extern_vec4 Decal+0x30
+                0x4d, 45, 1, // push_extern_texture Decal+0x8
+                0x4b, 46, 0, // push_extern_vec4 DecalSetTransform+0x0
+                0x4b, 87, 0, // push_extern_vec4 UberDepth+0x0
+                0x4b, 88, 0, // push_extern_vec4 GearDye+0x0
+                0x4b, 98, 0, // push_extern_vec4 ParticleMeshEmissionCompute+0x0
+            ],
+            &[],
+            true,
+        );
+
+        assert_eq!(decoded.unknown_ops, 0);
+        assert_eq!(
+            decoded
+                .externs
+                .iter()
+                .map(|external| (external.scope.as_str(), external.byte_offset))
+                .collect::<Vec<_>>(),
+            vec![
+                ("CuiDrawingShader", 0x00),
+                ("Decal", 0x30),
+                ("Decal", 0x08),
+                ("DecalSetTransform", 0x00),
+                ("UberDepth", 0x00),
+                ("GearDye", 0x00),
+                ("ParticleMeshEmissionCompute", 0x00),
+            ]
+        );
+        assert!(tfx_has_marathon_decal_abi(&decoded));
+
+        let legacy = parse_tfx_bytecode(&[0x3d, 45, 0]);
+        assert_eq!(legacy.externs[0].scope, "DecalSetTransform");
+        assert!(!tfx_has_marathon_decal_abi(&legacy));
     }
 
     #[test]

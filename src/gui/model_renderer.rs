@@ -728,6 +728,8 @@ struct SceneUniform {
     uv_transform: [f32; 4],
     light_direction: [f32; 4],
     light_parameters: [f32; 4],
+    /// View-space light origin relative to the model camera frame.
+    light_position: [f32; 4],
     postprocess0: [f32; 4],
     postprocess1: [f32; 4],
     postprocess2: [f32; 4],
@@ -764,13 +766,17 @@ pub(crate) struct ModelEnvironment {
     pub tone_mapping: bool,
     pub ambient_intensity: f32,
     pub specular_ibl_intensity: f32,
-    /// World-space point toward which the directional-light transform faces.
+    /// World-space point toward which the spotlight beam faces.
     pub light_target: [f32; 3],
-    /// Unit world-space offset locating the light transform on its orbit sphere.
+    /// Unit world-space offset locating the light source on its orbit sphere.
     pub light_orbit_position: [f32; 3],
-    /// World-space center of the light transform's orbit sphere.
+    /// World-space center of the light source's orbit sphere.
     pub light_orbit_center: [f32; 3],
     pub light_orbit_radius: f32,
+    /// Maximum distance at which the spotlight contributes direct light.
+    pub light_range: f32,
+    /// Spotlight half-angle in degrees, measured from the beam axis.
+    pub light_cone_angle: f32,
     pub light_size: f32,
     pub light_gizmo: bool,
     pub shadow_strength: f32,
@@ -826,12 +832,14 @@ impl Default for ModelEnvironment {
             tone_mapping: true,
             ambient_intensity: 0.2,
             specular_ibl_intensity: 0.3,
-            // The default orbit point faces the world origin, preserving the
-            // historical directional-light orientation.
-            light_target: [0.0; 3],
-            light_orbit_position: [-0.276, 0.627, 0.728],
-            light_orbit_center: [0.0; 3],
+            // The default source faces the world origin, preserving the
+            // historical key-light orientation while using finite lighting.
+            light_target: [-0.183, 0.017, -0.483],
+            light_orbit_position: [0.2562, 0.3389, 0.9053],
+            light_orbit_center: [0.174, -0.045, -0.117],
             light_orbit_radius: 1.0,
+            light_range: 4.0,
+            light_cone_angle: 70.0,
             light_size: 5.0,
             light_gizmo: false,
             shadow_strength: 1.0,
@@ -873,13 +881,13 @@ fn first_person_key_light(
     )
 }
 
-fn directional_light_softness(light_size: f32, shadow_softness: f32) -> f32 {
-    // Directional lights have angular size, never physical distance. Keep the
-    // established size-5 render while allowing size to widen/narrow penumbrae.
+fn light_shadow_softness(light_size: f32, shadow_softness: f32) -> f32 {
+    // Keep the established size-5 render while allowing source size to
+    // widen/narrow the penumbra.
     (shadow_softness.clamp(0.0, 1.0) + (light_size.clamp(0.0, 10.0) - 5.0) * 0.08).clamp(0.0, 1.0)
 }
 
-fn directional_light_cast_direction(environment: &ModelEnvironment) -> [f32; 3] {
+pub(crate) fn light_source_position(environment: &ModelEnvironment) -> [f32; 3] {
     let mut orbit_direction = environment.light_orbit_position;
     let orbit_length = orbit_direction
         .iter()
@@ -893,11 +901,21 @@ fn directional_light_cast_direction(environment: &ModelEnvironment) -> [f32; 3] 
             .iter_mut()
             .for_each(|value| *value /= orbit_length);
     }
-    let light_position: [f32; 3] = std::array::from_fn(|axis| {
+    std::array::from_fn(|axis| {
         environment.light_orbit_center[axis]
             + orbit_direction[axis] * environment.light_orbit_radius.max(0.0)
-    });
+    })
+}
+
+pub(crate) fn light_cast_direction(environment: &ModelEnvironment) -> [f32; 3] {
+    let light_position = light_source_position(environment);
     std::array::from_fn(|axis| environment.light_target[axis] - light_position[axis])
+}
+
+fn light_cone_cosines(half_angle_degrees: f32) -> (f32, f32) {
+    let outer_angle = half_angle_degrees.clamp(1.0, 89.0).to_radians();
+    let inner_angle = (outer_angle * 0.72).max(0.5_f32.to_radians());
+    (outer_angle.cos(), inner_angle.cos())
 }
 
 pub(crate) fn model_direction_to_view(direction: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
@@ -1269,18 +1287,18 @@ impl ModelPaintCallback {
                         .forward_coating
                         .map(|coating| coating.detail)
                         .or_else(|| draw.material.map(|material| material.color))
-                        .map(|tag| texture_cache.get_or_default(tag).0)
+                        .map(|tag| texture_cache.get_or_default_material(tag).0)
                         .and_then(usable_2d_texture);
                     let normal = draw
                         .material
                         .and_then(|material| material.normal)
-                        .and_then(|tag| texture_cache.get_or_load(tag))
+                        .and_then(|tag| texture_cache.get_or_load_material(tag))
                         .map(|loaded| loaded.0)
                         .and_then(usable_2d_texture);
                     let emissive = draw
                         .material
                         .and_then(|material| material.emissive)
-                        .and_then(|tag| texture_cache.get_or_load(tag))
+                        .and_then(|tag| texture_cache.get_or_load_material(tag))
                         .map(|loaded| loaded.0)
                         .and_then(usable_2d_texture);
                     let control = draw
@@ -1290,12 +1308,12 @@ impl ModelPaintCallback {
                                 .filter(|surface| surface.mode == 2)
                                 .map(|surface| surface.selector)
                         })
-                        .and_then(|tag| texture_cache.get_or_load(tag))
+                        .and_then(|tag| texture_cache.get_or_load_material(tag))
                         .map(|loaded| loaded.0)
                         .and_then(usable_2d_texture);
                     let load_wear = |tag: TagHash| {
                         texture_cache
-                            .get_or_load(tag)
+                            .get_or_load_material(tag)
                             .map(|loaded| loaded.0)
                             .and_then(usable_2d_texture)
                     };
@@ -1375,7 +1393,7 @@ impl ModelPaintCallback {
                         .and_then(load_wear);
                     let coating_environment_map = draw
                         .forward_coating
-                        .and_then(|coating| texture_cache.get_or_load(coating.environment))
+                        .and_then(|coating| texture_cache.get_or_load_material(coating.environment))
                         .map(|loaded| loaded.0)
                         .filter(|texture| texture.desc.kind() == TextureType::TextureCube);
                     let coating_environment_sampler = draw
@@ -1490,16 +1508,24 @@ impl ModelPaintCallback {
                     .iter()
                     .filter_map(|material| material.key.map(|key| key.color)),
             )
-            .find_map(|tag| texture_cache.get_or_load(tag).map(|loaded| loaded.0))
+            .find_map(|tag| {
+                texture_cache
+                    .get_or_load_material(tag)
+                    .map(|loaded| loaded.0)
+            })
             .filter(|texture| texture.desc.kind() == TextureType::TextureCube);
         let decal = environment
             .decal
-            .and_then(|tag| texture_cache.get_or_load(tag).map(|loaded| loaded.0))
+            .and_then(|tag| {
+                texture_cache
+                    .get_or_load_material(tag)
+                    .map(|loaded| loaded.0)
+            })
             .and_then(usable_2d_texture);
 
         let (light_direction, sun_height) = first_person_key_light(
             environment.time_of_day,
-            directional_light_cast_direction(&environment),
+            light_cast_direction(&environment),
             environment.shadow_strength,
         );
         let mut light_direction = light_direction;
@@ -1512,15 +1538,23 @@ impl ModelPaintCallback {
             pitch,
         ));
         let effective_shadow_softness =
-            directional_light_softness(environment.light_size, environment.shadow_softness);
+            light_shadow_softness(environment.light_size, environment.shadow_softness);
+        let light_position_world = light_source_position(&environment);
+        let light_position_view = model_direction_to_view(
+            std::array::from_fn(|axis| light_position_world[axis] - center[axis]),
+            yaw,
+            pitch,
+        );
+        let (outer_cone_cosine, inner_cone_cosine) =
+            light_cone_cosines(environment.light_cone_angle);
         Self {
             preview,
             target_format: texture_cache.render_state.target_format,
             target_size,
             export_camera: None,
             scene: SceneUniform {
-                // center.w is the rotation-invariant bounding-sphere radius
-                // used by the directional-light orthographic projection.
+                // center.w remains available to diagnostics and camera tools;
+                // spotlight projection uses the explicit source position.
                 center: [center[0], center[1], center[2], shadow_radius],
                 params0: [radius, yaw, pitch, zoom],
                 params1: [
@@ -1536,7 +1570,18 @@ impl ModelPaintCallback {
                     transform.offset[1],
                 ],
                 light_direction,
-                light_parameters: [environment.light_size.clamp(0.0, 10.0), 0.0, 0.0, 0.0],
+                light_parameters: [
+                    environment.light_size.clamp(0.0, 10.0),
+                    environment.light_range.max(0.05),
+                    outer_cone_cosine,
+                    inner_cone_cosine,
+                ],
+                light_position: [
+                    light_position_view[0],
+                    light_position_view[1],
+                    light_position_view[2],
+                    1.0,
+                ],
                 postprocess0: [
                     exposure,
                     environment.bloom_strength,
@@ -1907,6 +1952,7 @@ impl ModelPaintCallback {
                         match decal.mode {
                             InvestmentDecalMode::SelectorMask => 1,
                             InvestmentDecalMode::DetailSelectorMask => 2,
+                            InvestmentDecalMode::SceneNormalColorMask => 3,
                         },
                         match decal.mask_mode {
                             InvestmentDecalMaskMode::Threshold => 0,
@@ -2265,7 +2311,7 @@ fn texture_luminance(texture_cache: &TextureCache, tag: TagHash) -> Option<Mater
         return value;
     }
     let value = texture_cache
-        .get_or_load(tag)
+        .get_or_load_material(tag)
         .and_then(|(texture, _)| texture.to_image(&texture_cache.render_state, 0).ok())
         .map(|image| image.thumbnail(64, 64).to_rgba8())
         .and_then(|image| {
@@ -2319,7 +2365,7 @@ fn is_debug_placeholder_texture(texture_cache: &TextureCache, tag: TagHash) -> b
         return value;
     }
     let value = texture_cache
-        .get_or_load(tag)
+        .get_or_load_material(tag)
         .and_then(|(texture, _id)| texture.to_image(&texture_cache.render_state, 0).ok())
         .map(|image| debug_placeholder_pixels(&image.thumbnail(64, 64).to_rgba8()))
         .unwrap_or(false);
@@ -2648,6 +2694,8 @@ struct ModelTargetResources {
     lit_color_view: wgpu::TextureView,
     scene_color_copy: wgpu::Texture,
     scene_color_copy_view: wgpu::TextureView,
+    scene_normal_copy: wgpu::Texture,
+    scene_normal_copy_view: wgpu::TextureView,
     _distortion: wgpu::Texture,
     distortion_view: wgpu::TextureView,
     _surface_normal: wgpu::Texture,
@@ -3134,6 +3182,7 @@ impl CallbackTrait for ModelPaintCallback {
                                 match decal.mode {
                                     InvestmentDecalMode::SelectorMask => 1.0,
                                     InvestmentDecalMode::DetailSelectorMask => 2.0,
+                                    InvestmentDecalMode::SceneNormalColorMask => 3.0,
                                 },
                                 f32::from(decal.selector_color_count),
                                 f32::from(decal.atlas_selector_max),
@@ -3649,6 +3698,7 @@ impl CallbackTrait for ModelPaintCallback {
                 surface_albedo_view,
                 depth_view,
                 scene_color_copy_view,
+                scene_normal_copy_view,
                 distortion_view,
                 shadow_depth_view,
                 bloom_half_view,
@@ -3667,6 +3717,7 @@ impl CallbackTrait for ModelPaintCallback {
                         target.surface_albedo_view.clone(),
                         target.depth_view.clone(),
                         target.scene_color_copy_view.clone(),
+                        target.scene_normal_copy_view.clone(),
                         target.distortion_view.clone(),
                         target.shadow_depth_view.clone(),
                         target.bloom_half_view.clone(),
@@ -3850,10 +3901,16 @@ impl CallbackTrait for ModelPaintCallback {
                         .get::<ModelPipelineResources>()
                         .expect("model pipelines exist while preparing frame resources")
                         .coating_deferred_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&depth_view),
-                    }],
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&scene_normal_copy_view),
+                        },
+                    ],
                 });
             let coating_fallback_bind_group =
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3862,10 +3919,16 @@ impl CallbackTrait for ModelPaintCallback {
                         .get::<ModelPipelineResources>()
                         .expect("model pipelines exist while preparing frame resources")
                         .coating_deferred_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
-                    }],
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&scene_normal_copy_view),
+                        },
+                    ],
                 });
             let make_bundles = |passes: &[RenderPassKind], coating_deferred| {
                 callback_resources
@@ -4062,6 +4125,20 @@ impl CallbackTrait for ModelPaintCallback {
         });
         pass.execute_bundles(frame.opaque_bundles.iter());
         drop(pass);
+
+        // Stage-2 investment decals read the normal already written by the
+        // opaque surface pass through an external screen-space texture. Keep
+        // the source and destination separate: the normal attachment is still
+        // loaded and written by the decal pass below.
+        egui_encoder.copy_texture_to_texture(
+            target._surface_normal.as_image_copy(),
+            target.scene_normal_copy.as_image_copy(),
+            wgpu::Extent3d {
+                width: target.size[0],
+                height: target.size[1],
+                depth_or_array_layers: 1,
+            },
+        );
 
         for (label, bundles) in [(
             "quicktag_model_investment_decal_pass",
@@ -4579,22 +4656,34 @@ fn create_pipeline_resources(
             },
         ],
     });
-    // Stage-8 coating reads the already-populated deferred scene depth.
-    // Keep that feedback input isolated from ordinary material bindings: the
-    // source texture is also an opaque-pass color attachment earlier in-frame.
+    // Stage-8 coating and stage-2 investment decals read deferred screen
+    // attachments. Keep those feedback inputs isolated from ordinary material
+    // bindings: both source textures are populated by earlier passes.
     let coating_deferred_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("quicktag_model_coating_deferred_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
     let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("quicktag_model_present_layout"),
@@ -5113,7 +5202,10 @@ fn create_model_pipeline(
                 blend: blend_state(key.blend),
                 write_mask: wgpu::ColorWrites::ALL,
             }),
-            Some(surface_target(SURFACE_FORMAT)),
+            Some(surface_target_with_mask(
+                SURFACE_FORMAT,
+                normal_surface_write_mask(key.pass),
+            )),
             Some(surface_target(SURFACE_PROPERTIES_FORMAT)),
             Some(surface_target(SURFACE_FORMAT)),
         ]
@@ -5227,10 +5319,30 @@ fn model_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 fn surface_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
+    surface_target_with_mask(format, wgpu::ColorWrites::ALL)
+}
+
+fn surface_target_with_mask(
+    format: wgpu::TextureFormat,
+    write_mask: wgpu::ColorWrites,
+) -> wgpu::ColorTargetState {
     wgpu::ColorTargetState {
         format,
         blend: None,
-        write_mask: wgpu::ColorWrites::ALL,
+        write_mask,
+    }
+}
+
+fn normal_surface_write_mask(pass: RenderPassKind) -> wgpu::ColorWrites {
+    if matches!(
+        pass,
+        RenderPassKind::DecalCompatibility | RenderPassKind::InvestmentDecalCompatibility
+    ) {
+        // Decal RT1 alpha has no authored roughness override. Preserve opaque
+        // roughness while still replacing RT1 RGB with the decal normal.
+        wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE
+    } else {
+        wgpu::ColorWrites::ALL
     }
 }
 
@@ -5390,6 +5502,17 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         view_formats: &[],
     });
     let scene_color_copy_view = scene_color_copy.create_view(&Default::default());
+    let scene_normal_copy = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quicktag_model_scene_normal_copy"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SURFACE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let scene_normal_copy_view = scene_normal_copy.create_view(&Default::default());
     let distortion = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_distortion_payload"),
         size: extent,
@@ -5498,6 +5621,8 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
         lit_color_view,
         scene_color_copy,
         scene_color_copy_view,
+        scene_normal_copy,
+        scene_normal_copy_view,
         _distortion: distortion,
         distortion_view,
         _surface_normal: surface_normal,
@@ -5562,7 +5687,7 @@ const LIGHTING_SHADER: &str = r#"
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, light_parameters: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 
 struct VertexOutput {
@@ -5602,6 +5727,24 @@ fn view_direction_to_world(value: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(z_up.x, z_up.z, z_up.y);
 }
 
+fn world_direction_to_view(value: vec3<f32>) -> vec3<f32> {
+    let z_up = vec3<f32>(value.x, value.z, value.y);
+    let cy = cos(scene.params0.y);
+    let sy = sin(scene.params0.y);
+    let cp = cos(scene.params0.z);
+    let sp = sin(scene.params0.z);
+    let yawed = vec3<f32>(
+        z_up.x * cy + z_up.z * sy,
+        z_up.y,
+        -z_up.x * sy + z_up.z * cy,
+    );
+    return vec3<f32>(
+        yawed.x,
+        yawed.y * cp - yawed.z * sp,
+        yawed.y * sp + yawed.z * cp,
+    );
+}
+
 fn reconstruct_object_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let clip = uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     let scale = 0.84 * scene.params0.w / max(scene.params0.x, 0.0001);
@@ -5613,21 +5756,66 @@ fn reconstruct_object_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return scene.center.xyz + view_direction_to_world(view_position);
 }
 
+fn light_clip(position: vec3<f32>) -> vec4<f32> {
+    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
+    let light_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
+    let up = select(
+        vec3<f32>(0.0, 0.0, 1.0),
+        vec3<f32>(0.0, 1.0, 0.0),
+        abs(light_axis.z) > 0.95,
+    );
+    let right = normalize(cross(up, light_axis));
+    let vertical = cross(light_axis, right);
+    let source_to_surface = position - light_position;
+    let light_depth = dot(source_to_surface, light_axis);
+    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
+    let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
+    let near_plane = 0.05;
+    let range = max(scene.light_parameters.y, near_plane + 0.01);
+    let depth_scale = range / max(range - near_plane, 0.01);
+    let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
+    let perspective_denominator = max(light_depth * tangent, 0.0001);
+    return vec4<f32>(
+        dot(source_to_surface, right) / perspective_denominator,
+        dot(source_to_surface, vertical) / perspective_denominator,
+        depth_clip / perspective_denominator,
+        1.0,
+    );
+}
+
+fn spotlight_factor_world(position: vec3<f32>) -> f32 {
+    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
+    let source_to_surface = position - light_position;
+    let distance = length(source_to_surface);
+    let source_to_surface_direction = source_to_surface / max(distance, 0.0001);
+    let beam_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
+    let cone = smoothstep(
+        scene.light_parameters.z,
+        scene.light_parameters.w,
+        dot(source_to_surface_direction, beam_axis),
+    );
+    let range = max(scene.light_parameters.y, 0.05);
+    let range_fade = 1.0 - smoothstep(range * 0.70, range, distance);
+    let distance_falloff = 1.0 / max(1.0, distance * distance);
+    return cone * range_fade * distance_falloff;
+}
+
 fn deferred_shadow(uv: vec2<f32>, normal: vec3<f32>) -> f32 {
     let dimensions = vec2<i32>(textureDimensions(scene_depth));
     let pixel = clamp(vec2<i32>(uv * vec2<f32>(dimensions)), vec2<i32>(0), dimensions - vec2<i32>(1));
     let depth = textureLoad(scene_depth, pixel, 0);
     let position = reconstruct_object_position(uv, depth);
-    let light_world = normalize(view_direction_to_world(scene.light_direction.xyz));
-    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_world.z) > 0.95);
-    let right = normalize(cross(up, light_world));
-    let vertical = cross(light_world, right);
-    let relative = (position - scene.center.xyz) / max(scene.center.w, 0.0001);
+    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
+    let light_world = normalize(light_position - position);
+    let light_clip_position = light_clip(position);
     let shadow_position = vec3<f32>(
-        vec2<f32>(dot(relative, right), dot(relative, vertical)) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5),
-        0.5 - dot(relative, light_world) * 0.5,
+        light_clip_position.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5),
+        light_clip_position.z,
     );
-    if any(shadow_position.xy < vec2<f32>(0.0)) || any(shadow_position.xy > vec2<f32>(1.0)) {
+    if any(shadow_position.xy < vec2<f32>(0.0))
+        || any(shadow_position.xy > vec2<f32>(1.0))
+        || shadow_position.z <= 0.0
+        || shadow_position.z >= 1.0 {
         return 1.0;
     }
     let texel = 1.0 / vec2<f32>(textureDimensions(sun_shadow));
@@ -5654,6 +5842,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     );
     let emissive = textureLoad(surface_emissive, emissive_pixel, 0).rgb;
     let surface = textureSample(surface_albedo, surface_sampler, input.uv);
+    let scene_dimensions = vec2<i32>(textureDimensions(scene_depth));
+    let scene_pixel = clamp(
+        vec2<i32>(input.uv * vec2<f32>(scene_dimensions)),
+        vec2<i32>(0),
+        scene_dimensions - vec2<i32>(1),
+    );
+    let scene_depth_value = textureLoad(scene_depth, scene_pixel, 0);
+    let position = reconstruct_object_position(input.uv, scene_depth_value);
     if u32(scene.postprocess2.x + 0.5) != 0u {
         return compatibility;
     }
@@ -5671,7 +5867,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         );
         let metalness = clamp(properties.r, 0.0, 1.0);
         let ao = clamp(properties.g, 0.0, 1.0);
-        let light = normalize(scene.light_direction.xyz);
+        let view_position = world_direction_to_view(position - scene.center.xyz);
+        let light = normalize(scene.light_position.xyz - view_position);
+        let spotlight = spotlight_factor_world(position);
         let view = vec3<f32>(0.0, 0.0, 1.0);
         let halfway = normalize(light + view);
         let n_dot_l = max(dot(normal, light), 0.0);
@@ -5690,7 +5888,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let specular = distribution * visibility_l * visibility_v * fresnel * 0.25;
         let diffuse = (vec3<f32>(1.0) - fresnel) * (1.0 - metalness) * albedo / 3.14159265;
         let shadow = mix(1.0, deferred_shadow(input.uv, normal), scene.light_direction.w);
-        let direct = (diffuse + specular) * n_dot_l * scene.postprocess0.w * shadow;
+        let direct = (diffuse + specular)
+            * n_dot_l
+            * scene.postprocess0.w
+            * spotlight
+            * shadow;
         let ibl_diffuse = albedo * (1.0 - metalness) * scene.postprocess4.z * ao;
         let ibl_specular = f0 * mix(0.08, 1.0, 1.0 - roughness)
             * scene.postprocess4.w * ao;
@@ -5698,8 +5900,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(color, surface.a);
     }
     if model == 2u {
-        let light = normalize(scene.light_direction.xyz);
-        let lambert = max(dot(normal, light), 0.0);
+        let view_position = world_direction_to_view(position - scene.center.xyz);
+        let light = normalize(scene.light_position.xyz - view_position);
+        let lambert = max(dot(normal, light), 0.0) * spotlight_factor_world(position);
         let ao = properties.g;
         return vec4<f32>(surface.rgb * (0.18 * ao + 0.82 * lambert) + emissive, compatibility.a);
     }
@@ -5869,7 +6072,7 @@ fn fs_blur_vertical(input: VertexOutput) -> @location(0) vec4<f32> {
 const SHADOW_SHADER: &str = r#"
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, light_parameters: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
 
@@ -5953,18 +6156,35 @@ fn view_direction_to_world(value: vec3<f32>) -> vec3<f32> {
 }
 
 fn light_clip(position: vec3<f32>) -> vec4<f32> {
-    // Shading light is authored in camera/view space. Convert only shadow
-    // projection back into model/world space so both passes agree.
-    let light = normalize(view_direction_to_world(scene.light_direction.xyz));
-    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light.z) > 0.95);
-    let right = normalize(cross(up, light));
-    let vertical = cross(light, right);
-    let relative = (position - scene.center.xyz) / max(scene.center.w, 0.0001);
-    // `light` points from the surface toward the source. The source-facing
-    // side must therefore have the smaller depth. The old +dot projection
-    // inverted this ordering and let hidden back surfaces shadow front ones.
-    let light_depth = 0.5 - dot(relative, light) * 0.5;
-    return vec4<f32>(dot(relative, right), dot(relative, vertical), light_depth, 1.0);
+    // The source position is stored in view space so the forward and deferred
+    // lighting paths can compute a per-fragment vector. Convert it back here
+    // for the shadow pass, whose vertex positions are model/world space.
+    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
+    let light_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
+    let up = select(
+        vec3<f32>(0.0, 0.0, 1.0),
+        vec3<f32>(0.0, 1.0, 0.0),
+        abs(light_axis.z) > 0.95,
+    );
+    let right = normalize(cross(up, light_axis));
+    let vertical = cross(light_axis, right);
+    let source_to_surface = position - light_position;
+    let light_depth = dot(source_to_surface, light_axis);
+    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
+    let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
+    // Keep light projection homogeneous. Rasterizer performs perspective
+    // divide, preserving correct depth interpolation in shadow map.
+    let near_plane = 0.05;
+    let range = max(scene.light_parameters.y, near_plane + 0.01);
+    let depth_scale = range / max(range - near_plane, 0.01);
+    let perspective_denominator = light_depth * tangent;
+    let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
+    return vec4<f32>(
+        dot(source_to_surface, right),
+        dot(source_to_surface, vertical),
+        depth_clip,
+        perspective_denominator,
+    );
 }
 
 struct ShadowVertexOutput {
@@ -6050,6 +6270,7 @@ struct SceneUniform {
     uv_transform: vec4<f32>,
     light_direction: vec4<f32>,
     light_parameters: vec4<f32>,
+    light_position: vec4<f32>,
     postprocess0: vec4<f32>,
     postprocess1: vec4<f32>,
     postprocess2: vec4<f32>,
@@ -6152,6 +6373,9 @@ struct MaterialUniform {
 // Tiger stage-8 coating PS t0: deferred RT2 produced by the opaque surface
 // pass. This is screen-space material data, not another authored 2D texture.
 @group(2) @binding(0) var coating_scene_depth: texture_depth_2d;
+// Stage-2 investment decal PS t2: packed screen-space surface normal copied
+// after the opaque pass. It must not alias the normal render attachment.
+@group(2) @binding(1) var investment_scene_normal: texture_2d<f32>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -6182,13 +6406,32 @@ fn view_direction_to_world(value: vec3<f32>) -> vec3<f32> {
 }
 
 fn light_clip(position: vec3<f32>) -> vec4<f32> {
-    let light = normalize(view_direction_to_world(scene.light_direction.xyz));
-    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light.z) > 0.95);
-    let right = normalize(cross(up, light));
-    let vertical = cross(light, right);
-    let relative = (position - scene.center.xyz) / max(scene.center.w, 0.0001);
-    let light_depth = 0.5 - dot(relative, light) * 0.5;
-    return vec4<f32>(dot(relative, right), dot(relative, vertical), light_depth, 1.0);
+    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
+    let light_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
+    let up = select(
+        vec3<f32>(0.0, 0.0, 1.0),
+        vec3<f32>(0.0, 1.0, 0.0),
+        abs(light_axis.z) > 0.95,
+    );
+    let right = normalize(cross(up, light_axis));
+    let vertical = cross(light_axis, right);
+    let source_to_surface = position - light_position;
+    let light_depth = dot(source_to_surface, light_axis);
+    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
+    let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
+    // Keep light projection homogeneous so rasterizer performs perspective
+    // divide and depth interpolation remains correct for finite spotlight.
+    let near_plane = 0.05;
+    let range = max(scene.light_parameters.y, near_plane + 0.01);
+    let depth_scale = range / max(range - near_plane, 0.01);
+    let perspective_denominator = light_depth * tangent;
+    let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
+    return vec4<f32>(
+        dot(source_to_surface, right),
+        dot(source_to_surface, vertical),
+        depth_clip,
+        perspective_denominator,
+    );
 }
 
 struct VertexOutput {
@@ -6198,7 +6441,6 @@ struct VertexOutput {
     @location(2) uv: vec2<f32>,
     @location(3) view_tangent: vec4<f32>,
     @location(4) ambient_occlusion: f32,
-    @location(5) shadow_position: vec3<f32>,
     @location(6) world_relative: vec3<f32>,
     @location(7) world_normal: vec3<f32>,
     @location(8) procedural_position: vec3<f32>,
@@ -6249,8 +6491,6 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.uv = input.uv * scene.uv_transform.xy + scene.uv_transform.zw;
     output.view_tangent = vec4<f32>(rotate_view(input.tangent.xyz), input.tangent.w);
     output.ambient_occlusion = input.ambient_occlusion;
-    let shadow_clip = light_clip(input.position);
-    output.shadow_position = vec3<f32>(shadow_clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5), shadow_clip.z);
     output.world_relative = input.position - scene.center.xyz;
     output.world_normal = input.normal;
     output.procedural_position = input.procedural_position;
@@ -8302,21 +8542,32 @@ const SHADOW_DISK = array<vec2<f32>, 24>(
     vec2<f32>(-0.7948,  0.5530), vec2<f32>( 0.2172, -0.9654),
 );
 
-fn directional_shadow(input: VertexOutput) -> f32 {
-    if any(input.shadow_position.xy < vec2<f32>(0.0))
-        || any(input.shadow_position.xy > vec2<f32>(1.0))
-        || input.shadow_position.z <= 0.0
-        || input.shadow_position.z >= 1.0 {
+fn spotlight_shadow(input: VertexOutput) -> f32 {
+    // Recompute finite light projection from interpolated world position.
+    // Interpolating post-divide coordinates from vertices distorts projective
+    // UV/depth across large triangles.
+    let shadow_clip = light_clip(scene.center.xyz + input.world_relative);
+    if shadow_clip.w <= 0.0001 {
+        return 1.0;
+    }
+    let shadow_position = vec3<f32>(
+        shadow_clip.xy / shadow_clip.w * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5),
+        shadow_clip.z / shadow_clip.w,
+    );
+    if any(shadow_position.xy < vec2<f32>(0.0))
+        || any(shadow_position.xy > vec2<f32>(1.0))
+        || shadow_position.z <= 0.0
+        || shadow_position.z >= 1.0 {
         return 1.0;
     }
 
     let shadow_texel = 1.0 / vec2<f32>(textureDimensions(sun_shadow));
-    let light_world = normalize(view_direction_to_world(scene.light_direction.xyz));
+    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
+    let light_world = normalize(light_position - (scene.center.xyz + input.world_relative));
     let geometric_normal = normalize(input.world_normal);
     let n_dot_light = max(dot(geometric_normal, light_world), 0.0);
-    // Depth is normalized across the fitted bounding sphere. Expressing bias
-    // in shadow texels keeps it stable for every weapon size and suppresses
-    // triangle/segment acne without detaching genuine contact shadows.
+    // Expressing bias in shadow texels keeps it stable for every weapon size
+    // and suppresses triangle/segment acne without detaching contact shadows.
     let receiver_bias = shadow_texel.x * (0.75 + (1.0 - n_dot_light) * 2.0);
     let softness = clamp(scene.params1.w, 0.0, 1.0);
 
@@ -8327,15 +8578,15 @@ fn directional_shadow(input: VertexOutput) -> f32 {
         return textureSampleCompare(
             sun_shadow,
             sun_shadow_sampler,
-            input.shadow_position.xy,
-            input.shadow_position.z - receiver_bias,
+            shadow_position.xy,
+            shadow_position.z - receiver_bias,
         );
     }
 
     let filter_radius = 0.75 + softness * softness * 48.0;
     var visibility = 0.0;
     for (var sample = 0u; sample < SHADOW_SAMPLE_COUNT; sample++) {
-        let sample_uv = input.shadow_position.xy
+        let sample_uv = shadow_position.xy
             + SHADOW_DISK[sample] * shadow_texel * filter_radius;
         // Out-of-frustum space contains no caster. Check every tap instead of
         // clamping it to an edge depth, which would stretch a silhouette into
@@ -8347,7 +8598,7 @@ fn directional_shadow(input: VertexOutput) -> f32 {
                 sun_shadow,
                 sun_shadow_sampler,
                 sample_uv,
-                input.shadow_position.z - receiver_bias,
+                shadow_position.z - receiver_bias,
             );
         }
     }
@@ -8361,6 +8612,9 @@ fn investment_decal_mask(uv: vec2<f32>) -> f32 {
         uv,
         material.sampler_params.x,
     ).r;
+    if material.decal_params.x > 2.5 {
+        return select(0.0, 1.0, raw_mask > material.decal_mask_params.y);
+    }
     if material.decal_params.x < 1.5 {
         return select(0.0, 1.0, raw_mask > material.decal_mask_params.y);
     }
@@ -8378,6 +8632,11 @@ fn investment_decal_mask(uv: vec2<f32>) -> f32 {
 }
 
 fn investment_decal_source(uv: vec2<f32>, atlas: vec3<f32>) -> vec3<f32> {
+    // Scene-normal decals use the directly sampled sRGB t3 colour. Their UV
+    // is ordinary mesh UV; there is no selector encoded in UV.x.
+    if material.decal_params.x > 2.5 {
+        return atlas;
+    }
     let selector = i32(uv.x);
     if material.decal_params.x < 1.5 {
         if selector == 0 {
@@ -8411,6 +8670,18 @@ fn investment_decal_source(uv: vec2<f32>, atlas: vec3<f32>) -> vec3<f32> {
         ).r
             * material.decal_mask_params.w;
     return vec3<f32>(grayscale);
+}
+
+fn investment_scene_normal_value(input: VertexOutput) -> vec3<f32> {
+    let dimensions = vec2<i32>(textureDimensions(investment_scene_normal));
+    let pixel = clamp(
+        vec2<i32>(input.clip_position.xy),
+        vec2<i32>(0),
+        dimensions - vec2<i32>(1),
+    );
+    return normalize(
+        textureLoad(investment_scene_normal, pixel, 0).rgb * 2.0 - vec3<f32>(1.0)
+    );
 }
 
 struct FragmentOutput {
@@ -8514,6 +8785,24 @@ fn character_palette_procedural_mask(
     );
 }
 
+fn spotlight_factor(position: vec3<f32>) -> f32 {
+    let source_to_surface = position - scene.light_position.xyz;
+    let distance = length(source_to_surface);
+    let source_to_surface_direction = source_to_surface / max(distance, 0.0001);
+    let beam_axis = normalize(-scene.light_direction.xyz);
+    let cone = smoothstep(
+        scene.light_parameters.z,
+        scene.light_parameters.w,
+        dot(source_to_surface_direction, beam_axis),
+    );
+    let range = max(scene.light_parameters.y, 0.05);
+    let range_fade = 1.0 - smoothstep(range * 0.70, range, distance);
+    // Clamp the near-field denominator so the configured source does not
+    // explode when a model surface crosses the light origin.
+    let distance_falloff = 1.0 / max(1.0, distance * distance);
+    return cone * range_fade * distance_falloff;
+}
+
 fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     let base_color = textureSampleBias(
         color_texture,
@@ -8557,7 +8846,7 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
             discard;
         }
         sampled_albedo = investment_decal_source(input.uv, base_color.rgb);
-        if material.decal_params.x > 1.5 {
+        if material.decal_params.x > 1.5 && material.decal_params.x < 2.5 {
             let detail_uv = input.uv * material.decal_detail_transform.xy
                 + material.decal_detail_transform.zw;
             let detail_sample = textureSampleBias(
@@ -8941,12 +9230,16 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     let condition_mask = weapon_surface_condition_mask(input);
     semantic_wear_mask = max(semantic_wear_mask, condition_mask);
     let mapped = mapped_normal(input);
-    let normal = normalize(mix(
+    var normal = normalize(mix(
         mapped,
         normalize(input.view_normal),
         condition_mask * material.wear_scratches_projection.w,
     ));
-    let light = normalize(scene.light_direction.xyz);
+    if investment_decal && material.decal_params.x > 2.5 {
+        normal = investment_scene_normal_value(input);
+    }
+    let light = normalize(scene.light_position.xyz - input.view_position);
+    let spotlight = spotlight_factor(input.view_position);
     let view_direction = vec3<f32>(0.0, 0.0, 1.0);
     let surface = material_surface(input, albedo);
     let roughness = clamp(
@@ -8995,7 +9288,7 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
         );
         vertex_ao = 0.5 * (vertex_ao + clamp(runner_ao, 0.0, 1.0));
     }
-    let sun_visibility = mix(1.0, directional_shadow(input), scene.light_direction.w);
+    let sun_visibility = mix(1.0, spotlight_shadow(input), scene.light_direction.w);
     let n_dot_l = max(dot(normal, light), 0.0);
     // Near-neutral 5400–5900 K source. Diffuse establishes the form; there is
     // deliberately no camera fill, rim term, or Fresnel added to final colour.
@@ -9005,7 +9298,7 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     // specular, which was responsible for the luminous cream contours.
     let diffuse_working_scale = 10.0;
     let direct_diffuse = albedo * (1.0 - metalness) * key_color
-        * scene.postprocess0.w * n_dot_l * sun_visibility * diffuse_working_scale;
+        * scene.postprocess0.w * n_dot_l * sun_visibility * spotlight * diffuse_working_scale;
     let up_factor = normal.y * 0.5 + 0.5;
     let hemi_irradiance = mix(
         vec3<f32>(0.075, 0.078, 0.082),
@@ -9024,6 +9317,7 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
             * scene.postprocess0.w
             * n_dot_l
             * sun_visibility
+            * spotlight
             * 0.24
             * grazing,
         0.22,
@@ -9158,7 +9452,13 @@ fn shade_model(input: VertexOutput, investment_decal: bool) -> FragmentOutput {
     }
     var output: FragmentOutput;
     output.compatibility_hdr = compatibility_hdr;
-    output.normal_roughness = vec4<f32>(normal * 0.5 + vec3<f32>(0.5), roughness);
+    // Authored stage-2 decal PS outputs alpha zero for RT1. Decal pipelines
+    // mask RT1 alpha, preserving opaque roughness while writing resolved
+    // scene or mesh normal RGB.
+    output.normal_roughness = vec4<f32>(
+        normal * 0.5 + vec3<f32>(0.5),
+        select(roughness, 0.0, investment_decal),
+    );
     output.material_properties = vec4<f32>(
         metalness,
         vertex_ao,
@@ -9241,9 +9541,10 @@ fn fs_forward_coating(input: VertexOutput) -> @location(0) vec4<f32> {
         1.0,
     );
 
-    let light = normalize(scene.light_direction.xyz);
+    let light = normalize(scene.light_position.xyz - input.view_position);
+    let spotlight = spotlight_factor(input.view_position);
     let n_dot_l = max(dot(normal, light), 0.0);
-    let sun_visibility = mix(1.0, directional_shadow(input), scene.light_direction.w);
+    let sun_visibility = mix(1.0, spotlight_shadow(input), scene.light_direction.w);
     // The coating PS is a narrow light-responsive lobe, not Lambert diffuse.
     // Its package response is sharply angular: preserve the lit face while
     // preventing an oblique inset face from receiving comparable irradiance.
@@ -9261,9 +9562,12 @@ fn fs_forward_coating(input: VertexOutput) -> @location(0) vec4<f32> {
         coating_shadow_sensitivity,
     );
     let coating_visibility = mix(0.08, 1.0, coating_shadow_response);
-    let ambient_illumination = 0.18 * scene.postprocess4.z * coating_visibility;
+    // Ambient environment light is independent of the spotlight's source,
+    // cone, and shadow map. Only the key lobe follows source visibility.
+    let ambient_illumination = 0.18 * scene.postprocess4.z;
     let key_illumination = coating_key_response
         * sun_visibility
+        * spotlight
         * coating_visibility
         * scene.postprocess0.w
         * 0.82;
@@ -9272,18 +9576,9 @@ fn fs_forward_coating(input: VertexOutput) -> @location(0) vec4<f32> {
         vec3<f32>(0.66, 1.05, 2.30),
         coating_shadow_sensitivity,
     );
-    let shadow_response = 1.0 - smoothstep(0.40, 0.55, n_dot_l);
-    let coating_shadow_fill = shadow_response
-        * coating_visibility
-        * scene.postprocess4.z
-        * vec3<f32>(0.045, 0.083, 0.080)
-        + (1.0 - coating_shadow_response)
-            * scene.postprocess4.z
-            * vec3<f32>(0.035, 0.065, 0.069);
     let base_illumination = ambient_illumination + key_illumination;
     let lit_base = base_color
-        * (vec3<f32>(ambient_illumination) + coating_key_color * key_illumination)
-        + coating_shadow_fill;
+        * (vec3<f32>(ambient_illumination) + coating_key_color * key_illumination);
 
     let reflection_direction = reflect(-view_direction, normal);
     // PS c31 chooses a lower mip floor from the detail response. The audited
@@ -9463,7 +9758,8 @@ fn fs_distortion(input: VertexOutput) -> @location(0) vec4<f32> {
         authored_color,
         material.transmission_params.x > 0.5,
     );
-    let light = normalize(scene.light_direction.xyz);
+    let light = normalize(scene.light_position.xyz - input.view_position);
+    let spotlight = spotlight_factor(input.view_position);
     let n_dot_l = max(dot(normal, light), 0.0);
     let half_vector = normalize(light + view_direction);
     if material.transmission_params.x > 0.5 {
@@ -9475,10 +9771,12 @@ fn fs_distortion(input: VertexOutput) -> @location(0) vec4<f32> {
         let metalness = clamp(authored_surface.y, 0.0, 1.0);
         let specular_power = mix(128.0, 4.0, roughness);
         let f0 = mix(vec3<f32>(0.04), base_color, metalness);
-        let direct_diffuse = base_color * (1.0 - metalness) * (0.18 + n_dot_l * 0.72);
+        let direct_diffuse =
+            base_color * (1.0 - metalness) * (0.18 + n_dot_l * 0.72 * spotlight);
         let direct_specular = f0
             * pow(max(dot(normal, half_vector), 0.0), specular_power)
-            * mix(1.0, 0.28, roughness);
+            * mix(1.0, 0.28, roughness)
+            * spotlight;
         let grazing_specular = f0 * fresnel * mix(0.42, 0.12, roughness);
         let surface_color = direct_diffuse + direct_specular + grazing_specular;
         let coverage = clamp(authored_signal, 0.0, 1.0);
@@ -9488,7 +9786,8 @@ fn fs_distortion(input: VertexOutput) -> @location(0) vec4<f32> {
     // Unclassified stage-8 effects retain map-driven coverage until their
     // own shader ABI proves opaque-surface semantics.
     let coverage = authored_signal * 0.45;
-    let surface_color = base_color * (0.055 + n_dot_l * 0.105 + fresnel * 0.025);
+    let surface_color = base_color
+        * (0.055 + n_dot_l * 0.105 * spotlight + fresnel * 0.025 * spotlight);
     return vec4<f32>(surface_color * coverage, coverage);
 }
 
@@ -9532,7 +9831,7 @@ const PRESENT_SHADER: &str = r#"
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, light_parameters: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
 }
 
 fn reconstruct_view_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -9789,17 +10088,17 @@ mod tests {
         ModelPipelineKey, ModelPipelineResources, PRESENT_SHADER, SHADOW_SHADER, adapt_exposure,
         alpha_mode, blend_enabled, blend_state, bounded_target_size, create_model_pipeline,
         create_model_sampler, create_pipeline_resources, create_target_resources,
-        decode_model_sampler_desc, directional_light_cast_direction, directional_light_softness,
-        exposure_target, first_person_key_light, fitted_export_zoom,
+        decode_model_sampler_desc, exposure_target, first_person_key_light, fitted_export_zoom,
         fitted_export_zoom_for_positions, fitted_export_zoom_for_positions_around,
-        hiz_draw_visible, is_distortion_payload_pass, model_direction_to_view, model_draws,
-        model_orthographic_depth, model_orthographic_view_depth, model_view_depth,
+        hiz_draw_visible, is_distortion_payload_pass, light_cast_direction, light_shadow_softness,
+        light_source_position, model_direction_to_view, model_draws, model_orthographic_depth,
+        model_orthographic_view_depth, model_view_depth, normal_surface_write_mask,
         project_hiz_vertex, projected_export_bounds, rasterizer_cull_mode, shadow_pipeline_index,
         smooth_normals, vertex_ambient_occlusion, view_direction_to_model,
     };
     use crate::{
         geometry::{
-            GeometryPreviewKind, GeometryTagPreview, RunnerShellCombination,
+            GearDyeMaterial, GeometryPreviewKind, GeometryTagPreview, RunnerShellCombination,
             WeaponModPreviewAttachment, WeaponModRarity, WireframeMaterialRange,
             WireframeMaterialTextures, WireframePreview,
         },
@@ -10002,9 +10301,9 @@ mod tests {
         schema: u32,
         adapter_version: &'static str,
         renderer_schema_version: u32,
-        asset: &'static str,
-        owner: &'static str,
-        attachments: [&'static str; 2],
+        asset: String,
+        owner: String,
+        attachments: Vec<String>,
         gpu_name: String,
         gpu_backend: String,
         gpu_driver: String,
@@ -10012,7 +10311,21 @@ mod tests {
         output_size: [u32; 2],
         yaw_degrees: f32,
         pitch_degrees: f32,
+        pan_pixels: [f32; 2],
         scale: f32,
+        light_target: [f32; 3],
+        light_orbit_position: [f32; 3],
+        light_orbit_center: [f32; 3],
+        light_orbit_radius: f32,
+        light_range: f32,
+        light_cone_angle: f32,
+        light_size: f32,
+        shadow_softness: f32,
+        exposure: f32,
+        ambient_intensity: f32,
+        specular_ibl_intensity: f32,
+        tone_mapping: bool,
+        auto_exposure: bool,
         fidelity: String,
         lighting_model: String,
         debug_channel: String,
@@ -10152,7 +10465,7 @@ mod tests {
     #[test]
     fn preserves_configured_default_key_light_direction() {
         let environment = ModelEnvironment::default();
-        let cast_direction = directional_light_cast_direction(&environment);
+        let cast_direction = light_cast_direction(&environment);
         let (light, _height) = first_person_key_light(
             environment.time_of_day,
             cast_direction,
@@ -10172,8 +10485,9 @@ mod tests {
     }
 
     #[test]
-    fn directional_light_transform_is_world_space_and_orbit_aimed() {
-        let direction = [0.276, -0.627, -0.728];
+    fn spotlight_transform_is_world_space_and_orbit_aimed() {
+        let defaults = ModelEnvironment::default();
+        let direction = light_cast_direction(&defaults);
         for (yaw, pitch) in [(0.0, 0.0), (-0.7, 0.3), (1.2, -0.8)] {
             let view = model_direction_to_view(direction, yaw, pitch);
             let restored = view_direction_to_model(view, yaw, pitch);
@@ -10182,25 +10496,59 @@ mod tests {
             }
         }
 
-        assert_eq!(directional_light_softness(5.0, 0.5), 0.5);
-        assert!(directional_light_softness(10.0, 0.5) > 0.5);
-        assert!(directional_light_softness(0.0, 0.5) < 0.5);
+        assert_eq!(light_shadow_softness(5.0, 0.5), 0.5);
+        assert!(light_shadow_softness(10.0, 0.5) > 0.5);
+        assert!(light_shadow_softness(0.0, 0.5) < 0.5);
 
-        let defaults = ModelEnvironment::default();
         assert_eq!(defaults.light_orbit_radius, 1.0);
-        assert_eq!(defaults.light_orbit_center, [0.0; 3]);
-        assert_eq!(defaults.light_target, [0.0; 3]);
+        assert_eq!(defaults.light_orbit_center, [0.174, -0.045, -0.117]);
+        assert_eq!(defaults.light_target, [-0.183, 0.017, -0.483]);
+        assert_eq!(defaults.light_orbit_position, [0.2562, 0.3389, 0.9053]);
 
-        let baseline = directional_light_cast_direction(&defaults);
+        let baseline = light_cast_direction(&defaults);
+        let source = light_source_position(&defaults);
+        let orbit_length = defaults
+            .light_orbit_position
+            .into_iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        let expected_source: [f32; 3] = std::array::from_fn(|axis| {
+            defaults.light_orbit_center[axis]
+                + defaults.light_orbit_position[axis] / orbit_length
+                    * defaults.light_orbit_radius.max(0.0)
+        });
+        for axis in 0..3 {
+            assert!((source[axis] - expected_source[axis]).abs() < 0.000_001);
+        }
+        let source_offset: [f32; 3] =
+            std::array::from_fn(|axis| source[axis] - defaults.light_orbit_center[axis]);
+        let source_length = source_offset
+            .into_iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((source_length - defaults.light_orbit_radius).abs() < 0.000_001);
+        for axis in 0..3 {
+            assert!(
+                (source_offset[axis] / source_length
+                    - defaults.light_orbit_position[axis] / orbit_length)
+                    .abs()
+                    < 0.000_001
+            );
+            assert!(
+                (baseline[axis] - (defaults.light_target[axis] - source[axis])).abs() < 0.000_001
+            );
+        }
         let mut moved_point = defaults;
         moved_point.light_orbit_position = [0.0, 1.0, 0.0];
-        assert_ne!(directional_light_cast_direction(&moved_point), baseline);
+        assert_ne!(light_cast_direction(&moved_point), baseline);
         let mut moved_center = defaults;
         moved_center.light_orbit_center = [1.0, 0.0, 0.0];
-        assert_ne!(directional_light_cast_direction(&moved_center), baseline);
+        assert_ne!(light_cast_direction(&moved_center), baseline);
         let mut moved_target = defaults;
         moved_target.light_target = [1.0, 0.0, 0.0];
-        assert_ne!(directional_light_cast_direction(&moved_target), baseline);
+        assert_ne!(light_cast_direction(&moved_target), baseline);
     }
 
     #[test]
@@ -10215,22 +10563,67 @@ mod tests {
         assert!(MODEL_SHADER.contains("* 0.24"));
         assert!(MODEL_SHADER.contains("let specular_occlusion"));
         assert!(MODEL_SHADER.contains("vertex_ao = material.sampler_params.w"));
-        assert!(MODEL_SHADER.contains("directional_shadow(input)"));
+        assert!(MODEL_SHADER.contains("spotlight_shadow(input)"));
         assert!(!MODEL_SHADER.contains("rim_"));
     }
 
     #[test]
-    fn uses_front_to_back_light_depth_and_stable_shadow_filtering() {
+    fn uses_finite_spotlight_depth_and_stable_shadow_filtering() {
         for shader in [MODEL_SHADER, SHADOW_SHADER] {
-            assert!(shader.contains("0.5 - dot(relative, light) * 0.5"));
-            assert!(shader.contains("max(scene.center.w, 0.0001)"));
+            assert!(shader.contains("scene.light_position.xyz"));
+            assert!(shader.contains("scene.light_parameters.y"));
+            assert!(shader.contains("perspective_denominator"));
         }
+        assert!(SHADOW_SHADER.contains("depth_clip,\n        perspective_denominator"));
+        assert!(MODEL_SHADER.contains("light_clip(scene.center.xyz + input.world_relative)"));
+        assert!(!MODEL_SHADER.contains("@location(5) shadow_position"));
         assert!(MODEL_SHADER.contains("let receiver_bias = shadow_texel.x"));
         assert!(MODEL_SHADER.contains("const SHADOW_DISK"));
         assert!(MODEL_SHADER.contains("let softness = clamp(scene.params1.w"));
         assert!(MODEL_SHADER.contains("softness * softness * 48.0"));
         assert!(!MODEL_SHADER.contains("shadow_texel * 5.0"));
         assert!(!MODEL_SHADER.contains("mix(0.30, 1.0"));
+    }
+
+    #[test]
+    fn finite_spotlight_depth_stays_perspective_over_depth_varying_triangle() {
+        let near_plane = 0.05_f32;
+        let range = 4.0_f32;
+        let tangent = 0.8_f32;
+        let clip_w = |depth: f32| depth * tangent;
+        let clip_z = |depth: f32| range * (depth - near_plane) * tangent / (range - near_plane);
+        let ndc_depth = |depth: f32| clip_z(depth) / clip_w(depth);
+
+        // Barycentric interpolation across a triangle must remain affine in
+        // homogeneous clip depth, while post-divide depth remains nonlinear.
+        let depths = [0.5_f32, 1.75, 3.5];
+        let weights = [0.2_f32, 0.35, 0.45];
+        let depth_at_sample = depths
+            .into_iter()
+            .zip(weights)
+            .map(|(depth, weight)| depth * weight)
+            .sum::<f32>();
+        let interpolated_clip_z = depths
+            .into_iter()
+            .zip(weights)
+            .map(|(depth, weight)| clip_z(depth) * weight)
+            .sum::<f32>();
+        let interpolated_clip_w = depths
+            .into_iter()
+            .zip(weights)
+            .map(|(depth, weight)| clip_w(depth) * weight)
+            .sum::<f32>();
+        assert!((interpolated_clip_z - clip_z(depth_at_sample)).abs() < 0.000_001);
+        assert!((interpolated_clip_w - clip_w(depth_at_sample)).abs() < 0.000_001);
+        assert!(
+            (interpolated_clip_z / interpolated_clip_w - ndc_depth(depth_at_sample)).abs()
+                < 0.000_001
+        );
+
+        // Old affine normalized depth would visibly disagree toward near
+        // vertices; this catches regressions back to linear depth packing.
+        let old_linear_depth = (depth_at_sample - near_plane) / (range - near_plane);
+        assert!((ndc_depth(depth_at_sample) - old_linear_depth).abs() > 0.08);
     }
 
     #[test]
@@ -10509,6 +10902,23 @@ mod tests {
     fn coating_uses_hdr_forward_target_not_distortion_payload() {
         assert!(is_distortion_payload_pass(RenderPassKind::Distortion));
         assert!(!is_distortion_payload_pass(RenderPassKind::ForwardCoating));
+    }
+
+    #[test]
+    fn decal_rt1_preserves_opaque_roughness() {
+        assert_eq!(
+            normal_surface_write_mask(RenderPassKind::DecalCompatibility),
+            wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE
+        );
+        assert_eq!(
+            normal_surface_write_mask(RenderPassKind::InvestmentDecalCompatibility),
+            wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE
+        );
+        assert_eq!(
+            normal_surface_write_mask(RenderPassKind::OpaqueCompatibility),
+            wgpu::ColorWrites::ALL
+        );
+        assert!(MODEL_SHADER.contains("mask RT1 alpha, preserving opaque roughness"));
     }
 
     #[test]
@@ -11132,6 +11542,18 @@ mod tests {
             .is_some_and(|value| value != 0);
         for (name, weapon, weapon_owner, mods, expected_dye_colors, yaw) in [
             (
+                "yokais-lash-zeus-rg",
+                TagHash(0x80B7BF4D),
+                TagHash(0x80A7AD4A),
+                vec![
+                    TagHash(0x80A9A3D0),
+                    TagHash(0x80A9A04E),
+                    TagHash(0x80A61CA5),
+                ],
+                vec![],
+                -22.2_f32.to_radians(),
+            ),
+            (
                 "d54-default-optic",
                 TagHash(0x80B7CAE9),
                 TagHash(0x80A7C982),
@@ -11482,7 +11904,7 @@ mod tests {
                 TagHash(0x80B14135),
                 vec![],
                 vec![],
-                -106.5_f32.to_radians(),
+                -58.1_f32.to_radians(),
             ),
             (
                 "runner-neo-cortex-combined",
@@ -11733,12 +12155,12 @@ mod tests {
                 -106.5_f32.to_radians(),
             ),
             (
-                "runner-agr-dual-r-e64f-combined",
+                "runner-vandal-cryo-shift-combined",
                 TagHash(0x80A9E76B),
                 TagHash(0x80A9E76B),
                 vec![],
                 vec![],
-                -106.5_f32.to_radians(),
+                -58.1_f32.to_radians(),
             ),
         ] {
             if requested_case
@@ -11751,12 +12173,32 @@ mod tests {
             let flat_panel_reference_case = name.starts_with("vox-nocturna-v85-flat-panel");
             let coating_reference_case = name == "vox-nocturna-copperhead-forward-coating";
             let investment_decal_reference_case = name == "m77-investment-decal";
+            let cryo_shift_reference_case = name == "runner-vandal-cryo-shift-combined";
             let revamp_baseline_case = name == "revamp-br33-vibrant-sport-deluxe";
+            let yokais_lash_reference_case = name == "yokais-lash-zeus-rg";
             let probe_f32 = |key: &str, fallback: f32| {
                 std::env::var(key)
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(fallback)
+            };
+            let mods = if yokais_lash_reference_case {
+                std::env::var("QUICKTAG_PROBE_MODS")
+                    .ok()
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .filter(|tag| !tag.trim().is_empty())
+                            .map(|tag| {
+                                TagHash(u32::from_str_radix(tag.trim().trim_start_matches("0x"), 16).expect(
+                                    "QUICKTAG_PROBE_MODS must be comma-separated hex tag hashes",
+                                ))
+                            })
+                            .collect_vec()
+                    })
+                    .unwrap_or(mods)
+            } else {
+                mods
             };
             let yaw = probe_f32("QUICKTAG_PROBE_YAW_DEGREES", yaw.to_degrees()).to_radians();
             let Some(entry) = package_manager().get_entry(weapon) else {
@@ -11959,13 +12401,14 @@ mod tests {
                     body: TagHash(0x80A9BDA1),
                     additional_parts: vec![TagHash(0x80A9BDCC)],
                 }),
-                "runner-agr-dual-r-e64f-combined" => Some(RunnerShellCombination {
+                "runner-vandal-cryo-shift-combined" => Some(RunnerShellCombination {
                     head: TagHash(0x80A9E76B),
                     body: TagHash(0x80A9E6F9),
                     additional_parts: vec![TagHash(0x80A9E730)],
                 }),
                 _ => None,
             };
+            let runner_selection = combined_runner.clone();
             let preview = if let Some(combination) = combined_runner {
                 GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
             } else {
@@ -12218,7 +12661,7 @@ mod tests {
                 .unique()
                 .collect_vec();
             for tag in &texture_tags {
-                let texture = Texture::load(&render_state, *tag, true)
+                let texture = Texture::load(&render_state, *tag, false)
                     .unwrap_or_else(|error| panic!("texture {tag}: {error}"));
                 if name == "d54-default-optic"
                     || name.starts_with("atrax-sting")
@@ -12226,6 +12669,16 @@ mod tests {
                     || name == "arata-vectus-v66-detail"
                     || name == "bully-smg-transmit-engine"
                     || name == "runner-destroyer-emerald-impact-combined"
+                    || (cryo_shift_reference_case
+                        && matches!(
+                            tag.0,
+                            0x80A9C1D6
+                                | 0x80A9C1D7
+                                | 0x80A9C1E2
+                                | 0x80A9C1EC
+                                | 0x80A9C1EF
+                                | 0x80A9C1F9
+                        ))
                     || matches!(
                         tag.0,
                         0x80AA0ED7
@@ -12253,7 +12706,7 @@ mod tests {
                 texture_cache
                     .cache
                     .write()
-                    .insert(*tag, Left(Some((Arc::new(texture), id))));
+                    .insert((*tag, false), Left(Some((Arc::new(texture), id))));
             }
             let fallback = wireframe
                 .material_ranges
@@ -12422,7 +12875,9 @@ mod tests {
                         .collect_vec()
                 );
             }
-            let size = if lighting_reference_case {
+            let size = if yokais_lash_reference_case {
+                [864_u32, 331_u32]
+            } else if lighting_reference_case {
                 [997_u32, 326_u32]
             } else {
                 [1024_u32, 640_u32]
@@ -12431,7 +12886,12 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(size[0] as f32, size[1] as f32),
             );
-            let mut verification_environment = if lighting_reference_case {
+            let mut verification_environment = if yokais_lash_reference_case {
+                ModelEnvironment {
+                    diagnostic_pass,
+                    ..ModelEnvironment::default()
+                }
+            } else if lighting_reference_case {
                 let defaults = ModelEnvironment::default();
                 ModelEnvironment {
                     time_of_day: probe_f32("QUICKTAG_PROBE_TIME", defaults.time_of_day),
@@ -12495,6 +12955,19 @@ mod tests {
                     .expect("QUICKTAG_PROBE_TONEMAP must be 0 or 1")
                     != 0;
             }
+            // Keep visual probes reproducible across fixture branches. The
+            // target-specific harness uses the same camera and attachments
+            // while tuning authored lighting/exposure against a reference.
+            verification_environment.exposure =
+                probe_f32("QUICKTAG_PROBE_EXPOSURE", verification_environment.exposure);
+            verification_environment.ambient_intensity = probe_f32(
+                "QUICKTAG_PROBE_AMBIENT",
+                verification_environment.ambient_intensity,
+            );
+            verification_environment.specular_ibl_intensity = probe_f32(
+                "QUICKTAG_PROBE_SPECULAR_IBL",
+                verification_environment.specular_ibl_intensity,
+            );
             verification_environment.fidelity_mode = match std::env::var("QUICKTAG_PROBE_FIDELITY")
                 .unwrap_or_else(|_| "strict".into())
                 .to_ascii_lowercase()
@@ -12543,6 +13016,14 @@ mod tests {
                 "QUICKTAG_PROBE_LIGHT_ORBIT_RADIUS",
                 verification_environment.light_orbit_radius,
             );
+            verification_environment.light_range = probe_f32(
+                "QUICKTAG_PROBE_LIGHT_RANGE",
+                verification_environment.light_range,
+            );
+            verification_environment.light_cone_angle = probe_f32(
+                "QUICKTAG_PROBE_LIGHT_CONE_ANGLE",
+                verification_environment.light_cone_angle,
+            );
             verification_environment.light_size = probe_f32(
                 "QUICKTAG_PROBE_LIGHT_SIZE",
                 verification_environment.light_size,
@@ -12558,10 +13039,14 @@ mod tests {
                 model.preview_uv_transform(),
                 None,
                 if coating_reference_case { 0.0 } else { yaw },
-                if lighting_reference_case {
+                if yokais_lash_reference_case {
+                    probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 14.0).to_radians()
+                } else if lighting_reference_case {
                     probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 16.2).to_radians()
                 } else if revamp_baseline_case {
                     probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 14.0).to_radians()
+                } else if cryo_shift_reference_case {
+                    probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 9.7).to_radians()
                 } else if flat_panel_reference_case || investment_decal_reference_case {
                     if investment_decal_reference_case {
                         15.2_f32.to_radians()
@@ -12573,14 +13058,540 @@ mod tests {
                 } else {
                     probe_f32("QUICKTAG_PROBE_PITCH_DEGREES", 0.05_f32.to_degrees()).to_radians()
                 },
-                probe_f32("QUICKTAG_PROBE_ZOOM", 3.1),
-                egui::Vec2::ZERO,
+                probe_f32(
+                    "QUICKTAG_PROBE_ZOOM",
+                    if yokais_lash_reference_case { 6.2 } else { 3.1 },
+                ),
+                egui::vec2(
+                    probe_f32("QUICKTAG_PROBE_PAN_X", 0.0),
+                    probe_f32(
+                        "QUICKTAG_PROBE_PAN_Y",
+                        if yokais_lash_reference_case {
+                            19.0
+                        } else {
+                            0.0
+                        },
+                    ),
+                ),
                 false,
                 rect,
                 1.0,
                 verification_environment,
             );
-            if revamp_baseline_case {
+            if cryo_shift_reference_case && isolated_draw.is_none() {
+                let selection = runner_selection
+                    .as_ref()
+                    .expect("Cryo Shift case must use combined runner loader");
+                assert_eq!(selection.head, TagHash(0x80A9E76B));
+                assert_eq!(selection.body, TagHash(0x80A9E6F9));
+                assert_eq!(selection.additional_parts, vec![TagHash(0x80A9E730)]);
+                for tag in std::iter::once(selection.head).chain(selection.submeshes()) {
+                    assert!(
+                        package_manager().get_entry(tag).is_some(),
+                        "Cryo Shift loader lost source tag {tag}"
+                    );
+                }
+
+                let tag_string = |tag: Option<TagHash>| tag.map(|tag| tag.to_string());
+                let tag_strings =
+                    |tags: &[TagHash]| tags.iter().map(ToString::to_string).collect::<Vec<_>>();
+                let gear_dye_json = |dye: Option<GearDyeMaterial>| {
+                    dye.map(|dye| {
+                        serde_json::json!({
+                            "color": dye.color,
+                            "roughness_remap": dye.roughness_remap,
+                            "metal_remap": dye.metal_remap,
+                        })
+                    })
+                };
+                let gear_palette_json = |palette: Option<[GearDyeMaterial; 6]>| {
+                    palette.map(|palette| {
+                        palette
+                            .into_iter()
+                            .map(|dye| {
+                                serde_json::json!({
+                                    "color": dye.color,
+                                    "roughness_remap": dye.roughness_remap,
+                                    "metal_remap": dye.metal_remap,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let technique_bindings = |technique: Option<
+                    &crate::render::technique::TechniqueDescriptor,
+                >| {
+                    technique
+                            .map(|technique| {
+                                technique
+                                    .stages
+                                    .iter()
+                                    .map(|stage| {
+                                        let resources = stage
+                                            .resources
+                                            .iter()
+                                            .map(|resource| {
+                                                serde_json::json!({
+                                                    "slot": resource.slot,
+                                                    "raw": format!("{:?}", resource.raw),
+                                                    "resolved": tag_string(resource.resolved),
+                                                    "texture_abi": resource
+                                                        .texture_abi
+                                                        .as_ref()
+                                                        .map(|abi| format!("{:?}", abi)),
+                                                    "required": resource.required,
+                                                })
+                                            })
+                                            .collect::<Vec<_>>();
+                                        let samplers = stage
+                                            .samplers
+                                            .iter()
+                                            .map(|sampler| {
+                                                serde_json::json!({
+                                                    "ordinal": sampler.ordinal,
+                                                    "raw": format!("{:?}", sampler.raw),
+                                                    "resolved": tag_string(sampler.resolved),
+                                                })
+                                            })
+                                            .collect::<Vec<_>>();
+                                        let tfx_dependencies = stage
+                                            .tfx_execution
+                                            .dependencies
+                                            .iter()
+                                            .map(|dependency| {
+                                                serde_json::json!({
+                                                    "scope_id": dependency.scope_id,
+                                                    "scope": dependency.scope,
+                                                    "byte_offset": dependency.byte_offset,
+                                                    "resolved": dependency.resolved,
+                                                })
+                                            })
+                                            .collect::<Vec<_>>();
+                                        let tfx_externs = stage
+                                            .tfx
+                                            .externs
+                                            .iter()
+                                            .map(|external| {
+                                                let resolved = stage
+                                                    .tfx_execution
+                                                    .dependencies
+                                                    .iter()
+                                                    .find(|dependency| {
+                                                        dependency.scope_id == external.scope_id
+                                                            && dependency.scope
+                                                                == external.scope
+                                                            && dependency.byte_offset
+                                                                == external.byte_offset
+                                                    })
+                                                    .is_some_and(|dependency| dependency.resolved);
+                                                serde_json::json!({
+                                                    "op_offset": external.op_offset,
+                                                    "scope_id": external.scope_id,
+                                                    "value_type": external.value_type,
+                                                    "scope": external.scope,
+                                                    "byte_offset": external.byte_offset,
+                                                    "hint": external.hint,
+                                                    "resolved": resolved,
+                                                })
+                                            })
+                                            .collect::<Vec<_>>();
+                                        serde_json::json!({
+                                            "stage": stage.raw_stage_label,
+                                            "shader": tag_string(stage.shader),
+                                            "signature": {
+                                                "texture_count": stage.signature.texture_count,
+                                                "sampler_count": stage.signature.sampler_count,
+                                                "constant_count": stage.signature.constant_count,
+                                                "inline_constant_count": stage.signature.inline_constant_count,
+                                                "tfx_byte_count": stage.signature.tfx_byte_count,
+                                            },
+                                            "resources": resources,
+                                            "samplers": samplers,
+                                            "constant_buffer_slot": stage.constant_buffer_slot,
+                                            "constant_buffer": tag_string(stage.constant_buffer),
+                                            "tfx_status": format!("{:?}", stage.tfx_execution.status),
+                                            "tfx_dependencies": tfx_dependencies,
+                                            "tfx_externs": tfx_externs,
+                                            "tfx_outputs": format!("{:?}", stage.tfx_execution.outputs),
+                                            "tfx_undecoded_offset": stage.tfx_execution.undecoded_offset,
+                                            "tfx_undecoded_byte_count": stage.tfx_execution.undecoded_bytes.len(),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                };
+                let texture_record =
+                    |role: &str, tag: Option<TagHash>, texture: Option<&Arc<Texture>>| {
+                        tag.map(|tag| {
+                            let desc = texture.map(|texture| &texture.desc);
+                            serde_json::json!({
+                                "role": role,
+                                "tag": tag.to_string(),
+                                "loaded": texture.is_some(),
+                                "format": desc.map(|desc| format!("{:?}", desc.format)),
+                                "width": desc.map(|desc| desc.width),
+                                "height": desc.map(|desc| desc.height),
+                                "depth": desc.map(|desc| desc.depth),
+                                "array_size": desc.map(|desc| desc.array_size),
+                            })
+                        })
+                    };
+                let preview_ranges = callback
+                    .preview
+                    .draws
+                    .iter()
+                    .enumerate()
+                    .map(|(draw_index, draw)| {
+                        let range = wireframe.material_ranges.iter().find(|range| {
+                            range.index_start as u32 == draw.indices.start
+                                && range.index_start.saturating_add(range.index_count) as u32
+                                    == draw.indices.end
+                        });
+                        let prepared = callback
+                            .draws
+                            .iter()
+                            .find(|prepared| prepared.stable_index == draw_index);
+                        let loaded = prepared
+                            .and_then(|prepared| callback.materials.get(prepared.material_index));
+                        let mut texture_bindings = Vec::new();
+                        let mut add_texture =
+                            |role: &str, tag: Option<TagHash>, texture: Option<&Arc<Texture>>| {
+                                if let Some(binding) = texture_record(role, tag, texture) {
+                                    texture_bindings.push(binding);
+                                }
+                            };
+                        add_texture(
+                            "color",
+                            draw.material.map(|material| material.color),
+                            loaded.and_then(|material| material.color.as_ref()),
+                        );
+                        add_texture(
+                            "normal",
+                            draw.material.and_then(|material| material.normal),
+                            loaded.and_then(|material| material.normal.as_ref()),
+                        );
+                        add_texture(
+                            "emissive",
+                            draw.material.and_then(|material| material.emissive),
+                            loaded.and_then(|material| material.emissive.as_ref()),
+                        );
+                        add_texture(
+                            "control",
+                            draw.control,
+                            loaded.and_then(|material| material.control.as_ref()),
+                        );
+                        add_texture(
+                            "wear_scratches",
+                            draw.mod_wear
+                                .map(|wear| wear.scratches)
+                                .or_else(|| draw.runner_layered_surface.and_then(|surface| {
+                                    surface.procedural_wear.map(|wear| wear[0])
+                                })),
+                            loaded.and_then(|material| material.wear_scratches.as_ref()),
+                        );
+                        add_texture(
+                            "wear_grime",
+                            draw.mod_wear
+                                .map(|wear| wear.grime)
+                                .or_else(|| draw.runner_layered_surface.and_then(|surface| {
+                                    surface.procedural_wear.map(|wear| wear[1])
+                                })),
+                            loaded.and_then(|material| material.wear_grime.as_ref()),
+                        );
+                        add_texture(
+                            "wear_damage",
+                            draw.mod_wear
+                                .map(|wear| wear.damage)
+                                .or_else(|| draw.runner_layered_surface.and_then(|surface| {
+                                    surface.procedural_wear.map(|wear| wear[2])
+                                })),
+                            loaded.and_then(|material| material.wear_damage.as_ref()),
+                        );
+                        if let Some(surface) = draw.runner_layered_surface {
+                            add_texture(
+                                "runner.surface",
+                                Some(surface.surface),
+                                loaded.and_then(|material| material.runner_surface_map.as_ref()),
+                            );
+                            add_texture(
+                                "runner.material_response",
+                                surface.material_response,
+                                loaded.and_then(|material| {
+                                    material.runner_material_response_map.as_ref()
+                                }),
+                            );
+                            add_texture(
+                                "runner.procedural",
+                                surface.procedural,
+                                loaded.and_then(|material| material.runner_procedural_map.as_ref()),
+                            );
+                            add_texture(
+                                "runner.color_overlay",
+                                surface.color_overlay,
+                                loaded.and_then(|material| {
+                                    material.runner_color_overlay_map.as_ref()
+                                }),
+                            );
+                            add_texture(
+                                "runner.detail_normal_a",
+                                Some(surface.detail_normal_a),
+                                loaded.and_then(|material| {
+                                    material.runner_detail_normal_a.as_ref()
+                                }),
+                            );
+                            add_texture(
+                                "runner.detail_normal_b",
+                                Some(surface.detail_normal_b),
+                                loaded.and_then(|material| {
+                                    material.runner_detail_normal_b.as_ref()
+                                }),
+                            );
+                            add_texture(
+                                "runner.detail_normal_c",
+                                surface.detail_normal_c,
+                                loaded.and_then(|material| {
+                                    material.runner_detail_normal_c.as_ref()
+                                }),
+                            );
+                            add_texture(
+                                "runner.detail_normal_d",
+                                surface.detail_normal_d,
+                                loaded.and_then(|material| {
+                                    material.runner_detail_normal_d.as_ref()
+                                }),
+                            );
+                        }
+                        if let Some(occlusion) = draw.runner_occlusion {
+                            add_texture(
+                                "runner.occlusion",
+                                Some(occlusion.texture),
+                                loaded.and_then(|material| material.runner_occlusion_map.as_ref()),
+                            );
+                        }
+                        if let Some(surface) = draw.character_surface {
+                            add_texture(
+                                "character.surface",
+                                Some(surface.surface),
+                                loaded.and_then(|material| material.character_surface_map.as_ref()),
+                            );
+                            add_texture(
+                                "character.detail_color",
+                                Some(surface.detail_color),
+                                loaded.and_then(|material| material.character_detail_color.as_ref()),
+                            );
+                            add_texture(
+                                "character.procedural",
+                                surface.procedural,
+                                loaded.and_then(|material| material.character_procedural_map.as_ref()),
+                            );
+                        }
+                        let runner_surface = draw.runner_layered_surface.map(|surface| {
+                            serde_json::json!({
+                                "mode": surface.mode,
+                                "surface": surface.surface.to_string(),
+                                "material_response": tag_string(surface.material_response),
+                                "detail_normal_a": surface.detail_normal_a.to_string(),
+                                "detail_normal_b": surface.detail_normal_b.to_string(),
+                                "detail_normal_c": tag_string(surface.detail_normal_c),
+                                "detail_normal_d": tag_string(surface.detail_normal_d),
+                                "procedural": tag_string(surface.procedural),
+                                "color_overlay": tag_string(surface.color_overlay),
+                                "procedural_wear": surface.procedural_wear.map(|wear| tag_strings(&wear)),
+                                "constants": surface.constants,
+                                "color_overlay_constants": surface.color_overlay_constants,
+                            })
+                        });
+                        let range_textures = range.map(|range| {
+                            serde_json::json!({
+                                "color": tag_string(range.textures.color),
+                                "normal": tag_string(range.textures.normal),
+                                "emissive": tag_string(range.textures.emissive),
+                                "control": tag_string(range.textures.control),
+                                "aux": tag_strings(&range.textures.aux),
+                                "sampler": tag_string(range.textures.sampler),
+                                "gear_dye_change_color_index": range.gear_dye_change_color_index,
+                                "textures_debug": format!("{:?}", range.textures),
+                            })
+                        });
+                        serde_json::json!({
+                            "draw_index": draw_index,
+                            "indices": [draw.indices.start, draw.indices.end],
+                            "raw_lod": draw.packet.raw_lod_category,
+                            "raw_stage": draw.packet.raw_render_stage,
+                            "technique": tag_string(draw.packet.technique_hash),
+                            "family": format!("{:?}", draw.packet.material.family()),
+                            "passes": draw.packet.pass_plan.passes.iter().map(|pass| format!("{pass:?}")).collect::<Vec<_>>(),
+                            "pipeline": format!("{:?}", draw.pipeline),
+                            "provenance": callback.preview.provenance.get(draw.packet.source).map(|record| format!("{:?}", record)),
+                            "tfx_states": draw.packet.technique.as_ref().map(|technique| technique.stages.iter().map(|stage| format!("{}:{:?}", stage.raw_stage_label, stage.tfx_execution.status)).collect::<Vec<_>>()).unwrap_or_default(),
+                            "technique_bindings": technique_bindings(draw.packet.technique.as_ref()),
+                            "warnings": draw.packet.pass_plan.warnings.iter().map(|warning| format!("{warning:?}")).collect::<Vec<_>>(),
+                            "wireframe_range": range_textures,
+                            "material": {
+                                "color": draw.material.map(|material| material.color.to_string()),
+                                "normal": tag_string(draw.material.and_then(|material| material.normal)),
+                                "emissive": tag_string(draw.material.and_then(|material| material.emissive)),
+                                "control": tag_string(draw.control),
+                                "sampler": tag_string(draw.sampler),
+                                "roughness_channel": draw.roughness_channel,
+                                "runner_layered_surface": runner_surface,
+                                "runner_occlusion": draw.runner_occlusion.map(|occlusion| serde_json::json!({"texture": occlusion.texture.to_string(), "channel": occlusion.channel})),
+                                "alpha_mask": draw.alpha_mask.map(|mask| serde_json::json!({"texture": mask.texture.to_string(), "remap": mask.remap, "threshold": mask.threshold})),
+                                "gear_dye": gear_dye_json(draw.gear_dye),
+                                "gear_dye_default": draw.gear_dye_default,
+                                "gear_dye_palette": gear_palette_json(draw.gear_dye_palette),
+                                "gear_worn_dye_palette": draw.gear_worn_dye_palette,
+                                "gear_dye_detail_palette": draw.gear_dye_detail_palette,
+                                "investment_decal": draw.investment_decal.map(|decal| serde_json::json!({"mode": format!("{:?}", decal.mode), "color": decal.color.to_string(), "mask": decal.mask.to_string(), "detail": tag_string(decal.detail), "mask_mode": format!("{:?}", decal.mask_mode), "selector_color_count": decal.selector_color_count, "atlas_selector_max": decal.atlas_selector_max})),
+                                "debug": format!("{:?}", draw.packet.material),
+                            },
+                            "loaded_material": loaded.map(|material| serde_json::json!({
+                                "color": material.color.is_some(),
+                                "normal": material.normal.is_some(),
+                                "emissive": material.emissive.is_some(),
+                                "control": material.control.is_some(),
+                                "runner_surface": material.runner_surface_map.is_some(),
+                                "runner_material_response": material.runner_material_response_map.is_some(),
+                                "runner_procedural": material.runner_procedural_map.is_some(),
+                                "runner_color_overlay": material.runner_color_overlay_map.is_some(),
+                                "runner_occlusion": material.runner_occlusion_map.is_some(),
+                                "runner_detail_normal_a": material.runner_detail_normal_a.is_some(),
+                                "runner_detail_normal_b": material.runner_detail_normal_b.is_some(),
+                                "runner_detail_normal_c": material.runner_detail_normal_c.is_some(),
+                                "runner_detail_normal_d": material.runner_detail_normal_d.is_some(),
+                                "wear_scratches": material.wear_scratches.is_some(),
+                                "wear_grime": material.wear_grime.is_some(),
+                                "wear_damage": material.wear_damage.is_some(),
+                                "blend": material.blend,
+                                "control_tag": tag_string(material.control_tag),
+                                "sampler_tag": tag_string(material.sampler_tag),
+                            })),
+                            "texture_bindings": texture_bindings,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let prepared_draws = callback
+                    .draws
+                    .iter()
+                    .map(|draw| {
+                        serde_json::json!({
+                            "stable_index": draw.stable_index,
+                            "indices": [draw.indices.start, draw.indices.end],
+                            "material_index": draw.material_index,
+                            "pipeline": format!("{:?}", draw.pipeline),
+                            "passes": draw.passes.iter().map(|pass| format!("{pass:?}")).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let parent_component_tags = [
+                    TagHash(0x80A9E6F8),
+                    TagHash(0x80A9E76A),
+                    TagHash(0x80A9E72F),
+                ];
+                let technique_tags = callback
+                    .preview
+                    .draws
+                    .iter()
+                    .filter_map(|draw| draw.packet.technique_hash)
+                    .unique()
+                    .collect::<Vec<_>>();
+                let mut raw_component_dumps = Vec::new();
+                for (label, tag) in parent_component_tags
+                    .into_iter()
+                    .map(|tag| ("parent_component", tag))
+                    .chain(technique_tags.into_iter().map(|tag| ("technique", tag)))
+                {
+                    let file_name = format!("{name}-{label}-{tag}.bin");
+                    match package_manager().read_tag(tag) {
+                        Ok(data) => {
+                            let byte_count = data.len();
+                            std::fs::write(output.join(&file_name), data)
+                                .expect("write Cryo Shift raw component");
+                            raw_component_dumps.push(serde_json::json!({
+                                "label": label,
+                                "tag": tag.to_string(),
+                                "file": file_name,
+                                "byte_count": byte_count,
+                            }));
+                        }
+                        Err(error) => raw_component_dumps.push(serde_json::json!({
+                            "label": label,
+                            "tag": tag.to_string(),
+                            "error": error.to_string(),
+                        })),
+                    }
+                }
+                let metadata = serde_json::json!({
+                    "schema": 1,
+                    "capture_kind": "runner_skin_diagnostic",
+                    "case": name,
+                    "asset": "80A9E76B",
+                    "loader": "GeometryTagPreview::load_combined_runner_shell",
+                    "selection": {
+                        "root": selection.head.to_string(),
+                        "submeshes": selection.submeshes().map(|tag| tag.to_string()).collect::<Vec<_>>(),
+                        "selected_geometry_parts": model.geometry_parts.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        "geometry_part_count": model.geometry_parts.len(),
+                        "parent_components": [
+                            "80A9E6F8",
+                            "80A9E76A",
+                            "80A9E72F",
+                        ],
+                    },
+                    "camera": {
+                        "width": size[0],
+                        "height": size[1],
+                        "yaw_degrees": yaw.to_degrees(),
+                        "pitch_degrees": callback.scene.params0[2].to_degrees(),
+                        "zoom": callback.scene.params0[3],
+                        "pan_pixels": [callback.scene.params1[1] * size[0] as f32 / 2.0, -callback.scene.params1[2] * size[1] as f32 / 2.0],
+                    },
+                    "environment": {
+                        "light_target": verification_environment.light_target,
+                        "light_orbit_position": verification_environment.light_orbit_position,
+                        "light_orbit_center": verification_environment.light_orbit_center,
+                        "light_orbit_radius": verification_environment.light_orbit_radius,
+                        "light_range": verification_environment.light_range,
+                        "light_cone_angle": verification_environment.light_cone_angle,
+                        "light_size": verification_environment.light_size,
+                        "shadow_softness": verification_environment.shadow_softness,
+                        "exposure": verification_environment.exposure,
+                        "ambient_intensity": verification_environment.ambient_intensity,
+                        "specular_ibl_intensity": verification_environment.specular_ibl_intensity,
+                        "tone_mapping": verification_environment.tone_mapping,
+                        "auto_exposure": verification_environment.auto_exposure,
+                        "fidelity": format!("{:?}", verification_environment.fidelity_mode),
+                        "lighting_model": format!("{:?}", verification_environment.lighting_model),
+                    },
+                    "geometry": {
+                        "source": wireframe.source,
+                        "vertex_count": wireframe.vertex_count_total,
+                        "index_count": wireframe.index_count_total,
+                        "bounds_min": wireframe.min,
+                        "bounds_max": wireframe.max,
+                        "material_range_count": wireframe.material_ranges.len(),
+                        "mesh_source_debug": format!("{:?}", model.mesh_source),
+                    },
+                    "adapter": {
+                        "version": crate::render::adapter::GoliathAdapter::ADAPTER_VERSION,
+                        "gpu_name": adapter_info.name,
+                        "gpu_backend": format!("{:?}", adapter_info.backend),
+                        "gpu_driver": adapter_info.driver,
+                        "gpu_driver_info": adapter_info.driver_info,
+                    },
+                    "debug_channel": diagnostic_name,
+                    "raw_component_dumps": raw_component_dumps,
+                    "preview_ranges": preview_ranges,
+                    "prepared_draws": prepared_draws,
+                });
+                std::fs::write(
+                    output.join(format!("{name}-{diagnostic_name}.capture.json")),
+                    serde_json::to_vec_pretty(&metadata).expect("serialize Cryo Shift metadata"),
+                )
+                .expect("write Cryo Shift metadata");
+            }
+            if revamp_baseline_case || yokais_lash_reference_case {
                 let draws = callback
                     .preview
                     .draws
@@ -12647,17 +13658,42 @@ mod tests {
                     schema: 2,
                     adapter_version: crate::render::adapter::GoliathAdapter::ADAPTER_VERSION,
                     renderer_schema_version: 2,
-                    asset: "80A9FF17",
-                    owner: "80A7AA89",
-                    attachments: ["80A60FED", "80A60608"],
+                    asset: if yokais_lash_reference_case {
+                        "80B7BF4D".into()
+                    } else {
+                        "80A9FF17".into()
+                    },
+                    owner: if yokais_lash_reference_case {
+                        "80A7AD4A".into()
+                    } else {
+                        "80A7AA89".into()
+                    },
+                    attachments: mods.iter().map(ToString::to_string).collect(),
                     gpu_name: adapter_info.name.clone(),
                     gpu_backend: format!("{:?}", adapter_info.backend),
                     gpu_driver: adapter_info.driver.clone(),
                     gpu_driver_info: adapter_info.driver_info.clone(),
-                    output_size: [1024, 640],
+                    output_size: size,
                     yaw_degrees: yaw.to_degrees(),
                     pitch_degrees: callback.scene.params0[2].to_degrees(),
-                    scale: 3.1,
+                    pan_pixels: [
+                        callback.scene.params1[1] * size[0] as f32 / 2.0,
+                        -callback.scene.params1[2] * size[1] as f32 / 2.0,
+                    ],
+                    scale: callback.scene.params0[3],
+                    light_target: verification_environment.light_target,
+                    light_orbit_position: verification_environment.light_orbit_position,
+                    light_orbit_center: verification_environment.light_orbit_center,
+                    light_orbit_radius: verification_environment.light_orbit_radius,
+                    light_range: verification_environment.light_range,
+                    light_cone_angle: verification_environment.light_cone_angle,
+                    light_size: verification_environment.light_size,
+                    shadow_softness: verification_environment.shadow_softness,
+                    exposure: verification_environment.exposure,
+                    ambient_intensity: verification_environment.ambient_intensity,
+                    specular_ibl_intensity: verification_environment.specular_ibl_intensity,
+                    tone_mapping: verification_environment.tone_mapping,
+                    auto_exposure: verification_environment.auto_exposure,
                     fidelity: format!("{:?}", verification_environment.fidelity_mode),
                     lighting_model: format!("{:?}", verification_environment.lighting_model),
                     debug_channel: diagnostic_name.clone(),
@@ -12795,7 +13831,7 @@ mod tests {
                         | "runner-selector-d952-combined"
                         | "runner-full10-b610-combined"
                         | "runner-dual-r-bd17-combined"
-                        | "runner-agr-dual-r-e64f-combined"
+                        | "runner-vandal-cryo-shift-combined"
                 ) {
                     assert!(
                         callback.materials.iter().any(|material| {

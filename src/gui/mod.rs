@@ -56,7 +56,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use strings::StringViewVariant;
 use tiger_pkg::{TagHash, package_manager};
 
-use self::gear::GearView;
+pub(crate) use self::gear::GearView;
 use self::modellist::ModelsView;
 use self::named_tags::NamedTagView;
 use self::packages::PackagesView;

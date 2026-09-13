@@ -1281,6 +1281,30 @@ mod tests {
             panic!("GPU premultiplication validation failed: {error}");
         }
 
+        render_state
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let model_texture = Texture::load(&render_state, TagHash(0x80B6_F6EF), false)
+            .expect("straight-alpha model texture");
+        assert_eq!(model_texture.desc.format, wgpu::TextureFormat::Bc7RgbaUnorm);
+        assert!(!model_texture.desc.premultiply_alpha);
+        let _model_srgb_view = model_texture
+            .handle
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Bc7RgbaUnormSrgb),
+                ..Default::default()
+            });
+        render_state
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("model texture view creation");
+        if let Some(error) = pollster::block_on(render_state.device.pop_error_scope()) {
+            panic!("straight-alpha model texture view failed: {error}");
+        }
+
         let buffer = render_state.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("implant icon alpha verification"),
             size: 64 * 64 * 4,

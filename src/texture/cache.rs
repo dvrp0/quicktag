@@ -18,8 +18,10 @@ use tiger_pkg::TagHash;
 
 pub type LoadedTexture = (Arc<Texture>, TextureId);
 
+pub(crate) type TextureCacheKey = (TagHash, bool);
+
 pub(crate) type TextureCacheMap = LinkedHashMap<
-    TagHash,
+    TextureCacheKey,
     Either<Option<LoadedTexture>, Promise<Option<LoadedTexture>>>,
     BuildHasherDefault<FxHasher>,
 >;
@@ -82,27 +84,46 @@ impl TextureCache {
     }
 
     pub fn get_or_load(&self, hash: TagHash) -> Option<LoadedTexture> {
+        self.get_or_load_with_alpha_mode(hash, true)
+    }
+
+    pub(crate) fn get_or_default_material(&self, hash: TagHash) -> LoadedTexture {
+        self.get_or_load_material(hash)
+            .unwrap_or_else(|| self.loading_placeholder.clone())
+    }
+
+    pub(crate) fn get_or_load_material(&self, hash: TagHash) -> Option<LoadedTexture> {
+        self.get_or_load_with_alpha_mode(hash, false)
+    }
+
+    fn get_or_load_with_alpha_mode(
+        &self,
+        hash: TagHash,
+        premultiply_alpha: bool,
+    ) -> Option<LoadedTexture> {
+        let key = (hash, premultiply_alpha);
         let mut cache = self.cache.write();
 
-        let c = cache.remove(&hash);
+        let c = cache.remove(&key);
 
         let texture = if let Some(Either::Left(r)) = c {
-            cache.insert(hash, Left(r.clone()));
+            cache.insert(key, Left(r.clone()));
             r.clone()
         } else if let Some(Either::Right(p)) = c {
             if let std::task::Poll::Ready(r) = p.poll() {
-                cache.insert(hash, Left(r.clone()));
+                cache.insert(key, Left(r.clone()));
                 return r.clone();
             } else {
-                cache.insert(hash, Either::Right(p));
+                cache.insert(key, Either::Right(p));
                 None
             }
         } else if c.is_none() {
             cache.insert(
-                hash,
+                key,
                 Either::Right(Promise::spawn_async(Self::load_texture_task(
                     self.render_state.clone(),
                     hash,
+                    premultiply_alpha,
                 ))),
             );
 
@@ -120,8 +141,9 @@ impl TextureCache {
     pub(crate) async fn load_texture_task(
         render_state: RenderState,
         hash: TagHash,
+        premultiply_alpha: bool,
     ) -> Option<LoadedTexture> {
-        let texture = match Texture::load(&render_state, hash, true) {
+        let texture = match Texture::load(&render_state, hash, premultiply_alpha) {
             Ok(t) => t,
             Err(e) => {
                 log::error!("Failed to load texture {hash}: {e}");

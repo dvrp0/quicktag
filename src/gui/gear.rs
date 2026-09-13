@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use eframe::egui::{self, Color32, RichText};
 use itertools::Itertools;
@@ -9,9 +13,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use tiger_pkg::{GameVersion, TagHash, package_manager};
 
-use crate::{geometry::WeaponModRarity, texture::cache::TextureCache};
+use crate::{
+    geometry::WeaponModRarity,
+    texture::{Texture, cache::TextureCache},
+};
 
-use super::implant_stats::{ImplantDetails, ImplantIconResolver};
+use super::implant_stats::{ImplantDetails, ImplantIconResolver, ImplantStatsResolver};
 use super::item_effect::{ItemEffect, ItemEffectResolver};
 use super::profile_texture::resolve_profile_textures;
 use super::sticker_texture::resolve_sticker_texture;
@@ -99,7 +106,12 @@ const MOD_CATEGORY_UNIQUE_MARKER: u32 = 0x037d_053c;
 const PROFILE_BACKGROUND_CATEGORY: &str = "item_type.#D5006AAF";
 const PROFILE_EMBLEM_CATEGORY: &str = "item_type.#5F40AEB9";
 const PROFILE_TITLE_CATEGORY: &str = "item_type.#A8805E93";
-const LOCALIZED_HIGHLIGHT_COLOR: Color32 = Color32::from_rgb(0x4a, 0xaf, 0xff);
+// Goliath's pure-white presentation style is a default format sentinel, not
+// the final UI tint. Marathon renders those formatted spans with its standard
+// blue (also used by Deluxe UI surfaces). Explicit authored colors remain
+// untouched.
+const LOCALIZED_FORMAT_COLOR: Color32 = Color32::from_rgb(0x4a, 0xaf, 0xff);
+const LOCALIZED_FORMAT_COLOR_HEX: &str = "#4aafff";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum GearRarity {
@@ -232,6 +244,7 @@ struct GearItem {
     types: Vec<String>,
     internal_categories: Vec<String>,
     price: Option<u32>,
+    buying_price: Option<u32>,
     description: Option<String>,
     description_parts: Vec<LocalizedStringPart>,
 }
@@ -253,6 +266,7 @@ struct GearExportRecord<'a> {
     display_class: Option<&'a str>,
     types: &'a [String],
     price: Option<u32>,
+    buying_price: Option<u32>,
     description: Option<String>,
     internal_type: Option<&'a str>,
     internal_hash: Option<String>,
@@ -273,7 +287,8 @@ struct GearExportEffect<'a> {
 #[derive(Serialize)]
 struct GearExportStat<'a> {
     name: &'a str,
-    value: f32,
+    raw_name_hash: String,
+    value: i32,
 }
 
 pub struct GearView {
@@ -393,6 +408,57 @@ impl GearView {
                 status: Some(error),
             },
         }
+    }
+
+    pub(crate) fn export_implant_icons(
+        output: &Path,
+        render_state: &eframe::egui_wgpu::RenderState,
+    ) -> Result<usize, String> {
+        let strings = Arc::new(
+            quicktag_strings::localized::create_stringmap_for_language(LocalizedLanguage::Korean)
+                .map_err(|error| format!("Failed to load Korean localized strings: {error:#}"))?,
+        );
+        let view = Self::new_for_language(strings, LocalizedLanguage::Korean);
+        if let Some(error) = view.load_error() {
+            return Err(error.to_owned());
+        }
+        std::fs::create_dir_all(output)
+            .map_err(|error| format!("Could not create {}: {error}", output.display()))?;
+
+        let mut used_names = HashSet::new();
+        let mut seen_icons = HashSet::new();
+        let mut exported = 0;
+        for item in &view.items {
+            let (slot, prefix) = match implant_slot(item) {
+                Some("Head") => ("Head", "머리"),
+                Some("Torso") => ("Torso", "상체"),
+                Some("Leg") => ("Leg", "다리"),
+                _ => continue,
+            };
+            let Some(icon) = item.icon_tag else { continue };
+            if !seen_icons.insert((slot, icon)) {
+                continue;
+            }
+            let base_name = sanitize_icon_name(&item.name);
+            let base_name = if base_name.is_empty() {
+                "unnamed".to_owned()
+            } else {
+                base_name
+            };
+            let mut filename = format!("마라톤아이콘_{prefix}_{base_name}.png");
+            if !used_names.insert(filename.clone()) {
+                filename = format!("마라톤아이콘_{prefix}_{base_name}_{}.png", item.display_tag);
+                used_names.insert(filename.clone());
+            }
+            let image = Texture::load(render_state, icon, false)
+                .and_then(|texture| texture.to_image(render_state, 0))
+                .map_err(|error| format!("Failed to decode {icon} for {}: {error:#}", item.name))?;
+            image
+                .save(output.join(filename))
+                .map_err(|error| format!("Failed to write icon for {}: {error}", item.name))?;
+            exported += 1;
+        }
+        Ok(exported)
     }
 
     /// A compact, render-ready projection of Gear's authored weapon/mod data.
@@ -906,6 +972,7 @@ impl GearView {
                     .iter()
                     .map(|stat| GearExportStat {
                         name: &stat.name,
+                        raw_name_hash: format!("{:08X}", stat.raw_name_hash),
                         value: stat.value,
                     })
                     .collect();
@@ -931,6 +998,7 @@ impl GearView {
                     display_class: item.classification.as_deref(),
                     types: &item.types,
                     price: item.price,
+                    buying_price: item.buying_price,
                     description: item.description.as_deref().map(|description| {
                         export_localized_text(description, &item.description_parts)
                     }),
@@ -1356,6 +1424,9 @@ impl GearView {
                             {
                                 metadata_row(ui, "Price", Some(&format_number(price)));
                             }
+                            if let Some(price) = item.buying_price {
+                                metadata_row(ui, "Buying price", Some(&format_number(price)));
+                            }
                             metadata_row(ui, "Internal type", item.internal_name.as_deref());
                             metadata_row(
                                 ui,
@@ -1554,7 +1625,7 @@ fn localized_text_label(
             egui::TextFormat {
                 font_id: egui::TextStyle::Body.resolve(ui.style()),
                 color: if part.highlighted {
-                    LOCALIZED_HIGHLIGHT_COLOR
+                    localized_part_color(part).unwrap_or(LOCALIZED_FORMAT_COLOR)
                 } else {
                     ui.visuals().text_color()
                 },
@@ -1581,12 +1652,53 @@ fn export_localized_text(text: &str, parts: &[LocalizedStringPart]) -> String {
         .map(|part| {
             let text = export_html_text(&part.text);
             if part.highlighted {
-                format!(r#"<span style="color: #4aafff;">{text}</span>"#)
+                let color = localized_part_color_hex(part)
+                    .unwrap_or_else(|| LOCALIZED_FORMAT_COLOR_HEX.to_owned());
+                format!(r#"<span style="color: {color};">{text}</span>"#)
             } else {
                 text
             }
         })
         .collect()
+}
+
+fn localized_part_color(part: &LocalizedStringPart) -> Option<Color32> {
+    let [red, green, blue, alpha] = part.authored_color?;
+    if is_default_format_color([red, green, blue, alpha]) {
+        return None;
+    }
+    Some(Color32::from_rgba_unmultiplied(
+        color_channel(red),
+        color_channel(green),
+        color_channel(blue),
+        color_channel(alpha),
+    ))
+}
+
+fn localized_part_color_hex(part: &LocalizedStringPart) -> Option<String> {
+    let [red, green, blue, alpha] = part.authored_color?;
+    if is_default_format_color([red, green, blue, alpha]) {
+        return None;
+    }
+    let red = color_channel(red);
+    let green = color_channel(green);
+    let blue = color_channel(blue);
+    let alpha = color_channel(alpha);
+    if alpha == u8::MAX {
+        Some(format!("#{red:02x}{green:02x}{blue:02x}"))
+    } else {
+        Some(format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}"))
+    }
+}
+
+fn is_default_format_color([red, green, blue, alpha]: [f32; 4]) -> bool {
+    [red, green, blue, alpha]
+        .iter()
+        .all(|channel| (*channel - 1.0).abs() <= f32::EPSILON)
+}
+
+fn color_channel(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn export_html_text(text: &str) -> String {
@@ -2297,6 +2409,7 @@ fn load_gear_resolved(
             types: extract_types(&data, &wordlist),
             internal_categories,
             price,
+            buying_price: parse_buying_price(&definition),
             description,
             description_parts,
         });
@@ -2358,7 +2471,9 @@ fn load_gear_resolved(
             } else if item.subcategory.is_none() {
                 item.subcategory = Some("Implant".to_owned());
             }
-            item.icon_tag = implant_icons.resolve_implant(&identifier(&item.name));
+            item.icon_tag = item
+                .definition_tag
+                .and_then(|tag| implant_icons.resolve_implant(tag));
         }
         if item.item_type.as_deref() == Some("Sticker") {
             item.detail_texture_tags = item
@@ -2402,6 +2517,19 @@ fn implant_slot(item: &GearItem) -> Option<&'static str> {
             "item_type.implant.lower" | "item_type.implant.leg" => Some("Leg"),
             _ => None,
         })
+}
+
+fn sanitize_icon_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        })
+        .collect();
+    sanitized.trim().trim_matches('.').to_owned()
 }
 
 /// Correct stale localized UI labels with authored definition semantics. These
@@ -2486,6 +2614,7 @@ fn extract_item_effects(
         return (FxHashMap::default(), FxHashMap::default());
     };
     let resolver = ItemEffectResolver::load();
+    let stat_resolver = ImplantStatsResolver::load(language, &localized);
     let mut implants = FxHashMap::default();
     let mut weapon_mods = FxHashMap::default();
 
@@ -2496,18 +2625,13 @@ fn extract_item_effects(
             continue;
         };
         let effects = resolver.extract(definition_tag, strings, &localized);
-        if effects.is_empty() {
-            continue;
-        }
         if implant_slot(item).is_some() {
-            implants.insert(
-                item.display_tag,
-                ImplantDetails {
-                    effects,
-                    stats: vec![],
-                },
-            );
-        } else {
+            let stats = stat_resolver.resolve(definition_tag);
+            if effects.is_empty() && stats.is_empty() {
+                continue;
+            }
+            implants.insert(item.display_tag, ImplantDetails { effects, stats });
+        } else if !effects.is_empty() {
             weapon_mods.insert(item.display_tag, effects);
         }
     }
@@ -3768,11 +3892,19 @@ fn assign_weapon_mod_metadata(items: &mut [GearItem]) {
         }
 
         if category == "Stock" {
-            item.compatible_weapons = base_weapons
-                .iter()
-                .filter(|weapon| weapon.internal_hash == Some(D54_BATTLE_PISTOL_HASH))
-                .map(|weapon| weapon.name.clone())
-                .collect();
+            // Stock definitions are hash-only and shared by both pistol rigs.
+            item.compatible_weapons = sorted_unique_names(
+                weapons
+                    .iter()
+                    .filter(|weapon| {
+                        matches!(
+                            weapon.internal_hash,
+                            Some(D54_BATTLE_PISTOL_HASH | KKV_9SD_HASH)
+                        )
+                    })
+                    .map(|weapon| weapon.name.clone())
+                    .collect(),
+            );
             continue;
         }
 
@@ -5286,6 +5418,17 @@ fn parse_rarity_from_categories(categories: &[String]) -> Option<GearRarity> {
     })
 }
 
+fn parse_buying_price(data: &[u8]) -> Option<u32> {
+    let marker = data
+        .chunks_exact(4)
+        .position(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == PRICE_MARKER)?
+        * 4;
+    // Implant offset 0x52C is this shared component's base price at +8.
+    let price = f32::from_bits(read_u32(data, marker + 8)?);
+    (price.is_finite() && price >= 0.0 && f64::from(price) <= f64::from(u32::MAX))
+        .then_some(price as u32)
+}
+
 fn parse_price(data: &[u8]) -> Option<u32> {
     data.chunks_exact(4)
         .position(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == PRICE_MARKER)
@@ -5386,6 +5529,7 @@ mod tests {
             types: vec![],
             internal_categories: vec![],
             price: None,
+            buying_price: None,
             description: None,
             description_parts: vec![],
         }
@@ -5408,11 +5552,15 @@ mod tests {
         exported.description_parts = vec![
             LocalizedStringPart {
                 text: "Styled".to_owned(),
+                style_reference_offset: 0,
                 highlighted: true,
+                authored_color: None,
             },
             LocalizedStringPart {
                 text: "\nplain & safe".to_owned(),
+                style_reference_offset: 0,
                 highlighted: false,
+                authored_color: None,
             },
         ];
         exported.internal_categories = vec!["item_type.runner_skin".to_owned()];
@@ -5427,17 +5575,22 @@ mod tests {
                     description_parts: vec![
                         LocalizedStringPart {
                             text: "Colored".to_owned(),
+                            style_reference_offset: 0,
                             highlighted: true,
+                            authored_color: None,
                         },
                         LocalizedStringPart {
                             text: "\r\nnormal".to_owned(),
+                            style_reference_offset: 0,
                             highlighted: false,
+                            authored_color: None,
                         },
                     ],
                 }],
                 stats: vec![super::super::implant_stats::ImplantStat {
                     name: "Speed".to_owned(),
-                    value: 2.0,
+                    raw_name_hash: 0x1234_5678,
+                    value: 2,
                 }],
             },
         );
@@ -5493,6 +5646,56 @@ mod tests {
             assert!(!record.contains_key(excluded), "unexpected {excluded}");
         }
         assert!(!record.contains_key("mod_is_universal"));
+    }
+
+    #[test]
+    fn export_uses_authored_localization_colors_when_present() {
+        let parts = vec![
+            LocalizedStringPart {
+                text: "green".to_owned(),
+                style_reference_offset: 0x120,
+                highlighted: true,
+                authored_color: Some([0.184314, 0.968627, 0.392157, 1.0]),
+            },
+            LocalizedStringPart {
+                text: " fallback".to_owned(),
+                style_reference_offset: 0x80,
+                highlighted: true,
+                authored_color: None,
+            },
+            LocalizedStringPart {
+                text: " alpha".to_owned(),
+                style_reference_offset: 0x40,
+                highlighted: true,
+                authored_color: Some([1.0, 0.0, 0.0, 0.5]),
+            },
+        ];
+
+        assert_eq!(
+            export_localized_text("green fallback alpha", &parts),
+            r#"<span style="color: #2ff764;">green</span><span style="color: #4aafff;"> fallback</span><span style="color: #ff000080;"> alpha</span>"#
+        );
+    }
+
+    #[test]
+    fn pure_white_authored_style_uses_game_format_tint() {
+        let parts = vec![LocalizedStringPart {
+            text: "default".to_owned(),
+            style_reference_offset: 0x40,
+            highlighted: true,
+            authored_color: Some([1.0, 1.0, 1.0, 1.0]),
+        }];
+
+        assert_eq!(localized_part_color(&parts[0]), None);
+        assert_eq!(
+            localized_part_color_hex(&parts[0]),
+            None,
+            "pure-white package style must fall back to game tint"
+        );
+        assert_eq!(
+            export_localized_text("default", &parts),
+            r#"<span style="color: #4aafff;">default</span>"#
+        );
     }
 
     #[test]
@@ -5585,7 +5788,9 @@ mod tests {
         quicktag_core::classes::initialize_reference_names();
         let strings =
             Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
-        let view = GearView::new(strings);
+        let mut view = GearView::new(strings);
+        let cache = quicktag_scanner::load_tag_cache();
+        view.reconcile_weapon_skin_models(&cache);
         let names = runner_shell_names(&view.items);
         for (internal, shell) in [
             ("Agile", "Vandal"),
@@ -6007,13 +6212,14 @@ mod tests {
             ("Backdraft", TagHash(0x80B6_E5E9)),
             ("Reactive Holster", TagHash(0x80B6_E6A6)),
             ("Bionic Legs", TagHash(0x80B6_F6E3)),
+            ("Back in Action", TagHash(0x80B6_F6EB)),
             ("Counter Intel", TagHash(0x80B6_F6A2)),
-            ("Dynamo", TagHash(0x80B6_F67B)),
+            ("Dynamo", TagHash(0x80B6_F699)),
             ("Explosive and Melee Resistance", TagHash(0x80B6_F6C4)),
-            ("Petty Theft", TagHash(0x80B6_F71D)),
-            ("Ping+", TagHash(0x80B6_F68D)),
+            ("Petty Theft", TagHash(0x80B6_F6E9)),
+            ("Ping+", TagHash(0x80B6_F6A7)),
             ("Splash Guard", TagHash(0x80B6_F716)),
-            ("Targeting Brace", TagHash(0x80B6_F6A7)),
+            ("Targeting Brace", TagHash(0x80B6_F68D)),
         ] {
             let matching = view
                 .items
@@ -6623,6 +6829,7 @@ mod tests {
             types: vec![],
             internal_categories: vec![],
             price: None,
+            buying_price: None,
             description: None,
             description_parts: vec![],
         };
@@ -7600,6 +7807,7 @@ mod tests {
             types: vec![],
             internal_categories: vec![],
             price: None,
+            buying_price: None,
             description: None,
             description_parts: vec![],
         };
@@ -9534,7 +9742,7 @@ mod tests {
 
         assert_eq!(
             prestige_mod("Daredevil Stock").compatible_weapons,
-            ["D54 Battle Pistol"]
+            ["D54 Battle Pistol", "KKV-9SD"]
         );
         assert_eq!(
             prestige_mod("Flechette Drum").compatible_weapons,
@@ -9623,6 +9831,59 @@ mod tests {
         assert!(compatible_names.contains("Heart of Fire"));
         assert!(compatible_names.contains("Eyes of Ash"));
         assert!(!compatible_names.contains("Law of Embers"));
+    }
+
+    #[test]
+    #[ignore = "requires the current local Marathon package installation"]
+    fn gear_view_populates_package_authored_implant_stats() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let view = GearView::new(strings);
+
+        for (definition, expected) in [
+            (
+                TagHash(0x80B6_F118),
+                vec![
+                    ("Heat Capacity", 3),
+                    ("Agility", 5),
+                    ("Fall Resistance", 5),
+                    ("Loot Speed", 5),
+                ],
+            ),
+            (
+                TagHash(0x80B6_F1E4),
+                vec![
+                    ("Melee Damage", 20),
+                    ("Hardware", -10),
+                    ("Fall Resistance", 10),
+                ],
+            ),
+        ] {
+            let item = view
+                .items
+                .iter()
+                .find(|item| item.definition_tag == Some(definition))
+                .unwrap_or_else(|| panic!("missing Gear item for {definition}"));
+            let actual = view.implant_details[&item.display_tag]
+                .stats
+                .iter()
+                .map(|stat| (stat.name.as_str(), stat.value))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -9953,7 +10214,7 @@ mod tests {
                         .any(|candidate| candidate == weapon)
             })
         };
-        assert!(!compatible("Daredevil Stock", "KKV-9SD"));
+        assert!(compatible("Daredevil Stock", "KKV-9SD"));
         assert!(compatible("Daredevil Stock", "D54 Battle Pistol"));
         assert!(compatible("Null-Grav Generator", "ARES RG"));
         assert!(compatible("Null-Grav Generator", "V00 ZEUS RG"));
@@ -10041,9 +10302,7 @@ mod tests {
 
         let strings =
             Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
-        let mut view = GearView::new(strings);
-        let cache = quicktag_scanner::load_tag_cache();
-        view.reconcile_weapon_skin_models(&cache);
+        let view = GearView::new(strings);
         let items = view.items;
         let mut category_counts = FxHashMap::<&str, usize>::default();
         for item in &items {
@@ -10525,7 +10784,10 @@ mod tests {
         }
 
         for (name, expected_weapons) in [
-            ("Daredevil Stock", vec!["D54 Battle Pistol".to_owned()]),
+            (
+                "Daredevil Stock",
+                vec!["D54 Battle Pistol".to_owned(), "KKV-9SD".to_owned()],
+            ),
             ("Flechette Drum", vec!["KKV-9SD".to_owned()]),
             ("Full-Auto Selector", vec!["Misriah 2442".to_owned()]),
             ("Adrenal Feedback Rounds", vec!["Hardline PR".to_owned()]),
@@ -11459,5 +11721,221 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "probe: requires a local Marathon package installation"]
+    fn probes_cross_kind_thumbnail_payloads() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+
+        let strings = quicktag_strings::localized::create_stringmap().expect("localized strings");
+        let items = load_gear(&strings).expect("gear");
+        let resolver = InvestmentPatternResolver::load();
+        let wanted = [
+            "weapons.pistols.v100.pistol_battery_01",
+            "weapons.auto_rifles.v100.auto_light_01",
+            "weapons.shotguns.v100.shotgun_mips_01",
+        ];
+        for path in wanted {
+            let matching = items
+                .iter()
+                .filter(|item| item.internal_name.as_deref() == Some(path))
+                .collect::<Vec<_>>();
+            eprintln!("CROSS_KIND path={path:?} records={}", matching.len());
+            for item in matching {
+                eprintln!(
+                    "  item name={:?} subtype={:?} display={} definition={:?} model={:?}",
+                    item.name,
+                    item.subcategory,
+                    item.display_tag,
+                    item.definition_tag,
+                    item.model_tag,
+                );
+                let Some(definition_tag) = item.definition_tag else {
+                    continue;
+                };
+                let Ok(definition) = package_manager().read_tag(definition_tag) else {
+                    continue;
+                };
+                print_thumbnail_payload_probe("definition", definition_tag, &definition);
+                let Some(model) = item.model_tag else {
+                    continue;
+                };
+                let Ok(pattern) = package_manager().read_tag(model) else {
+                    continue;
+                };
+                eprintln!(
+                    "  model_entry={model} class={:?}",
+                    package_manager()
+                        .get_entry(model)
+                        .map(|entry| entry.reference)
+                );
+                print_thumbnail_payload_probe("pattern", model, &pattern);
+                if let Some((translation, pattern_index)) =
+                    definition_pattern_translation(&definition)
+                {
+                    let global = resolver
+                        .pattern_globals
+                        .get(usize::from(pattern_index))
+                        .copied();
+                    eprintln!(
+                        "  pattern_translation offset=0x{translation:X} index={pattern_index} global={global:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires current Marathon packages"]
+    fn registers_kkv_stock_but_not_chips_in_mod_simulator() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let mut view = GearView::new(strings);
+        let cache = quicktag_scanner::load_tag_cache();
+        view.reconcile_weapon_skin_models(&cache);
+        let catalog = view.model_weapon_catalog();
+        let runtime = catalog
+            .weapons
+            .iter()
+            .find(|entry| entry.name == "KKV-9SD")
+            .expect("KKV runtime catalog");
+        assert!(runtime.slots.iter().all(|slot| slot.name != "Chip"));
+        let stock_names = runtime
+            .slots
+            .iter()
+            .find(|slot| slot.name == "Shield")
+            .expect("KKV stock slot")
+            .mods
+            .iter()
+            .map(|item| item.name.as_str())
+            .unique()
+            .sorted()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stock_names,
+            [
+                "Cantilever Stock",
+                "Daredevil Stock",
+                "Rigidbody Stock",
+                "Versatile Stock",
+            ]
+        );
+    }
+
+    fn print_thumbnail_payload_probe(label: &str, tag: TagHash, data: &[u8]) {
+        let words = [
+            ("camera_target", quicktag_core::util::fnv1(b"camera_target")),
+            (
+                "camera_control",
+                quicktag_core::util::fnv1(b"camera_control"),
+            ),
+            (
+                "camera_safe_position",
+                quicktag_core::util::fnv1(b"camera_safe_position"),
+            ),
+            ("fp_camera", quicktag_core::util::fnv1(b"fp_camera")),
+            (
+                "primary_weapon",
+                quicktag_core::util::fnv1(b"primary_weapon"),
+            ),
+            (
+                "secondary_weapon",
+                quicktag_core::util::fnv1(b"secondary_weapon"),
+            ),
+            ("weapon_back", quicktag_core::util::fnv1(b"weapon_back")),
+            (
+                "weapon_stow_secondary",
+                quicktag_core::util::fnv1(b"weapon_stow_secondary"),
+            ),
+            (
+                "preview_camera",
+                quicktag_core::util::fnv1(b"preview_camera"),
+            ),
+            ("thumbnail", quicktag_core::util::fnv1(b"thumbnail")),
+            ("skeleton", 0x8080_AF42),
+            ("transform", 0x8080_BF47),
+            ("weapon_pose", 0x8080_9F82),
+        ];
+        let mut hits = Vec::new();
+        for offset in (0..data.len().saturating_sub(3)).step_by(4) {
+            let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            for (name, needle) in words {
+                if value == needle {
+                    hits.push((name, offset));
+                }
+            }
+        }
+        let finite_float4 = (0..data.len().saturating_sub(15))
+            .step_by(4)
+            .filter_map(|offset| {
+                let values = (0..4)
+                    .map(|index| {
+                        f32::from_le_bytes(
+                            data[offset + index * 4..offset + index * 4 + 4]
+                                .try_into()
+                                .unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (values
+                    .iter()
+                    .all(|value| value.is_finite() && value.abs() <= 1000.0)
+                    && values.iter().any(|value| value.abs() > 0.0001)
+                    && values.iter().filter(|value| value.abs() <= 1.0).count() >= 2)
+                    .then_some((offset, values))
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let translation = data
+            .chunks_exact(4)
+            .position(|bytes| {
+                u32::from_le_bytes(bytes.try_into().unwrap()) == PATTERN_TRANSLATION_BLOCK_MARKER
+            })
+            .map(|index| index * 4);
+        let windows = [
+            0usize, 0xF0, 0x260, 0x450, 0x6B0, 0x700, 0x760, 0x7C0, 0x810, 0x960, 0xA00,
+        ];
+        let sampled = windows
+            .into_iter()
+            .filter(|start| start + 0x20 <= data.len())
+            .map(|start| {
+                let values = data[start..start + 0x20]
+                    .chunks_exact(4)
+                    .map(|bytes| format!("{:08X}", u32::from_le_bytes(bytes.try_into().unwrap())))
+                    .collect::<Vec<_>>();
+                (start, values)
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "    payload label={label} tag={tag} size={} translation={translation:?} marker_hits={hits:?} float4={finite_float4:?}",
+            data.len()
+        );
+        eprintln!("    payload_windows={sampled:?}");
     }
 }

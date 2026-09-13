@@ -28,7 +28,8 @@ use super::gear::{
 };
 use super::model_renderer::{
     GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelExportCamera,
-    ModelPaintCallback, model_direction_to_view, view_direction_to_model,
+    ModelPaintCallback, light_cast_direction, light_source_position, model_direction_to_view,
+    view_direction_to_model,
 };
 use super::{View, ViewAction};
 
@@ -1702,13 +1703,15 @@ pub(super) fn model_wireframe_ui(
                     "Albedo MRT",
                 );
                 ui.separator();
-                ui.checkbox(&mut environment.light_gizmo, "Orbit gizmo");
+                ui.checkbox(&mut environment.light_gizmo, "Spotlight gizmo");
                 if ui.button("Reset lighting").clicked() {
                     let defaults = ModelEnvironment::default();
                     environment.light_target = defaults.light_target;
                     environment.light_orbit_position = defaults.light_orbit_position;
                     environment.light_orbit_center = defaults.light_orbit_center;
                     environment.light_orbit_radius = defaults.light_orbit_radius;
+                    environment.light_range = defaults.light_range;
+                    environment.light_cone_angle = defaults.light_cone_angle;
                     environment.light_size = defaults.light_size;
                     environment.shadow_strength = defaults.shadow_strength;
                     environment.shadow_softness = defaults.shadow_softness;
@@ -1791,7 +1794,7 @@ pub(super) fn model_wireframe_ui(
                         }
                     });
             });
-            ui.label("Directional light target (world space)");
+            ui.label("Spotlight beam target (world space)");
             for axis in 0..3 {
                 ui.add(
                     egui::Slider::new(
@@ -1802,7 +1805,7 @@ pub(super) fn model_wireframe_ui(
                 );
             }
             ui.separator();
-            ui.label("Orbit transform");
+            ui.label("Spotlight source orbit");
             ui.label("Point on sphere");
             for axis in 0..3 {
                 ui.add(
@@ -1822,7 +1825,12 @@ pub(super) fn model_wireframe_ui(
             }
             ui.add(
                 egui::Slider::new(&mut environment.light_orbit_radius, 0.25..=10.0)
-                    .text("Orbit radius"),
+                    .text("Source distance"),
+            );
+            ui.add(egui::Slider::new(&mut environment.light_range, 0.25..=20.0).text("Beam range"));
+            ui.add(
+                egui::Slider::new(&mut environment.light_cone_angle, 1.0..=89.0)
+                    .text("Beam half-angle"),
             );
             ui.add(egui::Slider::new(&mut environment.light_size, 0.0..=10.0).text("Light size"));
             ui.add(
@@ -1938,12 +1946,8 @@ pub(super) fn model_wireframe_ui(
     let mut orbit_position = environment.light_orbit_position;
     normalize_direction(&mut orbit_position, defaults.light_orbit_position);
     let orbit_view = model_direction_to_view(orbit_position, *yaw, *pitch);
-    let center_view = model_direction_to_view(environment.light_orbit_center, *yaw, *pitch);
-    let light_world_position: [f32; 3] = std::array::from_fn(|axis| {
-        environment.light_orbit_center[axis] + orbit_position[axis] * environment.light_orbit_radius
-    });
-    let mut cast_direction =
-        std::array::from_fn(|axis| environment.light_target[axis] - light_world_position[axis]);
+    let light_world_position = light_source_position(environment);
+    let mut cast_direction = light_cast_direction(environment);
     let cast_length = cast_direction
         .iter()
         .map(|value| value * value)
@@ -1951,19 +1955,45 @@ pub(super) fn model_wireframe_ui(
         .sqrt();
     normalize_direction(&mut cast_direction, [0.276, -0.627, -0.728]);
     let cast_view = model_direction_to_view(cast_direction, *yaw, *pitch);
+    let camera_frame = camera_frame.unwrap_or_else(|| ModelCameraFrame::from_wireframe(wireframe));
     let viewport_center = rect.center() + *pan;
-    let world_scale = rect.width().min(rect.height()) * 0.24;
-    let gizmo_center =
-        viewport_center + vec2(-center_view[0] * world_scale, -center_view[1] * world_scale);
-    let gizmo_radius = (world_scale * environment.light_orbit_radius).max(24.0);
-    let light_handle =
-        gizmo_center + vec2(-orbit_view[0] * gizmo_radius, -orbit_view[1] * gizmo_radius);
-    let direction_length = (gizmo_radius * 0.65).clamp(42.0, 140.0);
-    let direction_handle = light_handle
-        + vec2(
-            -cast_view[0] * direction_length,
-            -cast_view[1] * direction_length,
-        );
+    let view_yaw = *yaw;
+    let view_pitch = *pitch;
+    let pixels_per_world_unit =
+        0.84 * *zoom / camera_frame.radius.max(0.0001) * rect.height() * 0.5;
+    let project_model_point = |position: [f32; 3]| {
+        let relative = std::array::from_fn(|axis| position[axis] - camera_frame.center[axis]);
+        let view = model_direction_to_view(relative, view_yaw, view_pitch);
+        viewport_center
+            + vec2(
+                -view[0] * pixels_per_world_unit,
+                -view[1] * pixels_per_world_unit,
+            )
+    };
+    let gizmo_center = project_model_point(environment.light_orbit_center);
+    let light_handle = project_model_point(light_world_position);
+    let center_relative = std::array::from_fn(|axis| {
+        environment.light_orbit_center[axis] - camera_frame.center[axis]
+    });
+    let center_view = model_direction_to_view(center_relative, *yaw, *pitch);
+    let orbit_radius_world = environment.light_orbit_radius.max(0.0);
+    let gizmo_radius = (0..=64)
+        .map(|step| {
+            let angle = step as f32 / 64.0 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            let point = [
+                environment.light_orbit_center[0] + cos * orbit_radius_world,
+                environment.light_orbit_center[1],
+                environment.light_orbit_center[2] + sin * orbit_radius_world,
+            ];
+            project_model_point(point).distance(gizmo_center)
+        })
+        .fold(24.0_f32, f32::max);
+    let direction_length = 64.0_f32;
+    let direction_world_length = direction_length / pixels_per_world_unit.max(0.0001);
+    let direction_handle = project_model_point(std::array::from_fn(|axis| {
+        light_world_position[axis] + cast_direction[axis] * direction_world_length
+    }));
     let light_handle_radius = (6.0 * environment.light_size.sqrt()).clamp(5.0, 12.0);
     let orbit_gizmo_response = environment.light_gizmo.then(|| {
         ui.interact(
@@ -1971,7 +2001,7 @@ pub(super) fn model_wireframe_ui(
             ui.id().with("model_light_orbit_point"),
             Sense::drag(),
         )
-        .on_hover_text("Move light transform on orbit sphere")
+        .on_hover_text("Move spotlight source on orbit sphere")
     });
     let direction_gizmo_response = environment.light_gizmo.then(|| {
         ui.interact(
@@ -1979,7 +2009,7 @@ pub(super) fn model_wireframe_ui(
             ui.id().with("model_light_direction"),
             Sense::drag(),
         )
-        .on_hover_text("Move directional-light target")
+        .on_hover_text("Move spotlight beam target")
     });
     let center_gizmo_response = environment.light_gizmo.then(|| {
         ui.interact(
@@ -1987,7 +2017,7 @@ pub(super) fn model_wireframe_ui(
             ui.id().with("model_light_orbit_center"),
             Sense::drag(),
         )
-        .on_hover_text("Move orbit-sphere center")
+        .on_hover_text("Move spotlight orbit center")
     });
     if let Some(gizmo) = &orbit_gizmo_response
         && gizmo.dragged()
@@ -2039,16 +2069,18 @@ pub(super) fn model_wireframe_ui(
         && gizmo.dragged()
         && let Some(pointer) = gizmo.interact_pointer_pos()
     {
-        let offset = pointer - viewport_center;
-        environment.light_orbit_center = view_direction_to_model(
+        let offset = pointer - gizmo_center;
+        let center_relative = view_direction_to_model(
             [
-                -offset.x / world_scale,
-                -offset.y / world_scale,
+                center_view[0] - offset.x / pixels_per_world_unit.max(0.0001),
+                center_view[1] - offset.y / pixels_per_world_unit.max(0.0001),
                 center_view[2],
             ],
             *yaw,
             *pitch,
         );
+        environment.light_orbit_center =
+            std::array::from_fn(|axis| camera_frame.center[axis] + center_relative[axis]);
         ui.ctx().request_repaint();
     }
 
@@ -2109,7 +2141,7 @@ pub(super) fn model_wireframe_ui(
             texture_cache,
             wireframe,
             uv_transform,
-            camera_frame,
+            Some(camera_frame),
             *yaw,
             *pitch,
             *zoom,
@@ -2128,7 +2160,6 @@ pub(super) fn model_wireframe_ui(
 
     if environment.light_gizmo {
         let sphere_stroke = Stroke::new(1.0, Color32::from_white_alpha(90));
-        painter.circle_stroke(gizmo_center, gizmo_radius, sphere_stroke);
         for (axis, color) in [
             (0, Color32::from_rgba_unmultiplied(245, 90, 90, 125)),
             (1, Color32::from_rgba_unmultiplied(90, 220, 120, 125)),
@@ -2137,15 +2168,19 @@ pub(super) fn model_wireframe_ui(
                 .map(|step| {
                     let angle = step as f32 / 64.0 * std::f32::consts::TAU;
                     let (sin, cos) = angle.sin_cos();
-                    if axis == 0 {
-                        gizmo_center + vec2(cos * gizmo_radius, sin * gizmo_radius * 0.28)
+                    let offset = if axis == 0 {
+                        [cos * orbit_radius_world, 0.0, sin * orbit_radius_world]
                     } else {
-                        gizmo_center + vec2(cos * gizmo_radius * 0.28, sin * gizmo_radius)
-                    }
+                        [0.0, cos * orbit_radius_world, sin * orbit_radius_world]
+                    };
+                    project_model_point(std::array::from_fn(|component| {
+                        environment.light_orbit_center[component] + offset[component]
+                    }))
                 })
                 .collect::<Vec<_>>();
             painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
         }
+        painter.circle_stroke(gizmo_center, gizmo_radius, sphere_stroke);
         painter.line_segment(
             [gizmo_center, light_handle],
             Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 220, 105, 170)),
@@ -2176,9 +2211,15 @@ pub(super) fn model_wireframe_ui(
         painter.circle_filled(direction_handle, 4.5, Color32::from_rgb(255, 126, 82));
     }
 
-    let Some(projected) =
-        project_vertices(wireframe, camera_frame, *yaw, *pitch, *zoom, *pan, rect)
-    else {
+    let Some(projected) = project_vertices(
+        wireframe,
+        Some(camera_frame),
+        *yaw,
+        *pitch,
+        *zoom,
+        *pan,
+        rect,
+    ) else {
         return rect;
     };
 

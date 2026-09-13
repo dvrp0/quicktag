@@ -13,7 +13,7 @@ use crate::material::{
     MaterialPreviewKind, MaterialTagPreview, TechniqueMaterialConstants, TechniqueTextureBinding,
     interpret_tfx_stack_with_object_channels, is_technique_entry, material_constants_for_technique,
     primary_sampler_for_technique, render_state_for_technique, sampler_for_technique_slot,
-    texture_bindings_for_technique,
+    texture_bindings_for_technique, tfx_has_marathon_decal_abi,
 };
 use crate::texture::Texture;
 
@@ -520,6 +520,9 @@ pub struct ForwardCoatingMaterial {
 pub enum InvestmentDecalMode {
     SelectorMask,
     DetailSelectorMask,
+    /// Stage-2 decals whose pixel shader consumes the already-rendered
+    /// screen-space surface normal as its external t2 input.
+    SceneNormalColorMask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6115,12 +6118,7 @@ fn direct_shared_color_atlas_for_technique(
     let preview = MaterialTagPreview::load(&entry, &data)?;
     let MaterialPreviewKind::Technique(preview) = preview.kind;
     let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
-    if pixel
-        .bytecode
-        .expressions
-        .iter()
-        .any(|expression| expression.expression.contains("DecalSetTransform"))
-    {
+    if tfx_has_marathon_decal_abi(&pixel.bytecode) {
         return None;
     }
     let pixel_textures = bindings
@@ -6191,11 +6189,13 @@ fn shared_atlas_detail_material(
 /// Resolve Tiger's investment-decal pass.
 ///
 /// Weapon and runner geometry carries decal quads with selector UVs already
-/// baked into the mesh. Their pixel techniques read `DecalSetTransform` and
-/// use either a sole colour atlas or a colour + opacity + detail texture ABI.
-/// Treating these bindings as an ordinary material drops the authored stencil
-/// and renders Quicktag's white fallback. Decode the pass from its blend state,
-/// TFX extern, texture formats, and constant layout; no asset/tag rule is used.
+/// baked into the mesh. Their pixel techniques read Marathon `Decal` extern
+/// fields at raw scope 45 (`normals_read` texture +0x8 and resolution/offset
+/// vec4 +0x30), then use either a sole colour atlas or a colour + opacity +
+/// detail texture ABI. Treating these bindings as an ordinary material drops
+/// the authored stencil and renders Quicktag's white fallback. Decode the pass
+/// from its blend state, TFX extern, texture formats, and constant layout; no
+/// asset/tag rule is used.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum InvestmentDecalResolution {
     Atlas(TagHash),
@@ -6223,15 +6223,7 @@ fn investment_decal_for_technique(
     let preview = MaterialTagPreview::load(&entry, &data)?;
     let MaterialPreviewKind::Technique(preview) = preview.kind;
     let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
-    let reads_decal_transform = pixel
-        .bytecode
-        .expressions
-        .iter()
-        .any(|expression| expression.expression.contains("DecalSetTransform"));
-    if !reads_decal_transform {
-        return None;
-    }
-
+    let has_marathon_decal_abi = tfx_has_marathon_decal_abi(&pixel.bytecode);
     let pixel_textures = bindings
         .iter()
         .filter(|binding| binding.stage == "PS")
@@ -6241,12 +6233,63 @@ fn investment_decal_for_technique(
         .collect_vec();
 
     match pixel_textures.as_slice() {
-        [atlas] => Some(InvestmentDecalResolution::Atlas(atlas.tag)),
+        [atlas] if has_marathon_decal_abi => Some(InvestmentDecalResolution::Atlas(atlas.tag)),
         [color, mask]
-            if texture_is_srgb(color.tag)
+            if color.slot == 3
+                && mask.slot == 4
+                && has_marathon_decal_abi
+                && texture_is_srgb(color.tag)
+                && texture_is_single_channel(mask.tag)
+                && pixel.inline_constants.len() == 9 =>
+        {
+            let constants = &pixel.inline_constants;
+            Some(InvestmentDecalResolution::Shader(InvestmentDecalMaterial {
+                mode: InvestmentDecalMode::SceneNormalColorMask,
+                color: color.tag,
+                mask: mask.tag,
+                detail: None,
+                selector_colors: [[0.0; 4]; 5],
+                selector_color_count: 0,
+                atlas_selector_max: 0,
+                mask_mode: InvestmentDecalMaskMode::Threshold,
+                mask_threshold: constants[1][0],
+                detail_transform: [1.0, 1.0, 0.0, 0.0],
+                detail_base: [1.0; 4],
+                detail_scale: [0.0; 4],
+                grayscale_remap: [0.0, 1.0, 0.0, 0.0],
+                positive_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                negative_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                output_gate: 1.0,
+            }))
+        }
+        [color, mask]
+            if ((color.slot == 2 && mask.slot == 3) || (color.slot == 3 && mask.slot == 4))
+                && texture_is_srgb(color.tag)
                 && texture_is_single_channel(mask.tag)
                 && pixel.inline_constants.len() > 10 =>
         {
+            if color.slot == 2 && mask.slot == 3 && pixel.inline_constants.len() == 18 {
+                let constants = &pixel.inline_constants;
+                return Some(InvestmentDecalResolution::Shader(InvestmentDecalMaterial {
+                    mode: InvestmentDecalMode::SelectorMask,
+                    color: color.tag,
+                    mask: mask.tag,
+                    detail: None,
+                    selector_colors: [[0.0; 4]; 5],
+                    selector_color_count: 0,
+                    atlas_selector_max: 0,
+                    mask_mode: InvestmentDecalMaskMode::Threshold,
+                    mask_threshold: constants[1][0],
+                    detail_transform: [1.0, 1.0, 0.0, 0.0],
+                    detail_base: [1.0; 4],
+                    detail_scale: [0.0; 4],
+                    grayscale_remap: [0.0, 1.0, 0.0, 0.0],
+                    positive_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                    negative_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                    output_gate: constants[17][1].clamp(0.0, 1.0),
+                }));
+            }
+
             let mut selector_colors = [[0.0; 4]; 5];
             selector_colors[0] = pixel.inline_constants[1];
             selector_colors[1] = pixel.inline_constants[2];
@@ -6270,7 +6313,8 @@ fn investment_decal_for_technique(
             }))
         }
         [detail, color, mask]
-            if texture_is_single_channel(detail.tag)
+            if has_marathon_decal_abi
+                && texture_is_single_channel(detail.tag)
                 && texture_is_srgb(color.tag)
                 && texture_is_single_channel(mask.tag)
                 && pixel.inline_constants.len() > 15 =>
@@ -13018,6 +13062,25 @@ mod tests {
         assert_eq!(multi_color.selector_color_count, 5);
         assert_eq!(multi_color.mask_mode, InvestmentDecalMaskMode::Binary);
         assert_eq!(multi_color.atlas_selector_max, 0);
+
+        let InvestmentDecalResolution::Shader(scene_normal) = resolve(TagHash(0x80A9E674)) else {
+            panic!("runner scene-normal decal technique was not decoded")
+        };
+        assert_eq!(scene_normal.mode, InvestmentDecalMode::SceneNormalColorMask);
+        assert_eq!(scene_normal.color, TagHash(0x80A9C1D7));
+        assert_eq!(scene_normal.mask, TagHash(0x80A9C1D6));
+        assert_eq!(scene_normal.detail, None);
+        assert_eq!(scene_normal.mask_mode, InvestmentDecalMaskMode::Threshold);
+        assert!((scene_normal.mask_threshold - 0.135).abs() < 0.0001);
+
+        let InvestmentDecalResolution::Shader(direct_selector) = resolve(TagHash(0x80A9E65F))
+        else {
+            panic!("runner direct selector decal technique was not decoded")
+        };
+        assert_eq!(direct_selector.mode, InvestmentDecalMode::SelectorMask);
+        assert_eq!(direct_selector.color, TagHash(0x80A9C1D7));
+        assert_eq!(direct_selector.mask, TagHash(0x80A9C1D6));
+        assert!((direct_selector.mask_threshold - 0.075).abs() < 0.0001);
     }
 
     fn authored_geometry_dyes(
@@ -18353,6 +18416,7 @@ mod tests {
         }
     }
 
+    #[test]
     #[test]
     #[ignore = "probe: requires installed Marathon packages and GPU"]
     fn exports_quickdraw_grip_age_textures() {
