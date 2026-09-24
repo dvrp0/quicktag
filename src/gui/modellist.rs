@@ -30,27 +30,79 @@ use super::gear::{
 };
 use super::model_renderer::{
     GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelExportCamera,
-    ModelLightTransform, ModelPaintCallback, light_cast_direction, light_source_position,
-    model_direction_to_view, view_direction_to_model,
+    ModelLightTransform, ModelPaintCallback, fixed_light_direction_to_view,
+    fixed_view_direction_to_light, light_cast_direction, light_source_position,
 };
-use super::{View, ViewAction};
+use super::{TOASTS, View, ViewAction};
 
 pub(super) const DEFAULT_MODEL_YAW: f32 = -std::f32::consts::FRAC_PI_2;
 const DEFAULT_WEAPON_YAW: f32 = -24.0_f32.to_radians();
 const DEFAULT_WEAPON_PITCH: f32 = 14.0_f32.to_radians();
+const DEFAULT_PREVIEW_ZOOM: f32 = 2.5;
 const MODEL_EXPORT_WIDTH: u32 = 4198;
 const MODEL_EXPORT_HEIGHT: u32 = 2048;
 const MODEL_PARAMETER_RANGE: std::ops::RangeInclusive<f32> = -10.0..=10.0;
+const MODEL_OVERLAY_INSET: f32 = 8.0;
+const MODEL_OVERLAY_STACK_STEP: f32 = 51.0;
 
-fn model_export_filename(model: TagHash, modifications: &[(TagHash, &'static str)]) -> String {
+fn model_overlay_frame() -> egui::Frame {
+    egui::Frame::default()
+        .fill(Color32::from_rgba_unmultiplied(10, 13, 18, 238))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(73, 82, 96)))
+        .corner_radius(6)
+        .inner_margin(8)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelExportFormat {
+    #[default]
+    Png,
+    WebP,
+}
+
+impl ModelExportFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::WebP => "WebP",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::WebP => "webp",
+        }
+    }
+
+    fn dialog_label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG image",
+            Self::WebP => "WebP image",
+        }
+    }
+
+    fn image_format(self) -> image::ImageFormat {
+        match self {
+            Self::Png => image::ImageFormat::Png,
+            Self::WebP => image::ImageFormat::WebP,
+        }
+    }
+}
+
+fn model_export_filename(
+    model: TagHash,
+    modifications: &[(TagHash, &'static str)],
+    format: ModelExportFormat,
+) -> String {
     let suffix = modifications
         .iter()
         .map(|(tag, rarity)| format!("{tag}-{rarity}"))
         .join("_");
     if suffix.is_empty() {
-        format!("{model}.png")
+        format!("{model}.{}", format.extension())
     } else {
-        format!("{model}_{suffix}.png")
+        format!("{model}_{suffix}.{}", format.extension())
     }
 }
 
@@ -100,6 +152,7 @@ struct ModdedExportJob {
     show_stickers: bool,
     environment: ModelEnvironment,
     export_camera: Option<ModelExportCamera>,
+    format: ModelExportFormat,
     path: PathBuf,
     zip: Option<zip::ZipWriter<std::fs::File>>,
 }
@@ -113,6 +166,7 @@ impl ModdedExportJob {
         show_stickers: bool,
         environment: ModelEnvironment,
         export_camera: Option<ModelExportCamera>,
+        format: ModelExportFormat,
         path: PathBuf,
     ) -> anyhow::Result<Self> {
         let combinations = high_rarity_mod_combinations(&weapon);
@@ -130,6 +184,7 @@ impl ModdedExportJob {
             show_stickers,
             environment,
             export_camera,
+            format,
             path,
             zip: Some(zip),
         })
@@ -238,14 +293,15 @@ impl ModdedExportJob {
             .collect_vec();
         let zip = self.zip.as_mut().expect("unfinished export has zip");
         zip.start_file(
-            model_export_filename(self.model_tag, &descriptors),
-            // PNG payloads are already compressed; ZIP deflate only wastes CPU.
+            model_export_filename(self.model_tag, &descriptors, self.format),
+            // Encoded image payloads are already compressed; ZIP deflate only wastes CPU.
             zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored),
         )?;
-        zip.write_all(&callback.export_png_bytes(
+        zip.write_all(&callback.export_image_bytes(
             &texture_cache.render_state,
             [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
+            self.format.image_format(),
         )?)?;
         self.next += 1;
         Ok(false)
@@ -274,7 +330,8 @@ pub struct ModelsView {
     preview_show_stickers: bool,
     preview_show_default_mods: bool,
     preview_environment: ModelEnvironment,
-    preview_export_status: Option<(bool, String)>,
+    export_all_mods: bool,
+    export_format: ModelExportFormat,
     modded_export: Option<ModdedExportJob>,
     weapon_catalog: ModelWeaponCatalog,
     active_weapon: Option<usize>,
@@ -321,13 +378,14 @@ impl ModelsView {
             weapon_export_camera: None,
             preview_yaw: DEFAULT_WEAPON_YAW,
             preview_pitch: DEFAULT_WEAPON_PITCH,
-            preview_zoom: 1.0,
+            preview_zoom: DEFAULT_PREVIEW_ZOOM,
             preview_pan: vec2(0.0, 0.0),
             preview_show_wireframe: false,
             preview_show_stickers: false,
             preview_show_default_mods: true,
             preview_environment: ModelEnvironment::default(),
-            preview_export_status: None,
+            export_all_mods: false,
+            export_format: ModelExportFormat::default(),
             modded_export: None,
             weapon_catalog: ModelWeaponCatalog::default(),
             active_weapon: None,
@@ -517,7 +575,6 @@ impl ModelsView {
 
     fn load_model(&mut self, tag: TagHash) {
         self.selected_model = Some(tag);
-        self.preview_export_status = None;
         self.preview_camera_frame = None;
         self.weapon_export_camera = None;
         self.detect_selected_weapon();
@@ -963,12 +1020,13 @@ impl View for ModelsView {
         let default_mods_before = self.preview_show_default_mods;
         let preview_show_default_mods = &mut self.preview_show_default_mods;
         let preview_environment = &mut self.preview_environment;
+        let export_all_mods = &mut self.export_all_mods;
+        let export_format = &mut self.export_format;
         let active_weapon = self
             .active_weapon
             .and_then(|index| self.weapon_catalog.weapons.get(index))
             .cloned();
         let selected_mods = self.selected_mods.clone();
-        let export_status = self.preview_export_status.clone();
         let modded_export_active = self.modded_export.is_some();
         let mut mod_selection = None;
         let mut export_result = None;
@@ -990,107 +1048,6 @@ impl View for ModelsView {
                 {
                     action = Some(ViewAction::OpenTag(tag));
                 }
-                if let Some(tag) = selected_model
-                    && ui
-                        .add_enabled(!modded_export_active, egui::Button::new("Export PNG"))
-                        .clicked()
-                {
-                    let filename = model_export_filename(tag, &selected_mod_export_descriptors);
-                    match native_dialog::FileDialog::new()
-                        .add_filter("PNG image", &["png"])
-                        .set_filename(&filename)
-                        .show_save_single_file()
-                    {
-                        Ok(Some(mut path)) => {
-                            if !path
-                                .extension()
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
-                            {
-                                path.set_extension("png");
-                            }
-                            if let (Some(wireframe), Some(gpu_preview)) =
-                                (model.wireframe.as_ref(), gpu_model_preview)
-                            {
-                                let export_rect = egui::Rect::from_min_size(
-                                    egui::Pos2::ZERO,
-                                    vec2(MODEL_EXPORT_WIDTH as f32, MODEL_EXPORT_HEIGHT as f32),
-                                );
-                                let callback = ModelPaintCallback::new(
-                                    gpu_preview.clone(),
-                                    texture_cache,
-                                    wireframe,
-                                    model.preview_uv_transform(),
-                                    None,
-                                    DEFAULT_WEAPON_YAW,
-                                    DEFAULT_WEAPON_PITCH,
-                                    1.0,
-                                    egui::Vec2::ZERO,
-                                    *preview_show_stickers,
-                                    export_rect,
-                                    1.0,
-                                    *preview_environment,
-                                )
-                                .with_export_camera(weapon_export_camera);
-                                export_result = Some(
-                                    callback
-                                        .export_png(
-                                            &texture_cache.render_state,
-                                            &path,
-                                            [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
-                                        )
-                                        .map(|()| (path, 1)),
-                                );
-                            } else {
-                                export_result =
-                                    Some(Err(anyhow::anyhow!("GPU model preview is unavailable")));
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => export_result = Some(Err(error.into())),
-                    }
-                }
-                if let (Some(tag), Some(weapon)) = (selected_model, active_weapon.as_ref())
-                    && ui
-                        .add_enabled(
-                            !modded_export_active,
-                            egui::Button::new("Export All Modded"),
-                        )
-                        .clicked()
-                {
-                    let filename = model_modded_export_filename(tag);
-                    match native_dialog::FileDialog::new()
-                        .add_filter("ZIP archive", &["zip"])
-                        .set_filename(&filename)
-                        .show_save_single_file()
-                    {
-                        Ok(Some(mut path)) => {
-                            if !path
-                                .extension()
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
-                            {
-                                path.set_extension("zip");
-                            }
-                            modded_export_request = Some((
-                                tag,
-                                weapon.clone(),
-                                *preview_show_default_mods,
-                                *preview_show_stickers,
-                                *preview_environment,
-                                weapon_export_camera,
-                                path,
-                            ));
-                        }
-                        Ok(None) => {}
-                        Err(error) => export_result = Some(Err(error.into())),
-                    }
-                }
-                if let Some((success, message)) = &export_status {
-                    ui.label(RichText::new(message).small().color(if *success {
-                        Color32::LIGHT_GREEN
-                    } else {
-                        Color32::LIGHT_RED
-                    }));
-                }
             });
             ui.horizontal_wrapped(|ui| {
                 if let Some(class_name) = &model.class_name {
@@ -1105,48 +1062,137 @@ impl View for ModelsView {
             });
 
             ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if let Some(wireframe) = &model.wireframe {
-                        let viewport = model_wireframe_ui(
-                            ui,
-                            wireframe,
-                            model.preview_uv_transform(),
-                            texture_cache,
-                            &model.textures,
-                            gpu_model_preview,
-                            preview_camera_frame,
-                            preview_yaw,
-                            preview_pitch,
-                            preview_zoom,
-                            preview_pan,
-                            preview_show_wireframe,
-                            preview_show_stickers,
-                            active_weapon.is_some().then_some(preview_show_default_mods),
-                            preview_environment,
-                        );
+            if let Some(wireframe) = &model.wireframe {
+                let (viewport, texture_action) = model_wireframe_ui(
+                    ui,
+                    wireframe,
+                    model.preview_uv_transform(),
+                    texture_cache,
+                    &model.textures,
+                    gpu_model_preview,
+                    preview_camera_frame,
+                    preview_yaw,
+                    preview_pitch,
+                    preview_zoom,
+                    preview_pan,
+                    preview_show_wireframe,
+                    preview_show_stickers,
+                    active_weapon.is_some().then_some(preview_show_default_mods),
+                    preview_environment,
+                    true,
+                );
+                if texture_action.is_some() {
+                    action = texture_action;
+                }
+
+                if model_export_toolbar(
+                    ui.ctx(),
+                    viewport,
+                    export_all_mods,
+                    export_format,
+                    active_weapon.is_some(),
+                    modded_export_active,
+                ) {
+                    let format = *export_format;
+                    if *export_all_mods {
                         if let (Some(tag), Some(weapon)) = (selected_model, active_weapon.as_ref())
                         {
-                            mod_selection = compact_weapon_mod_selector(
-                                ui.ctx(),
-                                viewport,
-                                tag,
-                                weapon,
-                                &selected_mods,
-                            );
+                            let filename = model_modded_export_filename(tag);
+                            match native_dialog::FileDialog::new()
+                                .add_filter("ZIP archive", &["zip"])
+                                .set_filename(&filename)
+                                .show_save_single_file()
+                            {
+                                Ok(Some(mut path)) => {
+                                    if !path.extension().is_some_and(|extension| {
+                                        extension.eq_ignore_ascii_case("zip")
+                                    }) {
+                                        path.set_extension("zip");
+                                    }
+                                    modded_export_request = Some((
+                                        tag,
+                                        weapon.clone(),
+                                        *preview_show_default_mods,
+                                        *preview_show_stickers,
+                                        *preview_environment,
+                                        weapon_export_camera,
+                                        format,
+                                        path,
+                                    ));
+                                }
+                                Ok(None) => {}
+                                Err(error) => export_result = Some(Err(error.into())),
+                            }
                         }
-                    } else {
-                        ui.label(RichText::new("No wireframe assembled yet").italics());
+                    } else if let Some(tag) = selected_model {
+                        let filename =
+                            model_export_filename(tag, &selected_mod_export_descriptors, format);
+                        match native_dialog::FileDialog::new()
+                            .add_filter(format.dialog_label(), &[format.extension()])
+                            .set_filename(&filename)
+                            .show_save_single_file()
+                        {
+                            Ok(Some(mut path)) => {
+                                if !path.extension().is_some_and(|extension| {
+                                    extension.eq_ignore_ascii_case(format.extension())
+                                }) {
+                                    path.set_extension(format.extension());
+                                }
+                                if let Some(gpu_preview) = gpu_model_preview {
+                                    let export_rect = egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        vec2(MODEL_EXPORT_WIDTH as f32, MODEL_EXPORT_HEIGHT as f32),
+                                    );
+                                    let callback = ModelPaintCallback::new(
+                                        gpu_preview.clone(),
+                                        texture_cache,
+                                        wireframe,
+                                        model.preview_uv_transform(),
+                                        None,
+                                        DEFAULT_WEAPON_YAW,
+                                        DEFAULT_WEAPON_PITCH,
+                                        1.0,
+                                        egui::Vec2::ZERO,
+                                        *preview_show_stickers,
+                                        export_rect,
+                                        1.0,
+                                        *preview_environment,
+                                    )
+                                    .with_export_camera(weapon_export_camera);
+                                    export_result = Some(
+                                        callback
+                                            .export_image(
+                                                &texture_cache.render_state,
+                                                &path,
+                                                [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
+                                                format.image_format(),
+                                            )
+                                            .map(|()| path),
+                                    );
+                                } else {
+                                    export_result = Some(Err(anyhow::anyhow!(
+                                        "GPU model preview is unavailable"
+                                    )));
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => export_result = Some(Err(error.into())),
+                        }
                     }
+                }
 
-                    ui.separator();
-                    if let Some(texture_action) =
-                        model_textures_ui(ui, texture_cache, &model.textures)
-                    {
-                        action = Some(texture_action);
-                    }
-                });
+                if let (Some(tag), Some(weapon)) = (selected_model, active_weapon.as_ref()) {
+                    mod_selection = compact_weapon_mod_selector(
+                        ui.ctx(),
+                        viewport,
+                        tag,
+                        weapon,
+                        &selected_mods,
+                    );
+                }
+            } else {
+                ui.label(RichText::new("No wireframe assembled yet").italics());
+            }
         });
 
         let mut rebuild_preview = *preview_show_default_mods != default_mods_before;
@@ -1164,47 +1210,56 @@ impl View for ModelsView {
             self.rebuild_model_preview();
         }
         if let Some(result) = export_result {
-            self.preview_export_status = Some(match result {
-                Ok((path, count)) => (
-                    true,
-                    if count == 1 {
-                        format!("Saved {}", path.display())
-                    } else {
-                        format!("Saved {count} PNGs to {}", path.display())
-                    },
-                ),
-                Err(error) => (false, format!("Export failed: {error:#}")),
-            });
+            match result {
+                Ok(path) => {
+                    TOASTS
+                        .lock()
+                        .success(format!("Export saved to {}", path.display()));
+                }
+                Err(error) => {
+                    TOASTS.lock().error(format!("Export failed: {error:#}"));
+                }
+            }
         }
-        if let Some((tag, weapon, defaults, stickers, environment, camera, path)) =
+        if let Some((tag, weapon, defaults, stickers, environment, camera, format, path)) =
             modded_export_request
         {
-            match ModdedExportJob::new(tag, weapon, defaults, stickers, environment, camera, path) {
+            match ModdedExportJob::new(
+                tag,
+                weapon,
+                defaults,
+                stickers,
+                environment,
+                camera,
+                format,
+                path,
+            ) {
                 Ok(job) => self.modded_export = Some(job),
                 Err(error) => {
-                    self.preview_export_status = Some((false, format!("Export failed: {error:#}")))
+                    TOASTS.lock().error(format!("Export failed: {error:#}"));
                 }
             }
         }
         if let Some(mut job) = self.modded_export.take() {
             let path = job.path.clone();
             let total = job.progress().1;
+            let format = job.format;
             match job.step(&self.cache, &self.texture_cache) {
                 Ok(true) => {
-                    self.preview_export_status =
-                        Some((true, format!("Saved {total} PNGs to {}", path.display())));
+                    TOASTS.lock().success(format!(
+                        "Saved {total} {} images to {}",
+                        format.label(),
+                        path.display()
+                    ));
                 }
                 Ok(false) => {
-                    let (completed, total) = job.progress();
-                    self.preview_export_status =
-                        Some((true, format!("Exporting {completed}/{total} PNGs…")));
                     self.modded_export = Some(job);
                     ui.ctx().request_repaint();
                 }
                 Err(error) => {
                     drop(job);
                     let _ = std::fs::remove_file(path);
-                    self.preview_export_status = Some((false, format!("Export failed: {error:#}")));
+                    TOASTS.lock().error(format!("Export failed: {error:#}"));
                 }
             }
         }
@@ -1458,104 +1513,95 @@ fn compact_weapon_mod_selector(
         return None;
     }
 
-    let width = viewport.width().min(310.0) - 20.0;
-    let height = (52.0 + weapon.slots.len() as f32 * 62.0).min(viewport.height() - 20.0);
-    let position = pos2(
-        viewport.right() - width - 10.0,
-        viewport.bottom() - height - 10.0,
-    );
+    let width = (viewport.width() - MODEL_OVERLAY_INSET * 2.0).min(310.0);
     let mut changed = None;
 
     egui::Area::new(egui::Id::new(("weapon_mod_selector", selected_model.0)))
         .order(egui::Order::Foreground)
-        .fixed_pos(position)
+        .fixed_pos(viewport.right_bottom() + vec2(-MODEL_OVERLAY_INSET, -MODEL_OVERLAY_INSET))
+        .pivot(egui::Align2::RIGHT_BOTTOM)
         .show(ctx, |ui| {
-            egui::Frame::default()
-                .fill(Color32::from_rgba_unmultiplied(10, 13, 18, 238))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(73, 82, 96)))
-                .corner_radius(6)
-                .inner_margin(10)
-                .show(ui, |ui| {
-                    ui.set_width(width - 20.0);
-                    ui.horizontal(|ui| {
-                        ui.strong("Mods");
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(&weapon.name).small().color(Color32::GRAY));
-                    });
-                    ui.separator();
+            model_overlay_frame().show(ui, |ui| {
+                ui.set_width(width - MODEL_OVERLAY_INSET * 2.0);
+                ui.horizontal(|ui| {
+                    ui.strong("Mods");
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&weapon.name).small().color(Color32::GRAY));
+                });
+                ui.separator();
 
-                    for (slot_index, slot) in weapon.slots.iter().enumerate() {
-                        let selected_index = selections.get(slot_index).copied().flatten();
-                        let selected = selected_index.and_then(|index| slot.mods.get(index));
-                        let accent = selected
-                            .map(|item| item.color)
-                            .unwrap_or(Color32::from_rgb(90, 98, 110));
-                        ui.label(RichText::new(&slot.name).small().strong());
-                        ui.horizontal(|ui| {
-                            let button_width = if selected.is_some() {
-                                ui.available_width() - 30.0
-                            } else {
-                                ui.available_width()
-                            };
-                            egui::Frame::default()
-                                .fill(accent.gamma_multiply(0.22))
-                                .stroke(Stroke::new(1.0, accent))
-                                .corner_radius(4)
-                                .inner_margin(2)
-                                .show(ui, |ui| {
-                                    ui.set_width(button_width.max(120.0));
-                                    ui.menu_button(
-                                        RichText::new(
-                                            selected
-                                                .map(|item| item.name.as_str())
-                                                .unwrap_or("Select mod…"),
-                                        )
-                                        .color(
-                                            if selected.is_some() {
-                                                Color32::WHITE
-                                            } else {
-                                                Color32::GRAY
-                                            },
-                                        ),
-                                        |ui| {
-                                            ui.set_min_width((width - 36.0).max(180.0));
-                                            if ui
-                                                .add_sized(
-                                                    [ui.available_width(), 28.0],
-                                                    egui::Button::new("None"),
-                                                )
-                                                .clicked()
-                                            {
-                                                changed = Some((slot_index, None));
+                for (slot_index, slot) in weapon.slots.iter().enumerate() {
+                    let selected_index = selections.get(slot_index).copied().flatten();
+                    let selected = selected_index.and_then(|index| slot.mods.get(index));
+                    let accent = selected
+                        .map(|item| item.color)
+                        .unwrap_or(Color32::from_rgb(90, 98, 110));
+                    ui.label(RichText::new(&slot.name).small().strong());
+                    ui.horizontal(|ui| {
+                        let button_width = if selected.is_some() {
+                            ui.available_width() - 30.0
+                        } else {
+                            ui.available_width()
+                        };
+                        egui::Frame::default()
+                            .fill(accent.gamma_multiply(0.22))
+                            .stroke(Stroke::new(1.0, accent))
+                            .corner_radius(4)
+                            .inner_margin(2)
+                            .show(ui, |ui| {
+                                ui.set_width(button_width.max(120.0));
+                                ui.menu_button(
+                                    RichText::new(
+                                        selected
+                                            .map(|item| item.name.as_str())
+                                            .unwrap_or("Select mod…"),
+                                    )
+                                    .color(
+                                        if selected.is_some() {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::GRAY
+                                        },
+                                    ),
+                                    |ui| {
+                                        ui.set_min_width((width - 36.0).max(180.0));
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width(), 28.0],
+                                                egui::Button::new("None"),
+                                            )
+                                            .clicked()
+                                        {
+                                            changed = Some((slot_index, None));
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        for (mod_index, modification) in
+                                            slot.mods.iter().enumerate()
+                                        {
+                                            if mod_option_button(ui, modification).clicked() {
+                                                changed = Some((
+                                                    slot_index,
+                                                    (selected_index != Some(mod_index))
+                                                        .then_some(mod_index),
+                                                ));
                                                 ui.close();
                                             }
-                                            ui.separator();
-                                            for (mod_index, modification) in
-                                                slot.mods.iter().enumerate()
-                                            {
-                                                if mod_option_button(ui, modification).clicked() {
-                                                    changed = Some((
-                                                        slot_index,
-                                                        (selected_index != Some(mod_index))
-                                                            .then_some(mod_index),
-                                                    ));
-                                                    ui.close();
-                                                }
-                                            }
-                                        },
-                                    );
-                                });
-                            if selected.is_some()
-                                && ui
-                                    .add_sized([26.0, 26.0], egui::Button::new("×"))
-                                    .on_hover_text("Remove mod")
-                                    .clicked()
-                            {
-                                changed = Some((slot_index, None));
-                            }
-                        });
-                    }
-                });
+                                        }
+                                    },
+                                );
+                            });
+                        if selected.is_some()
+                            && ui
+                                .add_sized([26.0, 26.0], egui::Button::new("×"))
+                                .on_hover_text("Remove mod")
+                                .clicked()
+                        {
+                            changed = Some((slot_index, None));
+                        }
+                    });
+                }
+            });
         });
 
     changed
@@ -1583,93 +1629,23 @@ fn normalize_direction(direction: &mut [f32; 3], fallback: [f32; 3]) {
     }
 }
 
-pub(super) fn model_wireframe_ui(
-    ui: &mut egui::Ui,
-    wireframe: &WireframePreview,
-    uv_transform: Option<UvTransformPreview>,
-    texture_cache: &TextureCache,
-    textures: &[(TagHash, UEntryHeader)],
-    gpu_preview: Option<&Arc<GpuModelPreview>>,
-    camera_frame: Option<ModelCameraFrame>,
-    yaw: &mut f32,
-    pitch: &mut f32,
-    zoom: &mut f32,
-    pan: &mut egui::Vec2,
-    show_wireframe: &mut bool,
-    show_stickers: &mut bool,
-    show_default_mods: Option<&mut bool>,
-    environment: &mut ModelEnvironment,
-) -> egui::Rect {
-    ui.horizontal(|ui| {
-        ui.label(format!(
-            "{} vertices, {} indices ({})",
-            wireframe.vertex_count_total, wireframe.index_count_total, wireframe.position_format
-        ));
-        ui.checkbox(show_wireframe, "Wireframe");
-        ui.checkbox(show_stickers, "Stickers");
-        let is_weapon = show_default_mods.is_some();
-        if let Some(show_default_mods) = show_default_mods {
-            ui.checkbox(show_default_mods, "Default mods")
-                .on_hover_text("Show authored empty-slot weapon meshes");
-        }
-        if ui.button("Reset view").clicked() {
-            *yaw = if is_weapon {
-                DEFAULT_WEAPON_YAW
-            } else {
-                DEFAULT_MODEL_YAW
-            };
-            *pitch = if is_weapon {
-                DEFAULT_WEAPON_PITCH
-            } else {
-                0.05
-            };
-            *zoom = 1.0;
-            *pan = vec2(0.0, 0.0);
-        }
-        ui.separator();
-        ui.label("Fidelity");
-        ui.selectable_value(
-            &mut environment.fidelity_mode,
-            crate::render::evidence::FidelityMode::StrictTiger,
-            "Strict Tiger",
-        );
-        ui.selectable_value(
-            &mut environment.fidelity_mode,
-            crate::render::evidence::FidelityMode::PrettyPreview,
-            "Pretty Preview",
-        );
-    });
-    if let Some(gpu_preview) = gpu_preview {
-        egui::CollapsingHeader::new("Render evidence")
-            .default_open(false)
-            .show(ui, |ui| {
-                for line in gpu_preview.inspection_lines() {
-                    ui.monospace(line);
-                }
-            });
-    }
-    egui::CollapsingHeader::new("TFX runtime")
-        .default_open(false)
+fn render_evidence_panel(ui: &mut egui::Ui, gpu_preview: &GpuModelPreview) {
+    ui.set_min_width(440.0);
+    egui::ScrollArea::vertical()
+        .max_height(520.0)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut environment.tfx_paused, "Paused");
-                if ui.button("Reset time").clicked() {
-                    environment.tfx_time_seconds = 0.0;
-                }
-            });
-            ui.add(
-                egui::Slider::new(&mut environment.tfx_time_seconds, 0.0..=120.0).text("Time (s)"),
-            );
-            ui.add(egui::Slider::new(&mut environment.tfx_speed, 0.0..=4.0).text("Speed"));
+            for line in gpu_preview.inspection_lines() {
+                ui.monospace(line);
+            }
         });
-    if !environment.tfx_paused {
-        environment.tfx_time_seconds += ui.input(|input| input.stable_dt) * environment.tfx_speed;
-        ui.ctx().request_repaint();
-    }
-    egui::CollapsingHeader::new("Lighting")
-        .default_open(true)
+}
+
+fn lighting_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
+    ui.set_min_width(440.0);
+    egui::ScrollArea::vertical()
+        .max_height(560.0)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Model");
                 ui.selectable_value(
                     &mut environment.lighting_model,
@@ -1711,7 +1687,21 @@ pub(super) fn model_wireframe_ui(
                     LightingModel::SurfaceAlbedo,
                     "Albedo MRT",
                 );
-                ui.separator();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Fidelity");
+                ui.selectable_value(
+                    &mut environment.fidelity_mode,
+                    crate::render::evidence::FidelityMode::StrictTiger,
+                    "Strict Tiger",
+                );
+                ui.selectable_value(
+                    &mut environment.fidelity_mode,
+                    crate::render::evidence::FidelityMode::PrettyPreview,
+                    "Pretty Preview",
+                );
+            });
+            ui.horizontal(|ui| {
                 ui.checkbox(&mut environment.light_gizmo, "Spotlight gizmo");
                 if ui.button("Reset lighting").clicked() {
                     let defaults = ModelEnvironment::default();
@@ -1839,12 +1829,18 @@ pub(super) fn model_wireframe_ui(
             );
             ui.checkbox(&mut environment.light_scale_with_model, "Scale lighting with model")
                 .on_hover_text("Fit the rig to the base model with default mods. Barrel swaps keep the same lighting. Distances use model-size units; brightness stays consistent.");
-            ui.add(egui::Slider::new(&mut environment.light_range, 0.25..=20.0).text("Beam range"));
+            ui.add(
+                egui::Slider::new(&mut environment.light_range, 0.25..=20.0)
+                    .text("Beam range"),
+            );
             ui.add(
                 egui::Slider::new(&mut environment.light_cone_angle, 1.0..=89.0)
                     .text("Beam half-angle"),
             );
-            ui.add(egui::Slider::new(&mut environment.light_size, 0.0..=10.0).text("Light size"));
+            ui.add(
+                egui::Slider::new(&mut environment.light_size, 0.0..=10.0)
+                    .text("Light size"),
+            );
             ui.add(
                 egui::Slider::new(
                     &mut environment.sun_intensity,
@@ -1860,11 +1856,8 @@ pub(super) fn model_wireframe_ui(
                 .text("Shadows"),
             );
             ui.add(
-                egui::Slider::new(
-                    &mut environment.shadow_softness,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Shadow softness"),
+                egui::Slider::new(&mut environment.shadow_softness, 0.0..=1.0)
+                    .text("Shadow softness"),
             );
             ui.add(
                 egui::Slider::new(
@@ -1881,83 +1874,333 @@ pub(super) fn model_wireframe_ui(
                 .text("Reflections"),
             );
         });
-    egui::CollapsingHeader::new("Image")
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Reset image").clicked() {
-                    let defaults = ModelEnvironment::default();
-                    environment.brightness = defaults.brightness;
-                    environment.contrast = defaults.contrast;
-                    environment.saturation = defaults.saturation;
-                    environment.gamma = defaults.gamma;
-                    environment.exposure = defaults.exposure;
-                    environment.bloom_strength = defaults.bloom_strength;
-                }
-            });
-            ui.add(
-                egui::Slider::new(&mut environment.brightness, MODEL_PARAMETER_RANGE.clone())
-                    .text("Brightness"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.contrast, MODEL_PARAMETER_RANGE.clone())
-                    .text("Contrast"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.saturation, MODEL_PARAMETER_RANGE.clone())
-                    .text("Saturation"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.gamma, MODEL_PARAMETER_RANGE.clone())
-                    .text("Gamma"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.exposure, MODEL_PARAMETER_RANGE.clone()).text(
-                    if environment.auto_exposure {
-                        "Exposure compensation"
-                    } else {
-                        "Exposure"
-                    },
-                ),
-            );
-            ui.checkbox(&mut environment.auto_exposure, "Autoexposure");
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.bloom_strength,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Bloom"),
-            );
-            ui.checkbox(&mut environment.tone_mapping, "Filmic tone mapping");
-        });
-    ui.collapsing("Environment & effects", |ui| {
-        ui.add(
-            egui::Slider::new(
-                &mut environment.vertex_ao_strength,
-                MODEL_PARAMETER_RANGE.clone(),
-            )
-            .text("Vertex AO"),
-        );
-        ui.checkbox(&mut environment.hiz_culling, "HiZ culling");
-        ui.checkbox(&mut environment.fxaa, "FXAA");
-        ui.add(
-            egui::Slider::new(
-                &mut environment.ssao_strength,
-                MODEL_PARAMETER_RANGE.clone(),
-            )
-            .text("SSAO"),
-        );
+}
+
+fn image_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
+    ui.set_min_width(360.0);
+
+    ui.strong("TFX runtime");
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut environment.tfx_paused, "Paused");
+        if ui.button("Reset time").clicked() {
+            environment.tfx_time_seconds = 0.0;
+        }
     });
+    ui.add(egui::Slider::new(&mut environment.tfx_time_seconds, 0.0..=120.0).text("Time (s)"));
+    ui.add(egui::Slider::new(&mut environment.tfx_speed, 0.0..=4.0).text("Speed"));
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.strong("Image");
+        if ui.button("Reset image").clicked() {
+            let defaults = ModelEnvironment::default();
+            environment.brightness = defaults.brightness;
+            environment.contrast = defaults.contrast;
+            environment.saturation = defaults.saturation;
+            environment.gamma = defaults.gamma;
+            environment.exposure = defaults.exposure;
+            environment.bloom_strength = defaults.bloom_strength;
+        }
+    });
+    ui.add(
+        egui::Slider::new(&mut environment.brightness, MODEL_PARAMETER_RANGE.clone())
+            .text("Brightness"),
+    );
+    ui.add(
+        egui::Slider::new(&mut environment.contrast, MODEL_PARAMETER_RANGE.clone())
+            .text("Contrast"),
+    );
+    ui.add(
+        egui::Slider::new(&mut environment.saturation, MODEL_PARAMETER_RANGE.clone())
+            .text("Saturation"),
+    );
+    ui.add(egui::Slider::new(&mut environment.gamma, MODEL_PARAMETER_RANGE.clone()).text("Gamma"));
+    ui.add(
+        egui::Slider::new(&mut environment.exposure, MODEL_PARAMETER_RANGE.clone()).text(
+            if environment.auto_exposure {
+                "Exposure compensation"
+            } else {
+                "Exposure"
+            },
+        ),
+    );
+    ui.checkbox(&mut environment.auto_exposure, "Autoexposure");
+    ui.add(
+        egui::Slider::new(
+            &mut environment.bloom_strength,
+            MODEL_PARAMETER_RANGE.clone(),
+        )
+        .text("Bloom"),
+    );
+    ui.checkbox(&mut environment.tone_mapping, "Filmic tone mapping");
+
+    ui.separator();
+    ui.strong("Environment & effects");
+    ui.add(
+        egui::Slider::new(
+            &mut environment.vertex_ao_strength,
+            MODEL_PARAMETER_RANGE.clone(),
+        )
+        .text("Vertex AO"),
+    );
+    ui.checkbox(&mut environment.hiz_culling, "HiZ culling");
+    ui.checkbox(&mut environment.fxaa, "FXAA");
+    ui.add(
+        egui::Slider::new(
+            &mut environment.ssao_strength,
+            MODEL_PARAMETER_RANGE.clone(),
+        )
+        .text("SSAO"),
+    );
+}
+
+fn model_viewport_toolbar(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    texture_cache: &TextureCache,
+    textures: &[(TagHash, UEntryHeader)],
+    gpu_preview: Option<&Arc<GpuModelPreview>>,
+    environment: &mut ModelEnvironment,
+    show_textures: bool,
+) -> Option<ViewAction> {
+    let mut action = None;
+    egui::Area::new(egui::Id::new("model_viewport_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.right_top() + vec2(-MODEL_OVERLAY_INSET, MODEL_OVERLAY_INSET))
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let lighting = ui.button("Lighting");
+                    egui::Popup::from_toggle_button_response(&lighting)
+                        .align(egui::RectAlign::BOTTOM_END)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| lighting_panel(ui, environment));
+
+                    let image = ui.button("Image");
+                    egui::Popup::from_toggle_button_response(&image)
+                        .align(egui::RectAlign::BOTTOM_END)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| image_panel(ui, environment));
+
+                    if show_textures {
+                        let textures_button = ui.button("Textures");
+                        egui::Popup::from_toggle_button_response(&textures_button)
+                            .align(egui::RectAlign::BOTTOM_END)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| {
+                                ui.set_min_width(500.0);
+                                egui::ScrollArea::vertical()
+                                    .max_height(560.0)
+                                    .show(ui, |ui| {
+                                        if let Some(texture_action) =
+                                            model_textures_ui(ui, texture_cache, textures)
+                                        {
+                                            action = Some(texture_action);
+                                        }
+                                    });
+                            });
+                    }
+
+                    let evidence =
+                        ui.add_enabled(gpu_preview.is_some(), egui::Button::new("Render evidence"));
+                    egui::Popup::from_toggle_button_response(&evidence)
+                        .align(egui::RectAlign::BOTTOM_END)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            if let Some(gpu_preview) = gpu_preview {
+                                render_evidence_panel(ui, gpu_preview);
+                            }
+                        });
+                });
+            });
+        });
+    action
+}
+
+fn model_view_options_toolbar(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    show_wireframe: &mut bool,
+    show_stickers: &mut bool,
+    show_default_mods: Option<&mut bool>,
+    yaw: &mut f32,
+    pitch: &mut f32,
+    zoom: &mut f32,
+    pan: &mut egui::Vec2,
+) {
+    let is_weapon = show_default_mods.is_some();
+    egui::Area::new(egui::Id::new("model_view_options_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(
+            rect.right_top()
+                + vec2(
+                    -MODEL_OVERLAY_INSET,
+                    MODEL_OVERLAY_INSET + MODEL_OVERLAY_STACK_STEP,
+                ),
+        )
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(show_wireframe, "Wireframe");
+                    ui.checkbox(show_stickers, "Stickers");
+                    if let Some(show_default_mods) = show_default_mods {
+                        ui.checkbox(show_default_mods, "Default mods")
+                            .on_hover_text("Show authored empty-slot weapon meshes");
+                    }
+                    if ui.button("Reset view").clicked() {
+                        *yaw = if is_weapon {
+                            DEFAULT_WEAPON_YAW
+                        } else {
+                            DEFAULT_MODEL_YAW
+                        };
+                        *pitch = if is_weapon {
+                            DEFAULT_WEAPON_PITCH
+                        } else {
+                            0.05
+                        };
+                        *zoom = DEFAULT_PREVIEW_ZOOM;
+                        *pan = vec2(0.0, 0.0);
+                    }
+                });
+            });
+        });
+}
+
+fn model_view_info_overlay(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    wireframe: &WireframePreview,
+    yaw: f32,
+    pitch: f32,
+) {
+    egui::Area::new(egui::Id::new("model_view_info"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.left_top() + vec2(MODEL_OVERLAY_INSET, MODEL_OVERLAY_INSET))
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Yaw {:+.1}°  Pitch {:+.1}°  Roll {:+.1}°",
+                        yaw.to_degrees(),
+                        pitch.to_degrees(),
+                        0.0_f32,
+                    ))
+                    .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} vertices, {} indices ({})",
+                        wireframe.vertex_count_total,
+                        wireframe.index_count_total,
+                        wireframe.position_format
+                    ))
+                    .small()
+                    .color(Color32::GRAY),
+                );
+            });
+        });
+}
+
+fn model_export_toolbar(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    all_mods: &mut bool,
+    format: &mut ModelExportFormat,
+    all_mods_available: bool,
+    exporting: bool,
+) -> bool {
+    if !all_mods_available {
+        *all_mods = false;
+    }
+
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new("model_export_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(
+            rect.right_top()
+                + vec2(
+                    -MODEL_OVERLAY_INSET,
+                    MODEL_OVERLAY_INSET + MODEL_OVERLAY_STACK_STEP * 2.0,
+                ),
+        )
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.add_enabled_ui(!exporting, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            all_mods_available,
+                            egui::Checkbox::new(all_mods, "All Mods"),
+                        );
+                        egui::ComboBox::from_id_salt("model_export_format")
+                            .selected_text(format.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(format, ModelExportFormat::Png, "PNG");
+                                ui.selectable_value(format, ModelExportFormat::WebP, "WebP");
+                            });
+                        clicked = ui.button("Export").clicked();
+                    });
+                });
+            });
+        });
+    clicked
+}
+
+pub(super) fn model_wireframe_ui(
+    ui: &mut egui::Ui,
+    wireframe: &WireframePreview,
+    uv_transform: Option<UvTransformPreview>,
+    texture_cache: &TextureCache,
+    textures: &[(TagHash, UEntryHeader)],
+    gpu_preview: Option<&Arc<GpuModelPreview>>,
+    camera_frame: Option<ModelCameraFrame>,
+    yaw: &mut f32,
+    pitch: &mut f32,
+    zoom: &mut f32,
+    pan: &mut egui::Vec2,
+    show_wireframe: &mut bool,
+    show_stickers: &mut bool,
+    show_default_mods: Option<&mut bool>,
+    environment: &mut ModelEnvironment,
+    show_textures: bool,
+) -> (egui::Rect, Option<ViewAction>) {
+    if !environment.tfx_paused {
+        environment.tfx_time_seconds += ui.input(|input| input.stable_dt) * environment.tfx_speed;
+        ui.ctx().request_repaint();
+    }
     let preview_textures = wireframe_preview_textures(wireframe, textures);
 
     let available = ui.available_size();
-    let size = vec2(available.x.max(320.0), available.y.clamp(320.0, 620.0));
+    let size = vec2(available.x.max(320.0), available.y.max(320.0));
     let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
+    let toolbar_action = model_viewport_toolbar(
+        ui.ctx(),
+        rect,
+        texture_cache,
+        textures,
+        gpu_preview,
+        environment,
+        show_textures,
+    );
+    model_view_options_toolbar(
+        ui.ctx(),
+        rect,
+        show_wireframe,
+        show_stickers,
+        show_default_mods,
+        yaw,
+        pitch,
+        zoom,
+        pan,
+    );
+    model_view_info_overlay(ui.ctx(), rect, wireframe, *yaw, *pitch);
 
     let defaults = ModelEnvironment::default();
     let mut orbit_position = environment.light_orbit_position;
     normalize_direction(&mut orbit_position, defaults.light_orbit_position);
-    let orbit_view = model_direction_to_view(orbit_position, *yaw, *pitch);
+    let orbit_view = fixed_light_direction_to_view(orbit_position);
     let light_transform = ModelLightTransform::new(environment, wireframe);
     let light_world_position = light_transform.to_model(light_source_position(environment));
     let orbit_center_world = light_transform.to_model(environment.light_orbit_center);
@@ -1968,16 +2211,14 @@ pub(super) fn model_wireframe_ui(
         .sum::<f32>()
         .sqrt();
     normalize_direction(&mut cast_direction, [0.276, -0.627, -0.728]);
-    let cast_view = model_direction_to_view(cast_direction, *yaw, *pitch);
+    let cast_view = fixed_light_direction_to_view(cast_direction);
     let camera_frame = camera_frame.unwrap_or_else(|| ModelCameraFrame::from_wireframe(wireframe));
     let viewport_center = rect.center() + *pan;
-    let view_yaw = *yaw;
-    let view_pitch = *pitch;
     let pixels_per_world_unit =
         0.84 * *zoom / camera_frame.radius.max(0.0001) * rect.height() * 0.5;
     let project_model_point = |position: [f32; 3]| {
         let relative = std::array::from_fn(|axis| position[axis] - camera_frame.center[axis]);
-        let view = model_direction_to_view(relative, view_yaw, view_pitch);
+        let view = fixed_light_direction_to_view(relative);
         viewport_center
             + vec2(
                 -view[0] * pixels_per_world_unit,
@@ -1988,7 +2229,7 @@ pub(super) fn model_wireframe_ui(
     let light_handle = project_model_point(light_world_position);
     let center_relative =
         std::array::from_fn(|axis| orbit_center_world[axis] - camera_frame.center[axis]);
-    let center_view = model_direction_to_view(center_relative, *yaw, *pitch);
+    let center_view = fixed_light_direction_to_view(center_relative);
     let orbit_radius_world = environment.light_orbit_radius.max(0.0) * light_transform.scale;
     let gizmo_radius = (0..=64)
         .map(|step| {
@@ -2046,11 +2287,8 @@ pub(super) fn model_wireframe_ui(
             (x, y)
         };
         let z_sign = if orbit_view[2] < 0.0 { -1.0 } else { 1.0 };
-        environment.light_orbit_position = view_direction_to_model(
-            [x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign],
-            *yaw,
-            *pitch,
-        );
+        environment.light_orbit_position =
+            fixed_view_direction_to_light([x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign]);
         ui.ctx().request_repaint();
     }
     if let Some(gizmo) = &direction_gizmo_response
@@ -2067,11 +2305,8 @@ pub(super) fn model_wireframe_ui(
             (x, y)
         };
         let z_sign = if cast_view[2] < 0.0 { -1.0 } else { 1.0 };
-        let cast_direction = view_direction_to_model(
-            [x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign],
-            *yaw,
-            *pitch,
-        );
+        let cast_direction =
+            fixed_view_direction_to_light([x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign]);
         let target_distance = cast_length.max(0.25) * light_transform.scale;
         environment.light_target = light_transform.to_rig(std::array::from_fn(|axis| {
             light_world_position[axis] + cast_direction[axis] * target_distance
@@ -2083,15 +2318,11 @@ pub(super) fn model_wireframe_ui(
         && let Some(pointer) = gizmo.interact_pointer_pos()
     {
         let offset = pointer - gizmo_center;
-        let center_relative = view_direction_to_model(
-            [
-                center_view[0] - offset.x / pixels_per_world_unit.max(0.0001),
-                center_view[1] - offset.y / pixels_per_world_unit.max(0.0001),
-                center_view[2],
-            ],
-            *yaw,
-            *pitch,
-        );
+        let center_relative = fixed_view_direction_to_light([
+            center_view[0] - offset.x / pixels_per_world_unit.max(0.0001),
+            center_view[1] - offset.y / pixels_per_world_unit.max(0.0001),
+            center_view[2],
+        ]);
         environment.light_orbit_center = light_transform.to_rig(std::array::from_fn(|axis| {
             camera_frame.center[axis] + center_relative[axis]
         }));
@@ -2188,7 +2419,7 @@ pub(super) fn model_wireframe_ui(
                         [0.0, cos * orbit_radius_world, sin * orbit_radius_world]
                     };
                     project_model_point(std::array::from_fn(|component| {
-                        environment.light_orbit_center[component] + offset[component]
+                        orbit_center_world[component] + offset[component]
                     }))
                 })
                 .collect::<Vec<_>>();
@@ -2234,7 +2465,7 @@ pub(super) fn model_wireframe_ui(
         *pan,
         rect,
     ) else {
-        return rect;
+        return (rect, toolbar_action);
     };
 
     if wireframe.indices.len() >= 3 {
@@ -2273,28 +2504,7 @@ pub(super) fn model_wireframe_ui(
         }
     }
 
-    let camera_text = format!(
-        "Yaw {:+.1}°  Pitch {:+.1}°  Roll {:+.1}°",
-        yaw.to_degrees(),
-        pitch.to_degrees(),
-        0.0_f32,
-    );
-    let text_position = rect.left_top() + vec2(10.0, 10.0);
-    let text_galley = painter.layout_no_wrap(
-        camera_text,
-        egui::FontId::monospace(12.0),
-        Color32::from_gray(225),
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_size(
-            text_position - vec2(5.0, 4.0),
-            text_galley.size() + vec2(10.0, 8.0),
-        ),
-        3.0,
-        Color32::from_black_alpha(165),
-    );
-    painter.galley(text_position, text_galley, Color32::WHITE);
-    rect
+    (rect, toolbar_action)
 }
 
 fn draw_textured_model_mesh(
@@ -2815,30 +3025,41 @@ mod tests {
     fn export_filename_distinguishes_mod_rarity_concisely() {
         let model = TagHash(0x80B7CAE9);
         let mod_tag = TagHash(0x80A6071A);
-        assert_eq!(model_export_filename(model, &[]), "80B7CAE9.png");
+        assert_eq!(
+            model_export_filename(model, &[], ModelExportFormat::Png),
+            "80B7CAE9.png"
+        );
+        assert_eq!(
+            model_export_filename(model, &[], ModelExportFormat::WebP),
+            "80B7CAE9.webp"
+        );
         assert_eq!(model_modded_export_filename(model), "80B7CAE9.zip");
         assert_eq!(
-            model_export_filename(model, &[(mod_tag, "E")]),
+            model_export_filename(model, &[(mod_tag, "E")], ModelExportFormat::Png),
             "80B7CAE9_80A6071A-E.png"
         );
         assert_eq!(
-            model_export_filename(model, &[(mod_tag, "D")]),
+            model_export_filename(model, &[(mod_tag, "D")], ModelExportFormat::Png),
             "80B7CAE9_80A6071A-D.png"
         );
         assert_eq!(
-            model_export_filename(model, &[(mod_tag, "S")]),
+            model_export_filename(model, &[(mod_tag, "S")], ModelExportFormat::Png),
             "80B7CAE9_80A6071A-S.png"
         );
         assert_eq!(
-            model_export_filename(model, &[(mod_tag, "P")]),
+            model_export_filename(model, &[(mod_tag, "P")], ModelExportFormat::Png),
             "80B7CAE9_80A6071A-P.png"
         );
         assert_eq!(
-            model_export_filename(model, &[(mod_tag, "C")]),
+            model_export_filename(model, &[(mod_tag, "C")], ModelExportFormat::Png),
             "80B7CAE9_80A6071A-C.png"
         );
         assert_eq!(
-            model_export_filename(model, &[(mod_tag, "E"), (TagHash(0x80A61008), "D"),],),
+            model_export_filename(
+                model,
+                &[(mod_tag, "E"), (TagHash(0x80A61008), "D")],
+                ModelExportFormat::Png,
+            ),
             "80B7CAE9_80A6071A-E_80A61008-D.png"
         );
     }
@@ -2928,6 +3149,7 @@ mod tests {
             false,
             ModelEnvironment::default(),
             None,
+            ModelExportFormat::Png,
             path.clone(),
         )
         .unwrap();

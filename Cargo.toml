@@ -72,7 +72,7 @@ base64 = "0.22.0"
 bincode = "2.0.0-rc.3"
 binrw.workspace = true
 either = "1.10.0"
-image = { version = "0.25.1", features = ["png"], default-features = false }
+image = { version = "0.25.1", features = ["png", "webp"], default-features = false }
 regex = "1.10.4"
 rodio = "0.18.1"
 serde = { version = "1.0.188", features = ["derive"] }

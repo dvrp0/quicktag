@@ -2775,6 +2775,7 @@ fn model_preview_ui(
             orbit.show_stickers,
             None,
             &mut environment,
+            false,
         );
     } else {
         ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));

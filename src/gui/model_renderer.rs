@@ -324,22 +324,7 @@ impl GpuModelPreview {
         if draws.is_empty() {
             return None;
         }
-        let has_authored_shadow = draws.iter().any(|draw| {
-            draw.packet.raw_render_stage
-                == Some(crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE)
-        });
-        if has_authored_shadow {
-            for draw in &mut draws {
-                if draw.packet.raw_render_stage
-                    != Some(crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE)
-                {
-                    draw.packet
-                        .pass_plan
-                        .passes
-                        .retain(|pass| *pass != RenderPassKind::Shadow);
-                }
-            }
-        }
+        prefer_visible_shadow_casters(&mut draws);
         let mut provenance = ProvenanceStore::default();
         for draw in &mut draws {
             let source_tag = draw.packet.technique_hash.unwrap_or(TagHash(0));
@@ -379,6 +364,36 @@ impl GpuModelPreview {
             vertex_abi: VertexAbiDescriptor::from_wireframe(wireframe),
             provenance,
         })
+    }
+}
+
+fn prefer_visible_shadow_casters(draws: &mut [ModelDraw]) {
+    let has_visible_shadow_caster = draws.iter().any(|draw| {
+        draw.packet.raw_render_stage
+            != Some(crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE)
+            && draw
+                .packet
+                .pass_plan
+                .passes
+                .contains(&RenderPassKind::Shadow)
+    });
+    if !has_visible_shadow_caster {
+        return;
+    }
+
+    // Stage-4 geometry is an authored shadow-only proxy. It is useful as a
+    // fallback for assets without a visible caster, but its simplified
+    // silhouette is inappropriate for a close-up model viewer. Prefer the
+    // rendered surface itself whenever available.
+    for draw in draws {
+        if draw.packet.raw_render_stage
+            == Some(crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE)
+        {
+            draw.packet
+                .pass_plan
+                .passes
+                .retain(|pass| *pass != RenderPassKind::Shadow);
+        }
     }
 }
 
@@ -742,6 +757,7 @@ struct SceneUniform {
     postprocess4: [f32; 4],
     postprocess5: [f32; 4],
     fidelity: [f32; 4],
+    shadow_parameters: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -789,7 +805,8 @@ pub(crate) struct ModelEnvironment {
     pub light_model_frame: Option<ModelCameraFrame>,
     pub light_gizmo: bool,
     pub shadow_strength: f32,
-    /// Normalized PCF radius: 0.0 is hard, 1.0 is the widest penumbra.
+    /// Normalized area-shadow softness: 0.0 is hard; larger values widen
+    /// penumbrae according to caster/receiver separation.
     pub shadow_softness: f32,
     pub brightness: f32,
     pub contrast: f32,
@@ -892,10 +909,42 @@ fn first_person_key_light(
     )
 }
 
-fn light_shadow_softness(light_size: f32, shadow_softness: f32) -> f32 {
-    // Keep the established size-5 render while allowing source size to
-    // widen/narrow the penumbra.
-    (shadow_softness.clamp(0.0, 1.0) + (light_size.clamp(0.0, 10.0) - 5.0) * 0.08).clamp(0.0, 1.0)
+fn shadow_source_radius(light_scale: f32, light_size: f32, shadow_softness: f32) -> f32 {
+    // Keep the established default appearance while giving each control one
+    // physical job: light_size is the source extent; shadow_softness blends
+    // from a point source toward that area-light extent.
+    light_scale.max(0.0001) * 0.002 * light_size.clamp(0.0, 10.0) * shadow_softness.clamp(0.0, 1.0)
+}
+
+fn shadow_depth_range(
+    light_position_view: [f32; 3],
+    light_direction_view: [f32; 3],
+    shadow_radius: f32,
+    light_scale: f32,
+    light_range: f32,
+) -> [f32; 2] {
+    let axis = [
+        -light_direction_view[0],
+        -light_direction_view[1],
+        -light_direction_view[2],
+    ];
+    let axis_length = axis.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let axis = if axis_length > 0.0001 {
+        axis.map(|value| value / axis_length)
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let center_depth = (-light_position_view[0]) * axis[0]
+        + (-light_position_view[1]) * axis[1]
+        + (-light_position_view[2]) * axis[2];
+
+    let scale = light_scale.max(0.0001);
+    let minimum_near = 0.02 * scale;
+    let minimum_span = 0.02 * scale;
+    let maximum_far = light_range.max(minimum_near + minimum_span);
+    let near_plane = (center_depth - shadow_radius).clamp(minimum_near, maximum_far - minimum_span);
+    let far_plane = (center_depth + shadow_radius).clamp(near_plane + minimum_span, maximum_far);
+    [near_plane, far_plane]
 }
 
 pub(crate) fn light_source_position(environment: &ModelEnvironment) -> [f32; 3] {
@@ -935,6 +984,14 @@ pub(crate) fn model_direction_to_view(direction: [f32; 3], yaw: f32, pitch: f32)
     let xz = direction[0] * cy + direction[1] * sy;
     let zz = -direction[0] * sy + direction[1] * cy;
     [xz, direction[2] * cp - zz * sp, direction[2] * sp + zz * cp]
+}
+
+pub(crate) fn fixed_light_direction_to_view(direction: [f32; 3]) -> [f32; 3] {
+    model_direction_to_view(direction, 0.0, 0.0)
+}
+
+pub(crate) fn fixed_view_direction_to_light(direction: [f32; 3]) -> [f32; 3] {
+    view_direction_to_model(direction, 0.0, 0.0)
 }
 
 pub(crate) fn view_direction_to_model(direction: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
@@ -1577,22 +1634,29 @@ impl ModelPaintCallback {
         let world_light_direction = light_direction[..3]
             .try_into()
             .expect("light direction xyz");
-        light_direction[..3].copy_from_slice(&model_direction_to_view(
-            world_light_direction,
-            yaw,
-            pitch,
-        ));
-        let effective_shadow_softness =
-            light_shadow_softness(environment.light_size, environment.shadow_softness);
+        light_direction[..3].copy_from_slice(&fixed_light_direction_to_view(world_light_direction));
         let light_transform = ModelLightTransform::new(&environment, wireframe);
         let light_position_world = light_transform.to_model(light_source_position(&environment));
-        let light_position_view = model_direction_to_view(
-            std::array::from_fn(|axis| light_position_world[axis] - center[axis]),
-            yaw,
-            pitch,
-        );
+        let light_position_view = fixed_light_direction_to_view(std::array::from_fn(|axis| {
+            light_position_world[axis] - center[axis]
+        }));
         let (outer_cone_cosine, inner_cone_cosine) =
             light_cone_cosines(environment.light_cone_angle);
+        let light_range = environment.light_range.max(0.05) * light_transform.scale;
+        let source_radius = shadow_source_radius(
+            light_transform.scale,
+            environment.light_size,
+            environment.shadow_softness,
+        );
+        let [near_plane, far_plane] = shadow_depth_range(
+            light_position_view,
+            light_direction[..3]
+                .try_into()
+                .expect("light direction xyz"),
+            shadow_radius,
+            light_transform.scale,
+            light_range,
+        );
         Self {
             preview,
             target_format: texture_cache.render_state.target_format,
@@ -1607,7 +1671,7 @@ impl ModelPaintCallback {
                     aspect,
                     pan.x * 2.0 / rect.width().max(1.0),
                     -pan.y * 2.0 / rect.height().max(1.0),
-                    effective_shadow_softness,
+                    environment.shadow_softness.clamp(0.0, 1.0),
                 ],
                 uv_transform: [
                     transform.scale[0],
@@ -1618,7 +1682,7 @@ impl ModelPaintCallback {
                 light_direction,
                 light_parameters: [
                     environment.light_size.clamp(0.0, 10.0),
-                    environment.light_range.max(0.05) * light_transform.scale,
+                    light_range,
                     outer_cone_cosine,
                     inner_cone_cosine,
                 ],
@@ -1679,6 +1743,7 @@ impl ModelPaintCallback {
                     environment.tfx_time_seconds,
                     environment.tfx_speed,
                 ],
+                shadow_parameters: [source_radius, near_plane, far_plane, 0.0],
             },
             materials,
             draws,
@@ -1696,20 +1761,25 @@ impl ModelPaintCallback {
         self
     }
 
-    pub(crate) fn export_png(
+    pub(crate) fn export_image(
         self,
         render_state: &eframe::egui_wgpu::RenderState,
         path: &Path,
         output_size: [u32; 2],
+        format: image::ImageFormat,
     ) -> anyhow::Result<()> {
-        std::fs::write(path, self.export_png_bytes(render_state, output_size)?)?;
+        std::fs::write(
+            path,
+            self.export_image_bytes(render_state, output_size, format)?,
+        )?;
         Ok(())
     }
 
-    pub(crate) fn export_png_bytes(
+    pub(crate) fn export_image_bytes(
         mut self,
         render_state: &eframe::egui_wgpu::RenderState,
         output_size: [u32; 2],
+        format: image::ImageFormat,
     ) -> anyhow::Result<Vec<u8>> {
         const FRAME_FILL: f32 = 0.88;
         anyhow::ensure!(
@@ -1748,7 +1818,7 @@ impl ModelPaintCallback {
             render_state
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("quicktag_model_png_prepare"),
+                    label: Some("quicktag_model_export_prepare"),
                 });
         self.prepare(
             &render_state.device,
@@ -1769,7 +1839,7 @@ impl ModelPaintCallback {
         let output = render_state
             .device
             .create_texture(&wgpu::TextureDescriptor {
-                label: Some("quicktag_model_png_output"),
+                label: Some("quicktag_model_export_output"),
                 size: wgpu::Extent3d {
                     width: size[0],
                     height: size[1],
@@ -1786,7 +1856,7 @@ impl ModelPaintCallback {
         let unpadded_bytes_per_row = size[0] * 4;
         let bytes_per_row = unpadded_bytes_per_row.div_ceil(256) * 256;
         let readback = render_state.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("quicktag_model_png_readback"),
+            label: Some("quicktag_model_export_readback"),
             size: u64::from(bytes_per_row) * u64::from(size[1]),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -1795,11 +1865,11 @@ impl ModelPaintCallback {
             render_state
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("quicktag_model_png_copy"),
+                    label: Some("quicktag_model_export_copy"),
                 });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("quicktag_model_png_present"),
+                label: Some("quicktag_model_export_present"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &output_view,
                     resolve_target: None,
@@ -1849,7 +1919,7 @@ impl ModelPaintCallback {
         })?;
         receiver
             .recv()
-            .map_err(|error| anyhow::anyhow!("PNG readback callback failed: {error}"))??;
+            .map_err(|error| anyhow::anyhow!("model export readback callback failed: {error}"))??;
         let mapped = slice.get_mapped_range();
         let mut pixels = Vec::with_capacity((size[0] * size[1] * 4) as usize);
         for row in mapped.chunks_exact(bytes_per_row as usize) {
@@ -1858,9 +1928,9 @@ impl ModelPaintCallback {
         drop(mapped);
         readback.unmap();
         let image = image::RgbaImage::from_raw(size[0], size[1], pixels)
-            .ok_or_else(|| anyhow::anyhow!("invalid PNG readback dimensions"))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid model export readback dimensions"))?;
         let mut output = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut output, image::ImageFormat::Png)?;
+        image.write_to(&mut output, format)?;
         Ok(output.into_inner())
     }
 
@@ -1879,15 +1949,8 @@ impl ModelPaintCallback {
     }
 
     fn apply_export_camera(&mut self, camera: ModelExportCamera) {
-        // Reframing must not move the world-space lighting rig.
-        let offset = model_direction_to_view(
-            std::array::from_fn(|axis| self.scene.center[axis] - camera.frame.center[axis]),
-            self.scene.params0[1],
-            self.scene.params0[2],
-        );
-        for (position, offset) in self.scene.light_position[..3].iter_mut().zip(offset) {
-            *position += offset;
-        }
+        // Lighting is anchored in renderer/view space. Reframing or rotating the
+        // model must not translate the light with the mesh.
         let shadow_radius = shadow_bounding_radius(
             &self.preview.vertices,
             camera.frame.center,
@@ -1899,6 +1962,19 @@ impl ModelPaintCallback {
             camera.frame.center[2],
             shadow_radius,
         ];
+        let [near_plane, far_plane] = shadow_depth_range(
+            self.scene.light_position[..3]
+                .try_into()
+                .expect("light position xyz"),
+            self.scene.light_direction[..3]
+                .try_into()
+                .expect("light direction xyz"),
+            shadow_radius,
+            self.scene.light_position[3],
+            self.scene.light_parameters[1],
+        );
+        self.scene.shadow_parameters[1] = near_plane;
+        self.scene.shadow_parameters[2] = far_plane;
         self.scene.params0[0] = camera.frame.radius;
         self.scene.params0[3] = camera.zoom;
         self.scene.params1[1] = camera.pan[0];
@@ -5006,11 +5082,13 @@ fn create_pipeline_resources(
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: Default::default(),
-                // Raster slope bias removes most coplanar self-occlusion;
-                // receiver bias below handles the remaining grazing angles.
+                // Keep caster bias deliberately small. Depth32Float gives us
+                // enough precision that a large raster bias only creates
+                // visible Peter-Panning at contact edges. The receiver shader
+                // handles sample-to-sample plane slope in shadow-depth space.
                 bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 2.0,
+                    constant: 1,
+                    slope_scale: 1.0,
                     clamp: 0.0,
                 },
             }),
@@ -5752,7 +5830,7 @@ const LIGHTING_SHADER: &str = r#"
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>, shadow_parameters: vec4<f32>,
 }
 
 struct VertexOutput {
@@ -5835,8 +5913,8 @@ fn light_clip(position: vec3<f32>) -> vec4<f32> {
     let light_depth = dot(source_to_surface, light_axis);
     let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
     let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
-    let near_plane = 0.05 * scene.light_position.w;
-    let range = max(scene.light_parameters.y, near_plane + 0.01 * scene.light_position.w);
+    let near_plane = scene.shadow_parameters.y;
+    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
     let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
     let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
     let perspective_denominator = max(light_depth * tangent, 0.0001 * scene.light_position.w);
@@ -5866,6 +5944,164 @@ fn spotlight_factor_world(position: vec3<f32>) -> f32 {
     return cone * range_fade * distance_falloff;
 }
 
+const SHADOW_SAMPLE_COUNT = 32u;
+const SHADOW_BLOCKER_SAMPLE_COUNT = 16u;
+const SHADOW_DISK = array<vec2<f32>, 32>(
+    vec2<f32>( 0.1250,  0.0000), vec2<f32>(-0.1596,  0.1462),
+    vec2<f32>( 0.0244, -0.2784), vec2<f32>( 0.2012,  0.2625),
+    vec2<f32>(-0.3693, -0.0653), vec2<f32>( 0.3498, -0.2225),
+    vec2<f32>(-0.1170,  0.4352), vec2<f32>(-0.2231, -0.4296),
+    vec2<f32>( 0.4841,  0.1768), vec2<f32>(-0.5036,  0.2079),
+    vec2<f32>( 0.2428, -0.5188), vec2<f32>( 0.1794,  0.5720),
+    vec2<f32>(-0.5408, -0.3134), vec2<f32>( 0.6344, -0.1395),
+    vec2<f32>(-0.3871,  0.5507), vec2<f32>(-0.0894, -0.6902),
+    vec2<f32>( 0.5491,  0.4628), vec2<f32>(-0.7389,  0.0306),
+    vec2<f32>( 0.5390, -0.5363), vec2<f32>(-0.0361,  0.7798),
+    vec2<f32>(-0.5128, -0.6145), vec2<f32>( 0.8124,  0.1093),
+    vec2<f32>(-0.6883,  0.4789), vec2<f32>( 0.1881, -0.8361),
+    vec2<f32>( 0.4350,  0.7592), vec2<f32>(-0.8504, -0.2713),
+    vec2<f32>( 0.8261, -0.3817), vec2<f32>(-0.3579,  0.8552),
+    vec2<f32>(-0.3194, -0.8880), vec2<f32>( 0.8499,  0.4467),
+    vec2<f32>(-0.9440,  0.2488), vec2<f32>( 0.5366, -0.8345),
+);
+
+fn shadow_linear_depth(depth: f32) -> f32 {
+    let near_plane = scene.shadow_parameters.y;
+    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
+    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
+    return depth_scale * near_plane / max(depth_scale - depth, 0.000001);
+}
+
+fn shadow_receiver_gradient(shadow_position: vec3<f32>) -> vec2<f32> {
+    let dx = dpdx(shadow_position);
+    let dy = dpdy(shadow_position);
+    let determinant = dx.x * dy.y - dx.y * dy.x;
+    if abs(determinant) < 0.00000001 {
+        return vec2<f32>(0.0);
+    }
+    return vec2<f32>(
+        (dx.z * dy.y - dy.z * dx.y) / determinant,
+        (dx.x * dy.z - dy.x * dx.z) / determinant,
+    );
+}
+
+fn shadow_reference_depth(
+    shadow_position: vec3<f32>,
+    sample_offset: vec2<f32>,
+    depth_gradient: vec2<f32>,
+    n_dot_light: f32,
+) -> f32 {
+    // Receiver-plane bias follows the actual perspective depth slope at the
+    // sample location. The remaining epsilon is only a few Depth32Float ULPs;
+    // it is intentionally unrelated to shadow-map XY texel size.
+    let epsilon = mix(0.00000025, 0.00000125, 1.0 - clamp(n_dot_light, 0.0, 1.0));
+    return shadow_position.z + dot(depth_gradient, sample_offset) - epsilon;
+}
+
+fn pcss_shadow(shadow_position: vec3<f32>, n_dot_light: f32) -> f32 {
+    let shadow_dimensions = vec2<i32>(textureDimensions(sun_shadow));
+    let shadow_texel = 1.0 / vec2<f32>(shadow_dimensions);
+    let depth_gradient = shadow_receiver_gradient(shadow_position);
+    let softness = clamp(scene.params1.w, 0.0, 1.0);
+    let center_reference = shadow_reference_depth(
+        shadow_position,
+        vec2<f32>(0.0),
+        depth_gradient,
+        n_dot_light,
+    );
+    if softness <= 0.001 {
+        return textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            shadow_position.xy,
+            center_reference,
+        );
+    }
+
+    let receiver_depth = shadow_linear_depth(shadow_position.z);
+    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
+    let cone_tangent =
+        sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
+    // Treat the softness control as an area-light radius in model-scale units.
+    // This is deliberately small: contact hardening, not a screen-space blur,
+    // determines how wide the final penumbra becomes.
+    let source_radius = scene.shadow_parameters.x;
+    let max_search_radius =
+        max(shadow_texel.x, shadow_texel.y) * 12.0;
+    let search_radius = min(
+        0.5 * source_radius
+            / max(receiver_depth * cone_tangent, 0.000001),
+        max_search_radius,
+    );
+
+    var blocker_depth_sum = 0.0;
+    var blocker_count = 0u;
+    for (var sample = 0u; sample < SHADOW_BLOCKER_SAMPLE_COUNT; sample++) {
+        let offset = SHADOW_DISK[sample] * search_radius;
+        let sample_uv = shadow_position.xy + offset;
+        if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
+            continue;
+        }
+        let sample_pixel = clamp(
+            vec2<i32>(sample_uv * vec2<f32>(shadow_dimensions)),
+            vec2<i32>(0),
+            shadow_dimensions - vec2<i32>(1),
+        );
+        let blocker_depth = textureLoad(sun_shadow, sample_pixel, 0);
+        let reference =
+            shadow_reference_depth(shadow_position, offset, depth_gradient, n_dot_light);
+        if blocker_depth < reference {
+            blocker_depth_sum += shadow_linear_depth(blocker_depth);
+            blocker_count += 1u;
+        }
+    }
+    if blocker_count == 0u {
+        return 1.0;
+    }
+
+    let average_blocker_depth = blocker_depth_sum / f32(blocker_count);
+    let separation = max(receiver_depth - average_blocker_depth, 0.0);
+    let penumbra_ratio =
+        separation / max(average_blocker_depth, scene.shadow_parameters.y);
+    let max_filter_radius =
+        max(shadow_texel.x, shadow_texel.y) * 12.0;
+    let filter_radius = min(
+        0.5 * source_radius * penumbra_ratio
+            / max(receiver_depth * cone_tangent, 0.000001),
+        max_filter_radius,
+    );
+    if filter_radius <= max(shadow_texel.x, shadow_texel.y) * 0.35 {
+        return textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            shadow_position.xy,
+            center_reference,
+        );
+    }
+
+    var visibility = 0.0;
+    for (var sample = 0u; sample < SHADOW_SAMPLE_COUNT; sample++) {
+        let offset = SHADOW_DISK[sample] * filter_radius;
+        let sample_uv = shadow_position.xy + offset;
+        if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
+            visibility += 1.0;
+            continue;
+        }
+        visibility += textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            sample_uv,
+            shadow_reference_depth(
+                shadow_position,
+                offset,
+                depth_gradient,
+                n_dot_light,
+            ),
+        );
+    }
+    return visibility / f32(SHADOW_SAMPLE_COUNT);
+}
+
 fn deferred_shadow(uv: vec2<f32>, normal: vec3<f32>) -> f32 {
     let dimensions = vec2<i32>(textureDimensions(scene_depth));
     let pixel = clamp(vec2<i32>(uv * vec2<f32>(dimensions)), vec2<i32>(0), dimensions - vec2<i32>(1));
@@ -5884,14 +6120,9 @@ fn deferred_shadow(uv: vec2<f32>, normal: vec3<f32>) -> f32 {
         || shadow_position.z >= 1.0 {
         return 1.0;
     }
-    let texel = 1.0 / vec2<f32>(textureDimensions(sun_shadow));
-    let receiver_bias = texel.x * (0.75 + (1.0 - max(dot(view_direction_to_world(normal), light_world), 0.0)) * 2.0);
-    return textureSampleCompareLevel(
-        sun_shadow,
-        sun_shadow_sampler,
-        shadow_position.xy,
-        shadow_position.z - receiver_bias,
-    );
+    let n_dot_light =
+        max(dot(view_direction_to_world(normal), light_world), 0.0);
+    return pcss_shadow(shadow_position, n_dot_light);
 }
 
 @fragment
@@ -6138,7 +6369,7 @@ fn fs_blur_vertical(input: VertexOutput) -> @location(0) vec4<f32> {
 const SHADOW_SHADER: &str = r#"
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>, shadow_parameters: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
 
@@ -6240,8 +6471,8 @@ fn light_clip(position: vec3<f32>) -> vec4<f32> {
     let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
     // Keep light projection homogeneous. Rasterizer performs perspective
     // divide, preserving correct depth interpolation in shadow map.
-    let near_plane = 0.05 * scene.light_position.w;
-    let range = max(scene.light_parameters.y, near_plane + 0.01 * scene.light_position.w);
+    let near_plane = scene.shadow_parameters.y;
+    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
     let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
     let perspective_denominator = light_depth * tangent;
     let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
@@ -6344,6 +6575,7 @@ struct SceneUniform {
     postprocess4: vec4<f32>,
     postprocess5: vec4<f32>,
     fidelity: vec4<f32>,
+    shadow_parameters: vec4<f32>,
 }
 
 struct MaterialUniform {
@@ -6487,8 +6719,8 @@ fn light_clip(position: vec3<f32>) -> vec4<f32> {
     let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
     // Keep light projection homogeneous so rasterizer performs perspective
     // divide and depth interpolation remains correct for finite spotlight.
-    let near_plane = 0.05 * scene.light_position.w;
-    let range = max(scene.light_parameters.y, near_plane + 0.01 * scene.light_position.w);
+    let near_plane = scene.shadow_parameters.y;
+    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
     let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
     let perspective_denominator = light_depth * tangent;
     let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
@@ -8589,29 +8821,161 @@ fn clamp_specular_luminance(value: vec3<f32>, maximum: f32) -> vec3<f32> {
     return value * min(1.0, maximum / max(luminance, 0.000001));
 }
 
-// Stable Vogel disk. Hardware comparison filtering turns each tap into a
-// bilinear 2x2 PCF sample. More taps keep wide softness settings smooth while
-// remaining deterministic, so the preview does not shimmer while orbiting.
-const SHADOW_SAMPLE_COUNT = 24u;
-const SHADOW_DISK = array<vec2<f32>, 24>(
-    vec2<f32>( 0.1443,  0.0000), vec2<f32>(-0.1843,  0.1689),
-    vec2<f32>( 0.0282, -0.3215), vec2<f32>( 0.2324,  0.3031),
-    vec2<f32>(-0.4264, -0.0754), vec2<f32>( 0.4039, -0.2569),
-    vec2<f32>(-0.1351,  0.5026), vec2<f32>(-0.2577, -0.4961),
-    vec2<f32>( 0.5590,  0.2041), vec2<f32>(-0.5816,  0.2401),
-    vec2<f32>( 0.2803, -0.5991), vec2<f32>( 0.2072,  0.6605),
-    vec2<f32>(-0.6244, -0.3619), vec2<f32>( 0.7325, -0.1610),
-    vec2<f32>(-0.4470,  0.6359), vec2<f32>(-0.1033, -0.7970),
-    vec2<f32>( 0.6340,  0.5343), vec2<f32>(-0.8532,  0.0353),
-    vec2<f32>( 0.6223, -0.6193), vec2<f32>(-0.0416,  0.9004),
-    vec2<f32>(-0.5922, -0.7096), vec2<f32>( 0.9380,  0.1262),
-    vec2<f32>(-0.7948,  0.5530), vec2<f32>( 0.2172, -0.9654),
+// Stable Vogel disk for blocker search and final comparison filtering.
+// The radius is no longer a fixed screen-space blur: blocker distance drives
+// the penumbra so contact shadows remain attached and naturally hard.
+const SHADOW_SAMPLE_COUNT = 32u;
+const SHADOW_BLOCKER_SAMPLE_COUNT = 16u;
+const SHADOW_DISK = array<vec2<f32>, 32>(
+    vec2<f32>( 0.1250,  0.0000), vec2<f32>(-0.1596,  0.1462),
+    vec2<f32>( 0.0244, -0.2784), vec2<f32>( 0.2012,  0.2625),
+    vec2<f32>(-0.3693, -0.0653), vec2<f32>( 0.3498, -0.2225),
+    vec2<f32>(-0.1170,  0.4352), vec2<f32>(-0.2231, -0.4296),
+    vec2<f32>( 0.4841,  0.1768), vec2<f32>(-0.5036,  0.2079),
+    vec2<f32>( 0.2428, -0.5188), vec2<f32>( 0.1794,  0.5720),
+    vec2<f32>(-0.5408, -0.3134), vec2<f32>( 0.6344, -0.1395),
+    vec2<f32>(-0.3871,  0.5507), vec2<f32>(-0.0894, -0.6902),
+    vec2<f32>( 0.5491,  0.4628), vec2<f32>(-0.7389,  0.0306),
+    vec2<f32>( 0.5390, -0.5363), vec2<f32>(-0.0361,  0.7798),
+    vec2<f32>(-0.5128, -0.6145), vec2<f32>( 0.8124,  0.1093),
+    vec2<f32>(-0.6883,  0.4789), vec2<f32>( 0.1881, -0.8361),
+    vec2<f32>( 0.4350,  0.7592), vec2<f32>(-0.8504, -0.2713),
+    vec2<f32>( 0.8261, -0.3817), vec2<f32>(-0.3579,  0.8552),
+    vec2<f32>(-0.3194, -0.8880), vec2<f32>( 0.8499,  0.4467),
+    vec2<f32>(-0.9440,  0.2488), vec2<f32>( 0.5366, -0.8345),
 );
 
+fn shadow_linear_depth(depth: f32) -> f32 {
+    let near_plane = scene.shadow_parameters.y;
+    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
+    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
+    return depth_scale * near_plane / max(depth_scale - depth, 0.000001);
+}
+
+fn shadow_receiver_gradient(shadow_position: vec3<f32>) -> vec2<f32> {
+    let dx = dpdx(shadow_position);
+    let dy = dpdy(shadow_position);
+    let determinant = dx.x * dy.y - dx.y * dy.x;
+    if abs(determinant) < 0.00000001 {
+        return vec2<f32>(0.0);
+    }
+    return vec2<f32>(
+        (dx.z * dy.y - dy.z * dx.y) / determinant,
+        (dx.x * dy.z - dy.x * dx.z) / determinant,
+    );
+}
+
+fn shadow_reference_depth(
+    shadow_position: vec3<f32>,
+    sample_offset: vec2<f32>,
+    depth_gradient: vec2<f32>,
+    n_dot_light: f32,
+) -> f32 {
+    // Receiver-plane bias follows perspective depth variation for each tap.
+    // The residual epsilon is tiny and expressed in depth units, not XY texels.
+    let epsilon = mix(0.00000025, 0.00000125, 1.0 - clamp(n_dot_light, 0.0, 1.0));
+    return shadow_position.z + dot(depth_gradient, sample_offset) - epsilon;
+}
+
+fn pcss_shadow(shadow_position: vec3<f32>, n_dot_light: f32) -> f32 {
+    let shadow_dimensions = vec2<i32>(textureDimensions(sun_shadow));
+    let shadow_texel = 1.0 / vec2<f32>(shadow_dimensions);
+    let depth_gradient = shadow_receiver_gradient(shadow_position);
+    let softness = clamp(scene.params1.w, 0.0, 1.0);
+    let center_reference = shadow_reference_depth(
+        shadow_position,
+        vec2<f32>(0.0),
+        depth_gradient,
+        n_dot_light,
+    );
+    if softness <= 0.001 {
+        return textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            shadow_position.xy,
+            center_reference,
+        );
+    }
+
+    let receiver_depth = shadow_linear_depth(shadow_position.z);
+    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
+    let cone_tangent =
+        sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
+    let source_radius = scene.shadow_parameters.x;
+    let max_search_radius = max(shadow_texel.x, shadow_texel.y) * 12.0;
+    let search_radius = min(
+        0.5 * source_radius / max(receiver_depth * cone_tangent, 0.000001),
+        max_search_radius,
+    );
+
+    var blocker_depth_sum = 0.0;
+    var blocker_count = 0u;
+    for (var sample = 0u; sample < SHADOW_BLOCKER_SAMPLE_COUNT; sample++) {
+        let offset = SHADOW_DISK[sample] * search_radius;
+        let sample_uv = shadow_position.xy + offset;
+        if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
+            continue;
+        }
+        let sample_pixel = clamp(
+            vec2<i32>(sample_uv * vec2<f32>(shadow_dimensions)),
+            vec2<i32>(0),
+            shadow_dimensions - vec2<i32>(1),
+        );
+        let blocker_depth = textureLoad(sun_shadow, sample_pixel, 0);
+        let reference =
+            shadow_reference_depth(shadow_position, offset, depth_gradient, n_dot_light);
+        if blocker_depth < reference {
+            blocker_depth_sum += shadow_linear_depth(blocker_depth);
+            blocker_count += 1u;
+        }
+    }
+    if blocker_count == 0u {
+        return 1.0;
+    }
+
+    let average_blocker_depth = blocker_depth_sum / f32(blocker_count);
+    let separation = max(receiver_depth - average_blocker_depth, 0.0);
+    let penumbra_ratio =
+        separation / max(average_blocker_depth, scene.shadow_parameters.y);
+    let max_filter_radius = max(shadow_texel.x, shadow_texel.y) * 12.0;
+    let filter_radius = min(
+        0.5 * source_radius * penumbra_ratio
+            / max(receiver_depth * cone_tangent, 0.000001),
+        max_filter_radius,
+    );
+    if filter_radius <= max(shadow_texel.x, shadow_texel.y) * 0.35 {
+        return textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            shadow_position.xy,
+            center_reference,
+        );
+    }
+
+    var visibility = 0.0;
+    for (var sample = 0u; sample < SHADOW_SAMPLE_COUNT; sample++) {
+        let offset = SHADOW_DISK[sample] * filter_radius;
+        let sample_uv = shadow_position.xy + offset;
+        if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
+            visibility += 1.0;
+            continue;
+        }
+        visibility += textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            sample_uv,
+            shadow_reference_depth(
+                shadow_position,
+                offset,
+                depth_gradient,
+                n_dot_light,
+            ),
+        );
+    }
+    return visibility / f32(SHADOW_SAMPLE_COUNT);
+}
+
 fn spotlight_shadow(input: VertexOutput) -> f32 {
-    // Recompute finite light projection from interpolated world position.
-    // Interpolating post-divide coordinates from vertices distorts projective
-    // UV/depth across large triangles.
     let shadow_clip = light_clip(scene.center.xyz + input.world_relative);
     if shadow_clip.w <= 0.0001 {
         return 1.0;
@@ -8627,48 +8991,11 @@ fn spotlight_shadow(input: VertexOutput) -> f32 {
         return 1.0;
     }
 
-    let shadow_texel = 1.0 / vec2<f32>(textureDimensions(sun_shadow));
     let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
     let light_world = normalize(light_position - (scene.center.xyz + input.world_relative));
     let geometric_normal = normalize(input.world_normal);
     let n_dot_light = max(dot(geometric_normal, light_world), 0.0);
-    // Expressing bias in shadow texels keeps it stable for every weapon size
-    // and suppresses triangle/segment acne without detaching contact shadows.
-    let receiver_bias = shadow_texel.x * (0.75 + (1.0 - n_dot_light) * 2.0);
-    let softness = clamp(scene.params1.w, 0.0, 1.0);
-
-    // A true hard-shadow endpoint is useful for inspection and cheaper than
-    // running the full PCF kernel. The squared response gives finer control
-    // near the sharp end while still allowing a broad penumbra at 1.0.
-    if softness <= 0.001 {
-        return textureSampleCompare(
-            sun_shadow,
-            sun_shadow_sampler,
-            shadow_position.xy,
-            shadow_position.z - receiver_bias,
-        );
-    }
-
-    let filter_radius = 0.75 + softness * softness * 48.0;
-    var visibility = 0.0;
-    for (var sample = 0u; sample < SHADOW_SAMPLE_COUNT; sample++) {
-        let sample_uv = shadow_position.xy
-            + SHADOW_DISK[sample] * shadow_texel * filter_radius;
-        // Out-of-frustum space contains no caster. Check every tap instead of
-        // clamping it to an edge depth, which would stretch a silhouette into
-        // a false shadow along the light-frustum boundary.
-        if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
-            visibility += 1.0;
-        } else if material.character_params.w < 2.5 {
-            visibility += textureSampleCompare(
-                sun_shadow,
-                sun_shadow_sampler,
-                sample_uv,
-                shadow_position.z - receiver_bias,
-            );
-        }
-    }
-    return visibility / f32(SHADOW_SAMPLE_COUNT);
+    return pcss_shadow(shadow_position, n_dot_light);
 }
 
 fn investment_decal_mask(uv: vec2<f32>) -> f32 {
@@ -9898,7 +10225,7 @@ const PRESENT_SHADER: &str = r#"
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
-    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>,
+    light_direction: vec4<f32>, light_parameters: vec4<f32>, light_position: vec4<f32>, postprocess0: vec4<f32>, postprocess1: vec4<f32>, postprocess2: vec4<f32>, postprocess3: vec4<f32>, postprocess4: vec4<f32>, postprocess5: vec4<f32>, fidelity: vec4<f32>, shadow_parameters: vec4<f32>,
 }
 
 fn reconstruct_view_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -10161,11 +10488,12 @@ mod tests {
         create_model_sampler, create_pipeline_resources, create_target_resources,
         decode_model_sampler_desc, exposure_target, first_person_key_light, fitted_export_zoom,
         fitted_export_zoom_for_positions, fitted_export_zoom_for_positions_around,
-        hiz_draw_visible, is_distortion_payload_pass, light_cast_direction, light_shadow_softness,
-        light_source_position, model_direction_to_view, model_draws, model_orthographic_depth,
-        model_orthographic_view_depth, model_view_depth, normal_surface_write_mask,
-        project_hiz_vertex, projected_export_bounds, rasterizer_cull_mode, shadow_pipeline_index,
-        smooth_normals, vertex_ambient_occlusion, view_direction_to_model,
+        fixed_light_direction_to_view, hiz_draw_visible, is_distortion_payload_pass,
+        light_cast_direction, light_source_position, model_direction_to_view, model_draws,
+        model_orthographic_depth, model_orthographic_view_depth, model_view_depth,
+        normal_surface_write_mask, prefer_visible_shadow_casters, project_hiz_vertex,
+        projected_export_bounds, rasterizer_cull_mode, shadow_depth_range, shadow_pipeline_index,
+        shadow_source_radius, smooth_normals, vertex_ambient_occlusion, view_direction_to_model,
     };
     use crate::{
         geometry::{
@@ -10589,6 +10917,24 @@ mod tests {
     }
 
     #[test]
+    fn lighting_stays_fixed_in_view_while_model_rotates() {
+        let direction = [0.31, -0.72, 0.44];
+        let fixed = fixed_light_direction_to_view(direction);
+        assert_eq!(fixed, model_direction_to_view(direction, 0.0, 0.0));
+
+        for (yaw, pitch) in [(-0.7, 0.3), (1.2, -0.8)] {
+            let model_rotated = model_direction_to_view(direction, yaw, pitch);
+            assert_ne!(model_rotated, fixed);
+
+            let world_for_shadow = view_direction_to_model(fixed, yaw, pitch);
+            let restored_view = model_direction_to_view(world_for_shadow, yaw, pitch);
+            for axis in 0..3 {
+                assert!((restored_view[axis] - fixed[axis]).abs() < 0.000_01);
+            }
+        }
+    }
+
+    #[test]
     fn spotlight_transform_is_world_space_and_orbit_aimed() {
         let defaults = ModelEnvironment::default();
         let direction = light_cast_direction(&defaults);
@@ -10600,9 +10946,17 @@ mod tests {
             }
         }
 
-        assert_eq!(light_shadow_softness(5.0, 0.5), 0.5);
-        assert!(light_shadow_softness(10.0, 0.5) > 0.5);
-        assert!(light_shadow_softness(0.0, 0.5) < 0.5);
+        assert!((shadow_source_radius(1.0, 5.0, 0.5) - 0.005).abs() < 0.000_001);
+        assert!(shadow_source_radius(1.0, 10.0, 0.5) > shadow_source_radius(1.0, 5.0, 0.5));
+        assert_eq!(shadow_source_radius(1.0, 0.0, 0.5), 0.0);
+        assert_eq!(shadow_source_radius(1.0, 5.0, 0.0), 0.0);
+        assert_eq!(
+            shadow_depth_range([0.0, 0.0, 2.0], [0.0, 0.0, 1.0], 0.5, 1.0, 4.0),
+            [1.5, 2.5]
+        );
+        let close_range = shadow_depth_range([0.0, 0.0, 0.1], [0.0, 0.0, 1.0], 1.0, 1.0, 4.0);
+        assert!((close_range[0] - 0.02).abs() < 0.000_001);
+        assert!((close_range[1] - 1.1).abs() < 0.000_001);
 
         assert_eq!(defaults.light_orbit_radius, 1.0);
         assert_eq!(defaults.light_orbit_center, [0.174, -0.045, -0.117]);
@@ -10675,18 +11029,26 @@ mod tests {
     fn uses_finite_spotlight_depth_and_stable_shadow_filtering() {
         for shader in [MODEL_SHADER, SHADOW_SHADER] {
             assert!(shader.contains("scene.light_position.xyz"));
-            assert!(shader.contains("scene.light_parameters.y"));
+            assert!(shader.contains("scene.shadow_parameters.y"));
+            assert!(shader.contains("scene.shadow_parameters.z"));
             assert!(shader.contains("perspective_denominator"));
         }
         assert!(SHADOW_SHADER.contains("depth_clip,\n        perspective_denominator"));
         assert!(MODEL_SHADER.contains("light_clip(scene.center.xyz + input.world_relative)"));
         assert!(!MODEL_SHADER.contains("@location(5) shadow_position"));
-        assert!(MODEL_SHADER.contains("let receiver_bias = shadow_texel.x"));
-        assert!(MODEL_SHADER.contains("const SHADOW_DISK"));
-        assert!(MODEL_SHADER.contains("let softness = clamp(scene.params1.w"));
-        assert!(MODEL_SHADER.contains("softness * softness * 48.0"));
-        assert!(!MODEL_SHADER.contains("shadow_texel * 5.0"));
-        assert!(!MODEL_SHADER.contains("mix(0.30, 1.0"));
+        for shader in [MODEL_SHADER, LIGHTING_SHADER] {
+            assert!(shader.contains("const SHADOW_BLOCKER_SAMPLE_COUNT = 16u"));
+            assert!(shader.contains("const SHADOW_SAMPLE_COUNT = 32u"));
+            assert!(shader.contains("fn shadow_receiver_gradient"));
+            assert!(shader.contains("fn shadow_reference_depth"));
+            assert!(shader.contains("fn shadow_linear_depth"));
+            assert!(shader.contains("blocker_depth_sum"));
+            assert!(shader.contains("penumbra_ratio"));
+            assert!(shader.contains("source_radius"));
+            assert!(shader.contains("max_filter_radius"));
+            assert!(!shader.contains("receiver_bias = shadow_texel.x"));
+            assert!(!shader.contains("softness * softness * 48.0"));
+        }
     }
 
     #[test]
@@ -10735,6 +11097,105 @@ mod tests {
         assert_eq!(shadow_pipeline_index(0), 0);
         assert_eq!(shadow_pipeline_index(3), 1);
         assert_eq!(shadow_pipeline_index(2), 2);
+    }
+
+    #[test]
+    fn closeup_preview_prefers_visible_mesh_over_shadow_proxy() {
+        let preview = |stages: &[u8]| {
+            let mut indices = Vec::new();
+            let mut ranges = Vec::new();
+            for (slot, stage) in stages.iter().copied().enumerate() {
+                let base = (slot * 3) as u32;
+                indices.extend_from_slice(&[base, base + 1, base + 2]);
+                ranges.push(WireframeMaterialRange {
+                    index_start: slot * 3,
+                    index_count: 3,
+                    raw_lod_category: Some(0),
+                    render_stage: Some(stage),
+                    technique: None,
+                    gear_dye_change_color_index: None,
+                    procedural_scale: 1.0,
+                    texture: None,
+                    textures: WireframeMaterialTextures::default(),
+                });
+            }
+            let vertices = (0..stages.len())
+                .flat_map(|slot| {
+                    let x = slot as f32 * 2.0;
+                    [[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 1.0, 0.0]]
+                })
+                .collect::<Vec<_>>();
+            WireframePreview {
+                rigid_indices: None,
+                source: "shadow proxy policy".into(),
+                position_format: "f32x3",
+                uv_format: None,
+                vertices,
+                normals: None,
+                procedural_positions: None,
+                procedural_normals: None,
+                tangents: None,
+                uvs: None,
+                normal_format: None,
+                tangent_format: None,
+                indices,
+                material_ranges: ranges,
+                min: [0.0, 0.0, 0.0],
+                max: [4.0, 1.0, 0.0],
+                vertex_count_total: stages.len() * 3,
+                index_count_total: stages.len() * 3,
+            }
+        };
+
+        let mut draws = model_draws(
+            &preview(&[
+                crate::render::adapter::GoliathAdapter::PRIMARY_STAGE,
+                crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE,
+            ]),
+            None,
+        );
+        prefer_visible_shadow_casters(&mut draws);
+        let primary = draws
+            .iter()
+            .find(|draw| {
+                draw.packet.raw_render_stage
+                    == Some(crate::render::adapter::GoliathAdapter::PRIMARY_STAGE)
+            })
+            .expect("primary draw");
+        let proxy = draws
+            .iter()
+            .find(|draw| {
+                draw.packet.raw_render_stage
+                    == Some(crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE)
+            })
+            .expect("shadow proxy");
+        assert!(
+            primary
+                .packet
+                .pass_plan
+                .passes
+                .contains(&RenderPassKind::Shadow)
+        );
+        assert!(
+            !proxy
+                .packet
+                .pass_plan
+                .passes
+                .contains(&RenderPassKind::Shadow)
+        );
+
+        let mut proxy_only = model_draws(
+            &preview(&[crate::render::adapter::GoliathAdapter::AUTHORED_SHADOW_STAGE]),
+            None,
+        );
+        prefer_visible_shadow_casters(&mut proxy_only);
+        assert!(
+            proxy_only[0]
+                .packet
+                .pass_plan
+                .passes
+                .contains(&RenderPassKind::Shadow)
+        );
     }
 
     #[test]
