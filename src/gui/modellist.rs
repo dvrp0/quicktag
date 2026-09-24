@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::Write, path::PathBuf, sync::Arc};
 
 use eframe::egui::{
     self, Color32, RichText, Sense, Stroke,
@@ -12,10 +12,10 @@ use quicktag_scanner::TagCache;
 use tiger_pkg::{TagHash, manager::PackagePath, package::UEntryHeader, package_manager};
 
 use crate::geometry::{
-    GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, UvTransformPreview,
-    WeaponModPreviewAttachment, WeaponModSocketIndex, WireframeMaterialLayer, WireframePreview,
-    is_model_catalog_reference, model_info_for_reference, pattern_component_descendants,
-    runner_shell_combinations, weapon_unoccupied_default_mod_patterns,
+    GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, RunnerShellAssembly,
+    UvTransformPreview, WeaponModPreviewAttachment, WeaponModSocketIndex, WireframeMaterialLayer,
+    WireframePreview, is_model_catalog_reference, model_info_for_reference,
+    pattern_component_descendants, weapon_unoccupied_default_mod_patterns,
 };
 use crate::gui::common::ResponseExt;
 use crate::gui::tag::format_tag_entry;
@@ -28,8 +28,8 @@ use super::gear::{
 };
 use super::model_renderer::{
     GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelExportCamera,
-    ModelPaintCallback, light_cast_direction, light_source_position, model_direction_to_view,
-    view_direction_to_model,
+    ModelLightTransform, ModelPaintCallback, light_cast_direction, light_source_position,
+    model_direction_to_view, view_direction_to_model,
 };
 use super::{View, ViewAction};
 
@@ -49,6 +49,204 @@ fn model_export_filename(model: TagHash, modifications: &[(TagHash, &'static str
         format!("{model}.png")
     } else {
         format!("{model}_{suffix}.png")
+    }
+}
+
+fn model_modded_export_filename(model: TagHash) -> String {
+    format!("{model}.zip")
+}
+
+fn high_rarity_mod_combinations(weapon: &ModelWeaponEntry) -> Vec<Vec<ModelModEntry>> {
+    let pools = weapon
+        .slots
+        .iter()
+        .filter_map(|slot| {
+            let mut mods = slot
+                .mods
+                .iter()
+                .filter(|item| matches!(item.rarity_code, "S" | "P" | "C"))
+                .cloned()
+                .collect_vec();
+            mods.sort_by_key(|item| (item.model_tag, item.rarity_code));
+            mods.dedup_by_key(|item| (item.model_tag, item.rarity_code));
+            (!mods.is_empty()).then_some(mods)
+        })
+        .collect_vec();
+    if pools.is_empty() {
+        return vec![];
+    }
+    pools.into_iter().fold(vec![vec![]], |combinations, pool| {
+        combinations
+            .into_iter()
+            .flat_map(|combination| {
+                pool.iter().cloned().map(move |item| {
+                    let mut next = combination.clone();
+                    next.push(item);
+                    next
+                })
+            })
+            .collect()
+    })
+}
+
+struct ModdedExportJob {
+    model_tag: TagHash,
+    weapon: ModelWeaponEntry,
+    combinations: Vec<Vec<ModelModEntry>>,
+    next: usize,
+    show_default_mods: bool,
+    show_stickers: bool,
+    environment: ModelEnvironment,
+    export_camera: Option<ModelExportCamera>,
+    path: PathBuf,
+    zip: Option<zip::ZipWriter<std::fs::File>>,
+}
+
+impl ModdedExportJob {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        model_tag: TagHash,
+        weapon: ModelWeaponEntry,
+        show_default_mods: bool,
+        show_stickers: bool,
+        environment: ModelEnvironment,
+        export_camera: Option<ModelExportCamera>,
+        path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let combinations = high_rarity_mod_combinations(&weapon);
+        anyhow::ensure!(
+            !combinations.is_empty(),
+            "current gun has no Superior, Prestige, or Contraband mods"
+        );
+        let zip = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        Ok(Self {
+            model_tag,
+            weapon,
+            combinations,
+            next: 0,
+            show_default_mods,
+            show_stickers,
+            environment,
+            export_camera,
+            path,
+            zip: Some(zip),
+        })
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        (self.next, self.combinations.len())
+    }
+
+    fn step(
+        &mut self,
+        cache: &Arc<TagCache>,
+        texture_cache: &TextureCache,
+    ) -> anyhow::Result<bool> {
+        if self.next == self.combinations.len() {
+            self.zip
+                .take()
+                .expect("unfinished export has zip")
+                .finish()?;
+            return Ok(true);
+        }
+        let entry = package_manager()
+            .get_entry(self.model_tag)
+            .ok_or_else(|| anyhow::anyhow!("model {} is unavailable", self.model_tag))?;
+        let socket_owner = self.weapon.socket_owner.unwrap_or(self.weapon.owner_tag);
+        let combination = &self.combinations[self.next];
+        let mut attachments = combination
+            .iter()
+            .map(|item| WeaponModPreviewAttachment {
+                model_tag: item.model_tag,
+                rarity: item.preview_rarity,
+                unique_id: 0.5,
+            })
+            .collect_vec();
+        let equipped = attachments.iter().map(|item| item.model_tag).collect_vec();
+        if self.show_default_mods {
+            attachments.extend(
+                weapon_unoccupied_default_mod_patterns(
+                    &cache,
+                    self.weapon.owner_tag,
+                    socket_owner,
+                    &equipped,
+                )
+                .into_iter()
+                .map(|model_tag| WeaponModPreviewAttachment {
+                    model_tag,
+                    rarity: None,
+                    unique_id: 0.5,
+                }),
+            );
+        }
+        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache.clone(),
+            self.model_tag,
+            &entry,
+            self.weapon.owner_tag,
+            socket_owner,
+            &attachments,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to assemble {} with selected mods", self.model_tag)
+        })?;
+        let GeometryPreviewKind::Model(model) = &preview.kind else {
+            anyhow::bail!("{} did not decode as a model", self.model_tag);
+        };
+        let wireframe = model
+            .wireframe
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("wireframe unavailable for {}", self.model_tag))?;
+        let fallback_color = wireframe_preview_textures(wireframe, &model.textures)
+            .first()
+            .copied();
+        let gpu = Arc::new(
+            GpuModelPreview::create(
+                &texture_cache.render_state.device,
+                wireframe,
+                fallback_color,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!("failed to create GPU preview for {}", self.model_tag)
+            })?,
+        );
+        let export_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            vec2(MODEL_EXPORT_WIDTH as f32, MODEL_EXPORT_HEIGHT as f32),
+        );
+        let callback = ModelPaintCallback::new(
+            gpu,
+            texture_cache,
+            wireframe,
+            model.preview_uv_transform(),
+            None,
+            DEFAULT_WEAPON_YAW,
+            DEFAULT_WEAPON_PITCH,
+            1.0,
+            egui::Vec2::ZERO,
+            self.show_stickers,
+            export_rect,
+            1.0,
+            self.environment,
+        )
+        .with_export_camera(self.export_camera);
+        let descriptors = combination
+            .iter()
+            .map(|item| (item.model_tag, item.rarity_code))
+            .collect_vec();
+        let zip = self.zip.as_mut().expect("unfinished export has zip");
+        zip.start_file(
+            model_export_filename(self.model_tag, &descriptors),
+            // PNG payloads are already compressed; ZIP deflate only wastes CPU.
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )?;
+        zip.write_all(&callback.export_png_bytes(
+            &texture_cache.render_state,
+            [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
+        )?)?;
+        self.next += 1;
+        Ok(false)
     }
 }
 
@@ -74,14 +272,13 @@ pub struct ModelsView {
     preview_show_default_mods: bool,
     preview_environment: ModelEnvironment,
     preview_export_status: Option<(bool, String)>,
+    modded_export: Option<ModdedExportJob>,
     weapon_catalog: ModelWeaponCatalog,
     active_weapon: Option<usize>,
     selected_mods: Vec<Option<usize>>,
     selected_mod_unique_ids: Vec<Option<f32>>,
     mod_unique_rng: u32,
-    runner_shell_pairs: Vec<crate::geometry::RunnerShellCombination>,
-    hidden_weapon_components: rustc_hash::FxHashSet<TagHash>,
-    runner_root_compositions: rustc_hash::FxHashMap<TagHash, RunnerRootComposition>,
+    runner_models: rustc_hash::FxHashMap<TagHash, RunnerShellAssembly>,
 }
 
 #[derive(Clone, Copy)]
@@ -101,12 +298,6 @@ struct ProjectedTriangle {
     color_tint: [u8; 4],
     emissive_strength: u8,
     light: f32,
-}
-
-#[derive(Clone, Debug)]
-struct RunnerRootComposition {
-    skin_tag: TagHash,
-    components: Vec<TagHash>,
 }
 
 impl ModelsView {
@@ -133,14 +324,13 @@ impl ModelsView {
             preview_show_default_mods: true,
             preview_environment: ModelEnvironment::default(),
             preview_export_status: None,
+            modded_export: None,
             weapon_catalog: ModelWeaponCatalog::default(),
             active_weapon: None,
             selected_mods: vec![],
             selected_mod_unique_ids: vec![],
             mod_unique_rng: 0xA341_316C,
-            runner_shell_pairs: vec![],
-            hidden_weapon_components: Default::default(),
-            runner_root_compositions: Default::default(),
+            runner_models: Default::default(),
         }
     }
 
@@ -154,7 +344,7 @@ impl ModelsView {
             .filter_map(|weapon| Some((weapon.owner_tag, weapon.socket_owner?)))
             .collect::<Vec<_>>();
         self.weapon_catalog = catalog;
-        self.refresh_catalog_components();
+        self.refresh_runner_models();
         for weapon in &mut self.weapon_catalog.weapons {
             weapon.socket_owner = previous_owners
                 .iter()
@@ -185,17 +375,13 @@ impl ModelsView {
         }
         if self.selected_model.is_some() {
             self.rebuild_model_preview();
-            self.rebuild_weapon_export_camera();
+            self.rebuild_weapon_reference_frames();
         }
     }
 
     pub fn set_cache(&mut self, cache: Arc<TagCache>) {
         self.cache = cache;
-        self.refresh_catalog_components();
-        self.runner_shell_pairs = runner_shell_combinations(
-            &self.cache,
-            &self.models.iter().map(|entry| entry.tag).collect_vec(),
-        );
+        self.refresh_runner_models();
         for weapon in &mut self.weapon_catalog.weapons {
             weapon.socket_owner = None;
         }
@@ -210,6 +396,7 @@ impl ModelsView {
     }
 
     pub fn show_model(&mut self, tag: TagHash) {
+        let tag = runner_model_root(&self.runner_models, tag).unwrap_or(tag);
         self.package_filter.clear();
         self.model_filter.clear();
         self.packages_with_models = Self::search_models(None);
@@ -249,23 +436,8 @@ impl ModelsView {
         }
     }
 
-    fn refresh_catalog_components(&mut self) {
-        let roots = self
-            .weapon_catalog
-            .weapons
-            .iter()
-            .flat_map(|weapon| {
-                weapon
-                    .model_tags
-                    .iter()
-                    .copied()
-                    .chain(weapon.skins.iter().map(|skin| skin.model_tag))
-            })
-            .unique()
-            .collect_vec();
-        self.hidden_weapon_components = pattern_component_descendants(&self.cache, roots);
-        self.runner_root_compositions =
-            runner_root_composition_index(&self.cache, &self.weapon_catalog);
+    fn refresh_runner_models(&mut self) {
+        self.runner_models = runner_model_index(&self.cache, &self.weapon_catalog);
     }
 
     fn search_models(search: Option<String>) -> Vec<u16> {
@@ -315,11 +487,7 @@ impl ModelsView {
                 })
             })
             .collect();
-        self.runner_shell_pairs = runner_shell_combinations(
-            &self.cache,
-            &self.models.iter().map(|entry| entry.tag).collect_vec(),
-        );
-        self.refresh_catalog_components();
+        self.refresh_runner_models();
         self.selected_model = None;
         self.preview = None;
         self.gpu_model_preview = None;
@@ -329,12 +497,7 @@ impl ModelsView {
         self.selected_mods.clear();
         self.selected_mod_unique_ids.clear();
 
-        if let Some(tag) = self
-            .models
-            .iter()
-            .find(|entry| !self.hidden_weapon_components.contains(&entry.tag))
-            .map(|entry| entry.tag)
-        {
+        if let Some(tag) = self.models.first().map(|entry| entry.tag) {
             self.load_model(tag);
         }
     }
@@ -350,7 +513,7 @@ impl ModelsView {
             self.preview_pitch = DEFAULT_WEAPON_PITCH;
         }
         self.rebuild_model_preview();
-        self.rebuild_weapon_export_camera();
+        self.rebuild_weapon_reference_frames();
     }
 
     fn detect_selected_weapon(&mut self) {
@@ -447,8 +610,9 @@ impl ModelsView {
         attachments
     }
 
-    fn rebuild_weapon_export_camera(&mut self) {
+    fn rebuild_weapon_reference_frames(&mut self) {
         self.weapon_export_camera = None;
+        self.preview_environment.light_model_frame = None;
         let Some(tag) = self.selected_model else {
             return;
         };
@@ -488,6 +652,22 @@ impl ModelsView {
         let Some(base_wireframe) = base.as_ref().and_then(GeometryTagPreview::wireframe) else {
             return;
         };
+        let vanilla = package_manager()
+            .get_entry(weapon.owner_tag)
+            .and_then(|entry| {
+                GeometryTagPreview::load_model_with_weapon_mod_attachments(
+                    self.cache.clone(),
+                    weapon.owner_tag,
+                    &entry,
+                    weapon.owner_tag,
+                    weapon_owner,
+                    &default_attachments,
+                )
+            });
+        self.preview_environment.light_model_frame = vanilla
+            .as_ref()
+            .and_then(GeometryTagPreview::wireframe)
+            .map(ModelCameraFrame::from_wireframe);
 
         // Anchor to the authored default presentation, including empty-slot
         // barrel/stock/etc. meshes. Fit once against every authored attachment
@@ -566,12 +746,8 @@ impl ModelsView {
         let weapon_owner = active_weapon
             .map(|weapon| weapon.socket_owner.unwrap_or(weapon.owner_tag))
             .unwrap_or(tag);
-        self.preview = if let Some(combination) = self
-            .runner_shell_pairs
-            .iter()
-            .find(|combination| combination.head == tag)
-        {
-            GeometryTagPreview::load_combined_runner_shell(self.cache.clone(), combination)
+        self.preview = if let Some(composition) = self.runner_models.get(&tag) {
+            composition.load(self.cache.clone())
         } else if model_info_for_reference(entry.reference).is_some() {
             GeometryTagPreview::load_model_with_weapon_mod_attachments(
                 self.cache.clone(),
@@ -641,115 +817,44 @@ fn weapon_skin_for_model(
     matches.next().is_none().then_some(matched)
 }
 
-fn runner_skin_for_combination<'a>(
-    catalog: &'a ModelWeaponCatalog,
-    combination: &crate::geometry::RunnerShellCombination,
-) -> Option<&'a ModelRunnerSkinEntry> {
-    let mut matches = catalog
-        .runner_skins
-        .iter()
-        .filter(|skin| combination.contains(skin.model_tag));
-    let matched = matches.next()?;
-    matches.next().is_none().then_some(matched)
-}
-
 fn runner_skin_for_model<'a>(
     catalog: &'a ModelWeaponCatalog,
-    compositions: &rustc_hash::FxHashMap<TagHash, RunnerRootComposition>,
     selected: TagHash,
 ) -> Option<&'a ModelRunnerSkinEntry> {
-    let skin_tag = if let Some(composition) = compositions.get(&selected) {
-        composition.skin_tag
-    } else if compositions
-        .values()
-        .any(|composition| composition.skin_tag == selected)
-    {
-        return None;
-    } else {
-        selected
-    };
     let mut matches = catalog
         .runner_skins
         .iter()
-        .filter(|skin| skin.model_tag == skin_tag);
+        .filter(|skin| skin.model_tag == selected);
     let matched = matches.next()?;
     matches.next().is_none().then_some(matched)
 }
 
-fn runner_root_composition_index(
+fn runner_model_index(
     cache: &TagCache,
     catalog: &ModelWeaponCatalog,
-) -> rustc_hash::FxHashMap<TagHash, RunnerRootComposition> {
-    let patterns = package_manager()
-        .get_all_by_reference(0x8080BAAD)
-        .into_iter()
-        .filter_map(|(pattern, _entry)| {
-            let scan = cache.hashes.get(&pattern)?;
-            let mut local_components = scan
-                .file_hashes
-                .iter()
-                .map(|item| item.hash)
-                .filter(|child| {
-                    child.pkg_id() == pattern.pkg_id()
-                        && package_manager()
-                            .get_entry(*child)
-                            .is_some_and(|entry| entry.reference == 0x8080BADB)
-                })
-                .unique()
-                .collect_vec();
-            local_components.sort_unstable();
-            Some((
-                pattern,
-                scan.references.iter().copied().collect_vec(),
-                local_components,
-            ))
-        })
-        .collect_vec();
-
-    let proposals = catalog
+) -> rustc_hash::FxHashMap<TagHash, RunnerShellAssembly> {
+    catalog
         .runner_skins
         .iter()
-        .filter(|skin| {
-            package_manager()
-                .get_entry(skin.model_tag)
-                .is_some_and(|entry| entry.reference == 0x8080BAAD)
-        })
         .filter_map(|skin| {
-            let owned = pattern_component_descendants(cache, [skin.model_tag]);
-            let mut candidates =
-                patterns
-                    .iter()
-                    .filter_map(|(pattern, parents, local_children)| {
-                        if *pattern == skin.model_tag || local_children.is_empty() {
-                            return None;
-                        }
-                        let mut components = parents
-                            .iter()
-                            .copied()
-                            .filter(|parent| owned.contains(parent))
-                            .chain(local_children.iter().copied())
-                            .unique()
-                            .collect_vec();
-                        components.sort_unstable();
-                        (components.len() >= 2
-                            && components.iter().any(|component| owned.contains(component)))
-                        .then_some((*pattern, components))
-                    });
-            let (pattern, components) = candidates.next()?;
-            candidates.next().is_none().then_some((
-                pattern,
-                RunnerRootComposition {
-                    skin_tag: skin.model_tag,
-                    components,
-                },
-            ))
+            let assembly = RunnerShellAssembly::resolve(cache, skin.model_tag)?;
+            Some((assembly.pattern, assembly))
         })
-        .collect_vec();
-    let claimed = proposals.iter().map(|(pattern, _)| *pattern).counts();
-    proposals
-        .into_iter()
-        .filter(|(pattern, _)| claimed.get(pattern) == Some(&1))
         .collect()
+}
+
+fn runner_model_root(
+    models: &rustc_hash::FxHashMap<TagHash, RunnerShellAssembly>,
+    tag: TagHash,
+) -> Option<TagHash> {
+    if models.contains_key(&tag) {
+        return Some(tag);
+    }
+    let mut owners = models.iter().filter(|(_, model)| {
+        model.nested_patterns.contains(&tag) || model.parts.iter().any(|part| part.component == tag)
+    });
+    let root = *owners.next()?.0;
+    owners.next().is_none().then_some(root)
 }
 
 impl View for ModelsView {
@@ -832,8 +937,10 @@ impl View for ModelsView {
             .cloned();
         let selected_mods = self.selected_mods.clone();
         let export_status = self.preview_export_status.clone();
+        let modded_export_active = self.modded_export.is_some();
         let mut mod_selection = None;
         let mut export_result = None;
+        let mut modded_export_request = None;
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let Some(model) = preview.and_then(|preview| match &preview.kind {
@@ -852,7 +959,9 @@ impl View for ModelsView {
                     action = Some(ViewAction::OpenTag(tag));
                 }
                 if let Some(tag) = selected_model
-                    && ui.button("Export PNG").clicked()
+                    && ui
+                        .add_enabled(!modded_export_active, egui::Button::new("Export PNG"))
+                        .clicked()
                 {
                     let filename = model_export_filename(tag, &selected_mod_export_descriptors);
                     match native_dialog::FileDialog::new()
@@ -897,12 +1006,47 @@ impl View for ModelsView {
                                             &path,
                                             [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
                                         )
-                                        .map(|()| path),
+                                        .map(|()| (path, 1)),
                                 );
                             } else {
                                 export_result =
                                     Some(Err(anyhow::anyhow!("GPU model preview is unavailable")));
                             }
+                        }
+                        Ok(None) => {}
+                        Err(error) => export_result = Some(Err(error.into())),
+                    }
+                }
+                if let (Some(tag), Some(weapon)) = (selected_model, active_weapon.as_ref())
+                    && ui
+                        .add_enabled(
+                            !modded_export_active,
+                            egui::Button::new("Export All Modded"),
+                        )
+                        .clicked()
+                {
+                    let filename = model_modded_export_filename(tag);
+                    match native_dialog::FileDialog::new()
+                        .add_filter("ZIP archive", &["zip"])
+                        .set_filename(&filename)
+                        .show_save_single_file()
+                    {
+                        Ok(Some(mut path)) => {
+                            if !path
+                                .extension()
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+                            {
+                                path.set_extension("zip");
+                            }
+                            modded_export_request = Some((
+                                tag,
+                                weapon.clone(),
+                                *preview_show_default_mods,
+                                *preview_show_stickers,
+                                *preview_environment,
+                                weapon_export_camera,
+                                path,
+                            ));
                         }
                         Ok(None) => {}
                         Err(error) => export_result = Some(Err(error.into())),
@@ -989,9 +1133,48 @@ impl View for ModelsView {
         }
         if let Some(result) = export_result {
             self.preview_export_status = Some(match result {
-                Ok(path) => (true, format!("Saved {}", path.display())),
+                Ok((path, count)) => (
+                    true,
+                    if count == 1 {
+                        format!("Saved {}", path.display())
+                    } else {
+                        format!("Saved {count} PNGs to {}", path.display())
+                    },
+                ),
                 Err(error) => (false, format!("Export failed: {error:#}")),
             });
+        }
+        if let Some((tag, weapon, defaults, stickers, environment, camera, path)) =
+            modded_export_request
+        {
+            match ModdedExportJob::new(tag, weapon, defaults, stickers, environment, camera, path) {
+                Ok(job) => self.modded_export = Some(job),
+                Err(error) => {
+                    self.preview_export_status = Some((false, format!("Export failed: {error:#}")))
+                }
+            }
+        }
+        if let Some(mut job) = self.modded_export.take() {
+            let path = job.path.clone();
+            let total = job.progress().1;
+            match job.step(&self.cache, &self.texture_cache) {
+                Ok(true) => {
+                    self.preview_export_status =
+                        Some((true, format!("Saved {total} PNGs to {}", path.display())));
+                }
+                Ok(false) => {
+                    let (completed, total) = job.progress();
+                    self.preview_export_status =
+                        Some((true, format!("Exporting {completed}/{total} PNGs…")));
+                    self.modded_export = Some(job);
+                    ui.ctx().request_repaint();
+                }
+                Err(error) => {
+                    drop(job);
+                    let _ = std::fs::remove_file(path);
+                    self.preview_export_status = Some((false, format!("Export failed: {error:#}")));
+                }
+            }
         }
 
         action
@@ -999,173 +1182,6 @@ impl View for ModelsView {
 }
 
 impl ModelsView {
-    #[cfg(any())]
-    fn model_grid_ui(&mut self, ui: &mut egui::Ui) -> Option<ViewAction> {
-        const GAP: f32 = 10.0;
-        const TARGET_CARD_WIDTH: f32 = 280.0;
-        const IMAGE_ASPECT: f32 = 0.82;
-        const FOOTER_HEIGHT: f32 = 38.0;
-
-        let filter = self.model_filter.to_lowercase();
-        let models = self
-            .models
-            .iter()
-            .filter(|entry| {
-                !self.hidden_weapon_components.contains(&entry.tag)
-                    && (filter.is_empty()
-                        || entry
-                            .search_label(
-                                weapon_skin_for_model(&self.weapon_catalog, entry.tag),
-                                self.runner_shell_pairs
-                                    .iter()
-                                    .find(|pair| pair.head == entry.tag)
-                                    .map(|pair| pair.submeshes().collect_vec()),
-                                runner_skin_for_model(
-                                    &self.weapon_catalog,
-                                    &self.runner_root_compositions,
-                                    entry.tag,
-                                )
-                                .or_else(|| {
-                                    self.runner_shell_pairs
-                                        .iter()
-                                        .find(|pair| pair.contains(entry.tag))
-                                        .and_then(|pair| {
-                                            runner_skin_for_combination(&self.weapon_catalog, pair)
-                                        })
-                                }),
-                                self.runner_shell_pairs
-                                    .iter()
-                                    .any(|pair| pair.head != entry.tag && pair.contains(entry.tag)),
-                            )
-                            .contains(&filter))
-            })
-            .cloned()
-            .collect_vec();
-        if models.is_empty() {
-            ui.label(RichText::new("No matching model entities").italics());
-            return None;
-        }
-
-        let available_width = ui.available_width().max(TARGET_CARD_WIDTH);
-        let columns = ((available_width + GAP) / (TARGET_CARD_WIDTH + GAP))
-            .floor()
-            .max(1.0) as usize;
-        let card_width = ((available_width - GAP * (columns.saturating_sub(1)) as f32)
-            / columns as f32)
-            .max(160.0);
-        let image_height = card_width * IMAGE_ASPECT;
-        let card_height = image_height + FOOTER_HEIGHT;
-        let row_height = card_height + GAP;
-        let row_count = models.len().div_ceil(columns);
-        let mut action = None;
-        let mut clicked = None;
-
-        egui::ScrollArea::vertical()
-            .id_salt("models_grid")
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, row_count, |ui, rows| {
-                for row in rows {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = GAP;
-                        for entry in models.iter().skip(row * columns).take(columns) {
-                            if !self.thumbnails.contains_key(&entry.tag) {
-                                let thumbnail = ModelThumbnail::load(
-                                    self.cache.clone(),
-                                    &self.texture_cache,
-                                    entry.tag,
-                                );
-                                self.thumbnails.insert(entry.tag, thumbnail);
-                            }
-
-                            let (rect, response) = ui
-                                .allocate_exact_size(vec2(card_width, card_height), Sense::click());
-                            let response = response.tag_context(entry.tag);
-                            let selected = self.selected_model == Some(entry.tag);
-                            let footer = egui::Rect::from_min_max(
-                                pos2(rect.left(), rect.bottom() - FOOTER_HEIGHT),
-                                rect.max,
-                            );
-                            let image_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                pos2(rect.right(), footer.top()),
-                            );
-                            let painter = ui.painter_at(rect);
-                            painter.rect_filled(image_rect, 3.0, Color32::from_rgb(89, 108, 150));
-                            painter.rect_filled(footer, 0.0, Color32::from_rgb(7, 8, 10));
-
-                            if let Some(Some(thumbnail)) = self.thumbnails.get(&entry.tag)
-                                && let GeometryPreviewKind::Model(model) = &thumbnail.preview.kind
-                                && let Some(wireframe) = &model.wireframe
-                            {
-                                let callback = ModelPaintCallback::new(
-                                    thumbnail.gpu.clone(),
-                                    &self.texture_cache,
-                                    wireframe,
-                                    model.preview_uv_transform(),
-                                    None,
-                                    DEFAULT_MODEL_YAW,
-                                    0.05,
-                                    0.9,
-                                    egui::Vec2::ZERO,
-                                    false,
-                                    image_rect,
-                                    ui.ctx().pixels_per_point(),
-                                    ModelEnvironment::default(),
-                                );
-                                ui.painter()
-                                    .add(Callback::new_paint_callback(image_rect, callback));
-                            } else {
-                                painter.text(
-                                    image_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Preview unavailable",
-                                    egui::TextStyle::Small.resolve(ui.style()),
-                                    Color32::GRAY,
-                                );
-                            }
-
-                            painter.text(
-                                pos2(footer.left() + 10.0, footer.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                entry.tag.to_string(),
-                                egui::TextStyle::Monospace.resolve(ui.style()),
-                                Color32::WHITE,
-                            );
-                            painter.rect_stroke(
-                                rect,
-                                3.0,
-                                Stroke::new(
-                                    if selected || response.hovered() {
-                                        2.0
-                                    } else {
-                                        1.0
-                                    },
-                                    if selected {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::DARK_GRAY
-                                    },
-                                ),
-                                egui::StrokeKind::Inside,
-                            );
-
-                            if response.clicked() {
-                                clicked = Some(entry.tag);
-                            }
-                            if response.double_clicked() {
-                                action = Some(ViewAction::OpenTag(entry.tag));
-                            }
-                        }
-                    });
-                }
-            });
-
-        if let Some(tag) = clicked {
-            self.selected_model = Some(tag);
-        }
-        action
-    }
-
     fn model_list_ui(&mut self, ui: &mut egui::Ui) -> Option<ViewAction> {
         let mut action = None;
 
@@ -1191,59 +1207,19 @@ impl ModelsView {
                 let models = self.models.clone();
                 let mut selected = None;
                 for entry in models {
-                    if self.hidden_weapon_components.contains(&entry.tag) {
+                    let detected_skin = weapon_skin_for_model(&self.weapon_catalog, entry.tag);
+                    if !self.runner_models.contains_key(&entry.tag)
+                        && self
+                            .runner_models
+                            .values()
+                            .any(|model| model.nested_patterns.contains(&entry.tag))
+                    {
                         continue;
                     }
-                    let detected_skin = weapon_skin_for_model(&self.weapon_catalog, entry.tag);
-                    let combination = self
-                        .runner_shell_pairs
-                        .iter()
-                        .find(|combination| combination.head == entry.tag);
-                    let member_combination = self
-                        .runner_shell_pairs
-                        .iter()
-                        .find(|combination| combination.contains(entry.tag));
-                    let root_composition = self.runner_root_compositions.get(&entry.tag);
-                    let member_composition = self
-                        .runner_root_compositions
-                        .values()
-                        .find(|composition| composition.components.contains(&entry.tag));
-                    let is_runner_submesh = combination.is_none()
-                        && root_composition.is_none()
-                        && (member_combination.is_some() || member_composition.is_some());
-                    let combined_parts = combination
-                        .map(|combination| combination.submeshes().collect_vec())
-                        .or_else(|| {
-                            root_composition.map(|composition| composition.components.clone())
-                        });
-                    let runner_skin = runner_skin_for_model(
-                        &self.weapon_catalog,
-                        &self.runner_root_compositions,
-                        entry.tag,
-                    )
-                    .or_else(|| {
-                        let skin_tag = member_composition?.skin_tag;
-                        let mut matches = self
-                            .weapon_catalog
-                            .runner_skins
-                            .iter()
-                            .filter(|skin| skin.model_tag == skin_tag);
-                        let matched = matches.next()?;
-                        matches.next().is_none().then_some(matched)
-                    })
-                    .or_else(|| {
-                        member_combination.and_then(|combination| {
-                            runner_skin_for_combination(&self.weapon_catalog, combination)
-                        })
-                    });
+                    let runner_skin = runner_skin_for_model(&self.weapon_catalog, entry.tag);
                     if !filter.is_empty()
                         && !entry
-                            .search_label(
-                                detected_skin,
-                                combined_parts.as_deref(),
-                                runner_skin,
-                                is_runner_submesh,
-                            )
+                            .search_label(detected_skin, runner_skin)
                             .contains(filter.as_str())
                     {
                         continue;
@@ -1253,19 +1229,10 @@ impl ModelsView {
                         .add(
                             egui::Button::selectable(
                                 self.selected_model == Some(entry.tag),
-                                entry.list_label(
-                                    ui,
-                                    detected_skin,
-                                    combined_parts.as_deref(),
-                                    runner_skin,
-                                    is_runner_submesh,
-                                ),
+                                entry.list_label(ui, detected_skin, runner_skin),
                             )
                             .wrap_mode(
-                                if detected_skin.is_some()
-                                    || combined_parts.is_some()
-                                    || runner_skin.is_some()
-                                {
+                                if detected_skin.is_some() || runner_skin.is_some() {
                                     egui::TextWrapMode::Wrap
                                 } else {
                                     egui::TextWrapMode::Truncate
@@ -1313,9 +1280,7 @@ impl ModelListEntry {
     fn search_label(
         &self,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
-        combined_parts: Option<&[TagHash]>,
         runner_skin: Option<&ModelRunnerSkinEntry>,
-        is_runner_submesh: bool,
     ) -> String {
         let identity = detected_skin
             .map(|(weapon, skin)| {
@@ -1327,26 +1292,11 @@ impl ModelListEntry {
                 )
             })
             .unwrap_or_default();
-        let combined = combined_parts
-            .map(|parts| {
-                format!(
-                    " combined runner shell submeshed {}",
-                    parts.iter().format(" ")
-                )
-            })
-            .unwrap_or_default();
         let runner_identity = runner_skin
-            .map(|skin| {
-                format!(
-                    " {} {}{}",
-                    skin.shell_name,
-                    skin.name,
-                    if is_runner_submesh { " submesh" } else { "" }
-                )
-            })
+            .map(|skin| format!(" {} {}", skin.shell_name, skin.name,))
             .unwrap_or_default();
         format!(
-            "{} {}{identity}{combined}{runner_identity}",
+            "{} {}{identity}{runner_identity}",
             self.label(),
             self.info.label
         )
@@ -1357,9 +1307,7 @@ impl ModelListEntry {
         &self,
         ui: &egui::Ui,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
-        combined_parts: Option<&[TagHash]>,
         runner_skin: Option<&ModelRunnerSkinEntry>,
-        is_runner_submesh: bool,
     ) -> egui::text::LayoutJob {
         let mut label = egui::text::LayoutJob::default();
         label.append(
@@ -1367,11 +1315,7 @@ impl ModelListEntry {
             0.0,
             egui::TextFormat {
                 font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                color: if is_runner_submesh {
-                    Color32::DARK_GRAY
-                } else {
-                    self.role_color()
-                },
+                color: self.role_color(),
                 ..Default::default()
             },
         );
@@ -1395,27 +1339,9 @@ impl ModelListEntry {
                 },
             );
         }
-        if let Some(parts) = combined_parts {
-            for part in parts {
-                label.append(
-                    &format!("\n    └ Submeshed – {part}"),
-                    0.0,
-                    egui::TextFormat {
-                        font_id: egui::TextStyle::Small.resolve(ui.style()),
-                        color: Color32::DARK_GRAY,
-                        ..Default::default()
-                    },
-                );
-            }
-        }
         if let Some(skin) = runner_skin {
             label.append(
-                &format!(
-                    "\n    └ {}: {}{}",
-                    skin.shell_name,
-                    skin.name,
-                    if is_runner_submesh { " (submesh)" } else { "" }
-                ),
+                &format!("\n    └ {}: {}", skin.shell_name, skin.name,),
                 0.0,
                 egui::TextFormat {
                     font_id: egui::TextStyle::Small.resolve(ui.style()),
@@ -1713,6 +1639,7 @@ pub(super) fn model_wireframe_ui(
                     environment.light_range = defaults.light_range;
                     environment.light_cone_angle = defaults.light_cone_angle;
                     environment.light_size = defaults.light_size;
+                    environment.light_scale_with_model = defaults.light_scale_with_model;
                     environment.shadow_strength = defaults.shadow_strength;
                     environment.shadow_softness = defaults.shadow_softness;
                     environment.sun_intensity = defaults.sun_intensity;
@@ -1827,6 +1754,8 @@ pub(super) fn model_wireframe_ui(
                 egui::Slider::new(&mut environment.light_orbit_radius, 0.25..=10.0)
                     .text("Source distance"),
             );
+            ui.checkbox(&mut environment.light_scale_with_model, "Scale lighting with model")
+                .on_hover_text("Fit the rig to the base model with default mods. Barrel swaps keep the same lighting. Distances use model-size units; brightness stays consistent.");
             ui.add(egui::Slider::new(&mut environment.light_range, 0.25..=20.0).text("Beam range"));
             ui.add(
                 egui::Slider::new(&mut environment.light_cone_angle, 1.0..=89.0)
@@ -1946,7 +1875,9 @@ pub(super) fn model_wireframe_ui(
     let mut orbit_position = environment.light_orbit_position;
     normalize_direction(&mut orbit_position, defaults.light_orbit_position);
     let orbit_view = model_direction_to_view(orbit_position, *yaw, *pitch);
-    let light_world_position = light_source_position(environment);
+    let light_transform = ModelLightTransform::new(environment, wireframe);
+    let light_world_position = light_transform.to_model(light_source_position(environment));
+    let orbit_center_world = light_transform.to_model(environment.light_orbit_center);
     let mut cast_direction = light_cast_direction(environment);
     let cast_length = cast_direction
         .iter()
@@ -1970,21 +1901,20 @@ pub(super) fn model_wireframe_ui(
                 -view[1] * pixels_per_world_unit,
             )
     };
-    let gizmo_center = project_model_point(environment.light_orbit_center);
+    let gizmo_center = project_model_point(orbit_center_world);
     let light_handle = project_model_point(light_world_position);
-    let center_relative = std::array::from_fn(|axis| {
-        environment.light_orbit_center[axis] - camera_frame.center[axis]
-    });
+    let center_relative =
+        std::array::from_fn(|axis| orbit_center_world[axis] - camera_frame.center[axis]);
     let center_view = model_direction_to_view(center_relative, *yaw, *pitch);
-    let orbit_radius_world = environment.light_orbit_radius.max(0.0);
+    let orbit_radius_world = environment.light_orbit_radius.max(0.0) * light_transform.scale;
     let gizmo_radius = (0..=64)
         .map(|step| {
             let angle = step as f32 / 64.0 * std::f32::consts::TAU;
             let (sin, cos) = angle.sin_cos();
             let point = [
-                environment.light_orbit_center[0] + cos * orbit_radius_world,
-                environment.light_orbit_center[1],
-                environment.light_orbit_center[2] + sin * orbit_radius_world,
+                orbit_center_world[0] + cos * orbit_radius_world,
+                orbit_center_world[1],
+                orbit_center_world[2] + sin * orbit_radius_world,
             ];
             project_model_point(point).distance(gizmo_center)
         })
@@ -2059,10 +1989,10 @@ pub(super) fn model_wireframe_ui(
             *yaw,
             *pitch,
         );
-        let target_distance = cast_length.max(0.25);
-        environment.light_target = std::array::from_fn(|axis| {
+        let target_distance = cast_length.max(0.25) * light_transform.scale;
+        environment.light_target = light_transform.to_rig(std::array::from_fn(|axis| {
             light_world_position[axis] + cast_direction[axis] * target_distance
-        });
+        }));
         ui.ctx().request_repaint();
     }
     if let Some(gizmo) = &center_gizmo_response
@@ -2079,8 +2009,9 @@ pub(super) fn model_wireframe_ui(
             *yaw,
             *pitch,
         );
-        environment.light_orbit_center =
-            std::array::from_fn(|axis| camera_frame.center[axis] + center_relative[axis]);
+        environment.light_orbit_center = light_transform.to_rig(std::array::from_fn(|axis| {
+            camera_frame.center[axis] + center_relative[axis]
+        }));
         ui.ctx().request_repaint();
     }
 
@@ -2699,6 +2630,103 @@ fn model_textures_ui(
 
 #[cfg(test)]
 mod tests {
+    include!("model_lighting_catalog_test.rs");
+    include!("runner_shell_tests.rs");
+    #[test]
+    #[ignore = "requires installed Marathon packages and GPU"]
+    fn preserves_open_and_skin_switch_inputs() {
+        use super::*;
+        use std::time::Instant;
+        use tiger_pkg::{GameVersion, MarathonVersion, PackageManager};
+
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into());
+        let manager = Arc::new(
+            PackageManager::new(
+                packages,
+                GameVersion::Marathon(MarathonVersion::Marathon),
+                None,
+            )
+            .expect("packages"),
+        );
+        tiger_pkg::initialize_package_manager(&manager);
+        quicktag_core::classes::initialize_reference_names();
+        let graph = Arc::new(quicktag_scanner::load_tag_cache());
+        let strings = Arc::new(quicktag_strings::localized::create_stringmap().expect("strings"));
+        let mut gear = super::super::gear::GearView::new(strings);
+        gear.reconcile_weapon_skin_models(&graph);
+        let catalog = gear.model_weapon_catalog();
+        let target = TagHash(0x80B7CE0A);
+        let owner = weapon_index_for_model(&catalog, target).expect("target catalog owner");
+        let weapon = &catalog.weapons[owner];
+        let other = weapon
+            .skins
+            .iter()
+            .find(|skin| skin.model_tag != target)
+            .expect("another skin for switch test")
+            .model_tag;
+        eprintln!(
+            "open benchmark: {} target={target} alternate={other} owner={} slots={}",
+            weapon.name,
+            weapon.owner_tag,
+            weapon.slots.len()
+        );
+        let render_state = crate::create_headless_render_state().expect("GPU");
+        let mut view = ModelsView::new(graph, TextureCache::new(render_state));
+        view.set_weapon_catalog(catalog);
+
+        let start = Instant::now();
+        crate::asset_cache::without_asset_cache(|| view.load_model(target));
+        let uncached_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let expected = format!("{:?}", view.preview.as_ref().expect("preview"));
+        let expected_frame = view.preview_camera_frame;
+        let expected_export = view.weapon_export_camera;
+        let expected_gpu = view
+            .gpu_model_preview
+            .as_ref()
+            .expect("GPU preview")
+            .inspection_lines();
+        let expected_vertices = view
+            .gpu_model_preview
+            .as_ref()
+            .unwrap()
+            .vertex_input_bytes();
+        eprintln!("open uncached_ms={uncached_ms:.3}");
+        for (iteration, selected) in [target, other, target, other, target]
+            .into_iter()
+            .enumerate()
+        {
+            let start = Instant::now();
+            view.load_model(selected);
+            eprintln!(
+                "open {iteration} tag={selected} elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+            if selected == target {
+                assert!(
+                    format!("{:?}", view.preview.as_ref().unwrap()) == expected,
+                    "skin switch changed decoded model"
+                );
+                assert_eq!(view.preview_camera_frame, expected_frame);
+                assert_eq!(view.weapon_export_camera, expected_export);
+                assert_eq!(
+                    view.gpu_model_preview.as_ref().unwrap().inspection_lines(),
+                    expected_gpu
+                );
+                assert!(
+                    view.gpu_model_preview
+                        .as_ref()
+                        .unwrap()
+                        .vertex_input_bytes()
+                        == expected_vertices,
+                    "skin switch changed GPU vertex bytes"
+                );
+            }
+        }
+        // Driver teardown is unrelated to load timing and can block on Windows.
+        std::mem::forget(view);
+    }
+
     use super::*;
 
     #[test]
@@ -2706,6 +2734,7 @@ mod tests {
         let model = TagHash(0x80B7CAE9);
         let mod_tag = TagHash(0x80A6071A);
         assert_eq!(model_export_filename(model, &[]), "80B7CAE9.png");
+        assert_eq!(model_modded_export_filename(model), "80B7CAE9.zip");
         assert_eq!(
             model_export_filename(model, &[(mod_tag, "E")]),
             "80B7CAE9_80A6071A-E.png"
@@ -2730,6 +2759,105 @@ mod tests {
             model_export_filename(model, &[(mod_tag, "E"), (TagHash(0x80A61008), "D"),],),
             "80B7CAE9_80A6071A-E_80A61008-D.png"
         );
+    }
+
+    #[test]
+    fn all_modded_uses_cartesian_product_of_superior_and_above() {
+        fn modification(tag: u32, rarity_code: &'static str) -> ModelModEntry {
+            ModelModEntry {
+                name: format!("{tag:08X}"),
+                rarity: String::new(),
+                rarity_code,
+                color: Color32::WHITE,
+                model_tag: TagHash(tag),
+                preview_rarity: None,
+            }
+        }
+        let weapon = ModelWeaponEntry {
+            name: "Test".to_owned(),
+            owner_tag: TagHash(1),
+            socket_owner: None,
+            model_tags: vec![],
+            skins: vec![],
+            slots: vec![
+                super::super::gear::ModelModSlot {
+                    name: "A".to_owned(),
+                    mods: vec![
+                        modification(10, "D"),
+                        modification(11, "S"),
+                        modification(12, "P"),
+                    ],
+                },
+                super::super::gear::ModelModSlot {
+                    name: "B".to_owned(),
+                    mods: vec![modification(20, "C"), modification(21, "E")],
+                },
+            ],
+        };
+        let combinations = high_rarity_mod_combinations(&weapon);
+        assert_eq!(combinations.len(), 2);
+        assert_eq!(
+            combinations
+                .iter()
+                .map(|items| items.iter().map(|item| item.model_tag.0).collect_vec())
+                .collect_vec(),
+            [vec![11, 20], vec![12, 20]]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires installed Marathon packages and GPU"]
+    async fn exports_modded_pngs_into_named_zip() {
+        use std::io::Read;
+        use tiger_pkg::{GameVersion, MarathonVersion, PackageManager};
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into());
+        let manager = Arc::new(
+            PackageManager::new(
+                packages,
+                GameVersion::Marathon(MarathonVersion::Marathon),
+                None,
+            )
+            .unwrap(),
+        );
+        tiger_pkg::initialize_package_manager(&manager);
+        quicktag_core::classes::initialize_reference_names();
+        let graph = Arc::new(quicktag_scanner::load_tag_cache());
+        let strings = Arc::new(quicktag_strings::localized::create_stringmap().unwrap());
+        let mut gear = super::super::gear::GearView::new(strings);
+        gear.reconcile_weapon_skin_models(&graph);
+        let weapon = gear
+            .model_weapon_catalog()
+            .weapons
+            .into_iter()
+            .find(|weapon| weapon.name == "Firestorm")
+            .unwrap();
+        assert_eq!(high_rarity_mod_combinations(&weapon).len(), 1);
+        let model = weapon.model_tags[0];
+        let path = std::env::temp_dir().join(format!(
+            "quicktag-{model}-{}-modded-export.zip",
+            std::process::id()
+        ));
+        let texture_cache = TextureCache::new(crate::create_headless_render_state().unwrap());
+        let mut job = ModdedExportJob::new(
+            model,
+            weapon,
+            true,
+            false,
+            ModelEnvironment::default(),
+            None,
+            path.clone(),
+        )
+        .unwrap();
+        while !job.step(&graph, &texture_cache).unwrap() {}
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut png = vec![];
+        archive.by_index(0).unwrap().read_to_end(&mut png).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        drop(archive);
+        std::fs::remove_file(&path).unwrap();
+        std::mem::forget(texture_cache);
     }
 
     #[test]
@@ -2789,23 +2917,14 @@ mod tests {
         assert_eq!(ikari.shell_name, "Destroyer");
         assert_eq!(ikari.model_tag, TagHash(0x80A9F6BD));
         assert_eq!(entry.reference, 0x8080BAAD);
-        let compositions = runner_root_composition_index(&cache, &catalog);
+        let compositions = runner_model_index(&cache, &catalog);
         let composed = compositions
-            .get(&TagHash(0x80B7E242))
-            .expect("Ikari composed shell Pattern");
-        assert_eq!(composed.skin_tag, ikari.model_tag);
+            .get(&ikari.model_tag)
+            .expect("Ikari authored shell Pattern");
+        assert_eq!(composed.pattern, ikari.model_tag);
+        assert_eq!(composed.geometry().len(), 2);
         assert_eq!(
-            composed.components,
-            [TagHash(0x80B7E203), TagHash(0x80B7E241)]
-        );
-        assert_eq!(
-            runner_skin_for_model(&catalog, &compositions, ikari.model_tag)
-                .map(|skin| skin.name.as_str()),
-            None
-        );
-        assert_eq!(
-            runner_skin_for_model(&catalog, &compositions, TagHash(0x80B7E242))
-                .map(|skin| skin.name.as_str()),
+            runner_skin_for_model(&catalog, ikari.model_tag).map(|skin| skin.name.as_str()),
             Some("IKARI YŌKAI")
         );
     }
@@ -2874,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_runner_skin_on_combined_body_tag() {
+    fn finds_runner_skin_on_authored_pattern() {
         let skin = ModelRunnerSkinEntry {
             name: "Arata Vectus".to_owned(),
             shell_name: "Assassin".to_owned(),
@@ -2885,19 +3004,12 @@ mod tests {
             weapons: vec![],
             runner_skins: vec![skin],
         };
-        let combination = crate::geometry::RunnerShellCombination {
-            head: TagHash(0x80B14135),
-            body: TagHash(0x80B140CE),
-            additional_parts: vec![],
-        };
-        let found = runner_skin_for_combination(&catalog, &combination)
-            .expect("combined runner skin identity");
+        let found = runner_skin_for_model(&catalog, TagHash(0x80B140CE)).expect("shell identity");
         assert_eq!(found.shell_name, "Assassin");
         assert_eq!(found.name, "Arata Vectus");
         assert_eq!(found.color, Color32::from_rgb(232, 184, 72));
         assert_eq!(
-            runner_skin_for_model(&catalog, &Default::default(), TagHash(0x80B140CE))
-                .map(|skin| skin.name.as_str()),
+            runner_skin_for_model(&catalog, TagHash(0x80B140CE)).map(|skin| skin.name.as_str()),
             Some("Arata Vectus")
         );
     }

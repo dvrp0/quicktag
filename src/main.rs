@@ -1,3 +1,4 @@
+mod asset_cache;
 mod geometry;
 mod gui;
 mod material;
@@ -149,8 +150,14 @@ fn create_headless_render_state() -> Result<eframe::egui_wgpu::RenderState, Stri
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .map_err(|error| format!("Could not find a GPU adapter: {error}"))?;
+    let mut required_limits = wgpu::Limits::default();
+    required_limits.max_sampled_textures_per_shader_stage = 18;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+        required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
+            | wgpu::Features::TEXTURE_BINDING_ARRAY
+            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+        required_limits,
         ..Default::default()
     }))
     .map_err(|error| format!("Could not create a GPU device: {error}"))?;

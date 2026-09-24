@@ -22,8 +22,14 @@ use super::implant_stats::{ImplantDetails, ImplantIconResolver, ImplantStatsReso
 use super::item_effect::{ItemEffect, ItemEffectResolver};
 use super::profile_texture::resolve_profile_textures;
 use super::sticker_texture::resolve_sticker_texture;
-use super::weapon_stats::{WeaponStatResolver, WeaponStats};
+use super::weapon_stats::{
+    WeaponModDetails, WeaponModStatChange, WeaponModWeaponStats, WeaponStatResolver, WeaponStats,
+};
 use super::{TOASTS, ViewAction, common::ResponseExt};
+
+#[cfg(test)]
+#[path = "weapon_mod_stat_probe.rs"]
+mod weapon_mod_stat_probe;
 
 const GEAR_DISPLAY_REFERENCE: u32 = 0x80806ef6;
 const DISPLAY_TO_HASH_REFERENCE: u32 = 0x80806ef0;
@@ -294,6 +300,7 @@ struct GearExportStat<'a> {
 pub struct GearView {
     items: Vec<GearItem>,
     weapon_stats: FxHashMap<TagHash, WeaponStats>,
+    weapon_mod_stats: FxHashMap<TagHash, WeaponModDetails>,
     implant_details: FxHashMap<TagHash, ImplantDetails>,
     weapon_mod_effects: FxHashMap<TagHash, Vec<ItemEffect>>,
     item_types: Vec<(String, usize)>,
@@ -373,6 +380,7 @@ impl GearView {
                 let mut view = Self {
                     items,
                     weapon_stats: FxHashMap::default(),
+                    weapon_mod_stats: FxHashMap::default(),
                     implant_details,
                     weapon_mod_effects,
                     item_types,
@@ -393,6 +401,7 @@ impl GearView {
             Err(error) => Self {
                 items: vec![],
                 weapon_stats: FxHashMap::default(),
+                weapon_mod_stats: FxHashMap::default(),
                 implant_details: FxHashMap::default(),
                 weapon_mod_effects: FxHashMap::default(),
                 item_types: vec![],
@@ -746,6 +755,7 @@ impl GearView {
         assign_legacy_unresolved_skin_owners(&mut self.items);
         self.reconcile_weapon_mod_models(cache);
         self.extract_weapon_stats(cache);
+        self.extract_weapon_mod_stats(cache);
         self.update_filter();
     }
 
@@ -757,6 +767,96 @@ impl GearView {
             .filter(|item| is_authored_weapon(item))
             .filter_map(|item| Some((item.display_tag, resolver.extract(item.definition_tag?)?)))
             .collect();
+    }
+
+    fn extract_weapon_mod_stats(&mut self, cache: &quicktag_scanner::TagCache) {
+        let manager = package_manager();
+        let metadata = quicktag_core::implant::ImplantStatResolver::load(&manager)
+            .and_then(|resolver| manager.read_tag(resolver.semantic_table))
+            .inspect_err(|error| log::warn!("Failed to load weapon rating routes: {error:#}"))
+            .ok();
+        let resolver = WeaponStatResolver::load(cache);
+
+        let mut candidates = self
+            .items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Weapon"))
+            .filter_map(|item| Some((item.name.clone(), item.rarity, item.definition_tag?)))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(name, rarity, tag)| {
+            (
+                name.clone(),
+                usize::from(*rarity != Some(GearRarity::Standard)),
+                *tag,
+            )
+        });
+        let mut weapons = FxHashMap::default();
+        for (name, _, tag) in candidates {
+            if weapons.contains_key(&name) {
+                continue;
+            }
+            match resolver.mod_weapon_context(tag) {
+                Ok(context) => {
+                    weapons.insert(name, context);
+                }
+                Err(error) => log::debug!("Skipping weapon mod context {tag}: {error:#}"),
+            }
+        }
+        let mut weapon_names = weapons.keys().cloned().collect::<Vec<_>>();
+        weapon_names.sort_unstable_by_key(|name| name.to_lowercase());
+
+        self.weapon_mod_stats.clear();
+        for item in self
+            .items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Weapon Mod"))
+        {
+            let Some(definition) = item.definition_tag else {
+                continue;
+            };
+            let ratings = match resolver.mod_raw_stats(definition) {
+                Ok(ratings) => ratings,
+                Err(error) => {
+                    log::warn!("Failed to decode weapon mod {definition}: {error:#}");
+                    continue;
+                }
+            };
+            let targets = if item.mod_is_universal {
+                weapon_names.as_slice()
+            } else {
+                item.compatible_weapons.as_slice()
+            };
+            let mut contextual = vec![];
+            if !ratings.is_empty()
+                && let Some(metadata) = metadata.as_deref()
+            {
+                for weapon in targets {
+                    let Some(context) = weapons.get(weapon) else {
+                        continue;
+                    };
+                    match resolver.mod_stat_changes_for_ratings(context, &ratings, metadata) {
+                        Ok(evaluation) if !evaluation.curves.is_empty() => {
+                            contextual.push(WeaponModWeaponStats {
+                                weapon: weapon.clone(),
+                                changes: evaluation.changes,
+                                curves: evaluation.curves,
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => log::debug!(
+                            "Failed contextual weapon mod stats {definition} on {weapon}: {error:#}"
+                        ),
+                    }
+                }
+            }
+            self.weapon_mod_stats.insert(
+                item.display_tag,
+                WeaponModDetails {
+                    ratings,
+                    weapons: contextual,
+                },
+            );
+        }
     }
 
     fn reconcile_weapon_mod_models(&mut self, cache: &quicktag_scanner::TagCache) {
@@ -1518,6 +1618,9 @@ impl GearView {
                                 effects,
                             );
                         }
+                        if let Some(details) = self.weapon_mod_stats.get(&item.display_tag) {
+                            weapon_mod_stats_panel(ui, details);
+                        }
                     }
 
                     ui.add_space(12.0);
@@ -1586,6 +1689,113 @@ fn implant_details_table(ui: &mut egui::Ui, details: &ImplantDetails) {
                 }
             });
     }
+}
+
+fn weapon_mod_stats_panel(ui: &mut egui::Ui, details: &WeaponModDetails) {
+    ui.add_space(12.0);
+    ui.heading("Mod stats");
+    ui.separator();
+    if details.ratings.is_empty() {
+        ui.weak("No direct rating modifiers");
+    } else {
+        egui::Grid::new("weapon_mod_rating_grid")
+            .num_columns(2)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                for stat in &details.ratings {
+                    ui.label(&stat.name)
+                        .on_hover_text(format!("Authored rating ID {}", stat.rating_id));
+                    ui.strong(format!("{:+}", stat.value));
+                    ui.end_row();
+                }
+            });
+    }
+
+    if !details.weapons.is_empty() {
+        ui.add_space(8.0);
+        ui.strong("Weapon-specific changes");
+        for weapon in &details.weapons {
+            egui::CollapsingHeader::new(&weapon.weapon)
+                .default_open(details.weapons.len() == 1)
+                .show(ui, |ui| {
+                    egui::Grid::new(("weapon_mod_physical_grid", &weapon.weapon))
+                        .num_columns(2)
+                        .spacing([24.0, 6.0])
+                        .show(ui, |ui| {
+                            for change in &weapon.changes {
+                                ui.label(change.name);
+                                let source =
+                                    change.derived_from.map(str::to_owned).unwrap_or_else(|| {
+                                        format!(
+                                            "Rating {:.0} → {:.0} (ID {})",
+                                            change.base_rating,
+                                            change.modified_rating,
+                                            change.rating_id
+                                        )
+                                    });
+                                ui.strong(format_weapon_mod_change(change))
+                                    .on_hover_text(format!(
+                                        "{} → {}\n{source}",
+                                        format_display_float(change.before, false),
+                                        format_display_float(change.after, false)
+                                    ));
+                                ui.end_row();
+                            }
+                        });
+                    egui::CollapsingHeader::new("Package curve values").show(ui, |ui| {
+                        for curve in &weapon.curves {
+                            ui.label(format!(
+                                "Semantic {} / {} · rating {}: {} → {}",
+                                curve.semantic,
+                                curve.occurrence,
+                                curve.rating_id,
+                                format_display_float(curve.base_rating, false),
+                                format_display_float(curve.modified_rating, false)
+                            ));
+                            for (channel, (before, after)) in
+                                curve.before.iter().zip(&curve.after).enumerate()
+                            {
+                                if (after - before).abs() > 0.000001 {
+                                    ui.monospace(format!(
+                                        "Channel {channel}: {} → {} ({})",
+                                        format_display_float(*before, false),
+                                        format_display_float(*after, false),
+                                        format_display_float(after - before, true)
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                });
+        }
+    }
+}
+
+fn format_weapon_mod_change(change: &WeaponModStatChange) -> String {
+    let delta = change.delta();
+    match change.unit {
+        "rounds" => format!("{}", format_display_float(delta, true)),
+        "m" => format!("{} m", format_display_float(delta, true)),
+        "RPM" => format!("{} RPM", format_display_float(delta, true)),
+        "x" => format!("{}×", format_display_float(delta, true)),
+        "degrees" => format!("{}°", format_display_float(delta, true)),
+        "percentage points" => format!("{}%", format_display_float(delta, true)),
+        "s" => format!("{} s", format_display_float(delta, true)),
+        "" => format_display_float(delta, true),
+        unit => format!("{} {unit}", format_display_float(delta, true)),
+    }
+}
+
+fn format_display_float(value: f32, signed: bool) -> String {
+    let mut text = if signed {
+        format!("{value:+.3}")
+    } else {
+        format!("{value:.3}")
+    };
+    if text.contains('.') {
+        text = text.trim_end_matches('0').trim_end_matches('.').to_owned();
+    }
+    text
 }
 
 fn item_effect_panel(ui: &mut egui::Ui, heading: &str, effects: &[ItemEffect]) {
@@ -1846,9 +2056,9 @@ fn weapon_stats_table(ui: &mut egui::Ui, stats: &WeaponStats) {
     });
 }
 
-fn format_optional(value: Option<f32>, decimals: usize, suffix: &str) -> String {
+fn format_optional(value: Option<f32>, _decimals: usize, suffix: &str) -> String {
     value
-        .map(|value| format!("{value:.decimals$}{suffix}"))
+        .map(|value| format!("{}{suffix}", format_display_float(value, false)))
         .unwrap_or_else(|| "—".to_owned())
 }
 
@@ -5597,6 +5807,7 @@ mod tests {
         let view = GearView {
             items: vec![hidden, exported],
             weapon_stats: FxHashMap::default(),
+            weapon_mod_stats: FxHashMap::default(),
             implant_details,
             weapon_mod_effects: FxHashMap::default(),
             item_types: vec![],
@@ -9887,6 +10098,180 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Marathon packages; diagnostic catalog audit"]
+    fn audits_reported_missing_implant_rarities() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into());
+        let pm = Arc::new(
+            tiger_pkg::PackageManager::new(
+                packages,
+                GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+                None,
+            )
+            .unwrap(),
+        );
+        tiger_pkg::initialize_package_manager(&pm);
+        quicktag_core::classes::initialize_reference_names();
+        let language = LocalizedLanguage::Korean;
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap_for_language(language).unwrap());
+        let view = GearView::new_for_language(strings, language);
+        let names = [
+            "장거리 주자",
+            "타격 키트",
+            "은신 서보",
+            "첫 번째 법",
+            "열 배출구",
+            "오버드라이브",
+            "반응성 홀스터",
+            "살육 카트리지",
+            "생체 다리",
+            "개척자 키트",
+            "견고한 자세",
+            "기품 있는 착지",
+        ];
+        let en = quicktag_strings::localized::create_stringresolver_d2_for_language(
+            LocalizedLanguage::English,
+        )
+        .unwrap();
+        let en_strings = quicktag_strings::localized::create_stringmap().unwrap();
+        for item in view
+            .items
+            .iter()
+            .filter(|item| implant_slot(item) == Some("Leg"))
+        {
+            let data = pm.read_tag(item.display_tag).unwrap();
+            println!(
+                "LEG {} {} {:?} EN={:?} DEF={}",
+                item.display_tag,
+                item.name,
+                item.rarity,
+                localized_at(&data, 0xbc, 0xc0, &en_strings, &en),
+                item.definition_tag.unwrap()
+            );
+        }
+        let mut words = FxHashMap::default();
+        quicktag_strings::wordlist::load_wordlist(|word, hash| {
+            words.insert(hash, word.to_owned());
+        });
+        let registry = load_internal_category_registry(&words);
+        for (tag, _) in pm.get_all_by_reference(GEAR_DEFINITION_REFERENCE) {
+            let data = pm.read_tag(tag).unwrap();
+            let categories = extract_internal_categories(&data, &registry);
+            if categories.iter().any(|c| c == "item_type.implant.lower")
+                && !view.items.iter().any(|i| i.definition_tag == Some(tag))
+            {
+                println!("ORPHAN LEG DEF={tag} categories={categories:?}");
+            }
+        }
+        for name in names {
+            for item in view.items.iter().filter(|item| item.name.contains(name)) {
+                println!(
+                    "AUDIT {name}: display={} def={:?} rarity={:?} type={:?} slot={:?} internal={:?} categories={:?} stats={:?}",
+                    item.display_tag,
+                    item.definition_tag,
+                    item.rarity,
+                    item.item_type,
+                    item.subcategory,
+                    item.internal_name,
+                    item.internal_categories,
+                    view.implant_details
+                        .get(&item.display_tag)
+                        .map(|d| &d.stats)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the current local Marathon package installation"]
+    fn all_implant_stat_bindings_reach_gear() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into());
+        let pm = Arc::new(
+            tiger_pkg::PackageManager::new(
+                packages,
+                GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+                None,
+            )
+            .unwrap(),
+        );
+        tiger_pkg::initialize_package_manager(&pm);
+        quicktag_core::classes::initialize_reference_names();
+        let strings = Arc::new(
+            quicktag_strings::localized::create_stringmap_for_language(LocalizedLanguage::Korean)
+                .unwrap(),
+        );
+        let view = GearView::new_for_language(strings, LocalizedLanguage::Korean);
+        let decoder = quicktag_core::implant::ImplantStatResolver::load(&pm).unwrap();
+        let cases = [
+            ("교묘한 손재주", GearRarity::Superior),
+            ("교묘한 손재주", GearRarity::Prestige),
+            ("군중 제어", GearRarity::Superior),
+            ("군중 제어", GearRarity::Prestige),
+            ("닥터 킬조이", GearRarity::Superior),
+            ("닥터 킬조이", GearRarity::Prestige),
+            ("해로운 손길", GearRarity::Prestige),
+            ("광란 매트릭스", GearRarity::Deluxe),
+            ("은신 서보", GearRarity::Deluxe),
+            ("작별 선물", GearRarity::Enhanced),
+            ("작별 선물", GearRarity::Deluxe),
+        ];
+        for (name, rarity) in cases {
+            let item = view
+                .items
+                .iter()
+                .find(|i| i.name == name && i.rarity == Some(rarity) && implant_slot(i).is_some())
+                .unwrap();
+            let stats = &view.implant_details[&item.display_tag].stats;
+            assert!(!stats.is_empty(), "{name} {rarity:?}");
+            println!(
+                "FIXED {name} {rarity:?} {} {stats:?}",
+                item.definition_tag.unwrap()
+            );
+        }
+        let mut checked = 0;
+        for item in view.items.iter().filter(|i| implant_slot(i).is_some()) {
+            let Some(tag) = item.definition_tag else {
+                continue;
+            };
+            let data = pm.read_tag(tag).unwrap();
+            if !data
+                .chunks_exact(4)
+                .any(|b| b == 0x808092B2u32.to_le_bytes())
+            {
+                continue;
+            }
+            let decoded = decoder
+                .resolve(&data)
+                .unwrap_or_else(|e| panic!("{} {tag}: {e:#}", item.name));
+            let shown = view
+                .implant_details
+                .get(&item.display_tag)
+                .map(|d| {
+                    d.stats
+                        .iter()
+                        .map(|s| (s.raw_name_hash, s.value))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                shown,
+                decoded
+                    .stats
+                    .iter()
+                    .map(|s| (s.raw_name_hash, s.value))
+                    .collect::<Vec<_>>(),
+                "{} {tag}",
+                item.name
+            );
+            checked += 1;
+        }
+        println!("Verified {checked} implant definitions with stat components");
+        assert!(checked > 100);
+    }
+
+    #[test]
     #[ignore = "requires the current local Marathon package installation"]
     fn audits_current_marathon_gear_contract() {
         let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
@@ -10065,7 +10450,7 @@ mod tests {
                 .collect_vec();
             shell_combinations_by_package.insert(
                 package_id,
-                crate::geometry::runner_shell_combinations(&cache, &containers),
+                crate::geometry::runner_shell_assemblies(&cache, &containers),
             );
         }
         for skin in &catalog.runner_skins {
@@ -10081,7 +10466,7 @@ mod tests {
                     panic!("unassembled Vandal skin {} ({})", skin.name, skin.model_tag)
                 });
                 assert_eq!(
-                    combination.additional_parts.len(),
+                    combination.parts.len().saturating_sub(2),
                     1,
                     "Vandal must assemble body + face + hair: {} ({}) {combination:?}",
                     skin.name,
@@ -10093,7 +10478,7 @@ mod tests {
             assert!(
                 combinations
                     .iter()
-                    .all(|combination| combination.additional_parts.len() <= 1),
+                    .all(|combination| combination.parts.len().saturating_sub(2) <= 1),
                 "runner combination absorbed another skin"
             );
         }

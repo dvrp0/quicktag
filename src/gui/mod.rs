@@ -426,6 +426,7 @@ impl eframe::App for QuickTagApp {
             )
         {
             quicktag_core::classes::load_schemafile();
+            crate::geometry::invalidate_cached_models();
             info!("Reloaded schema file");
         }
 

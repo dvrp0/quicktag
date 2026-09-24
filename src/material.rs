@@ -485,8 +485,8 @@ fn compact_mask_palette(values: &[[f32; 4]]) -> Option<[[f32; 4]; 2]> {
 }
 
 fn texture_is_bc4(tag: TagHash) -> bool {
-    Texture::load_data_d2(tag, false)
-        .map(|(desc, _data, _comment)| format!("{:?}", desc.format).contains("Bc4"))
+    Texture::validated_descriptor_d2(tag)
+        .map(|desc| format!("{:?}", desc.format).contains("Bc4"))
         .unwrap_or(false)
 }
 

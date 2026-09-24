@@ -33,7 +33,7 @@ pub struct DecodedImplantStats {
 
 struct StatGroup {
     hash: u32,
-    levels: Vec<(u32, Vec<(u32, i32)>)>,
+    levels: Vec<Vec<(u32, i32)>>,
 }
 
 pub struct ImplantStatResolver {
@@ -86,17 +86,15 @@ impl ImplantStatResolver {
                 .groups
                 .get(usize::from(group_index))
                 .with_context(|| format!("unknown stat group {group_index}"))?;
-            let mut candidates = group
+            // Binding levels are one-based positions in the group's level array.
+            // Row +4 is not a unique key: shipped groups contain repeated values.
+            let index = level
+                .checked_sub(1)
+                .context("stat-group level must be positive")?;
+            let stats = group
                 .levels
-                .iter()
-                .filter(|(selector, _)| *selector == u32::from(level));
-            let (_, stats) = candidates
-                .next()
-                .with_context(|| format!("group {group_index} has no authored level {level}"))?;
-            ensure!(
-                candidates.next().is_none(),
-                "group {group_index} has ambiguous authored level {level}"
-            );
+                .get(usize::from(index))
+                .with_context(|| format!("group {group_index} has no level position {level}"))?;
             resolved_bindings.push(ImplantStatBinding {
                 group_index,
                 group_hash: group.hash,
@@ -156,12 +154,11 @@ fn parse_groups(data: &[u8]) -> Result<Vec<StatGroup>> {
         .map(|row| {
             let mut levels = vec![];
             for level_row in table_range(data, row + 8, 0x70, 0x8080_9159)?.step_by(0x70) {
-                let level = read_u32(data, level_row + 4)?;
                 let stats = table_range(data, level_row + 0x50, 8, 0x8080_679D)?
                     .step_by(8)
                     .map(|offset| Ok((read_u32(data, offset)?, read_u32(data, offset + 4)? as i32)))
                     .collect::<Result<Vec<_>>>()?;
-                levels.push((level, stats));
+                levels.push(stats);
             }
             Ok(StatGroup {
                 hash: read_u32(data, row)?,
@@ -248,7 +245,7 @@ mod tests {
     use tiger_pkg::{GameVersion, MarathonVersion};
 
     #[test]
-    fn selects_authored_level_not_position_and_rejects_ambiguity() {
+    fn selects_one_based_level_position_and_rejects_out_of_range() {
         let mut bytes = vec![0u8; 0x50];
         bytes[0..4].copy_from_slice(&BINDING_COMPONENT.to_le_bytes());
         bytes[0xC..0x14].copy_from_slice(&1u64.to_le_bytes());
@@ -256,22 +253,22 @@ mod tests {
         bytes[0x1C..0x20].copy_from_slice(&ARRAY.to_le_bytes());
         bytes[0x20..0x28].copy_from_slice(&1u64.to_le_bytes());
         bytes[0x28..0x2C].copy_from_slice(&0x8080_92B4u32.to_le_bytes());
-        bytes[0x32..0x34].copy_from_slice(&4u16.to_le_bytes());
-        let mut resolver = ImplantStatResolver {
+        bytes[0x32..0x34].copy_from_slice(&2u16.to_le_bytes());
+        let resolver = ImplantStatResolver {
             group_table: TagHash(0),
             semantic_table: TagHash(0),
             groups: vec![StatGroup {
                 hash: 123,
-                levels: vec![(4, vec![(5, -10)]), (1, vec![(5, 20)])],
+                levels: vec![vec![(5, 20)], vec![(5, -10)]],
             }],
             semantics: BTreeMap::from([(5, 0x0CD9_B0AC)]),
         };
         let result = resolver.resolve(&bytes).unwrap();
-        assert_eq!(result.bindings[0].level, 4);
+        assert_eq!(result.bindings[0].level, 2);
         assert_eq!(result.stats[0].value, -10);
-        resolver.groups[0].levels.push((4, vec![]));
+        bytes[0x32..0x34].copy_from_slice(&0u16.to_le_bytes());
         assert!(resolver.resolve(&bytes).is_err());
-        bytes[0x32..0x34].copy_from_slice(&2u16.to_le_bytes());
+        bytes[0x32..0x34].copy_from_slice(&3u16.to_le_bytes());
         assert!(resolver.resolve(&bytes).is_err());
     }
 
@@ -301,6 +298,59 @@ mod tests {
         assert_eq!(table_range(&bytes, 8, 8, 0x8080_679D).unwrap(), 0x30..0x38);
         assert!(table_range(&bytes[..0x37], 8, 8, 0x8080_679D).is_err());
         assert!(table_range(&bytes, 8, 8, 0x8080_9159).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires MARATHON_PACKAGES pointing to installed packages"]
+    fn repeated_row_metadata_does_not_hide_authored_stats() -> Result<()> {
+        let pm = PackageManager::new(
+            std::env::var("MARATHON_PACKAGES")?,
+            GameVersion::Marathon(MarathonVersion::Marathon),
+            None,
+        )?;
+        let resolver = ImplantStatResolver::load(&pm)?;
+        for (tag, value) in [
+            (0x80B6F162, 15),
+            (0x80B6F189, 15),
+            (0x80B6F159, 10),
+            (0x80B6F15A, 15),
+        ] {
+            let decoded = resolver.resolve(&pm.read_tag(TagHash(tag))?)?;
+            assert_eq!(
+                decoded
+                    .stats
+                    .iter()
+                    .map(|s| (s.semantic_id, s.value))
+                    .collect::<Vec<_>>(),
+                vec![(48, value), (3, value), (71, value)],
+                "{tag:08X}"
+            );
+        }
+        for tag in [0x80B6F1C1, 0x80B6F1BA, 0x80B6F1ED] {
+            let decoded = resolver.resolve(&pm.read_tag(TagHash(tag))?)?;
+            assert_eq!(
+                decoded
+                    .stats
+                    .iter()
+                    .map(|s| (s.semantic_id, s.value))
+                    .collect::<Vec<_>>(),
+                vec![(69, 15), (63, 40), (54, 20)],
+                "{tag:08X}"
+            );
+        }
+        for tag in [0x80B6F1C2, 0x80B6F1BB, 0x80B6F1EE, 0x80B6F20D] {
+            let decoded = resolver.resolve(&pm.read_tag(TagHash(tag))?)?;
+            assert_eq!(
+                decoded
+                    .stats
+                    .iter()
+                    .map(|s| (s.semantic_id, s.value))
+                    .collect::<Vec<_>>(),
+                vec![(69, 20), (63, 50), (54, 25)],
+                "{tag:08X}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

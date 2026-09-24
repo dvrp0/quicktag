@@ -4,6 +4,7 @@ mod dxgi;
 mod headers_pc;
 mod headers_ps;
 mod headers_xbox;
+mod metadata;
 mod swizzle;
 pub use capture::capture_texture;
 
@@ -25,7 +26,7 @@ use tiger_pkg::version::EngineVersion;
 use tiger_pkg::{DestinyVersion, MarathonVersion, package_manager};
 use tiger_pkg::{GameVersion, TagHash, package::PackagePlatform};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TextureHeaderGeneric {
     pub data_size: u32,
     pub format: wgpu::TextureFormat,
@@ -250,6 +251,11 @@ impl Texture {
             format: Some(linear_texture_format(self.desc.format)),
             ..Default::default()
         })
+    }
+
+    /// Reuse a successfully validated D2/Marathon descriptor without retaining pixels.
+    pub(crate) fn validated_descriptor_d2(hash: TagHash) -> anyhow::Result<TextureHeaderGeneric> {
+        metadata::descriptor(hash)
     }
 
     pub fn load_data_d2(

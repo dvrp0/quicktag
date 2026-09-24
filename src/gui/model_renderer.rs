@@ -223,6 +223,11 @@ pub(crate) struct GpuModelPreview {
 }
 
 impl GpuModelPreview {
+    #[cfg(test)]
+    pub(crate) fn vertex_input_bytes(&self) -> Vec<u8> {
+        bytemuck::cast_slice(&self.vertices).to_vec()
+    }
+
     pub(crate) fn inspection_lines(&self) -> Vec<String> {
         self.draws
             .iter()
@@ -766,11 +771,11 @@ pub(crate) struct ModelEnvironment {
     pub tone_mapping: bool,
     pub ambient_intensity: f32,
     pub specular_ibl_intensity: f32,
-    /// World-space point toward which the spotlight beam faces.
+    /// Beam target in rig units when scaling is enabled, otherwise model units.
     pub light_target: [f32; 3],
     /// Unit world-space offset locating the light source on its orbit sphere.
     pub light_orbit_position: [f32; 3],
-    /// World-space center of the light source's orbit sphere.
+    /// Orbit center in rig units when scaling is enabled, otherwise model units.
     pub light_orbit_center: [f32; 3],
     pub light_orbit_radius: f32,
     /// Maximum distance at which the spotlight contributes direct light.
@@ -778,6 +783,10 @@ pub(crate) struct ModelEnvironment {
     /// Spotlight half-angle in degrees, measured from the beam axis.
     pub light_cone_angle: f32,
     pub light_size: f32,
+    /// Express rig distances relative to the base model's largest extent.
+    pub light_scale_with_model: bool,
+    /// Base weapon with default mods, captured independently of equipped mods.
+    pub light_model_frame: Option<ModelCameraFrame>,
     pub light_gizmo: bool,
     pub shadow_strength: f32,
     /// Normalized PCF radius: 0.0 is hard, 1.0 is the widest penumbra.
@@ -830,8 +839,8 @@ impl Default for ModelEnvironment {
             fxaa: true,
             ssao_strength: 10.0,
             tone_mapping: true,
-            ambient_intensity: 0.2,
-            specular_ibl_intensity: 0.3,
+            ambient_intensity: 0.3,
+            specular_ibl_intensity: 0.2,
             // The default source faces the world origin, preserving the
             // historical key-light orientation while using finite lighting.
             light_target: [-0.183, 0.017, -0.483],
@@ -841,13 +850,15 @@ impl Default for ModelEnvironment {
             light_range: 4.0,
             light_cone_angle: 70.0,
             light_size: 5.0,
+            light_scale_with_model: true,
+            light_model_frame: None,
             light_gizmo: false,
             shadow_strength: 1.0,
             shadow_softness: 0.5,
-            brightness: 1.3,
-            contrast: 1.0,
+            brightness: 1.4,
+            contrast: 1.01,
             saturation: 1.2,
-            gamma: 0.76,
+            gamma: 0.85,
             diagnostic_pass: 0,
         }
     }
@@ -1091,6 +1102,40 @@ pub(crate) struct ModelPaintCallback {
 pub(crate) struct ModelCameraFrame {
     pub(crate) center: [f32; 3],
     pub(crate) radius: f32,
+}
+
+/// Converts lighting controls to model coordinates independently of camera fit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelLightTransform {
+    pub(crate) center: [f32; 3],
+    pub(crate) scale: f32,
+}
+
+impl ModelLightTransform {
+    pub(crate) fn new(environment: &ModelEnvironment, wireframe: &WireframePreview) -> Self {
+        if environment.light_scale_with_model {
+            let frame = environment
+                .light_model_frame
+                .unwrap_or_else(|| ModelCameraFrame::from_wireframe(wireframe));
+            Self {
+                center: frame.center,
+                scale: frame.radius,
+            }
+        } else {
+            Self {
+                center: [0.0; 3],
+                scale: 1.0,
+            }
+        }
+    }
+
+    pub(crate) fn to_model(self, point: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|axis| self.center[axis] + point[axis] * self.scale)
+    }
+
+    pub(crate) fn to_rig(self, point: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|axis| (point[axis] - self.center[axis]) / self.scale)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1539,7 +1584,8 @@ impl ModelPaintCallback {
         ));
         let effective_shadow_softness =
             light_shadow_softness(environment.light_size, environment.shadow_softness);
-        let light_position_world = light_source_position(&environment);
+        let light_transform = ModelLightTransform::new(&environment, wireframe);
+        let light_position_world = light_transform.to_model(light_source_position(&environment));
         let light_position_view = model_direction_to_view(
             std::array::from_fn(|axis| light_position_world[axis] - center[axis]),
             yaw,
@@ -1572,7 +1618,7 @@ impl ModelPaintCallback {
                 light_direction,
                 light_parameters: [
                     environment.light_size.clamp(0.0, 10.0),
-                    environment.light_range.max(0.05),
+                    environment.light_range.max(0.05) * light_transform.scale,
                     outer_cone_cosine,
                     inner_cone_cosine,
                 ],
@@ -1580,7 +1626,7 @@ impl ModelPaintCallback {
                     light_position_view[0],
                     light_position_view[1],
                     light_position_view[2],
-                    1.0,
+                    light_transform.scale,
                 ],
                 postprocess0: [
                     exposure,
@@ -1651,11 +1697,20 @@ impl ModelPaintCallback {
     }
 
     pub(crate) fn export_png(
-        mut self,
+        self,
         render_state: &eframe::egui_wgpu::RenderState,
         path: &Path,
         output_size: [u32; 2],
     ) -> anyhow::Result<()> {
+        std::fs::write(path, self.export_png_bytes(render_state, output_size)?)?;
+        Ok(())
+    }
+
+    pub(crate) fn export_png_bytes(
+        mut self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        output_size: [u32; 2],
+    ) -> anyhow::Result<Vec<u8>> {
         const FRAME_FILL: f32 = 0.88;
         anyhow::ensure!(
             output_size.into_iter().all(|dimension| dimension > 0),
@@ -1802,10 +1857,11 @@ impl ModelPaintCallback {
         }
         drop(mapped);
         readback.unmap();
-        image::RgbaImage::from_raw(size[0], size[1], pixels)
-            .ok_or_else(|| anyhow::anyhow!("invalid PNG readback dimensions"))?
-            .save(path)?;
-        Ok(())
+        let image = image::RgbaImage::from_raw(size[0], size[1], pixels)
+            .ok_or_else(|| anyhow::anyhow!("invalid PNG readback dimensions"))?;
+        let mut output = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut output, image::ImageFormat::Png)?;
+        Ok(output.into_inner())
     }
 
     fn fit_export_camera(&mut self, frame_fill: f32) {
@@ -1823,6 +1879,15 @@ impl ModelPaintCallback {
     }
 
     fn apply_export_camera(&mut self, camera: ModelExportCamera) {
+        // Reframing must not move the world-space lighting rig.
+        let offset = model_direction_to_view(
+            std::array::from_fn(|axis| self.scene.center[axis] - camera.frame.center[axis]),
+            self.scene.params0[1],
+            self.scene.params0[2],
+        );
+        for (position, offset) in self.scene.light_position[..3].iter_mut().zip(offset) {
+            *position += offset;
+        }
         let shadow_radius = shadow_bounding_radius(
             &self.preview.vertices,
             camera.frame.center,
@@ -5770,11 +5835,11 @@ fn light_clip(position: vec3<f32>) -> vec4<f32> {
     let light_depth = dot(source_to_surface, light_axis);
     let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
     let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
-    let near_plane = 0.05;
-    let range = max(scene.light_parameters.y, near_plane + 0.01);
-    let depth_scale = range / max(range - near_plane, 0.01);
+    let near_plane = 0.05 * scene.light_position.w;
+    let range = max(scene.light_parameters.y, near_plane + 0.01 * scene.light_position.w);
+    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
     let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
-    let perspective_denominator = max(light_depth * tangent, 0.0001);
+    let perspective_denominator = max(light_depth * tangent, 0.0001 * scene.light_position.w);
     return vec4<f32>(
         dot(source_to_surface, right) / perspective_denominator,
         dot(source_to_surface, vertical) / perspective_denominator,
@@ -5787,16 +5852,17 @@ fn spotlight_factor_world(position: vec3<f32>) -> f32 {
     let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
     let source_to_surface = position - light_position;
     let distance = length(source_to_surface);
-    let source_to_surface_direction = source_to_surface / max(distance, 0.0001);
+    let source_to_surface_direction = source_to_surface / max(distance, 0.0001 * scene.light_position.w);
     let beam_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
     let cone = smoothstep(
         scene.light_parameters.z,
         scene.light_parameters.w,
         dot(source_to_surface_direction, beam_axis),
     );
-    let range = max(scene.light_parameters.y, 0.05);
+    let range = max(scene.light_parameters.y, 0.05 * scene.light_position.w);
     let range_fade = 1.0 - smoothstep(range * 0.70, range, distance);
-    let distance_falloff = 1.0 / max(1.0, distance * distance);
+    let rig_distance = distance / scene.light_position.w;
+    let distance_falloff = 1.0 / max(1.0, rig_distance * rig_distance);
     return cone * range_fade * distance_falloff;
 }
 
@@ -6174,9 +6240,9 @@ fn light_clip(position: vec3<f32>) -> vec4<f32> {
     let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
     // Keep light projection homogeneous. Rasterizer performs perspective
     // divide, preserving correct depth interpolation in shadow map.
-    let near_plane = 0.05;
-    let range = max(scene.light_parameters.y, near_plane + 0.01);
-    let depth_scale = range / max(range - near_plane, 0.01);
+    let near_plane = 0.05 * scene.light_position.w;
+    let range = max(scene.light_parameters.y, near_plane + 0.01 * scene.light_position.w);
+    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
     let perspective_denominator = light_depth * tangent;
     let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
     return vec4<f32>(
@@ -6421,9 +6487,9 @@ fn light_clip(position: vec3<f32>) -> vec4<f32> {
     let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
     // Keep light projection homogeneous so rasterizer performs perspective
     // divide and depth interpolation remains correct for finite spotlight.
-    let near_plane = 0.05;
-    let range = max(scene.light_parameters.y, near_plane + 0.01);
-    let depth_scale = range / max(range - near_plane, 0.01);
+    let near_plane = 0.05 * scene.light_position.w;
+    let range = max(scene.light_parameters.y, near_plane + 0.01 * scene.light_position.w);
+    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
     let perspective_denominator = light_depth * tangent;
     let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
     return vec4<f32>(
@@ -8788,18 +8854,19 @@ fn character_palette_procedural_mask(
 fn spotlight_factor(position: vec3<f32>) -> f32 {
     let source_to_surface = position - scene.light_position.xyz;
     let distance = length(source_to_surface);
-    let source_to_surface_direction = source_to_surface / max(distance, 0.0001);
+    let source_to_surface_direction = source_to_surface / max(distance, 0.0001 * scene.light_position.w);
     let beam_axis = normalize(-scene.light_direction.xyz);
     let cone = smoothstep(
         scene.light_parameters.z,
         scene.light_parameters.w,
         dot(source_to_surface_direction, beam_axis),
     );
-    let range = max(scene.light_parameters.y, 0.05);
+    let range = max(scene.light_parameters.y, 0.05 * scene.light_position.w);
     let range_fade = 1.0 - smoothstep(range * 0.70, range, distance);
     // Clamp the near-field denominator so the configured source does not
     // explode when a model surface crosses the light origin.
-    let distance_falloff = 1.0 / max(1.0, distance * distance);
+    let rig_distance = distance / scene.light_position.w;
+    let distance_falloff = 1.0 / max(1.0, rig_distance * rig_distance);
     return cone * range_fade * distance_falloff;
 }
 
@@ -10081,6 +10148,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
 #[cfg(test)]
+#[path = "model_lighting_tests.rs"]
+mod lighting_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         BLOOM_SHADER, GpuModelPreview, LIGHTING_SHADER, LightingModel, MAX_MODEL_TARGET_PIXELS,
@@ -10098,7 +10169,7 @@ mod tests {
     };
     use crate::{
         geometry::{
-            GearDyeMaterial, GeometryPreviewKind, GeometryTagPreview, RunnerShellCombination,
+            GearDyeMaterial, GeometryPreviewKind, GeometryTagPreview, RunnerShellAssembly,
             WeaponModPreviewAttachment, WeaponModRarity, WireframeMaterialRange,
             WireframeMaterialTextures, WireframePreview,
         },
@@ -10116,6 +10187,7 @@ mod tests {
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
+        time::Instant,
     };
     use tiger_pkg::{GameVersion, MarathonVersion, PackageManager, TagHash, package_manager};
 
@@ -10361,11 +10433,11 @@ mod tests {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.02_f64);
 
-        let mut channel_deltas = Vec::with_capacity((image.width() * image.height() * 3) as usize);
+        let mut channel_deltas = Vec::with_capacity((image.width() * image.height() * 4) as usize);
         let mut changed_pixels = 0_u64;
         for (actual, expected) in image.pixels().zip(baseline.pixels()) {
             let mut changed = false;
-            for channel in 0..3 {
+            for channel in 0..4 {
                 let delta = actual[channel].abs_diff(expected[channel]);
                 channel_deltas.push(delta);
                 changed |= delta > changed_pixel_threshold;
@@ -10403,6 +10475,9 @@ mod tests {
             baseline_path.display(),
             changed_pixel_fraction * 100.0,
         );
+        if std::env::var_os("QUICKTAG_PROBE_EXACT_RGBA").is_some() {
+            assert_exact_rgba(image, &baseline);
+        }
         assert!(
             mean_absolute_error <= max_mae
                 && p99_channel_delta <= max_p99
@@ -10411,6 +10486,35 @@ mod tests {
             baseline_path.display(),
             report_path.display(),
         );
+    }
+
+    fn assert_exact_rgba(actual: &image::RgbaImage, expected: &image::RgbaImage) {
+        assert_eq!(
+            actual.dimensions(),
+            expected.dimensions(),
+            "RGBA dimensions changed"
+        );
+        let first = actual
+            .as_raw()
+            .iter()
+            .zip(expected.as_raw())
+            .enumerate()
+            .find(|(_, (actual, expected))| actual != expected);
+        assert!(
+            first.is_none(),
+            "RGBA output changed: first differing byte {first:?}"
+        );
+    }
+
+    #[test]
+    fn exact_rgba_gate_rejects_single_channel_and_alpha_changes() {
+        let baseline = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 4]));
+        assert_exact_rgba(&baseline, &baseline);
+        for channel in 0..4 {
+            let mut changed = baseline.clone();
+            changed.get_pixel_mut(1, 1)[channel] += 1;
+            assert!(std::panic::catch_unwind(|| assert_exact_rgba(&changed, &baseline)).is_err());
+        }
     }
 
     #[test]
@@ -11621,6 +11725,14 @@ mod tests {
                 -24.0_f32.to_radians(),
             ),
             (
+                "performance-80b7ce0a",
+                TagHash(0x80B7CE0A),
+                TagHash(0x80B7CE0A),
+                vec![],
+                vec![],
+                -24.0_f32.to_radians(),
+            ),
+            (
                 "dont-let-up-brrt-darksight-precision-yaw-left",
                 TagHash(0x80AA0CA3),
                 TagHash(0x80A7D43D),
@@ -12246,171 +12358,140 @@ mod tests {
                 })
                 .collect_vec();
             let combined_runner = match name {
-                "runner-destroyer-emerald-impact-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9F542),
-                    body: TagHash(0x80A9F5AD),
-                    additional_parts: vec![TagHash(0x80A9F541)],
-                }),
-                "runner-arata-vectus-assassin-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80B14135),
-                    body: TagHash(0x80B140CE),
-                    additional_parts: vec![],
-                }),
-                "runner-neo-cortex-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9D5DE),
-                    body: TagHash(0x80A9D5DF),
-                    additional_parts: vec![TagHash(0x80A9D693)],
-                }),
-                "runner-destroyer-base-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80AA055F),
-                    body: TagHash(0x80AA053A),
-                    additional_parts: vec![],
-                }),
-                "runner-full9-layered-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9C3D2),
-                    body: TagHash(0x80A9C387),
-                    additional_parts: vec![],
-                }),
-                "runner-switched-layered-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9CEB9),
-                    body: TagHash(0x80A9CD5E),
-                    additional_parts: vec![TagHash(0x80A9CE0C)],
-                }),
-                "runner-full10-layered-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80B146C9),
-                    body: TagHash(0x80B14666),
-                    additional_parts: vec![TagHash(0x80B14700)],
-                }),
-                "runner-package394-full13-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80B14302),
-                    body: TagHash(0x80B14303),
-                    additional_parts: vec![TagHash(0x80B143A9)],
-                }),
-                "runner-package394-full10-agrb-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80B1440A),
-                    body: TagHash(0x80B143C3),
-                    additional_parts: vec![TagHash(0x80B1459B)],
-                }),
-                "runner-package394-full10-gbr-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80B144C1),
-                    body: TagHash(0x80B14470),
-                    additional_parts: vec![],
-                }),
-                "runner-alpha-occlusion-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9C426),
-                    body: TagHash(0x80A9C2C4),
-                    additional_parts: vec![TagHash(0x80A9C366)],
-                }),
-                "runner-c96f-response-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9CADF),
-                    body: TagHash(0x80A9CA45),
-                    additional_parts: vec![TagHash(0x80A9CB46)],
-                }),
-                "runner-d3fc-procedural-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9D4FE),
-                    body: TagHash(0x80A9D46D),
-                    additional_parts: vec![TagHash(0x80A9D530)],
-                }),
-                "runner-e4db-condition-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9E5B4),
-                    body: TagHash(0x80A9E522),
-                    additional_parts: vec![TagHash(0x80A9E56D)],
-                }),
-                "runner-full9-procedural-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9CBCD),
-                    body: TagHash(0x80A9CB76),
-                    additional_parts: vec![],
-                }),
-                "runner-full9-local-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9DA07),
-                    body: TagHash(0x80A9D9C1),
-                    additional_parts: vec![TagHash(0x80A9D9EC)],
-                }),
-                "runner-full9-local-expanded-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9D7BC),
-                    body: TagHash(0x80A9D77B),
-                    additional_parts: vec![TagHash(0x80A9D7DE)],
-                }),
-                "runner-full8-procedural-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9AF87),
-                    body: TagHash(0x80A9AF3C),
-                    additional_parts: vec![],
-                }),
-                "runner-full10-local-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9DCC2),
-                    body: TagHash(0x80A9DC79),
-                    additional_parts: vec![],
-                }),
-                "runner-full11-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9E1D1),
-                    body: TagHash(0x80A9E17E),
-                    additional_parts: vec![TagHash(0x80A9E1F4)],
-                }),
-                "runner-a8cf-full11-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9A966),
-                    body: TagHash(0x80A9A915),
-                    additional_parts: vec![TagHash(0x80A9A997)],
-                }),
-                "runner-selector-agrb-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9C317),
-                    body: TagHash(0x80A9C2C8),
-                    additional_parts: vec![],
-                }),
-                "runner-selector-local-agrb-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9AEC4),
-                    body: TagHash(0x80A9AE71),
-                    additional_parts: vec![],
-                }),
-                "runner-selector-gbr-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9DB54),
-                    body: TagHash(0x80A9DB07),
-                    additional_parts: vec![],
-                }),
-                "runner-selector-agrb-sibling-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9DEFE),
-                    body: TagHash(0x80A9DEA9),
-                    additional_parts: vec![],
-                }),
-                "runner-selector-aa0261-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80B15E20),
-                    body: TagHash(0x80B15E21),
-                    additional_parts: vec![TagHash(0x80B15E58)],
-                }),
-                "runner-selector-aa0263-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80B15D83),
-                    body: TagHash(0x80B15D84),
-                    additional_parts: vec![TagHash(0x80B15DBB)],
-                }),
-                "runner-selector-b86a-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9BA03),
-                    body: TagHash(0x80A9B9B8),
-                    additional_parts: vec![TagHash(0x80A9B9E8)],
-                }),
-                "runner-selector-d952-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9D2B5),
-                    body: TagHash(0x80A9D230),
-                    additional_parts: vec![TagHash(0x80A9D279)],
-                }),
-                "runner-full10-b610-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9B6F6),
-                    body: TagHash(0x80A9B695),
-                    additional_parts: vec![],
-                }),
-                "runner-dual-r-bd17-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9BE19),
-                    body: TagHash(0x80A9BDA1),
-                    additional_parts: vec![TagHash(0x80A9BDCC)],
-                }),
-                "runner-vandal-cryo-shift-combined" => Some(RunnerShellCombination {
-                    head: TagHash(0x80A9E76B),
-                    body: TagHash(0x80A9E6F9),
-                    additional_parts: vec![TagHash(0x80A9E730)],
-                }),
+                "runner-destroyer-emerald-impact-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9F543))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-arata-vectus-assassin-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80B140CE))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-neo-cortex-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9D5DF))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-destroyer-base-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80AA053A))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full9-layered-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9C387))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-switched-layered-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9CD5E))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full10-layered-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80B14666))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-package394-full13-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80B14303))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-package394-full10-agrb-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80B143C3))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-package394-full10-gbr-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80B14470))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-alpha-occlusion-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9C2C4))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-c96f-response-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9CA45))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-d3fc-procedural-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9D46D))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-e4db-condition-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9E522))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full9-procedural-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9CB76))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full9-local-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9D9C1))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full9-local-expanded-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9D77B))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full8-procedural-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9AF3C))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full10-local-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9DC79))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full11-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9E17E))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-a8cf-full11-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9A915))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-agrb-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9C2C8))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-local-agrb-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9AE71))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-gbr-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9DB07))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-agrb-sibling-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9DEA9))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-aa0261-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80B15E21))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-aa0263-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80B15D84))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-b86a-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9B9B8))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-selector-d952-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9D230))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-full10-b610-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9B695))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-dual-r-bd17-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9BDA1))
+                        .expect("authored shell Pattern"),
+                ),
+                "runner-vandal-cryo-shift-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, TagHash(0x80A9E6F9))
+                        .expect("authored shell Pattern"),
+                ),
                 _ => None,
             };
             let runner_selection = combined_runner.clone();
+            let preview_started = Instant::now();
             let preview = if let Some(combination) = combined_runner {
-                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
+                combination.load(cache.clone())
             } else {
                 GeometryTagPreview::load_model_with_weapon_mod_attachments(
                     cache.clone(),
@@ -12422,6 +12503,50 @@ mod tests {
                 )
             }
             .expect("model preview");
+            eprintln!(
+                "{name} preview_load_ms={:.3}",
+                preview_started.elapsed().as_secs_f64() * 1000.0
+            );
+            if std::env::var_os("QUICKTAG_PROBE_CHECK_CACHE").is_some() {
+                let load = || {
+                    if let Some(combination) = &runner_selection {
+                        combination.load(cache.clone())
+                    } else {
+                        GeometryTagPreview::load_model_with_weapon_mod_attachments(
+                            cache.clone(),
+                            weapon,
+                            &entry,
+                            weapon,
+                            weapon_socket,
+                            &attachments,
+                        )
+                    }
+                    .expect("repeated model preview")
+                };
+                let expected = format!("{preview:?}");
+                for iteration in 0..3 {
+                    let started = Instant::now();
+                    let warm = load();
+                    eprintln!(
+                        "{name} warm_load_{iteration}_ms={:.3}",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                    assert!(
+                        format!("{warm:?}") == expected,
+                        "cached model inputs changed"
+                    );
+                }
+                let started = Instant::now();
+                let uncached = crate::asset_cache::without_asset_cache(load);
+                eprintln!(
+                    "{name} uncached_load_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                assert!(
+                    format!("{uncached:?}") == expected,
+                    "cached/uncached model inputs differ"
+                );
+            }
             let GeometryPreviewKind::Model(model) = preview.kind else {
                 panic!("weapon preview must be model");
             };
@@ -12949,6 +13074,12 @@ mod tests {
                     ..ModelEnvironment::default()
                 }
             };
+            // Historical captures explicitly exercise the fixed-distance rig.
+            // Adaptive lighting probes opt in and use the current UI defaults.
+            verification_environment.light_scale_with_model =
+                std::env::var("QUICKTAG_PROBE_SCALE_LIGHTING")
+                    .ok()
+                    .is_some_and(|value| value == "1");
             if let Ok(value) = std::env::var("QUICKTAG_PROBE_TONEMAP") {
                 verification_environment.tone_mapping = value
                     .parse::<u8>()
@@ -13082,10 +13213,12 @@ mod tests {
                 let selection = runner_selection
                     .as_ref()
                     .expect("Cryo Shift case must use combined runner loader");
-                assert_eq!(selection.head, TagHash(0x80A9E76B));
-                assert_eq!(selection.body, TagHash(0x80A9E6F9));
-                assert_eq!(selection.additional_parts, vec![TagHash(0x80A9E730)]);
-                for tag in std::iter::once(selection.head).chain(selection.submeshes()) {
+                assert!(selection.nested_patterns.contains(&TagHash(0x80A9E76B)));
+                assert_eq!(selection.pattern, TagHash(0x80A9E6F9));
+                assert!(selection.nested_patterns.contains(&TagHash(0x80A9E730)));
+                for tag in std::iter::once(selection.pattern)
+                    .chain(selection.nested_patterns.iter().copied())
+                {
                     assert!(
                         package_manager().get_entry(tag).is_some(),
                         "Cryo Shift loader lost source tag {tag}"
@@ -13527,10 +13660,10 @@ mod tests {
                     "capture_kind": "runner_skin_diagnostic",
                     "case": name,
                     "asset": "80A9E76B",
-                    "loader": "GeometryTagPreview::load_combined_runner_shell",
+                    "loader": "RunnerShellAssembly::load",
                     "selection": {
-                        "root": selection.head.to_string(),
-                        "submeshes": selection.submeshes().map(|tag| tag.to_string()).collect::<Vec<_>>(),
+                        "root": selection.pattern.to_string(),
+                        "submeshes": selection.parts.iter().map(|part| part.component.to_string()).collect::<Vec<_>>(),
                         "selected_geometry_parts": model.geometry_parts.iter().map(ToString::to_string).collect::<Vec<_>>(),
                         "geometry_part_count": model.geometry_parts.len(),
                         "parent_components": [
@@ -14683,6 +14816,10 @@ mod tests {
             }
             renders.push((name, image));
         }
+        assert!(
+            !renders.is_empty(),
+            "no render matched QUICKTAG_MODEL_PROBE_CASE"
+        );
         let rarity_render = |rarity: &str| {
             renders
                 .iter()

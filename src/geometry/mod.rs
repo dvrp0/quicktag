@@ -1,3 +1,14 @@
+mod cache;
+mod runner;
+pub use runner::RunnerShellAssembly;
+#[cfg(test)]
+pub use runner::runner_shell_assemblies;
+
+/// Schema names participate in technique classification during model decoding.
+pub(crate) fn invalidate_cached_models() {
+    cache::invalidate();
+}
+
 use anyhow::{Context, bail};
 use binrw::Endian;
 use itertools::Itertools;
@@ -111,23 +122,6 @@ pub enum ModelTagRole {
 pub struct ModelTagInfo {
     pub role: ModelTagRole,
     pub label: &'static str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunnerShellCombination {
-    pub head: TagHash,
-    pub body: TagHash,
-    pub additional_parts: Vec<TagHash>,
-}
-
-impl RunnerShellCombination {
-    pub fn submeshes(&self) -> impl Iterator<Item = TagHash> + '_ {
-        std::iter::once(self.body).chain(self.additional_parts.iter().copied())
-    }
-
-    pub fn contains(&self, tag: TagHash) -> bool {
-        self.head == tag || self.submeshes().any(|part| part == tag)
-    }
 }
 
 impl ModelTagInfo {
@@ -862,69 +856,6 @@ impl GeometryTagPreview {
             weapon_owner,
             &attachments,
         )
-    }
-
-    pub fn load_combined_runner_shell(
-        cache: Arc<TagCache>,
-        combination: &RunnerShellCombination,
-    ) -> Option<Self> {
-        let entry = package_manager().get_entry(combination.head)?;
-        let mut model_tags = selected_model_geometry_tags(
-            &cache,
-            combination.body,
-            package_manager().get_entry(combination.body)?.reference,
-        );
-        for container in combination
-            .submeshes()
-            .chain(std::iter::once(combination.head))
-        {
-            let entry = package_manager().get_entry(container)?;
-            model_tags.extend(selected_model_geometry_tags(
-                &cache,
-                container,
-                entry.reference,
-            ));
-        }
-        model_tags = model_tags.into_iter().unique().collect();
-        let mut model = load_model_preview_from_tags(
-            cache.clone(),
-            combination.head,
-            &entry,
-            "Combined runner shell",
-            model_tags,
-            &[],
-        );
-        if let Some(palette) = runner_shell_gear_dye_palette(&cache, combination) {
-            if let Some(wireframe) = &mut model.wireframe {
-                for range in &mut wireframe.material_ranges {
-                    let Some(technique) = range.technique else {
-                        continue;
-                    };
-                    let default = technique_default_gear_dye_color(technique).or_else(|| {
-                        range
-                            .textures
-                            .character_surface
-                            .is_some()
-                            .then_some([1.0; 4])
-                    });
-                    let Some(default) = default else {
-                        continue;
-                    };
-                    let Some(dye) = range
-                        .gear_dye_change_color_index
-                        .and_then(|index| palette.get(index as usize).copied())
-                    else {
-                        continue;
-                    };
-                    range.textures.gear_dye_palette = Some(palette);
-                    range.textures.gear_dye = Some(dye);
-                    range.textures.gear_dye_default = Some(default);
-                }
-            }
-        }
-        Some(Self {
-            kind: GeometryPreviewKind::Model(model),
-        })
     }
 
     pub fn load_model_with_weapon_mod_attachments(
@@ -2338,10 +2269,9 @@ pub fn model_label_for_reference(reference: u32) -> Option<&'static str> {
 }
 
 pub fn is_model_catalog_reference(reference: u32) -> bool {
-    // Keep PatternComponents loadable: runner-shell assembly needs their
-    // containers. Catalog UIs collapse components owned by authored roots.
-    reference == CLASS_PATTERN
-        || model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
+    // Components remain loadable by the assembler, but never get catalog rows.
+    reference != CLASS_PATTERN_COMPONENT
+        && model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
 }
 
 /// PatternComponent tags are render implementation nodes. Return every such
@@ -2368,145 +2298,6 @@ pub fn pattern_component_descendants(
         }
     }
     components
-}
-
-/// Match runner-shell head/body containers through their authored component
-/// join. Body containers reference the same component which owns the head
-/// container. Both geometry resources are authored in shell/world space, so
-/// merging must preserve their decoded transforms; no fit-to-bounds scaling is
-/// valid here.
-pub fn runner_shell_combinations(
-    cache: &TagCache,
-    containers: &[TagHash],
-) -> Vec<RunnerShellCombination> {
-    struct Profile {
-        tag: TagHash,
-        parents: rustc_hash::FxHashSet<TagHash>,
-        children: rustc_hash::FxHashSet<TagHash>,
-        min: [f32; 3],
-        max: [f32; 3],
-    }
-
-    impl Profile {
-        fn volume(&self) -> f32 {
-            (0..3)
-                .map(|axis| (self.max[axis] - self.min[axis]).max(0.0))
-                .product()
-        }
-    }
-
-    let profiles = containers
-        .iter()
-        .copied()
-        .filter(|tag| {
-            package_manager()
-                .get_entry(*tag)
-                .is_some_and(|entry| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
-        })
-        .filter_map(|tag| {
-            let scan = cache.hashes.get(&tag)?;
-            let bounds = selected_model_geometry_tags(cache, tag, 0x8080BAAD)
-                .into_iter()
-                .filter_map(|geometry| {
-                    let entry = package_manager().get_entry(geometry)?;
-                    parse_model_wireframe(geometry, &entry)
-                        .map(|(_, wireframe)| (wireframe.min, wireframe.max))
-                })
-                .reduce(|(mut min, mut max), (part_min, part_max)| {
-                    for axis in 0..3 {
-                        min[axis] = min[axis].min(part_min[axis]);
-                        max[axis] = max[axis].max(part_max[axis]);
-                    }
-                    (min, max)
-                })?;
-            Some(Profile {
-                tag,
-                parents: scan.references.iter().copied().collect(),
-                children: scan
-                    .file_hashes
-                    .iter()
-                    .map(|reference| reference.hash)
-                    .chain(
-                        scan.file_hashes64
-                            .iter()
-                            .filter_map(|reference| tag64_to_hash32(reference.hash)),
-                    )
-                    .collect(),
-                min: bounds.0,
-                max: bounds.1,
-            })
-        })
-        .collect_vec();
-
-    let matches = profiles
-        .iter()
-        .cartesian_product(&profiles)
-        // Face/hair normally follow body, but some compiled groups place them
-        // immediately before it. Package-local proximity separates groups.
-        .filter(|(body, head)| {
-            body.tag != head.tag && body.tag.entry_index().abs_diff(head.tag.entry_index()) <= 0x200
-        })
-        .filter(|(body, head)| !body.children.is_disjoint(&head.parents))
-        .filter(|(body, head)| runner_shell_parts_fit(body.min, body.max, head.min, head.max))
-        .map(|(body, head)| (body.tag, head.tag, head.volume()))
-        .into_group_map_by(|(body, _head, _volume)| *body);
-
-    let mut combinations = matches
-        .into_iter()
-        .filter_map(|(body, mut parts)| {
-            parts.sort_by(|left, right| {
-                left.2
-                    .total_cmp(&right.2)
-                    .then_with(|| left.1.cmp(&right.1))
-            });
-            parts.dedup_by_key(|(_body, head, _volume)| *head);
-            if parts.len() == 1 {
-                let linked = profiles.iter().find(|profile| profile.tag == parts[0].1)?;
-                let sibling = profiles
-                    .iter()
-                    .filter(|profile| profile.tag != linked.tag)
-                    .filter(|profile| {
-                        profile.tag.entry_index().abs_diff(linked.tag.entry_index()) <= 4
-                    })
-                    .min_by_key(|profile| profile.tag);
-                if let Some(sibling) = sibling {
-                    parts.push((body, sibling.tag, sibling.volume()));
-                }
-            }
-            parts.truncate(2);
-            let (_body, head, _volume) = parts.first().copied()?;
-            Some(RunnerShellCombination {
-                head,
-                body,
-                additional_parts: parts
-                    .into_iter()
-                    .skip(1)
-                    .map(|(_body, part, _volume)| part)
-                    .collect(),
-            })
-        })
-        .collect_vec();
-    combinations.sort_by_key(|combination| (combination.head, combination.body));
-    combinations
-}
-
-fn runner_shell_parts_fit(
-    body_min: [f32; 3],
-    body_max: [f32; 3],
-    head_min: [f32; 3],
-    head_max: [f32; 3],
-) -> bool {
-    let body_height = body_max[2] - body_min[2];
-    let head_height = head_max[2] - head_min[2];
-    body_height.is_finite()
-        && head_height.is_finite()
-        && body_height > 1.0
-        && head_height > 0.01
-        && head_height < body_height * 0.5
-        && head_min[2] > body_min[2] + body_height * 0.5
-        && head_max[2] <= body_max[2] + body_height * 0.15
-        && (head_max[0] - head_min[0]) < (body_max[0] - body_min[0])
-        && (head_max[1] - head_min[1]) < (body_max[1] - body_min[1])
 }
 
 fn load_vertex_buffer_preview_for_tag(
@@ -2867,6 +2658,34 @@ fn load_model_preview_from_tags(
     model_tags: Vec<TagHash>,
     attachments: &[ResolvedWeaponModAttachment],
 ) -> ModelPreview {
+    cache::model(
+        &cache,
+        tag,
+        entry.reference,
+        label,
+        &model_tags,
+        attachments,
+        || {
+            decode_model_preview_from_tags(
+                cache.clone(),
+                tag,
+                entry,
+                label,
+                &model_tags,
+                attachments,
+            )
+        },
+    )
+}
+
+fn decode_model_preview_from_tags(
+    cache: Arc<TagCache>,
+    tag: TagHash,
+    entry: &UEntryHeader,
+    label: &'static str,
+    model_tags: &[TagHash],
+    attachments: &[ResolvedWeaponModAttachment],
+) -> ModelPreview {
     let class_name = get_class_by_id(entry.reference).map(|c| c.name.to_string());
     let model_entries = model_tags
         .iter()
@@ -2991,7 +2810,7 @@ fn load_model_preview_from_tags(
         techniques,
         textures,
         shaders,
-        geometry_parts: model_tags,
+        geometry_parts: model_tags.to_vec(),
         wireframe,
     }
 }
@@ -4574,38 +4393,6 @@ fn character_surface_material(
     None
 }
 
-fn runner_shell_gear_dye_palette(
-    cache: &TagCache,
-    combination: &RunnerShellCombination,
-) -> Option<[GearDyeMaterial; 6]> {
-    // The model container's immediate PatternComponent parent owns its exact
-    // cosmetic parameters. Walking the shared graph reaches sibling/default
-    // components and can apply another skin's palette (observed as red Emerald
-    // Impact). Body is authoritative; face/hair inherit it.
-    std::iter::once(combination.body)
-        .chain(std::iter::once(combination.head))
-        .chain(combination.additional_parts.iter().copied())
-        .flat_map(|container| {
-            cache
-                .hashes
-                .get(&container)
-                .into_iter()
-                .flat_map(|scan| scan.references.iter().copied())
-        })
-        .unique()
-        .filter(|parent| {
-            package_manager()
-                .get_entry(*parent)
-                .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
-        })
-        .find_map(|component| {
-            package_manager()
-                .read_tag(component)
-                .ok()
-                .and_then(|data| decode_weapon_skin_gear_dye_palette(&data))
-        })
-}
-
 pub(crate) fn weapon_skin_gear_dye_palette(
     cache: &TagCache,
     selected_pattern: TagHash,
@@ -5565,7 +5352,7 @@ struct TexturePreviewRank {
 }
 
 fn texture_preview_rank(tag: TagHash) -> TexturePreviewRank {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(tag, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(tag) else {
         return TexturePreviewRank {
             shape: 100,
             format: 100,
@@ -5628,6 +5415,7 @@ fn assign_wireframe_material_textures(
         return;
     }
 
+    let mut materials = rustc_hash::FxHashMap::default();
     for range in &mut wireframe.material_ranges {
         let Some(technique) = range.technique else {
             range.texture = textures.first().map(|(tag, _entry)| *tag);
@@ -5635,7 +5423,10 @@ fn assign_wireframe_material_textures(
             continue;
         };
 
-        range.textures = material_textures_for_technique(technique, cache, textures);
+        range.textures = materials
+            .entry(technique)
+            .or_insert_with(|| material_textures_for_technique(technique, cache, textures))
+            .clone();
         range.texture = range.textures.color;
     }
 }
@@ -6455,14 +6246,14 @@ fn gear_pattern_material(
 }
 
 fn texture_is_srgb(texture: TagHash) -> bool {
-    Texture::load_data_d2(texture, false)
-        .map(|(desc, _data, _comment)| format!("{:?}", desc.format).contains("Srgb"))
+    Texture::validated_descriptor_d2(texture)
+        .map(|desc| format!("{:?}", desc.format).contains("Srgb"))
         .unwrap_or(false)
 }
 
 fn texture_is_single_channel(texture: TagHash) -> bool {
-    Texture::load_data_d2(texture, false)
-        .map(|(desc, _data, _comment)| {
+    Texture::validated_descriptor_d2(texture)
+        .map(|desc| {
             let format = format!("{:?}", desc.format);
             format.contains("Bc4") || format.contains("R8Unorm")
         })
@@ -6942,7 +6733,7 @@ fn local_surface_texture_candidate(texture: TagHash, technique: TagHash) -> bool
     if texture.pkg_id() != technique.pkg_id() || fallback_aux_texture(texture) {
         return false;
     }
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -6958,7 +6749,7 @@ fn preview_mask_candidate(texture: TagHash) -> bool {
     if fallback_aux_texture(texture) {
         return false;
     }
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -7209,13 +7000,13 @@ fn material_control_texture_slot(
 }
 
 fn texture_preview_format(texture: TagHash) -> String {
-    Texture::load_data_d2(texture, false)
-        .map(|(desc, _data, _comment)| format!("{:?}", desc.format))
+    Texture::validated_descriptor_d2(texture)
+        .map(|desc| format!("{:?}", desc.format))
         .unwrap_or_default()
 }
 
 fn material_control_texture_candidate(texture: TagHash) -> bool {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -7352,7 +7143,7 @@ fn material_normal_texture_slot(bindings: &[TechniqueTextureBinding]) -> Option<
 }
 
 fn normal_surface_texture_candidate(texture: TagHash) -> bool {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -7369,7 +7160,7 @@ fn guessed_related_texture_role(
     technique: TagHash,
     material: &WireframeMaterialTextures,
 ) -> MaterialTextureRole {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return MaterialTextureRole::Aux;
     };
 
@@ -7386,7 +7177,7 @@ fn guessed_related_texture_role(
 }
 
 fn fallback_color_candidate(texture: TagHash, technique: TagHash) -> bool {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -7644,6 +7435,13 @@ fn triangle_indices_to_line_indices(indices: &[u32]) -> Vec<u32> {
 }
 
 fn parse_model_wireframe(
+    tag: TagHash,
+    entry: &UEntryHeader,
+) -> Option<(MeshSourcePreview, WireframePreview)> {
+    cache::mesh(tag, entry, || decode_model_wireframe(tag, entry))
+}
+
+fn decode_model_wireframe(
     tag: TagHash,
     entry: &UEntryHeader,
 ) -> Option<(MeshSourcePreview, WireframePreview)> {
@@ -9888,6 +9686,14 @@ fn read_i64(data: &[u8], endian: Endian) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_hides_pattern_components_but_keeps_patterns() {
+        assert!(!super::is_model_catalog_reference(
+            super::CLASS_PATTERN_COMPONENT
+        ));
+        assert!(super::is_model_catalog_reference(super::CLASS_PATTERN));
+        assert!(super::model_info_for_reference(super::CLASS_PATTERN_COMPONENT).is_some());
+    }
     use super::*;
 
     #[test]
@@ -11289,17 +11095,18 @@ mod tests {
                 .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
                 .map(|(index, _)| TagHash::new(head.pkg_id(), index as u16))
                 .collect_vec();
-            let pairs = runner_shell_combinations(&cache, &containers);
+            let pairs = runner_shell_assemblies(&cache, &containers);
             let expected = pairs
                 .iter()
-                .find(|combination| combination.body == body && combination.contains(head))
+                .find(|combination| combination.pattern == body && combination.contains(head))
                 .cloned();
             assert!(
                 expected.is_some(),
                 "missing authored runner-shell pair head={head} body={body}; pairs={pairs:?}"
             );
             let expected = expected.unwrap();
-            let preview = GeometryTagPreview::load_combined_runner_shell(cache.clone(), &expected)
+            let preview = expected
+                .load(cache.clone())
                 .expect("combined runner shell preview");
             let GeometryPreviewKind::Model(model) = preview.kind else {
                 panic!("runner shell must be model")
@@ -11421,17 +11228,17 @@ mod tests {
                 .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
                 .map(|(index, _)| TagHash::new(head.pkg_id(), index as u16))
                 .collect_vec();
-            let combination = runner_shell_combinations(&cache, &containers)
+            let combination = runner_shell_assemblies(&cache, &containers)
                 .into_iter()
                 .find(|combination| combination.contains(head))
                 .unwrap_or_else(|| panic!("{label} representative runner combination"));
             eprintln!(
                 "RUNNER_LAYERED_FIXTURE mode={expected_mode} head={} body={} parts={:?}",
-                combination.head, combination.body, combination.additional_parts
+                combination.pattern, combination.pattern, combination.nested_patterns
             );
-            let preview =
-                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
-                    .unwrap_or_else(|| panic!("{label} combined runner preview"));
+            let preview = combination
+                .load(cache.clone())
+                .unwrap_or_else(|| panic!("{label} combined runner preview"));
             let GeometryPreviewKind::Model(model) = preview.kind else {
                 panic!("{label} runner fixture must be a model")
             };
@@ -11476,16 +11283,15 @@ mod tests {
             .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
             .map(|(index, _)| TagHash::new(head.pkg_id(), index as u16))
             .collect_vec();
-        let combination = runner_shell_combinations(&cache, &containers)
+        let combination = runner_shell_assemblies(&cache, &containers)
             .into_iter()
             .find(|combination| combination.contains(head))
             .expect("AO representative runner combination");
         eprintln!(
             "RUNNER_OCCLUSION_FIXTURE head={} body={} parts={:?}",
-            combination.head, combination.body, combination.additional_parts
+            combination.pattern, combination.pattern, combination.nested_patterns
         );
-        let preview = GeometryTagPreview::load_combined_runner_shell(cache, &combination)
-            .expect("AO combined runner preview");
+        let preview = combination.load(cache).expect("AO combined runner preview");
         let GeometryPreviewKind::Model(model) = preview.kind else {
             panic!("AO runner fixture must be a model")
         };
@@ -11522,20 +11328,20 @@ mod tests {
                 .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
                 .map(|(index, _)| TagHash::new(body.pkg_id(), index as u16))
                 .collect_vec();
-            let combination = runner_shell_combinations(&cache, &containers)
+            let combination = runner_shell_assemblies(&cache, &containers)
                 .into_iter()
-                .find(|combination| combination.body == body)
+                .find(|combination| combination.pattern == body)
                 .unwrap_or_else(|| panic!("missing Thief three-part shell for {body}"));
-            assert!(combination.additional_parts.len() <= 1);
-            let preview =
-                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
-                    .unwrap_or_else(|| panic!("failed combining Thief {body}"));
+            assert!(combination.parts.len().saturating_sub(2) <= 1);
+            let preview = combination
+                .load(cache.clone())
+                .unwrap_or_else(|| panic!("failed combining Thief {body}"));
             let GeometryPreviewKind::Model(model) = preview.kind else {
                 panic!("Thief {body} must be model")
             };
             assert_eq!(
                 model.geometry_parts.len(),
-                2 + combination.additional_parts.len(),
+                2 + combination.parts.len().saturating_sub(2),
                 "wrong part count for {body}"
             );
             let wireframe = model.wireframe.expect("combined Thief wireframe");
@@ -11546,8 +11352,8 @@ mod tests {
             );
 
             if body == TagHash(0x80A9A915) {
-                assert_eq!(combination.head, TagHash(0x80A9A966));
-                assert_eq!(combination.additional_parts, [TagHash(0x80A9A997)]);
+                assert!(combination.nested_patterns.contains(&TagHash(0x80A9A966)));
+                assert!(combination.nested_patterns.contains(&TagHash(0x80A9A997)));
             }
         }
     }
@@ -11557,15 +11363,13 @@ mod tests {
     fn audits_emerald_impact_runner_material_coverage() {
         init_goliath_test_package_manager();
         let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let combination = RunnerShellCombination {
-            head: TagHash(0x80A9F542),
-            body: TagHash(0x80A9F5AD),
-            additional_parts: vec![TagHash(0x80A9F541)],
-        };
-        let palette = weapon_skin_gear_dye_palette(&cache, combination.body)
-            .or_else(|| weapon_skin_gear_dye_palette(&cache, combination.head));
+        let combination = RunnerShellAssembly::resolve(&cache, TagHash(0x80A9F543))
+            .expect("authored shell Pattern");
+        let palette = weapon_skin_gear_dye_palette(&cache, combination.pattern)
+            .or_else(|| weapon_skin_gear_dye_palette(&cache, combination.pattern));
         eprintln!("EMERALD palette={palette:?}");
-        let preview = GeometryTagPreview::load_combined_runner_shell(cache, &combination)
+        let preview = combination
+            .load(cache)
             .expect("Emerald Impact combined preview");
         let GeometryPreviewKind::Model(model) = preview.kind else {
             panic!("Emerald Impact must be model")
@@ -11620,32 +11424,23 @@ mod tests {
         for (name, combination) in [
             (
                 "Arata Vectus Assassin",
-                RunnerShellCombination {
-                    head: TagHash(0x80B14135),
-                    body: TagHash(0x80B140CE),
-                    additional_parts: vec![],
-                },
+                RunnerShellAssembly::resolve(&cache, TagHash(0x80B140CE))
+                    .expect("authored shell Pattern"),
             ),
             (
                 "Destroyer base",
-                RunnerShellCombination {
-                    head: TagHash(0x80AA055F),
-                    body: TagHash(0x80AA053A),
-                    additional_parts: vec![],
-                },
+                RunnerShellAssembly::resolve(&cache, TagHash(0x80AA053A))
+                    .expect("authored shell Pattern"),
             ),
             (
                 "Emerald Impact",
-                RunnerShellCombination {
-                    head: TagHash(0x80A9F542),
-                    body: TagHash(0x80A9F5AD),
-                    additional_parts: vec![TagHash(0x80A9F541)],
-                },
+                RunnerShellAssembly::resolve(&cache, TagHash(0x80A9F543))
+                    .expect("authored shell Pattern"),
             ),
         ] {
-            let preview =
-                GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
-                    .unwrap_or_else(|| panic!("missing {name}"));
+            let preview = combination
+                .load(cache.clone())
+                .unwrap_or_else(|| panic!("missing {name}"));
             let GeometryPreviewKind::Model(model) = preview.kind else {
                 panic!("{name} must be model")
             };
@@ -11795,10 +11590,8 @@ mod tests {
                 .filter(|(_, entry)| matches!(entry.reference, 0x8080BADB | 0x8080BAAD))
                 .map(|(index, _)| TagHash::new(package_id, index as u16))
                 .collect_vec();
-            for combination in runner_shell_combinations(&cache, &containers) {
-                let Some(preview) =
-                    GeometryTagPreview::load_combined_runner_shell(cache.clone(), &combination)
-                else {
+            for combination in runner_shell_assemblies(&cache, &containers) {
+                let Some(preview) = combination.load(cache.clone()) else {
                     continue;
                 };
                 let GeometryPreviewKind::Model(model) = preview.kind else {
@@ -11812,13 +11605,13 @@ mod tests {
                     if let Some(surface) = range.textures.runner_layered_surface {
                         layered_mode_representatives
                             .entry(surface.mode)
-                            .or_insert((combination.head, range.technique.unwrap_or_default()));
+                            .or_insert((combination.pattern, range.technique.unwrap_or_default()));
                     }
                     *stages.entry(range.render_stage).or_default() += 1;
                     let Some(technique) = range.technique else {
                         failures.push(format!(
                             "{} range {index}: missing technique",
-                            combination.head
+                            combination.pattern
                         ));
                         continue;
                     };
@@ -11935,7 +11728,7 @@ mod tests {
                                 .entry(key)
                                 .or_insert_with(|| (0, std::collections::BTreeSet::new()));
                             summary.0 += 1;
-                            summary.1.insert((technique, combination.head));
+                            summary.1.insert((technique, combination.pattern));
                         }
                         for texture in range.textures.aux.iter().copied().filter(|texture| {
                             !fallback_aux_texture(*texture)
@@ -12017,20 +11810,20 @@ mod tests {
                             && !texture_preview_format(expected_control.unwrap()).contains("Bc4")
                             && range.textures.control != expected_control
                         {
-                            failures.push(format!("{} range {index}: character selector {:?}, expected PS t3 {expected_control:?}", combination.head, range.textures.control));
+                            failures.push(format!("{} range {index}: character selector {:?}, expected PS t3 {expected_control:?}", combination.pattern, range.textures.control));
                         }
                         let expected_normal =
                             material_normal_texture_slot_for_technique(technique, &bindings);
                         if expected_normal.is_some() && range.textures.normal.is_none() {
                             failures.push(format!(
                                 "{} range {index}: character surface missing local normal",
-                                combination.head
+                                combination.pattern
                             ));
                         }
                         let Some(surface) = range.textures.character_surface else {
                             failures.push(format!(
                                 "{} range {index}: character t1/t2/t3/t7 ABI missing",
-                                combination.head
+                                combination.pattern
                             ));
                             continue;
                         };
@@ -12049,7 +11842,7 @@ mod tests {
                             let summary = character_mode3_families.entry(shader).or_insert((
                                 0,
                                 technique,
-                                combination.head,
+                                combination.pattern,
                             ));
                             summary.0 += 1;
                         }
@@ -12068,14 +11861,14 @@ mod tests {
                         {
                             failures.push(format!(
                                 "{} range {index}: invalid character surface {surface:?}",
-                                combination.head
+                                combination.pattern
                             ));
                         }
                     }
                     if range.textures.investment_decal.is_some() && range.render_stage != Some(2) {
                         failures.push(format!(
                             "{} range {index}: investment decal on unexpected stage {:?}",
-                            combination.head, range.render_stage
+                            combination.pattern, range.render_stage
                         ));
                     }
                 }
@@ -12447,22 +12240,6 @@ mod tests {
         assert_eq!(layered.mode, 47);
         assert_eq!(layered.detail_normal_a, TagHash(0x80A61463));
         assert_eq!(layered.material_response, Some(TagHash(0x80A9CC3D)));
-    }
-
-    #[test]
-    fn runner_shell_fit_rejects_full_height_head() {
-        assert!(runner_shell_parts_fit(
-            [-0.2, -0.5, 0.0],
-            [0.45, 0.5, 1.88],
-            [-0.05, -0.1, 1.53],
-            [0.17, 0.1, 1.82],
-        ));
-        assert!(!runner_shell_parts_fit(
-            [-0.2, -0.5, 0.0],
-            [0.45, 0.5, 1.88],
-            [-0.2, -0.5, 0.0],
-            [0.45, 0.5, 1.88],
-        ));
     }
 
     #[test]
@@ -12922,7 +12699,7 @@ mod tests {
         assert!(unknown.is_empty());
     }
 
-    fn init_goliath_test_package_manager() {
+    pub(super) fn init_goliath_test_package_manager() {
         use std::{path::PathBuf, sync::Arc};
         use tiger_pkg::{GameVersion, MarathonVersion, PackageManager};
 
@@ -18416,7 +18193,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     #[ignore = "probe: requires installed Marathon packages and GPU"]
     fn exports_quickdraw_grip_age_textures() {
