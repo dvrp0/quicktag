@@ -2,7 +2,7 @@
 
 ## Product Requirements Document v2.1 — Evidence-Gated Revision
 
-Status: implemented for the supported Marathon weapon/mod preview corpus
+Status: implemented and package-audited for the supported Marathon weapon/mod preview corpus
 Primary target: Marathon / Goliath asset preview  
 Secondary reference: Destiny-era Tiger behavior, never assumed equivalent
 
@@ -22,8 +22,13 @@ Completed gates:
 - separate Investment Decal, emissive, integer-flags, and sorted forward-transparent passes
 - confirmed six-slot Goliath Gear baseline, Gear Pattern, Weapon Mod Condition, compact-hair classification
 - deterministic schema-2 capture manifest with package inventory, adapter/schema, GPU/backend/driver, scene, fidelity, channel, draw plans, and unknown TFX counts
+- all 25 raw Marathon render ranges are retained; observed stage 4/9/13/15/17 geometry is routed as authored shadow, max-blend forward, depth-only, auxiliary, and forward-special work instead of being discarded or duplicated as opaque
+- Marathon TFX byte alignment is verified across 175,244 package stages; every program decodes to its end, while 18,160 stages with still-unclassified semantic operations remain explicitly Partial
+- live TFX execution re-evaluates constants, frame/view/object/global/Gear/context inputs, time, temporaries, comparisons, and outputs instead of replaying parse-time expression metadata
+- package catalog GearDye audits cover every skin palette, 399 mod associations, and 2,883 skin/mod combinations with zero missing/invalid channels
+- GPU gates cover BR33 Vibrant Sport Deluxe, Bully Transmit Engine, V85 Vox Nocturna, and Syntax Disrupt after authored-stage scheduling
 
-Current canonical capture quantifies 14 draws: 10 classified, 4 intentionally `Unknown`, and 0 partial/unknown TFX stages. Unknown families remain visible rather than guessed.
+Current canonical capture retains all authored ranges, including auxiliary and forward-special draws. Unknown families and the remaining semantic-partial TFX operations remain visible rather than guessed.
 
 Evidence-gated exclusions remain exclusions by design, not unfinished acceptance items: unsupported Runner/skinned ABI, unobserved dynamic effect families, anisotropic hair, speculative decal writes, distortion/energy/hologram behavior, and unconfirmed Destiny-style Gear fields.
 
