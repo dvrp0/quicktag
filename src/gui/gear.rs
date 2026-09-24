@@ -4136,19 +4136,13 @@ fn assign_weapon_mod_metadata(items: &mut [GearItem]) {
                 (category.as_str(), compatibility.as_str())
             })
         });
-        // Darksight is the five-family Prestige optic set. These definitions
-        // are hash-only, but their authored form names are stable and map one
-        // to one to the normal optic families.
-        let darksight_family = match item.name.as_str() {
-            "Darksight Holo" => Some(("Optic", "pistol")),
-            "Darksight Lens" => Some(("Optic", "lmg")),
-            "Darksight Optic" => Some(("Optic", "rifle")),
-            "Darksight Scope" => Some(("Optic", "sniper")),
-            "Darksight Surveyor" => Some(("Optic", "marksman")),
-            _ => None,
-        };
+        // Prestige optics such as Darksight are hash-only definitions, but
+        // their display records still author an exact optic subtype. Prefer
+        // that metadata over inferring compatibility from localized names.
+        let authored_family = weapon_mod_authored_family(item, category)
+            .map(|compatibility| (category, compatibility));
         if let Some((family_category, compatibility)) =
-            direct_family.or(propagated_family).or(darksight_family)
+            direct_family.or(propagated_family).or(authored_family)
         {
             item.compatible_weapons = sorted_unique_names(
                 base_weapons
@@ -6145,6 +6139,46 @@ mod tests {
                 .collect::<String>(),
             spiderbite.description
         );
+    }
+
+    #[test]
+    #[ignore = "requires current Marathon packages"]
+    fn audits_darksight_authored_optic_families() {
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
+            });
+        let pm = tiger_pkg::PackageManager::new(
+            packages,
+            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon),
+            None,
+        )
+        .expect("package manager");
+        tiger_pkg::initialize_package_manager(&Arc::new(pm));
+        quicktag_core::classes::initialize_reference_names();
+        let strings =
+            Arc::new(quicktag_strings::localized::create_stringmap().expect("localized strings"));
+        let view = GearView::new(strings);
+
+        for (name, family, subcategory) in [
+            ("Darksight Holo", "lmg", "LMG Optic Mod"),
+            ("Darksight Lens", "pistol", "Pistol Optic Mod"),
+            ("Darksight Optic", "rifle", "Assault Optic Mod"),
+            ("Darksight Scope", "marksman", "Precision Optic Mod"),
+            ("Darksight Surveyor", "sniper", "Sniper Optic Mod"),
+        ] {
+            let matching = view
+                .items
+                .iter()
+                .filter(|item| item.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 2, "expected both rarity rows for {name}");
+            assert!(matching.iter().all(|item| {
+                item.mod_family.as_deref() == Some(family)
+                    && item.subcategory.as_deref() == Some(subcategory)
+            }), "wrong authored optic family for {name}: {matching:?}");
+        }
     }
 
     #[test]
