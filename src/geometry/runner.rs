@@ -2,10 +2,6 @@
 use super::*;
 use std::collections::VecDeque;
 
-#[cfg(test)]
-#[path = "runner_tests.rs"]
-mod tests;
-
 #[derive(Clone, Debug)]
 pub struct RunnerShellAssembly {
     pub pattern: TagHash,

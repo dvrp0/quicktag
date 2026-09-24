@@ -14,8 +14,9 @@ use tiger_pkg::{TagHash, manager::PackagePath, package::UEntryHeader, package_ma
 use crate::geometry::{
     GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, RunnerShellAssembly,
     UvTransformPreview, WeaponModPreviewAttachment, WeaponModSocketIndex, WireframeMaterialLayer,
-    WireframePreview, is_model_catalog_reference, model_info_for_reference,
-    pattern_component_descendants, weapon_unoccupied_default_mod_patterns,
+    WireframePreview, is_model_catalog_reference, model_has_render_geometry,
+    model_info_for_reference, pattern_component_descendants,
+    weapon_unoccupied_default_mod_patterns,
 };
 use crate::gui::common::ResponseExt;
 use crate::gui::tag::format_tag_entry;
@@ -24,7 +25,8 @@ use crate::texture::cache::{MaterialTextureKey, TextureCache};
 use crate::util::{format_file_size, ui_image_rotated};
 
 use super::gear::{
-    ModelModEntry, ModelRunnerSkinEntry, ModelWeaponCatalog, ModelWeaponEntry, ModelWeaponSkinEntry,
+    ModelCharmEntry, ModelMeleeSkinEntry, ModelModEntry, ModelRunnerSkinEntry, ModelWeaponCatalog,
+    ModelWeaponEntry, ModelWeaponSkinEntry,
 };
 use super::model_renderer::{
     GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelExportCamera,
@@ -257,6 +259,7 @@ pub struct ModelsView {
     packages_with_models: Vec<u16>,
     package_filter: String,
     model_filter: String,
+    hide_empty_models: bool,
     models: Vec<ModelListEntry>,
     selected_model: Option<TagHash>,
     preview: Option<GeometryTagPreview>,
@@ -309,6 +312,7 @@ impl ModelsView {
             packages_with_models: Self::search_models(None),
             package_filter: String::new(),
             model_filter: String::new(),
+            hide_empty_models: true,
             models: vec![],
             selected_model: None,
             preview: None,
@@ -468,6 +472,8 @@ impl ModelsView {
     }
 
     fn load_package_models(&mut self, id: u16) {
+        let cache = self.cache.clone();
+        let mut geometry_presence = rustc_hash::FxHashMap::default();
         self.models = package_manager()
             .lookup
             .tag32_entries_by_pkg
@@ -479,10 +485,12 @@ impl ModelsView {
                     return None;
                 }
                 let info = model_info_for_reference(entry.reference)?;
+                let tag = TagHash::new(id, i as u16);
                 Some(ModelListEntry {
                     index: i,
-                    tag: TagHash::new(id, i as u16),
+                    tag,
                     info,
+                    is_empty: !model_has_render_geometry(&cache, tag, &mut geometry_presence),
                     entry: entry.clone(),
                 })
             })
@@ -497,7 +505,12 @@ impl ModelsView {
         self.selected_mods.clear();
         self.selected_mod_unique_ids.clear();
 
-        if let Some(tag) = self.models.first().map(|entry| entry.tag) {
+        if let Some(tag) = self
+            .models
+            .iter()
+            .find(|entry| !self.hide_empty_models || !entry.is_empty)
+            .map(|entry| entry.tag)
+        {
             self.load_model(tag);
         }
     }
@@ -815,6 +828,25 @@ fn weapon_skin_for_model(
     });
     let matched = matches.next()?;
     matches.next().is_none().then_some(matched)
+}
+
+fn melee_skins_for_model(
+    catalog: &ModelWeaponCatalog,
+    selected: TagHash,
+) -> Vec<&ModelMeleeSkinEntry> {
+    catalog
+        .melee_skins
+        .iter()
+        .filter(|skin| skin.model_tag == selected)
+        .collect()
+}
+
+fn charms_for_model(catalog: &ModelWeaponCatalog, selected: TagHash) -> Vec<&ModelCharmEntry> {
+    catalog
+        .charms
+        .iter()
+        .filter(|charm| charm.model_tag == selected)
+        .collect()
 }
 
 fn runner_skin_for_model<'a>(
@@ -1189,6 +1221,7 @@ impl ModelsView {
             ui.label("Search:");
             ui.text_edit_singleline(&mut self.model_filter);
         });
+        ui.checkbox(&mut self.hide_empty_models, "Hide empty");
 
         ui.separator();
         egui::ScrollArea::vertical()
@@ -1207,6 +1240,9 @@ impl ModelsView {
                 let models = self.models.clone();
                 let mut selected = None;
                 for entry in models {
+                    if self.hide_empty_models && entry.is_empty {
+                        continue;
+                    }
                     let detected_skin = weapon_skin_for_model(&self.weapon_catalog, entry.tag);
                     if !self.runner_models.contains_key(&entry.tag)
                         && self
@@ -1217,9 +1253,11 @@ impl ModelsView {
                         continue;
                     }
                     let runner_skin = runner_skin_for_model(&self.weapon_catalog, entry.tag);
+                    let melee_skins = melee_skins_for_model(&self.weapon_catalog, entry.tag);
+                    let charms = charms_for_model(&self.weapon_catalog, entry.tag);
                     if !filter.is_empty()
                         && !entry
-                            .search_label(detected_skin, runner_skin)
+                            .search_label(detected_skin, runner_skin, &melee_skins, &charms)
                             .contains(filter.as_str())
                     {
                         continue;
@@ -1229,10 +1267,20 @@ impl ModelsView {
                         .add(
                             egui::Button::selectable(
                                 self.selected_model == Some(entry.tag),
-                                entry.list_label(ui, detected_skin, runner_skin),
+                                entry.list_label(
+                                    ui,
+                                    detected_skin,
+                                    runner_skin,
+                                    &melee_skins,
+                                    &charms,
+                                ),
                             )
                             .wrap_mode(
-                                if detected_skin.is_some() || runner_skin.is_some() {
+                                if detected_skin.is_some()
+                                    || runner_skin.is_some()
+                                    || !melee_skins.is_empty()
+                                    || !charms.is_empty()
+                                {
                                     egui::TextWrapMode::Wrap
                                 } else {
                                     egui::TextWrapMode::Truncate
@@ -1263,6 +1311,7 @@ struct ModelListEntry {
     index: usize,
     tag: TagHash,
     info: ModelTagInfo,
+    is_empty: bool,
     entry: UEntryHeader,
 }
 
@@ -1281,6 +1330,8 @@ impl ModelListEntry {
         &self,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
         runner_skin: Option<&ModelRunnerSkinEntry>,
+        melee_skins: &[&ModelMeleeSkinEntry],
+        charms: &[&ModelCharmEntry],
     ) -> String {
         let identity = detected_skin
             .map(|(weapon, skin)| {
@@ -1295,8 +1346,16 @@ impl ModelListEntry {
         let runner_identity = runner_skin
             .map(|skin| format!(" {} {}", skin.shell_name, skin.name,))
             .unwrap_or_default();
+        let melee_identity = melee_skins
+            .iter()
+            .map(|skin| format!(" {} {}", skin.family_name, skin.name))
+            .collect::<String>();
+        let charm_identity = charms
+            .iter()
+            .map(|charm| format!(" Charm {}", charm.name))
+            .collect::<String>();
         format!(
-            "{} {}{identity}{runner_identity}",
+            "{} {}{identity}{runner_identity}{melee_identity}{charm_identity}",
             self.label(),
             self.info.label
         )
@@ -1308,6 +1367,8 @@ impl ModelListEntry {
         ui: &egui::Ui,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
         runner_skin: Option<&ModelRunnerSkinEntry>,
+        melee_skins: &[&ModelMeleeSkinEntry],
+        charms: &[&ModelCharmEntry],
     ) -> egui::text::LayoutJob {
         let mut label = egui::text::LayoutJob::default();
         label.append(
@@ -1346,6 +1407,28 @@ impl ModelListEntry {
                 egui::TextFormat {
                     font_id: egui::TextStyle::Small.resolve(ui.style()),
                     color: skin.color,
+                    ..Default::default()
+                },
+            );
+        }
+        for skin in melee_skins {
+            label.append(
+                &format!("\n    └ {}: {}", skin.family_name, skin.name),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::TextStyle::Small.resolve(ui.style()),
+                    color: skin.color,
+                    ..Default::default()
+                },
+            );
+        }
+        for charm in charms {
+            label.append(
+                &format!("\n    └ Charm: {}", charm.name),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::TextStyle::Small.resolve(ui.style()),
+                    color: charm.color,
                     ..Default::default()
                 },
             );
@@ -2631,7 +2714,6 @@ fn model_textures_ui(
 #[cfg(test)]
 mod tests {
     include!("model_lighting_catalog_test.rs");
-    include!("runner_shell_tests.rs");
     #[test]
     #[ignore = "requires installed Marathon packages and GPU"]
     fn preserves_open_and_skin_switch_inputs() {
@@ -2946,6 +3028,8 @@ mod tests {
                 slots: vec![],
             }],
             runner_skins: vec![],
+            melee_skins: vec![],
+            charms: vec![],
         };
 
         assert_eq!(
@@ -2986,6 +3070,8 @@ mod tests {
                 })
                 .collect(),
             runner_skins: vec![],
+            melee_skins: vec![],
+            charms: vec![],
         };
 
         assert_eq!(weapon_index_for_model(&catalog, shared), None);
@@ -3003,6 +3089,8 @@ mod tests {
         let catalog = ModelWeaponCatalog {
             weapons: vec![],
             runner_skins: vec![skin],
+            melee_skins: vec![],
+            charms: vec![],
         };
         let found = runner_skin_for_model(&catalog, TagHash(0x80B140CE)).expect("shell identity");
         assert_eq!(found.shell_name, "Assassin");
@@ -3012,6 +3100,60 @@ mod tests {
             runner_skin_for_model(&catalog, TagHash(0x80B140CE)).map(|skin| skin.name.as_str()),
             Some("Arata Vectus")
         );
+    }
+
+    #[test]
+    fn finds_all_melee_skins_sharing_an_authored_pattern() {
+        let model = TagHash(0x80B6E6D2);
+        let catalog = ModelWeaponCatalog {
+            weapons: vec![],
+            runner_skins: vec![],
+            melee_skins: vec![
+                ModelMeleeSkinEntry {
+                    name: "Alpha Cutter".to_owned(),
+                    family_name: "Knives".to_owned(),
+                    model_tag: model,
+                    color: Color32::from_rgb(166, 92, 214),
+                },
+                ModelMeleeSkinEntry {
+                    name: "Monoclast".to_owned(),
+                    family_name: "Knives".to_owned(),
+                    model_tag: model,
+                    color: Color32::from_rgb(232, 184, 72),
+                },
+            ],
+            charms: vec![],
+        };
+        let found = melee_skins_for_model(&catalog, model);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].name, "Alpha Cutter");
+        assert_eq!(found[1].name, "Monoclast");
+    }
+
+    #[test]
+    fn finds_all_charms_sharing_an_authored_pattern() {
+        let model = TagHash(0x80B6E701);
+        let catalog = ModelWeaponCatalog {
+            weapons: vec![],
+            runner_skins: vec![],
+            melee_skins: vec![],
+            charms: vec![
+                ModelCharmEntry {
+                    name: "Lucky Cat".to_owned(),
+                    model_tag: model,
+                    color: Color32::from_rgb(166, 92, 214),
+                },
+                ModelCharmEntry {
+                    name: "Second Charm".to_owned(),
+                    model_tag: model,
+                    color: Color32::from_rgb(232, 184, 72),
+                },
+            ],
+        };
+        let found = charms_for_model(&catalog, model);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].name, "Lucky Cat");
+        assert_eq!(found[1].name, "Second Charm");
     }
 
     #[test]

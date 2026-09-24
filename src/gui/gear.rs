@@ -320,6 +320,23 @@ pub struct GearView {
 pub(super) struct ModelWeaponCatalog {
     pub(super) weapons: Vec<ModelWeaponEntry>,
     pub(super) runner_skins: Vec<ModelRunnerSkinEntry>,
+    pub(super) melee_skins: Vec<ModelMeleeSkinEntry>,
+    pub(super) charms: Vec<ModelCharmEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ModelCharmEntry {
+    pub(super) name: String,
+    pub(super) model_tag: TagHash,
+    pub(super) color: Color32,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ModelMeleeSkinEntry {
+    pub(super) name: String,
+    pub(super) family_name: String,
+    pub(super) model_tag: TagHash,
+    pub(super) color: Color32,
 }
 
 #[derive(Clone, Debug)]
@@ -611,9 +628,51 @@ impl GearView {
                 && left.shell_name == right.shell_name
         });
 
+        let mut melee_skins = self
+            .items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Melee"))
+            .filter_map(|item| {
+                Some(ModelMeleeSkinEntry {
+                    name: item.name.clone(),
+                    family_name: item
+                        .subcategory
+                        .clone()
+                        .unwrap_or_else(|| "Melee".to_owned()),
+                    model_tag: item.model_tag?,
+                    color: item.rarity.map(GearRarity::color).unwrap_or(Color32::GRAY),
+                })
+            })
+            .collect::<Vec<_>>();
+        melee_skins.sort_by_cached_key(|skin| (skin.model_tag, skin.name.to_lowercase()));
+        melee_skins.dedup_by(|left, right| {
+            left.model_tag == right.model_tag
+                && left.name == right.name
+                && left.family_name == right.family_name
+        });
+
+        let mut charms = self
+            .items
+            .iter()
+            .filter(|item| item.item_type.as_deref() == Some("Charm"))
+            .filter_map(|item| {
+                Some(ModelCharmEntry {
+                    name: item.name.clone(),
+                    model_tag: item.model_tag?,
+                    color: item.rarity.map(GearRarity::color).unwrap_or(Color32::GRAY),
+                })
+            })
+            .collect::<Vec<_>>();
+        charms.sort_by_cached_key(|charm| (charm.model_tag, charm.name.to_lowercase()));
+        charms.dedup_by(|left, right| {
+            left.model_tag == right.model_tag && left.name == right.name
+        });
+
         ModelWeaponCatalog {
             weapons,
             runner_skins,
+            melee_skins,
+            charms,
         }
     }
 
@@ -973,13 +1032,9 @@ impl GearView {
                 );
                 let matches_search = search.is_empty()
                     || item.name.to_lowercase().contains(&search)
-                    || item
-                        .item_type
-                        .as_deref()
+                    || gear_item_type(item)
                         .is_some_and(|value| value.to_lowercase().contains(&search))
-                    || item
-                        .subcategory
-                        .as_deref()
+                    || gear_item_subcategory(item)
                         .is_some_and(|value| value.to_lowercase().contains(&search))
                     || item
                         .applies_to
@@ -1081,8 +1136,8 @@ impl GearView {
                     hash: item.display_tag.to_string(),
                     name: &item.name,
                     rarity: item.rarity.map(GearRarity::label),
-                    item_type: item.item_type.as_deref(),
-                    subcategory: item.subcategory.as_deref(),
+                    item_type: gear_item_type(item),
+                    subcategory: gear_item_subcategory(item),
                     target_weapon: (item.item_type.as_deref() == Some("Weapon Skin"))
                         .then_some(item.applies_to.as_deref())
                         .flatten(),
@@ -1469,8 +1524,7 @@ impl GearView {
                         if ui.small_button(format!("{}", item.display_tag)).clicked() {
                             action = Some(ViewAction::OpenTag(item.display_tag));
                         }
-                        if item.item_type.as_deref() == Some("Weapon Skin")
-                            && let Some(model) = item.model_tag
+                        if let Some(model) = gear_model_navigation_tag(item)
                             && ui.button("Go to Models").clicked()
                         {
                             action = Some(ViewAction::ShowModel(model));
@@ -1491,7 +1545,7 @@ impl GearView {
                         .spacing([16.0, 6.0])
                         .show(ui, |ui| {
                             metadata_row(ui, "Rarity", item.rarity.map(GearRarity::label));
-                            metadata_row(ui, "Category", item.item_type.as_deref());
+                            metadata_row(ui, "Category", gear_item_type(item));
                             metadata_row(
                                 ui,
                                 if item.mod_category.is_some() {
@@ -1499,7 +1553,7 @@ impl GearView {
                                 } else {
                                     "Subtype"
                                 },
-                                item.subcategory.as_deref(),
+                                gear_item_subcategory(item),
                             );
                             if let Some(owner_label) = metadata.owner_label {
                                 metadata_row(ui, owner_label, item.applies_to.as_deref());
@@ -1646,6 +1700,30 @@ impl GearView {
 
         action
     }
+}
+
+fn gear_item_type(item: &GearItem) -> Option<&str> {
+    match item.item_type.as_deref() {
+        Some("Melee") => Some("Weapon Skin"),
+        item_type => item_type,
+    }
+}
+
+fn gear_item_subcategory(item: &GearItem) -> Option<&str> {
+    if item.item_type.as_deref() == Some("Melee") {
+        Some("Melee")
+    } else {
+        item.subcategory.as_deref()
+    }
+}
+
+fn gear_model_navigation_tag(item: &GearItem) -> Option<TagHash> {
+    matches!(
+        item.item_type.as_deref(),
+        Some("Weapon Skin" | "Runner Skin" | "Charm" | "Melee")
+    )
+    .then_some(item.model_tag)
+    .flatten()
 }
 
 fn is_authored_weapon(item: &GearItem) -> bool {
@@ -2093,8 +2171,7 @@ fn gear_item_button(
         item.rarity
             .map(GearRarity::label)
             .unwrap_or("Unknown rarity"),
-        item.subcategory
-            .as_deref()
+        gear_item_subcategory(item)
             .or(item.mod_category.as_deref())
             .unwrap_or("Uncategorized")
     ))
@@ -2270,6 +2347,7 @@ fn gear_metadata_schema(item: &GearItem) -> GearMetadataSchema {
     GearMetadataSchema {
         owner_label: match item.item_type.as_deref() {
             Some("Weapon Skin") => Some("Weapon"),
+            Some("Melee") => None,
             Some("Runner Core" | "Runner Skin") => Some("Shell"),
             _ => None,
         },
@@ -2294,7 +2372,7 @@ fn filter_chip(
 
 fn collect_item_types(items: &[GearItem]) -> Vec<(String, usize)> {
     let mut counts: FxHashMap<String, usize> = FxHashMap::default();
-    for item_type in items.iter().filter_map(|item| item.item_type.as_deref()) {
+    for item_type in items.iter().filter_map(gear_item_type) {
         *counts.entry(item_type.to_owned()).or_default() += 1;
     }
     let mut item_types: Vec<_> = counts.into_iter().collect();
@@ -2361,10 +2439,7 @@ fn matches_chip_filters(
     selected_internal_categories: &FxHashSet<String>,
 ) -> bool {
     let matches_type = selected_item_types.is_empty()
-        || item
-            .item_type
-            .as_ref()
-            .is_some_and(|value| selected_item_types.contains(value));
+        || gear_item_type(item).is_some_and(|value| selected_item_types.contains(value));
     let matches_rarity = selected_rarities.is_empty()
         || item
             .rarity
@@ -2390,7 +2465,7 @@ fn rarity_sort_key(rarity: Option<GearRarity>) -> u8 {
 }
 
 fn gear_sections(item: &GearItem, show_subcategories: bool) -> Vec<String> {
-    let item_type = item.item_type.as_deref().unwrap_or("Uncategorized");
+    let item_type = gear_item_type(item).unwrap_or("Uncategorized");
     let section_owner = match item_type {
         "Runner Skin" => item.applies_to.as_deref().or(item.subcategory.as_deref()),
         "Weapon Skin" => item.applies_to.as_deref(),
@@ -2417,7 +2492,7 @@ fn gear_sections(item: &GearItem, show_subcategories: bool) -> Vec<String> {
             format!("{item_type} · {category}")
         }]
     } else if show_subcategories {
-        vec![item.subcategory.as_deref().unwrap_or(item_type).to_owned()]
+        vec![gear_item_subcategory(item).unwrap_or(item_type).to_owned()]
     } else {
         vec![item_type.to_owned()]
     }
@@ -5737,6 +5812,47 @@ mod tests {
             description: None,
             description_parts: vec![],
         }
+    }
+
+    #[test]
+    fn model_navigation_is_available_for_renderable_cosmetics() {
+        let model = TagHash(0x80AA_1234);
+        for item_type in ["Weapon Skin", "Runner Skin", "Charm", "Melee"] {
+            let mut item = test_item("Renderable", Some(item_type));
+            item.model_tag = Some(model);
+            assert_eq!(gear_model_navigation_tag(&item), Some(model), "{item_type}");
+        }
+
+        for item_type in ["Weapon", "Weapon Mod", "Runner Core", "Sticker"] {
+            let mut item = test_item("Not navigable", Some(item_type));
+            item.model_tag = Some(model);
+            assert_eq!(gear_model_navigation_tag(&item), None, "{item_type}");
+        }
+
+        let item = test_item("Missing model", Some("Charm"));
+        assert_eq!(gear_model_navigation_tag(&item), None);
+    }
+
+    #[test]
+    fn melee_is_presented_as_weapon_skin_subtype_in_gear() {
+        let mut melee = test_item("Alpha Cutter", Some("Melee"));
+        melee.subcategory = Some("Knives".to_owned());
+
+        assert_eq!(gear_item_type(&melee), Some("Weapon Skin"));
+        assert_eq!(gear_item_subcategory(&melee), Some("Melee"));
+        assert_eq!(
+            collect_item_types(&[melee.clone()]),
+            vec![("Weapon Skin".to_owned(), 1)]
+        );
+        assert!(matches_chip_filters(
+            &melee,
+            &FxHashSet::from_iter(["Weapon Skin".to_owned()]),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+        ));
+        assert_eq!(gear_sections(&melee, false), vec!["Weapon Skin"]);
+        assert_eq!(gear_sections(&melee, true), vec!["Melee"]);
+        assert_eq!(gear_metadata_schema(&melee).owner_label, None);
     }
 
     #[test]

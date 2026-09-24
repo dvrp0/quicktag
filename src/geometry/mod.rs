@@ -2274,6 +2274,82 @@ pub fn is_model_catalog_reference(reference: u32) -> bool {
         && model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
 }
 
+/// Fast catalog-only test for whether a model can lead to renderable geometry.
+/// This deliberately stays on the prebuilt TagCache graph: it does not read tag
+/// payloads, decode materials, build wireframes, or populate the model cache.
+/// Finding either a vertex or index-buffer header is sufficient to prove the
+/// entry is not literally empty.
+pub fn model_has_render_geometry(
+    cache: &TagCache,
+    root: TagHash,
+    memo: &mut rustc_hash::FxHashMap<TagHash, bool>,
+) -> bool {
+    if let Some(&result) = memo.get(&root) {
+        return result;
+    }
+
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut parent = rustc_hash::FxHashMap::default();
+    let mut frontier = vec![root];
+    while let Some(tag) = frontier.pop() {
+        if !seen.insert(tag) {
+            continue;
+        }
+        if let Some(&known) = memo.get(&tag) {
+            if !known {
+                continue;
+            }
+            let mut current = tag;
+            memo.insert(current, true);
+            while let Some(&owner) = parent.get(&current) {
+                memo.insert(owner, true);
+                current = owner;
+            }
+            return true;
+        }
+        let Some(scan) = cache.hashes.get(&tag) else {
+            continue;
+        };
+        for child in scan
+            .file_hashes
+            .iter()
+            .map(|reference| reference.hash)
+            .chain(
+                scan.file_hashes64
+                    .iter()
+                    .filter_map(|reference| tag64_to_hash32(reference.hash)),
+            )
+        {
+            let Some(entry) = package_manager().get_entry(child) else {
+                continue;
+            };
+            let tag_type = TagType::from_type_subtype(entry.file_type, entry.file_subtype);
+            if matches!(
+                tag_type,
+                TagType::VertexBuffer { is_header: true }
+                    | TagType::IndexBuffer { is_header: true }
+            ) {
+                let mut current = tag;
+                memo.insert(current, true);
+                while let Some(&owner) = parent.get(&current) {
+                    memo.insert(owner, true);
+                    current = owner;
+                }
+                return true;
+            }
+            if tag_type.is_tag() && !seen.contains(&child) {
+                parent.entry(child).or_insert(tag);
+                frontier.push(child);
+            }
+        }
+    }
+
+    for tag in seen {
+        memo.insert(tag, false);
+    }
+    false
+}
+
 /// PatternComponent tags are render implementation nodes. Return every such
 /// node reachable below authored Pattern roots so catalog UIs can show one row
 /// per cosmetic without losing the components needed to assemble its preview.
