@@ -356,6 +356,8 @@ However, inspection of all call sites showed that tfx_execution.outputs are curr
 
 They are not currently used as the authoritative source for Quicktag's GPU material constant/resource state.
 
+A short-lived renderer experiment uploaded full VS/PS register images into every material uniform even though the WGSL path did not read them. Because TFX time could change every frame, those values also changed frame-resource identity and forced repeated recreation of material buffers, bind groups, and render bundles. The 2026-09-25 memory audit removed that unused upload path. This does not remove the TFX interpreter; it prevents decoded-but-unconsumed state from becoming expensive GPU residency/churn. Renderer-authoritative TFX should return through a dynamic state path only alongside an actual shader consumer.
+
 ## 4.3 Consequence
 
 The current flow is approximately:
@@ -1110,6 +1112,24 @@ The two-mode proposal is no longer the chosen direction.
 `Pretty Preview` has been removed as a separate fidelity mode. Quicktag now exposes one renderer whose goal is to follow the authored Tiger/Marathon contract as closely as possible. Heuristic rendering remains useful only as an explicit internal compatibility fallback when an authored shader/state/input ABI has not yet been reconstructed.
 
 This simplifies the architecture: there is no longer a user-facing choice between “engine-faithful” and “looks good.” Fidelity work should improve the single renderer directly.
+
+## 16.4 Renderer memory/residency audit — 2026-09-25
+
+The renderer-fidelity work materially increased residency pressure: multiple full-resolution deferred attachments, a 4K shadow map, reconstructed geometry plus package-native geometry, large texture caches, and renderer-side TFX register images were all alive at once. The most serious issue was not one isolated allocation but the combination of high baseline residency and resources that could be recreated or accumulated during normal model browsing.
+
+The renderer was changed to keep the authored contract while bounding residency:
+
+- interactive rendering is now 1x physical resolution rather than a permanent 2x supersampled MRT set;
+- the interactive target is capped at 2560x1440 and the worst-case target-set estimate is guarded at 256 MiB;
+- shadow storage uses the 2048x2048 baseline observed in Alkahest instead of the former 4096x4096 preview allocation;
+- deferred-normal copies, distortion buffers, and bloom buffers allocate full resolution only when the current model/settings need them;
+- shared texture caches use conservative GPU-byte budgets in addition to entry counts, completed asynchronous loads are accounted for, and concurrent texture loads are throttled;
+- native authored vertex/index buffers are created only for stages that can currently consume them, and identical package data tags share one WGPU allocation;
+- model pipeline caching is keyed by GPU-equivalent state rather than accumulating aliases for every technique hash;
+- unused TFX register arrays were removed from material GPU uniforms, eliminating time-driven frame-resource rebuilds that did not affect shader output;
+- small long-session CPU analysis caches are bounded.
+
+This is intentionally an architectural memory fix rather than a reduction in authored rendering semantics. Full native stream/layout metadata is still retained on the CPU, and native ShadowGenerate/DepthPrepass behavior is preserved where supported.
 
 ---
 

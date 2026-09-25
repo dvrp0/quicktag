@@ -240,6 +240,37 @@ impl TextureDesc {
 }
 
 impl Texture {
+    /// Conservative GPU-residency estimate used by the shared texture cache.
+    ///
+    /// TextureDesc does not retain the exact uploaded mip count, so budget the
+    /// complete theoretical mip chain. This intentionally overestimates sparse
+    /// Tiger mip tails a little rather than allowing the cache to grow until
+    /// the OS/GPU driver starts paging or OOMs.
+    pub(crate) fn estimated_gpu_bytes(&self) -> u64 {
+        let mut width = self.desc.width.max(1);
+        let mut height = self.desc.height.max(1);
+        let mut per_layer = 0u64;
+        loop {
+            per_layer =
+                per_layer
+                    .saturating_add(mip_level_byte_size(self.desc.format, width, height) as u64);
+            if width == 1 && height == 1 {
+                break;
+            }
+            width = (width / 2).max(1);
+            height = (height / 2).max(1);
+        }
+
+        // create_texture() always retains the ordinary one-layer handle. Array
+        // textures additionally retain the full array/cubemap allocation.
+        let retained_layers = 1u64
+            + self
+                .full_cubemap_texture
+                .as_ref()
+                .map_or(0, |_| u64::from(self.desc.array_size.max(1)));
+        per_layer.saturating_mul(retained_layers)
+    }
+
     /// Raw texel view for UI presentation and extraction.
     ///
     /// Quicktag's Windows UI target is non-sRGB. Sampling an sRGB view there

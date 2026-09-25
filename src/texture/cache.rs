@@ -112,20 +112,26 @@ impl TextureCache {
         } else if let Some(Either::Right(p)) = c {
             if let std::task::Poll::Ready(r) = p.poll() {
                 cache.insert(key, Left(r.clone()));
-                return r.clone();
+                r.clone()
             } else {
                 cache.insert(key, Either::Right(p));
                 None
             }
         } else if c.is_none() {
-            cache.insert(
-                key,
-                Either::Right(Promise::spawn_async(Self::load_texture_task(
-                    self.render_state.clone(),
-                    hash,
-                    premultiply_alpha,
-                ))),
-            );
+            let pending = cache
+                .values()
+                .filter(|value| matches!(value, Either::Right(_)))
+                .count();
+            if pending < Self::MAX_PENDING_TEXTURE_LOADS {
+                cache.insert(
+                    key,
+                    Either::Right(Promise::spawn_async(Self::load_texture_task(
+                        self.render_state.clone(),
+                        hash,
+                        premultiply_alpha,
+                    ))),
+                );
+            }
 
             None
         } else {
@@ -310,21 +316,75 @@ impl TextureCache {
         }
     }
 
-    pub(crate) const MAX_TEXTURES: usize = 1024;
+    // Count-only limits are unsafe for modern Tiger assets: a handful of 4K
+    // RGBA textures can outweigh hundreds of small BC maps. Keep both a hard
+    // entry ceiling and a conservative GPU-byte budget so browsing models
+    // cannot accumulate several gigabytes of resident textures.
+    pub(crate) const MAX_TEXTURES: usize = 256;
+    pub(crate) const MAX_PENDING_TEXTURE_LOADS: usize = 8;
+    pub(crate) const MAX_TEXTURE_GPU_BYTES: u64 = 384 * 1024 * 1024;
+
     pub(crate) fn truncate(&self) {
         let mut cache = self.cache.write();
-        while cache.len() > Self::MAX_TEXTURES {
-            if let Some((_, Either::Left(Some((_, tid))))) = cache.pop_front() {
+
+        // A spawned Promise can already own a completed GPU texture even when
+        // its key is never requested again (common while rapidly browsing
+        // models). Promote completed promises before accounting so those
+        // allocations cannot sit outside the byte budget indefinitely.
+        for (_key, value) in cache.iter_mut() {
+            let completed = match value {
+                Either::Right(promise) => match promise.poll() {
+                    std::task::Poll::Ready(result) => Some(result.clone()),
+                    std::task::Poll::Pending => None,
+                },
+                Either::Left(_) => None,
+            };
+            if let Some(result) = completed {
+                *value = Either::Left(result);
+            }
+        }
+
+        let mut estimated_bytes = cache
+            .values()
+            .filter_map(|value| match value {
+                Either::Left(Some((texture, _))) => Some(texture.estimated_gpu_bytes()),
+                _ => None,
+            })
+            .fold(0u64, u64::saturating_add);
+
+        while cache.len() > Self::MAX_TEXTURES || estimated_bytes > Self::MAX_TEXTURE_GPU_BYTES {
+            let Some((_, value)) = cache.pop_front() else {
+                break;
+            };
+            if let Either::Left(Some((texture, tid))) = value {
+                estimated_bytes = estimated_bytes.saturating_sub(texture.estimated_gpu_bytes());
                 self.render_state.renderer.write().free_texture(&tid);
             }
         }
     }
 
-    pub(crate) const MAX_MATERIAL_TEXTURES: usize = 256;
+    pub(crate) const MAX_MATERIAL_TEXTURES: usize = 64;
+    pub(crate) const MAX_MATERIAL_TEXTURE_GPU_BYTES: u64 = 128 * 1024 * 1024;
+
     pub(crate) fn truncate_materials(&self) {
         let mut cache = self.material_cache.write();
-        while cache.len() > Self::MAX_MATERIAL_TEXTURES {
-            if let Some((_, Some((_, tid)))) = cache.pop_front() {
+        let mut estimated_bytes = cache
+            .values()
+            .filter_map(|value| {
+                value
+                    .as_ref()
+                    .map(|(texture, _)| texture.estimated_gpu_bytes())
+            })
+            .fold(0u64, u64::saturating_add);
+
+        while cache.len() > Self::MAX_MATERIAL_TEXTURES
+            || estimated_bytes > Self::MAX_MATERIAL_TEXTURE_GPU_BYTES
+        {
+            let Some((_, value)) = cache.pop_front() else {
+                break;
+            };
+            if let Some((texture, tid)) = value {
+                estimated_bytes = estimated_bytes.saturating_sub(texture.estimated_gpu_bytes());
                 self.render_state.renderer.write().free_texture(&tid);
             }
         }

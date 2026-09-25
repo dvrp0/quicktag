@@ -8,12 +8,13 @@ The ordering is intentional: avoid spending significant time tuning presentation
 
 - **Render-stage ABI:** partial. The 25-stage table, insertion point, strongest semantic anchors, dynamic/static census, and typed API are implemented; raw stage 3 and several feature-only stages remain semantically unresolved.
 - **Authored ShadowGenerate caster selection:** complete. Strict Tiger uses authored raw-stage-4 source ranges and package-native vertex/index streams where supported, with compatibility fallback.
-- **Authored vertex/input ABI:** partial. Raw streams/layout descriptors are preserved and GPU-materialized; Strict Shadow consumes them, but the rest of Strict Tiger still largely renders through reconstructed `ModelVertex`.
-- **Renderer-facing TFX:** partial. Runtime stage state, output register images, runtime bindings, and unresolved-dependency tracking exist; TFX register/resource state is not yet the authoritative input to the custom WGSL shading path.
+- **Authored vertex/input ABI:** partial. Raw streams/layout descriptors are preserved and GPU-materialized; Strict ShadowGenerate and compatible DepthPrepass draws can now consume authored package vertex/index streams directly. G-buffer and the remaining visible/material stages still largely render through reconstructed `ModelVertex`.
+- **Renderer-facing TFX:** partial. Runtime stage-state decoding, register images, runtime bindings, and unresolved-dependency tracking exist in the research/runtime layer, but the current custom WGSL path does not consume them. The previous renderer-side upload of unused time-varying TFX register images was removed after the memory audit because it rebuilt material buffers/bind groups/render bundles without affecting pixels. TFX must return through a dedicated dynamic GPU-state path only when shaders actually consume it.
 - **Shadow artifact:** resolved in the live model viewer on 2026-09-25. Replacing the finite spotlight perspective shadow transform with an affine directional Tiger-style shadow space removed the smooth-surface spike/teeth artifact. The exact Marathon authored shadow matrix is still not decoded, so projection fidelity remains a follow-up rather than a correctness blocker.
 - **Shadow shader fidelity:** partial. Native input layouts/source ranges are supported where the authored VS ABI is compatible; runtime-resource VS families such as Conquest's `SV_VertexID -> t2` path explicitly use the reconstructed-position compatibility path until that runtime buffer ABI is implemented.
 - **Renderer contract:** `Pretty Preview` has been removed as a separate fidelity mode. Quicktag now exposes one Tiger-faithful renderer contract; heuristic/custom behavior remains only as explicit internal compatibility fallback where authored behavior is still unresolved.
-- **Validation:** current diff passes `cargo check --release`, Tiger-shadow unit tests, and the Conquest GPU visual probe (existing repository warnings remain).
+- **Memory/residency audit:** completed for the current renderer architecture. Interactive MRT supersampling is 1x with a 2560x1440 / 256 MiB target-set ceiling; shadow storage matches Alkahest's 2048x2048 baseline; optional normal-copy/distortion/bloom targets collapse to 1x1 when unused; texture caches are byte-budgeted and async uploads are throttled; authored raw buffers are materialized only for native stages that consume them and deduplicated by package data tag; GPU-equivalent pipelines no longer accumulate per-technique aliases; small long-session analysis caches are bounded.
+- **Validation:** current diff passes `cargo check --release`, renderer memory-budget/regression tests, authored-depth metadata/shader tests, native DepthPrepass WGPU pipeline validation, Tiger-shadow tests, texture tests, and the Conquest package/GPU visual probe (existing repository warnings remain). The earlier bind-group regression is fixed by isolating authored depth into its own shader/pipeline layout.
 
 ---
 
@@ -104,7 +105,7 @@ The current jagged-shadow artifact may be caused upstream by drawing the wrong a
 
 Tiger can use multiple authored streams and stage-specific layout metadata. Quicktag previously collapsed these into `ModelVertex` too early.
 
-**Progress (2026-09-25):** authored geometry inputs are now first-class data. Quicktag preserves package stream/header/data references, index-buffer metadata, per-stage layout IDs, element semantic/index/format/offset information, instancing flags, geometry dequantization, and attachment transforms through merged model assembly. These streams are materialized as native WGPU vertex/index buffers. The Strict Tiger **ShadowGenerate** path can consume them directly; the general visible/depth/material paths still rely on reconstructed `ModelVertex`, so this P0 remains open.
+**Progress (2026-09-25):** authored geometry inputs are now first-class data. Quicktag preserves package stream/header/data references, index-buffer metadata, per-stage layout IDs, element semantic/index/format/offset information, instancing flags, geometry dequantization, attachment transforms, and the original per-draw source IA range through merged model assembly. These streams are materialized as native WGPU vertex/index buffers. The Strict Tiger **ShadowGenerate** path can consume them directly, and compatible **DepthPrepass** draws now have a dedicated authored-position pipeline that binds the package IA contract and authored geometry transform. G-buffer and the remaining visible/material paths still rely on reconstructed `ModelVertex`, so this P0 remains open.
 
 The package-wide ShadowGenerate relation probe also found an important constraint: among 1661 geometries with both stage 0 and stage 4, **1661/1661 use the same input-layout ID** and **0 use a different layout**. The real stage-specific difference is usually the authored vertex program: 1594/1661 geometry resources have completely disjoint visible-vs-shadow VS sets.
 
@@ -122,9 +123,11 @@ The package-wide ShadowGenerate relation probe also found an important constrain
 - [x] Decode Marathon input-layout tables from render globals / geometry metadata.
 - [x] Associate an input-layout ID with each render stage.
 - [x] Preserve semantic/index/format/offset/stream information.
-- [x] Materialize authored package streams as GPU vertex/index buffers.
+- [x] Materialize required authored package streams as GPU vertex/index buffers, deduplicated by package data tag.
 - [x] Allow Strict Tiger ShadowGenerate pipelines to consume authored stream layouts and source index ranges.
 - [ ] Generalize authored stream/layout consumption to Strict Tiger G-buffer/depth/other stage pipelines.
+  - [x] DepthPrepass: preserve original IA metadata and consume authored package streams/index range where the vertex ABI is compatible.
+  - [ ] GenerateGbuffer and remaining stages.
 - [ ] Keep reconstructed `ModelVertex` only as an explicit compatibility fallback for unsupported authored paths.
 - [x] Verify package-wide whether ShadowGenerate changes input-layout ID: 0 / 1661 differ.
 - [x] Add Conquest LMG regression coverage for authored source/range/layout preservation.
@@ -139,13 +142,13 @@ A Tiger-compatible shader path should not require reconstructing or guessing mis
 
 Quicktag now has a renderer-facing runtime-state layer, but authored TFX is **not yet the final authority for shading**.
 
-**Progress (2026-09-25):** `TechniqueStageRuntimeState` evaluates TFX per shader stage, overlays output registers onto authored inline constants, records runtime resource/sampler bindings, and carries unresolved dependencies. VS/PS register images and decode status are uploaded into `MaterialUniform` (`tfx_vs_registers`, `tfx_ps_registers`, `tfx_meta`). Runtime resource bindings are represented/resolved in CPU state and participate in material identity, but the custom WGSL shaders do not yet consume those TFX register arrays and TFX-driven resources are not yet applied as dynamic GPU bind-group bindings. Therefore this remains P0.
+**Progress (2026-09-25):** `TechniqueStageRuntimeState` can evaluate TFX per shader stage, overlay output registers onto authored inline constants, record runtime resource/sampler bindings, and carry unresolved dependencies. An earlier renderer experiment copied VS/PS register images into `MaterialUniform`, but the custom WGSL shaders never consumed those arrays. Because time-varying TFX values then invalidated `ModelFrameResources` and recreated material buffers/bind groups/render bundles every frame, that unused upload path was removed during the memory audit. Runtime decoding remains available for research/probes; renderer-authoritative TFX is still P0 and must be reintroduced as an explicitly dynamic GPU-state path that is consumed by the shader rather than folded into immutable frame-resource identity.
 
 ### Required work
 
 - [x] Define a renderer-facing TFX runtime result/state.
 - [x] Evaluate TFX outputs into per-stage constant-register images.
-- [x] Upload TFX VS/PS register images and decode status into actual GPU uniform data.
+- [ ] Bind TFX VS/PS register images and decode status through a dynamic GPU-state path once the consuming WGSL/native shader ABI is implemented.
 - [x] Represent runtime texture/sampler/resource bindings and unresolved dependencies in renderer state.
 - [ ] Make custom/compatibility shaders actually consume required TFX register values.
 - [ ] Apply TFX-driven:
@@ -190,6 +193,7 @@ rather than:
   - [x] ShadowGenerate uses authored stage membership
 - [ ] authored stage-specific vertex ABI across the full renderer
   - [x] ShadowGenerate can consume package-native vertex/index streams when its VS ABI is supported
+  - [x] DepthPrepass can consume package-native vertex/index streams when its VS ABI is supported
 - [ ] authored technique selection as shader behavior
 - [ ] authored render state across all passes
 - [ ] renderer-authoritative TFX

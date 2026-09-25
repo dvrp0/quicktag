@@ -31,6 +31,7 @@ fn panel(scale: f32, offset: [f32; 3]) -> WireframePreview {
             technique: None,
             gear_dye_change_color_index: None,
             authored_source: None,
+            authored_draw: None,
             procedural_scale: 1.0,
             texture: None,
             textures: WireframeMaterialTextures {

@@ -24,23 +24,17 @@ use crate::{
         CharacterSurfaceMaterial, ForwardCoatingMaterial, GearDyeMaterial, GearPatternMaterial,
         GeometryPositionTransform, InvestmentDecalMaskMode, InvestmentDecalMaterial,
         InvestmentDecalMode, RunnerLayeredSurfaceMaterial, RunnerOcclusionMaterial,
-        SharedAtlasDetailMaterial, TransmissionMaterial, UNIQUE_ID_CHANNEL, UvTransformPreview,
-        WEAPON_MOD_AGE_CHANNEL, WeaponModAttachmentPose, WeaponModConditionMaterial,
-        WeaponSurfaceConditionMaterial, WireframeMaterialTextures, WireframePreview,
+        SharedAtlasDetailMaterial, TransmissionMaterial, UvTransformPreview,
+        WeaponModAttachmentPose, WeaponModConditionMaterial, WeaponSurfaceConditionMaterial,
+        WireframeMaterialTextures, WireframePreview,
     },
     material::{TechniqueRenderState, is_sticker_proxy_technique, render_state_for_technique},
     render::{
         TigerDrawPacket,
-        evidence::{
-            EvidenceLevel, ProvenanceId, ProvenanceRecord, ProvenanceStore, SourceSpan,
-        },
+        evidence::{EvidenceLevel, ProvenanceId, ProvenanceRecord, ProvenanceStore, SourceSpan},
         material::MaterialIR,
         pass_plan::{DrawPassPlan, RenderPassKind},
-        technique::{
-            ShaderStage, TechniqueDescriptor, TechniqueRuntimeBinding, TechniqueStageRuntimeState,
-            VertexAbiDescriptor,
-        },
-        tfx::{TfxRuntimeInputs, TfxValue},
+        technique::{ShaderStage, TechniqueDescriptor, VertexAbiDescriptor},
     },
     texture::{
         Texture, TextureType,
@@ -58,8 +52,10 @@ const SURFACE_PROPERTIES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 const SURFACE_EMISSIVE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SURFACE_FLAGS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const SHADOW_MAP_SIZE: u32 = 4096;
-const MAX_TFX_GPU_REGISTERS: usize = 256;
+// Alkahest's Tiger shadow view uses a 2048x2048 shadow surface. Keep the
+// compatibility renderer at the same scale instead of retaining a 4K preview
+// allocation that consumed 64 MiB by itself.
+const SHADOW_MAP_SIZE: u32 = 2048;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -85,6 +81,7 @@ struct AuthoredShadowUniform {
 
 #[derive(Clone, Copy, Debug)]
 struct AuthoredStageMetadata {
+    raw_stage: u8,
     input_layout_id: u8,
     part_index: usize,
     source_index_start: u32,
@@ -131,11 +128,11 @@ struct ModelDraw {
     procedural_scale: f32,
     authored_source: Option<usize>,
     authored_stage: Option<AuthoredStageMetadata>,
-    /// Whether Quicktag's raw-stream compatibility VS can honor the authored
-    /// ShadowGenerate vertex contract. Shader families that consume runtime
+    /// Whether Quicktag's raw-stream compatibility VS can honor this
+    /// authored stage's vertex contract. Shader families that consume runtime
     /// vertex resources (for example SV_VertexID -> t2 packed positions) must
     /// use the reconstructed-position fallback until that resource ABI exists.
-    strict_shadow_native_supported: bool,
+    authored_native_vertex_supported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -276,11 +273,20 @@ struct StrictShadowPipelineKey {
     stream_strides: [u16; 8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StrictDepthPipelineKey {
+    layout_id: u8,
+    primitive_type: u8,
+    rasterizer: u8,
+    depth_stencil: u8,
+    depth_bias: u8,
+    index_32bit: bool,
+    stream_strides: [u16; 8],
+}
+
 struct GpuAuthoredGeometryInput {
     geometry: TagHash,
     vertex_streams: Vec<GpuAuthoredVertexStream>,
-    color_buffer: Option<GpuAuthoredVertexStream>,
-    skinning_buffer: Option<GpuAuthoredVertexStream>,
     index_buffer: Option<GpuAuthoredIndexBuffer>,
     stage_layouts: Vec<AuthoredStageInputLayout>,
     position_transform: Option<GeometryPositionTransform>,
@@ -335,7 +341,7 @@ impl GpuAuthoredGeometryInput {
     }
 }
 
-fn strict_shadow_stream_strides(
+fn authored_stream_strides(
     source: &GpuAuthoredGeometryInput,
     descriptor: &AuthoredInputLayoutDescriptor,
 ) -> Option<[u16; 8]> {
@@ -380,23 +386,30 @@ fn authored_vertex_format_size(format: u8) -> Option<u64> {
 fn create_gpu_authored_vertex_stream(
     device: &wgpu::Device,
     stream: &AuthoredVertexStreamRef,
+    buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
 ) -> Option<GpuAuthoredVertexStream> {
-    let data = package_manager().read_tag(stream.data_tag).ok()?;
-    let byte_count = data.len().min(stream.data_size as usize);
-    if byte_count == 0 {
-        return None;
-    }
-    let label = format!(
-        "quicktag_authored_stream_{}_{}",
-        stream.header_tag, stream.stream_index
-    );
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(&label),
-        contents: &data[..byte_count],
-        usage: wgpu::BufferUsages::VERTEX
-            | wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST,
-    });
+    let buffer = if let Some(buffer) = buffer_cache.get(&stream.data_tag) {
+        buffer.clone()
+    } else {
+        let data = package_manager().read_tag(stream.data_tag).ok()?;
+        let byte_count = data.len().min(stream.data_size as usize);
+        if byte_count == 0 {
+            return None;
+        }
+        let label = format!(
+            "quicktag_authored_stream_{}_{}",
+            stream.header_tag, stream.stream_index
+        );
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&label),
+            contents: &data[..byte_count],
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
+        });
+        buffer_cache.insert(stream.data_tag, buffer.clone());
+        buffer
+    };
     Some(GpuAuthoredVertexStream {
         stream_index: stream.stream_index,
         header_tag: stream.header_tag,
@@ -410,18 +423,25 @@ fn create_gpu_authored_vertex_stream(
 fn create_gpu_authored_index_buffer(
     device: &wgpu::Device,
     index: &AuthoredIndexBufferRef,
+    buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
 ) -> Option<GpuAuthoredIndexBuffer> {
-    let data = package_manager().read_tag(index.data_tag).ok()?;
-    let byte_count = data.len().min(index.data_size as usize);
-    if byte_count == 0 {
-        return None;
-    }
-    let label = format!("quicktag_authored_indices_{}", index.header_tag);
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(&label),
-        contents: &data[..byte_count],
-        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-    });
+    let buffer = if let Some(buffer) = buffer_cache.get(&index.data_tag) {
+        buffer.clone()
+    } else {
+        let data = package_manager().read_tag(index.data_tag).ok()?;
+        let byte_count = data.len().min(index.data_size as usize);
+        if byte_count == 0 {
+            return None;
+        }
+        let label = format!("quicktag_authored_indices_{}", index.header_tag);
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&label),
+            contents: &data[..byte_count],
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        });
+        buffer_cache.insert(index.data_tag, buffer.clone());
+        buffer
+    };
     Some(GpuAuthoredIndexBuffer {
         header_tag: index.header_tag,
         data_tag: index.data_tag,
@@ -438,31 +458,36 @@ fn create_gpu_authored_index_buffer(
 fn create_gpu_authored_geometry_input(
     device: &wgpu::Device,
     source: &AuthoredGeometryInput,
+    required_stages: &[u8],
+    vertex_buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
+    index_buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
 ) -> Option<GpuAuthoredGeometryInput> {
+    let required_streams = source
+        .stage_layouts
+        .iter()
+        .filter(|layout| required_stages.contains(&layout.raw_stage))
+        .filter_map(|layout| layout.descriptor.as_ref())
+        .flat_map(|descriptor| descriptor.streams.iter().map(|stream| stream.stream_index))
+        .unique()
+        .collect_vec();
+
     let vertex_streams = source
         .vertex_streams
         .iter()
-        .filter_map(|stream| create_gpu_authored_vertex_stream(device, stream))
+        .filter(|stream| required_streams.contains(&stream.stream_index))
+        .filter_map(|stream| create_gpu_authored_vertex_stream(device, stream, vertex_buffer_cache))
         .collect_vec();
-    if vertex_streams.is_empty() {
-        return None;
-    }
 
     Some(GpuAuthoredGeometryInput {
         geometry: source.geometry,
         vertex_streams,
-        color_buffer: source
-            .color_buffer
-            .as_ref()
-            .and_then(|stream| create_gpu_authored_vertex_stream(device, stream)),
-        skinning_buffer: source
-            .skinning_buffer
-            .as_ref()
-            .and_then(|stream| create_gpu_authored_vertex_stream(device, stream)),
-        index_buffer: source
-            .index_buffer
-            .as_ref()
-            .and_then(|index| create_gpu_authored_index_buffer(device, index)),
+        index_buffer: (!required_stages.is_empty())
+            .then(|| {
+                source.index_buffer.as_ref().and_then(|index| {
+                    create_gpu_authored_index_buffer(device, index, index_buffer_cache)
+                })
+            })
+            .flatten(),
         stage_layouts: source.stage_layouts.clone(),
         position_transform: source.position_transform,
         uv_transform: source.uv_transform,
@@ -686,10 +711,52 @@ impl GpuModelPreview {
             contents: bytemuck::cast_slice(&gpu_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let mut required_stages = vec![Vec::<u8>::new(); wireframe.authored_inputs.len()];
+        for draw in draws
+            .iter()
+            .filter(|draw| {
+                draw.authored_native_vertex_supported
+                    && draw
+                        .packet
+                        .pass_plan
+                        .passes
+                        .contains(&RenderPassKind::DepthOnly)
+            })
+            .chain(
+                authored_shadow_draws
+                    .iter()
+                    .filter(|draw| draw.authored_native_vertex_supported),
+            )
+        {
+            let (Some(source_index), Some(authored)) = (draw.authored_source, draw.authored_stage)
+            else {
+                continue;
+            };
+            if let Some(stages) = required_stages.get_mut(source_index)
+                && !stages.contains(&authored.raw_stage)
+            {
+                stages.push(authored.raw_stage);
+            }
+        }
+
+        let mut vertex_buffer_cache = HashMap::<TagHash, wgpu::Buffer>::new();
+        let mut index_buffer_cache = HashMap::<TagHash, wgpu::Buffer>::new();
         let authored_inputs = wireframe
             .authored_inputs
             .iter()
-            .map(|source| create_gpu_authored_geometry_input(device, source))
+            .enumerate()
+            .map(|(source_index, source)| {
+                create_gpu_authored_geometry_input(
+                    device,
+                    source,
+                    required_stages
+                        .get(source_index)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    &mut vertex_buffer_cache,
+                    &mut index_buffer_cache,
+                )
+            })
             .collect();
 
         Some(Self {
@@ -729,7 +796,7 @@ fn shader_payload_contains_ascii(shader: TagHash, needle: &[u8]) -> bool {
     data.windows(needle.len()).any(|window| window == needle)
 }
 
-fn strict_shadow_native_vertex_supported(technique: Option<&TechniqueDescriptor>) -> bool {
+fn authored_native_vertex_supported(technique: Option<&TechniqueDescriptor>) -> bool {
     let Some(vertex_shader) = technique
         .into_iter()
         .flat_map(|technique| technique.stages.iter())
@@ -791,8 +858,8 @@ fn model_draw_from_source(
         &pass_plan,
         source.technique,
     );
-    let strict_shadow_native_supported = source.authored_stage.is_some()
-        && strict_shadow_native_vertex_supported(technique.as_ref());
+    let authored_native_vertex_supported =
+        source.authored_stage.is_some() && authored_native_vertex_supported(technique.as_ref());
 
     ModelDraw {
         indices: source.indices.clone(),
@@ -846,7 +913,7 @@ fn model_draw_from_source(
         procedural_scale: source.procedural_scale,
         authored_source: source.authored_source,
         authored_stage: source.authored_stage,
-        strict_shadow_native_supported,
+        authored_native_vertex_supported,
     }
 }
 
@@ -867,6 +934,28 @@ fn model_draws(
             .saturating_add(range.index_count)
             .min(index_len);
         if start < end {
+            let authored_stage = range.authored_draw.and_then(|authored| {
+                let raw_stage = range.render_stage?;
+                let source_index = range.authored_source?;
+                let input_layout_id = wireframe
+                    .authored_inputs
+                    .get(source_index)?
+                    .stage_layouts
+                    .iter()
+                    .find(|layout| layout.raw_stage == raw_stage)?
+                    .layout_id;
+                Some(AuthoredStageMetadata {
+                    raw_stage,
+                    input_layout_id,
+                    part_index: authored.part_index,
+                    source_index_start: authored.source_index_start,
+                    source_index_count: authored.source_index_count,
+                    primitive_type: authored.primitive_type,
+                    variant_shader_index: authored.variant_shader_index,
+                    flags: authored.flags,
+                    lod_run: authored.lod_run,
+                })
+            });
             draws.push(model_draw_from_source(
                 ModelDrawSource {
                     indices: start as u32..end as u32,
@@ -878,7 +967,7 @@ fn model_draws(
                     texture: range.texture,
                     textures: &range.textures,
                     center: draw_range_center(wireframe, start, end),
-                    authored_stage: None,
+                    authored_stage,
                 },
                 &mut technique_descriptors,
             ));
@@ -934,7 +1023,7 @@ fn model_draws(
             procedural_scale: draw_range_procedural_scale(wireframe, 0, index_len),
             authored_source: None,
             authored_stage: None,
-            strict_shadow_native_supported: false,
+            authored_native_vertex_supported: false,
         });
     }
 
@@ -972,6 +1061,7 @@ fn model_authored_shadow_draws(
                 textures: &range.textures,
                 center: draw_indices_center(&wireframe.vertices, &range.indices),
                 authored_stage: Some(AuthoredStageMetadata {
+                    raw_stage: range.render_stage,
                     input_layout_id: range.input_layout_id,
                     part_index: range.part_index,
                     source_index_start: range.source_index_start,
@@ -1453,118 +1543,6 @@ struct MaterialUniform {
     runner_layered_constants: [[f32; 4]; 24],
     runner_color_constants: [[f32; 4]; 7],
     alpha_mask_params: [f32; 4],
-    /// Renderer-authoritative TFX register image. The first two lanes are
-    /// VS/PS register counts; z/w encode VS/PS decode status respectively.
-    tfx_meta: [f32; 4],
-    tfx_vs_registers: [[f32; 4]; MAX_TFX_GPU_REGISTERS],
-    tfx_ps_registers: [[f32; 4]; MAX_TFX_GPU_REGISTERS],
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct LoadedTfxRuntime {
-    vs_registers: Vec<[f32; 4]>,
-    ps_registers: Vec<[f32; 4]>,
-    bindings: Vec<TechniqueRuntimeBinding>,
-    unresolved_dependencies: Vec<String>,
-    vs_status: crate::material::TfxDecodeStatus,
-    ps_status: crate::material::TfxDecodeStatus,
-}
-
-impl Default for LoadedTfxRuntime {
-    fn default() -> Self {
-        Self {
-            vs_registers: vec![],
-            ps_registers: vec![],
-            bindings: vec![],
-            unresolved_dependencies: vec![],
-            vs_status: crate::material::TfxDecodeStatus::Complete,
-            ps_status: crate::material::TfxDecodeStatus::Complete,
-        }
-    }
-}
-
-fn tfx_status_code(status: crate::material::TfxDecodeStatus) -> f32 {
-    match status {
-        crate::material::TfxDecodeStatus::Complete => 0.0,
-        crate::material::TfxDecodeStatus::Partial => 1.0,
-        crate::material::TfxDecodeStatus::StoppedAtUnknown => 2.0,
-        crate::material::TfxDecodeStatus::Invalid => 3.0,
-    }
-}
-
-fn tfx_gpu_registers(values: &[[f32; 4]]) -> [[f32; 4]; MAX_TFX_GPU_REGISTERS] {
-    let mut registers = [[0.0; 4]; MAX_TFX_GPU_REGISTERS];
-    for (target, value) in registers.iter_mut().zip(values.iter().copied()) {
-        *target = value;
-    }
-    registers
-}
-
-fn loaded_tfx_runtime(
-    technique: Option<&TechniqueDescriptor>,
-    time_seconds: f32,
-    mod_wear: Option<WeaponModConditionMaterial>,
-) -> LoadedTfxRuntime {
-    let Some(technique) = technique else {
-        return LoadedTfxRuntime::default();
-    };
-    let mut inputs = TfxRuntimeInputs {
-        time_seconds,
-        ..Default::default()
-    };
-    if let Some(wear) = mod_wear {
-        if let Some(rarity) = wear.rarity {
-            inputs.object_channels.insert(
-                WEAPON_MOD_AGE_CHANNEL,
-                TfxValue::Vector([rarity.tier() as f32; 4]),
-            );
-        }
-        inputs.object_channels.insert(
-            UNIQUE_ID_CHANNEL,
-            TfxValue::Vector([wear.unique_id.clamp(0.0, 1.0); 4]),
-        );
-    }
-
-    let mut runtime = LoadedTfxRuntime::default();
-    for state in technique.runtime_states(&inputs) {
-        let registers = state
-            .constant_registers
-            .into_iter()
-            .take(MAX_TFX_GPU_REGISTERS)
-            .collect_vec();
-        match state.stage {
-            ShaderStage::Vertex => {
-                runtime.vs_registers = registers;
-                runtime.vs_status = state.status;
-            }
-            ShaderStage::Pixel => {
-                runtime.ps_registers = registers;
-                runtime.ps_status = state.status;
-            }
-            _ => {}
-        }
-        runtime.bindings.extend(state.bindings);
-        runtime
-            .unresolved_dependencies
-            .extend(state.unresolved_dependencies);
-    }
-    runtime.bindings.sort_by_key(|binding| {
-        (
-            match binding.stage {
-                ShaderStage::Vertex => 0u8,
-                ShaderStage::Geometry => 1,
-                ShaderStage::Pixel => 2,
-                ShaderStage::Compute => 3,
-                ShaderStage::Unknown => 4,
-            },
-            binding.slot,
-            binding.kind,
-        )
-    });
-    runtime.bindings.dedup();
-    runtime.unresolved_dependencies.sort();
-    runtime.unresolved_dependencies.dedup();
-    runtime
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1630,7 +1608,6 @@ struct LoadedMaterial {
     coating_environment_map: Option<Arc<Texture>>,
     coating_environment_sampler: Option<ModelSamplerDesc>,
     procedural_scale: f32,
-    tfx_runtime: LoadedTfxRuntime,
 }
 
 #[derive(Clone)]
@@ -1643,7 +1620,7 @@ struct PreparedDraw {
     passes: Vec<RenderPassKind>,
     authored_source: Option<usize>,
     authored_stage: Option<AuthoredStageMetadata>,
-    strict_shadow_native_supported: bool,
+    authored_native_vertex_supported: bool,
 }
 
 fn select_shadow_draws(
@@ -1890,11 +1867,6 @@ impl ModelPaintCallback {
                 continue;
             }
             let solid_color = draw.solid_color;
-            let tfx_runtime = loaded_tfx_runtime(
-                draw.packet.technique.as_ref(),
-                environment.tfx_time_seconds,
-                draw.mod_wear,
-            );
             let material_index = materials
                 .iter()
                 .position(|material| {
@@ -1925,7 +1897,6 @@ impl ModelPaintCallback {
                         && material.investment_decal == draw.investment_decal
                         && material.sampler_tag == draw.sampler
                         && material.procedural_scale == draw.procedural_scale
-                        && material.tfx_runtime == tfx_runtime
                 })
                 .unwrap_or_else(|| {
                     let color = draw
@@ -2096,7 +2067,6 @@ impl ModelPaintCallback {
                         coating_environment_map,
                         coating_environment_sampler,
                         procedural_scale: draw.procedural_scale,
-                        tfx_runtime: tfx_runtime.clone(),
                     });
                     materials.len() - 1
                 });
@@ -2111,7 +2081,7 @@ impl ModelPaintCallback {
                 passes,
                 authored_source: draw.authored_source,
                 authored_stage: draw.authored_stage,
-                strict_shadow_native_supported: draw.strict_shadow_native_supported,
+                authored_native_vertex_supported: draw.authored_native_vertex_supported,
             };
             if is_authored_shadow {
                 authored_shadow_draws.push(prepared);
@@ -2738,26 +2708,9 @@ impl ModelPaintCallback {
                             .map(|value| u64::from(value.to_bits())),
                     );
                 }
-                values.extend(
-                    material
-                        .tfx_runtime
-                        .vs_registers
-                        .iter()
-                        .chain(&material.tfx_runtime.ps_registers)
-                        .flat_map(|register| register.iter())
-                        .map(|value| u64::from(value.to_bits())),
-                );
-                values.extend(material.tfx_runtime.bindings.iter().flat_map(|binding| {
-                    [
-                        u64::from(binding.slot),
-                        binding.resolved.map_or(0, |tag| u64::from(tag.0)),
-                    ]
-                }));
-                values.extend([
-                    u64::from(tfx_status_code(material.tfx_runtime.vs_status).to_bits()),
-                    u64::from(tfx_status_code(material.tfx_runtime.ps_status).to_bits()),
-                    material.tfx_runtime.unresolved_dependencies.len() as u64,
-                ]);
+                // TFX register images are not part of the current WGSL ABI yet.
+                // Do not invalidate/rebuild every material buffer and render
+                // bundle as time-dependent TFX values advance each frame.
                 values.into_iter().fold(hash, |hash, value| {
                     (hash ^ value).wrapping_mul(0x100000001b3)
                 })
@@ -2896,13 +2849,39 @@ fn projected_export_bounds(
     }
 }
 
-/// Render the model above display resolution so fine atlas/decal strokes are
-/// integrated before presentation. This is especially important while zoomed
-/// out: texture mip filtering alone cannot antialias geometry-projected detail
-/// once an authored stroke becomes narrower than one viewport pixel.
-const MODEL_RENDER_SUPERSAMPLE: f32 = 2.0;
-const MAX_MODEL_TARGET_DIMENSION: f32 = 4096.0;
-const MAX_MODEL_TARGET_PIXELS: f32 = 8_294_400.0;
+/// Render the interactive model at physical display resolution. The previous
+/// 2x supersample multiplied every persistent MRT/copy/depth allocation by four
+/// and could put a single 1080p model view above half a gigabyte of GPU memory.
+/// Export remains explicitly sized by the export path, so interactive preview
+/// supersampling is not part of the authored Tiger contract.
+const MODEL_RENDER_SUPERSAMPLE: f32 = 1.0;
+const MAX_MODEL_TARGET_DIMENSION: f32 = 2560.0;
+const MAX_MODEL_TARGET_PIXELS: f32 = 3_686_400.0; // 2560x1440
+const MAX_MODEL_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+
+fn estimated_model_target_bytes(size: [u32; 2], features: ModelTargetFeatures) -> u64 {
+    let pixels = u64::from(size[0]) * u64::from(size[1]);
+    // Always-resident full-resolution targets:
+    // HDR compatibility color + lit color (16 B), five 4-byte logical MRTs
+    // (20 B), and depth (4 B).
+    let mut bytes = pixels.saturating_mul(40);
+    if features.deferred_normal_copy {
+        bytes = bytes.saturating_add(pixels.saturating_mul(4));
+    }
+    if features.distortion {
+        // HDR scene copy + RGBA8 distortion payload.
+        bytes = bytes.saturating_add(pixels.saturating_mul(12));
+    }
+    if features.bloom {
+        // RGBA16F half-resolution + two quarter-resolution ping-pong targets.
+        bytes = bytes.saturating_add(pixels.saturating_mul(3));
+    }
+    bytes.saturating_add(
+        u64::from(SHADOW_MAP_SIZE)
+            .saturating_mul(u64::from(SHADOW_MAP_SIZE))
+            .saturating_mul(4),
+    )
+}
 
 fn bounded_target_size(width: f32, height: f32) -> [u32; 2] {
     let desired = [
@@ -2943,6 +2922,9 @@ struct AdaptedExposure {
     updated: Instant,
 }
 
+const MAX_MATERIAL_ANALYSIS_CACHE_ENTRIES: usize = 4096;
+const MAX_ADAPTED_EXPOSURE_STATES: usize = 256;
+
 static MATERIAL_LUMINANCE: LazyLock<Mutex<HashMap<TagHash, Option<MaterialLuminance>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ADAPTED_EXPOSURE: LazyLock<Mutex<HashMap<Vec<u32>, AdaptedExposure>>> =
@@ -2968,6 +2950,9 @@ fn estimate_material_exposure(texture_cache: &TextureCache, materials: &[LoadedM
     let Ok(mut states) = ADAPTED_EXPOSURE.lock() else {
         return target;
     };
+    if states.len() >= MAX_ADAPTED_EXPOSURE_STATES && !states.contains_key(&key) {
+        states.clear();
+    }
     let state = states.entry(key).or_insert(AdaptedExposure {
         scale: target,
         updated: now,
@@ -3033,6 +3018,9 @@ fn texture_luminance(texture_cache: &TextureCache, tag: TagHash) -> Option<Mater
             })
         });
     if let Ok(mut cache) = MATERIAL_LUMINANCE.lock() {
+        if cache.len() >= MAX_MATERIAL_ANALYSIS_CACHE_ENTRIES && !cache.contains_key(&tag) {
+            cache.clear();
+        }
         cache.insert(tag, value);
     }
     value
@@ -3059,6 +3047,9 @@ fn is_debug_placeholder_texture(texture_cache: &TextureCache, tag: TagHash) -> b
         .map(|image| debug_placeholder_pixels(&image.thumbnail(64, 64).to_rgba8()))
         .unwrap_or(false);
     if let Ok(mut cache) = DEBUG_PLACEHOLDER_TEXTURES.lock() {
+        if cache.len() >= MAX_MATERIAL_ANALYSIS_CACHE_ENTRIES && !cache.contains_key(&tag) {
+            cache.clear();
+        }
         cache.insert(tag, value);
     }
     value
@@ -3358,8 +3349,10 @@ struct ModelPipelineResources {
     fallback_color_view: wgpu::TextureView,
     model_shader: wgpu::ShaderModule,
     shadow_shader: wgpu::ShaderModule,
+    authored_depth_shader: wgpu::ShaderModule,
     model_pipeline_layout: wgpu::PipelineLayout,
     strict_shadow_pipeline_layout: wgpu::PipelineLayout,
+    strict_depth_pipeline_layout: wgpu::PipelineLayout,
     model_pipelines: Vec<(ModelPipelineKey, wgpu::RenderPipeline)>,
     present_pipeline: wgpu::RenderPipeline,
     lighting_pipeline: wgpu::RenderPipeline,
@@ -3372,6 +3365,7 @@ struct ModelPipelineResources {
     // pipeline makes two-sided and reversed-winding parts cast incorrectly.
     shadow_pipelines: [wgpu::RenderPipeline; 3],
     strict_shadow_pipelines: Vec<(StrictShadowPipelineKey, wgpu::RenderPipeline)>,
+    strict_depth_pipelines: Vec<(StrictDepthPipelineKey, wgpu::RenderPipeline)>,
     depth_pipelines: [wgpu::RenderPipeline; 3],
     shadow_sampler: wgpu::Sampler,
     _fallback_cubemap: wgpu::Texture,
@@ -3379,8 +3373,16 @@ struct ModelPipelineResources {
     cubemap_sampler: wgpu::Sampler,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelTargetFeatures {
+    deferred_normal_copy: bool,
+    distortion: bool,
+    bloom: bool,
+}
+
 struct ModelTargetResources {
     size: [u32; 2],
+    features: ModelTargetFeatures,
     _color: wgpu::Texture,
     color_view: wgpu::TextureView,
     lit_color: wgpu::Texture,
@@ -3470,7 +3472,7 @@ fn create_model_render_bundles(
             let (_, pipeline) = pipelines
                 .model_pipelines
                 .iter()
-                .find(|(key, _)| *key == pipeline_key)?;
+                .find(|(key, _)| key.gpu_equivalent(pipeline_key))?;
             let material = material_bind_groups.get(draw.material_index)?;
             let distortion = accepted_passes
                 .iter()
@@ -3516,6 +3518,27 @@ fn create_model_render_bundles(
         .collect()
 }
 
+impl ModelPaintCallback {
+    fn target_features(&self) -> ModelTargetFeatures {
+        ModelTargetFeatures {
+            deferred_normal_copy: self.draws.iter().any(|draw| {
+                draw.passes.iter().any(|pass| {
+                    matches!(
+                        pass,
+                        RenderPassKind::InvestmentDecalCompatibility
+                            | RenderPassKind::ForwardCoating
+                    )
+                })
+            }),
+            distortion: self
+                .draws
+                .iter()
+                .any(|draw| draw.passes.contains(&RenderPassKind::Distortion)),
+            bloom: self.scene.postprocess0[1].abs() > 0.0001,
+        }
+    }
+}
+
 impl CallbackTrait for ModelPaintCallback {
     fn prepare(
         &self,
@@ -3540,7 +3563,7 @@ impl CallbackTrait for ModelPaintCallback {
             .shadow_draws
             .iter()
             .filter_map(|draw| {
-                if !draw.strict_shadow_native_supported {
+                if !draw.authored_native_vertex_supported {
                     return None;
                 }
                 let source_index = draw.authored_source?;
@@ -3552,7 +3575,7 @@ impl CallbackTrait for ModelPaintCallback {
                     return None;
                 }
                 let descriptor = layout.descriptor.clone()?;
-                let stream_strides = strict_shadow_stream_strides(source, &descriptor)?;
+                let stream_strides = authored_stream_strides(source, &descriptor)?;
                 let index = source.index_buffer.as_ref()?;
                 let end = authored
                     .source_index_start
@@ -3565,6 +3588,46 @@ impl CallbackTrait for ModelPaintCallback {
                         layout_id: layout.layout_id,
                         primitive_type: authored.primitive_type,
                         rasterizer: draw.pipeline.rasterizer,
+                        index_32bit: matches!(index.format, wgpu::IndexFormat::Uint32),
+                        stream_strides,
+                    },
+                    descriptor,
+                ))
+            })
+            .unique_by(|(key, _descriptor)| *key)
+            .collect_vec();
+
+        let strict_depth_specs = self
+            .draws
+            .iter()
+            .filter(|draw| draw.passes.contains(&RenderPassKind::DepthOnly))
+            .filter_map(|draw| {
+                if !draw.authored_native_vertex_supported {
+                    return None;
+                }
+                let source_index = draw.authored_source?;
+                let authored = draw.authored_stage?;
+                let source = self.preview.authored_inputs.get(source_index)?.as_ref()?;
+                let layout = source.stage_layout(authored.raw_stage)?;
+                if layout.layout_id != authored.input_layout_id {
+                    return None;
+                }
+                let descriptor = layout.descriptor.clone()?;
+                let stream_strides = authored_stream_strides(source, &descriptor)?;
+                let index = source.index_buffer.as_ref()?;
+                let end = authored
+                    .source_index_start
+                    .checked_add(authored.source_index_count)?;
+                if end > index.index_count {
+                    return None;
+                }
+                Some((
+                    StrictDepthPipelineKey {
+                        layout_id: layout.layout_id,
+                        primitive_type: authored.primitive_type,
+                        rasterizer: draw.pipeline.rasterizer,
+                        depth_stencil: draw.pipeline.depth_stencil,
+                        depth_bias: draw.pipeline.depth_bias,
                         index_32bit: matches!(index.format, wgpu::IndexFormat::Uint32),
                         stream_strides,
                     },
@@ -3595,17 +3658,8 @@ impl CallbackTrait for ModelPaintCallback {
                 if resources
                     .model_pipelines
                     .iter()
-                    .any(|(existing, _pipeline)| *existing == key)
+                    .any(|(existing, _pipeline)| existing.gpu_equivalent(key))
                 {
-                    continue;
-                }
-                let shared_pipeline = resources
-                    .model_pipelines
-                    .iter()
-                    .find(|(existing, _)| existing.gpu_equivalent(key))
-                    .map(|(_, pipeline)| pipeline.clone());
-                if let Some(pipeline) = shared_pipeline {
-                    resources.model_pipelines.push((key, pipeline));
                     continue;
                 }
                 let pipeline = create_model_pipeline(
@@ -3633,6 +3687,25 @@ impl CallbackTrait for ModelPaintCallback {
                     *key,
                 ) {
                     resources.strict_shadow_pipelines.push((*key, pipeline));
+                }
+            }
+
+            for (key, descriptor) in &strict_depth_specs {
+                if resources
+                    .strict_depth_pipelines
+                    .iter()
+                    .any(|(existing, _pipeline)| existing == key)
+                {
+                    continue;
+                }
+                if let Some(pipeline) = create_strict_depth_pipeline(
+                    device,
+                    &resources.authored_depth_shader,
+                    &resources.strict_depth_pipeline_layout,
+                    descriptor,
+                    *key,
+                ) {
+                    resources.strict_depth_pipelines.push((*key, pipeline));
                 }
             }
         }
@@ -3676,11 +3749,21 @@ impl CallbackTrait for ModelPaintCallback {
             return Vec::new();
         };
 
-        let needs_target = callback_resources
-            .get::<ModelTargetResources>()
-            .is_none_or(|resources| resources.size != self.target_size || needs_pipeline);
+        let target_features = self.target_features();
+        let needs_target =
+            callback_resources
+                .get::<ModelTargetResources>()
+                .is_none_or(|resources| {
+                    resources.size != self.target_size
+                        || resources.features != target_features
+                        || needs_pipeline
+                });
         if needs_target {
-            callback_resources.insert(create_target_resources(device, self.target_size));
+            callback_resources.insert(create_target_resources(
+                device,
+                self.target_size,
+                target_features,
+            ));
         }
 
         let frame_key = self.frame_resource_key();
@@ -3758,7 +3841,9 @@ impl CallbackTrait for ModelPaintCallback {
             let mut authored_shadow_bind_groups =
                 Vec::with_capacity(self.preview.authored_inputs.len());
             for (source_index, source) in self.preview.authored_inputs.iter().enumerate() {
-                let Some(source) = source.as_ref() else {
+                let Some(source) = source.as_ref().filter(|source| {
+                    !source.vertex_streams.is_empty() && source.index_buffer.is_some()
+                }) else {
                     authored_shadow_uniform_buffers.push(None);
                     authored_shadow_bind_groups.push(None);
                     continue;
@@ -4236,14 +4321,6 @@ impl CallbackTrait for ModelPaintCallback {
                         .alpha_mask
                         .map(|alpha| [1.0, alpha.threshold, alpha.remap[0], alpha.remap[1]])
                         .unwrap_or_default(),
-                    tfx_meta: [
-                        material.tfx_runtime.vs_registers.len() as f32,
-                        material.tfx_runtime.ps_registers.len() as f32,
-                        tfx_status_code(material.tfx_runtime.vs_status),
-                        tfx_status_code(material.tfx_runtime.ps_status),
-                    ],
-                    tfx_vs_registers: tfx_gpu_registers(&material.tfx_runtime.vs_registers),
-                    tfx_ps_registers: tfx_gpu_registers(&material.tfx_runtime.ps_registers),
                 };
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("quicktag_model_material_uniform"),
@@ -4829,7 +4906,7 @@ impl CallbackTrait for ModelPaintCallback {
                 );
 
                 let rendered_authored = (|| {
-                    if !draw.strict_shadow_native_supported {
+                    if !draw.authored_native_vertex_supported {
                         return None;
                     }
                     let source_index = draw.authored_source?;
@@ -4842,7 +4919,7 @@ impl CallbackTrait for ModelPaintCallback {
                         return None;
                     }
                     let descriptor = stage_layout.descriptor.as_ref()?;
-                    let stream_strides = strict_shadow_stream_strides(source, descriptor)?;
+                    let stream_strides = authored_stream_strides(source, descriptor)?;
                     let index = source.index_buffer.as_ref()?;
                     let transform_bind_group = frame
                         .authored_shadow_bind_groups
@@ -4940,21 +5017,105 @@ impl CallbackTrait for ModelPaintCallback {
                 occlusion_query_set: None,
             });
             depth_pass.set_bind_group(0, &frame.scene_bind_group, &[]);
-            depth_pass.set_bind_group(2, &frame._coating_fallback_bind_group, &[]);
-            depth_pass.set_vertex_buffer(0, self.preview.vertex_buffer.slice(..));
-            depth_pass.set_index_buffer(
-                self.preview.index_buffer.slice(..),
-                wgpu::IndexFormat::Uint32,
-            );
             for draw in self
                 .draws
                 .iter()
                 .filter(|draw| draw.passes.contains(&RenderPassKind::DepthOnly))
             {
-                depth_pass.set_pipeline(
-                    &pipelines.depth_pipelines[shadow_pipeline_index(draw.pipeline.rasterizer)],
-                );
-                depth_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
+                let rendered_authored = (|| {
+                    if !draw.authored_native_vertex_supported {
+                        return None;
+                    }
+                    let source_index = draw.authored_source?;
+                    let authored = draw.authored_stage?;
+                    let source = self.preview.authored_inputs.get(source_index)?.as_ref()?;
+                    let stage_layout = source.stage_layout(authored.raw_stage)?;
+                    if stage_layout.layout_id != authored.input_layout_id {
+                        return None;
+                    }
+                    let descriptor = stage_layout.descriptor.as_ref()?;
+                    let stream_strides = authored_stream_strides(source, descriptor)?;
+                    let index = source.index_buffer.as_ref()?;
+                    let transform_bind_group =
+                        frame.authored_shadow_bind_groups.get(source_index)?.as_ref()?;
+                    let end = authored
+                        .source_index_start
+                        .checked_add(authored.source_index_count)?;
+                    if end > index.index_count {
+                        return None;
+                    }
+                    let key = StrictDepthPipelineKey {
+                        layout_id: stage_layout.layout_id,
+                        primitive_type: authored.primitive_type,
+                        rasterizer: draw.pipeline.rasterizer,
+                        depth_stencil: draw.pipeline.depth_stencil,
+                        depth_bias: draw.pipeline.depth_bias,
+                        index_32bit: matches!(index.format, wgpu::IndexFormat::Uint32),
+                        stream_strides,
+                    };
+                    let pipeline = pipelines
+                        .strict_depth_pipelines
+                        .iter()
+                        .find(|(existing, _pipeline)| *existing == key)
+                        .map(|(_key, pipeline)| pipeline)?;
+
+                    for stream in descriptor.streams.iter().filter(|stream| {
+                        stream.elements.iter().any(|element| {
+                            element.semantic == 0 && element.semantic_index == 0
+                        })
+                    }) {
+                        let gpu_stream = source
+                            .vertex_streams
+                            .iter()
+                            .find(|candidate| candidate.stream_index == stream.stream_index)?;
+                        depth_pass.set_vertex_buffer(
+                            u32::from(stream.stream_index),
+                            gpu_stream.buffer.slice(..),
+                        );
+                    }
+                    depth_pass.set_index_buffer(index.buffer.slice(..), index.format);
+                    depth_pass.set_pipeline(pipeline);
+                    depth_pass.set_bind_group(1, transform_bind_group, &[]);
+                    depth_pass.draw_indexed(authored.source_index_start..end, 0, 0..1);
+                    #[cfg(test)]
+                    eprintln!(
+                        "STRICT_DEPTH_NATIVE source={} geometry={} stage={} layout={} primitive={} indices={}..{}",
+                        source_index,
+                        source.geometry,
+                        authored.raw_stage,
+                        stage_layout.layout_id,
+                        authored.primitive_type,
+                        authored.source_index_start,
+                        end,
+                    );
+                    Some(())
+                })()
+                .is_some();
+
+                if !rendered_authored {
+                    #[cfg(test)]
+                    if draw.authored_stage.is_some() {
+                        eprintln!(
+                            "STRICT_DEPTH_FALLBACK source={:?} stage={:?} indices={:?}",
+                            draw.authored_source, draw.authored_stage, draw.indices,
+                        );
+                    }
+                    depth_pass.set_pipeline(
+                        &pipelines.depth_pipelines[shadow_pipeline_index(draw.pipeline.rasterizer)],
+                    );
+                    depth_pass.set_bind_group(
+                        1,
+                        &frame.material_bind_groups[draw.material_index],
+                        &[],
+                    );
+                    depth_pass.set_bind_group(2, &frame._coating_fallback_bind_group, &[]);
+                    depth_pass.set_vertex_buffer(0, self.preview.vertex_buffer.slice(..));
+                    depth_pass.set_index_buffer(
+                        self.preview.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    depth_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
+                }
             }
         }
 
@@ -5001,15 +5162,17 @@ impl CallbackTrait for ModelPaintCallback {
         // opaque surface pass through an external screen-space texture. Keep
         // the source and destination separate: the normal attachment is still
         // loaded and written by the decal pass below.
-        egui_encoder.copy_texture_to_texture(
-            target._surface_normal.as_image_copy(),
-            target.scene_normal_copy.as_image_copy(),
-            wgpu::Extent3d {
-                width: target.size[0],
-                height: target.size[1],
-                depth_or_array_layers: 1,
-            },
-        );
+        if target.features.deferred_normal_copy {
+            egui_encoder.copy_texture_to_texture(
+                target._surface_normal.as_image_copy(),
+                target.scene_normal_copy.as_image_copy(),
+                wgpu::Extent3d {
+                    width: target.size[0],
+                    height: target.size[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
 
         for (label, bundles) in [(
             "quicktag_model_investment_decal_pass",
@@ -5071,7 +5234,7 @@ impl CallbackTrait for ModelPaintCallback {
                 let Some((_, pipeline)) = pipelines
                     .model_pipelines
                     .iter()
-                    .find(|(key, _)| *key == emissive_key)
+                    .find(|(key, _)| key.gpu_equivalent(emissive_key))
                 else {
                     continue;
                 };
@@ -5116,7 +5279,7 @@ impl CallbackTrait for ModelPaintCallback {
                 let Some((_, pipeline)) = pipelines
                     .model_pipelines
                     .iter()
-                    .find(|(key, _)| *key == flag_key)
+                    .find(|(key, _)| key.gpu_equivalent(flag_key))
                 else {
                     continue;
                 };
@@ -5802,6 +5965,16 @@ fn create_pipeline_resources(
             ],
             push_constant_ranges: &[],
         });
+    let authored_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quicktag_model_authored_depth_shader"),
+        source: wgpu::ShaderSource::Wgsl(AUTHORED_DEPTH_SHADER.into()),
+    });
+    let strict_depth_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("quicktag_model_strict_depth_pipeline_layout"),
+            bind_group_layouts: &[&scene_layout, &strict_shadow_transform_layout],
+            push_constant_ranges: &[],
+        });
     let create_shadow_pipeline = |label, cull_mode| {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
@@ -6018,8 +6191,10 @@ fn create_pipeline_resources(
         fallback_color_view,
         model_shader,
         shadow_shader,
+        authored_depth_shader,
         model_pipeline_layout,
         strict_shadow_pipeline_layout,
+        strict_depth_pipeline_layout,
         model_pipelines: Vec::new(),
         present_pipeline,
         lighting_pipeline,
@@ -6030,6 +6205,7 @@ fn create_pipeline_resources(
         bloom_blur_vertical_pipeline,
         shadow_pipelines,
         strict_shadow_pipelines: Vec::new(),
+        strict_depth_pipelines: Vec::new(),
         depth_pipelines,
         shadow_sampler,
         _fallback_cubemap: fallback_cubemap,
@@ -6088,7 +6264,8 @@ fn create_strict_shadow_pipeline(
                 continue;
             };
             let format = authored_vertex_format(element.format)?;
-            let attribute_end = u64::from(element.offset) + authored_vertex_format_size(element.format)?;
+            let attribute_end =
+                u64::from(element.offset) + authored_vertex_format_size(element.format)?;
             if attribute_end > stride {
                 return None;
             }
@@ -6171,6 +6348,117 @@ fn create_strict_shadow_pipeline(
                 compilation_options: Default::default(),
                 targets: &[],
             }),
+            multiview: None,
+            cache: None,
+        }),
+    )
+}
+
+fn create_strict_depth_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    pipeline_layout: &wgpu::PipelineLayout,
+    descriptor: &AuthoredInputLayoutDescriptor,
+    key: StrictDepthPipelineKey,
+) -> Option<wgpu::RenderPipeline> {
+    let position = descriptor
+        .streams
+        .iter()
+        .flat_map(|stream| stream.elements.iter().map(move |element| (stream, element)))
+        .find(|(_stream, element)| element.semantic == 0 && element.semantic_index == 0)?;
+
+    let vertex_entry = match position.1.format {
+        0x03 => "vs_authored_depth_vec3",
+        0x04 | 0x0B => "vs_authored_depth_vec4",
+        _ => return None,
+    };
+
+    let max_stream = position.0.stream_index;
+    let mut stream_storage =
+        Vec::<(u8, u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)>::new();
+    for stream_index in 0..=max_stream {
+        let stream = descriptor
+            .streams
+            .iter()
+            .find(|stream| stream.stream_index == stream_index)?;
+        let stride = u64::from(*key.stream_strides.get(usize::from(stream_index))?);
+        if stride == 0 {
+            return None;
+        }
+        let mut attributes = Vec::new();
+        for element in &stream.elements {
+            if element.semantic != 0 || element.semantic_index != 0 {
+                continue;
+            }
+            let format = authored_vertex_format(element.format)?;
+            let attribute_end =
+                u64::from(element.offset) + authored_vertex_format_size(element.format)?;
+            if attribute_end > stride {
+                return None;
+            }
+            attributes.push(wgpu::VertexAttribute {
+                format,
+                offset: u64::from(element.offset),
+                shader_location: 0,
+            });
+        }
+        stream_storage.push((
+            stream_index,
+            stride,
+            if stream.instanced {
+                wgpu::VertexStepMode::Instance
+            } else {
+                wgpu::VertexStepMode::Vertex
+            },
+            attributes,
+        ));
+    }
+    let vertex_layouts = stream_storage
+        .iter()
+        .map(
+            |(_stream_index, stride, step_mode, attributes)| wgpu::VertexBufferLayout {
+                array_stride: *stride,
+                step_mode: *step_mode,
+                attributes,
+            },
+        )
+        .collect_vec();
+
+    let (topology, strip_index_format) = match key.primitive_type {
+        3 => (wgpu::PrimitiveTopology::TriangleList, None),
+        5 => (
+            wgpu::PrimitiveTopology::TriangleStrip,
+            Some(if key.index_32bit {
+                wgpu::IndexFormat::Uint32
+            } else {
+                wgpu::IndexFormat::Uint16
+            }),
+        ),
+        _ => return None,
+    };
+    let label = format!(
+        "quicktag_strict_depth_layout{}_primitive{}_raster{}_depth{}_bias{}",
+        key.layout_id, key.primitive_type, key.rasterizer, key.depth_stencil, key.depth_bias
+    );
+    Some(
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&label),
+            layout: Some(pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(vertex_entry),
+                compilation_options: Default::default(),
+                buffers: &vertex_layouts,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology,
+                strip_index_format,
+                cull_mode: rasterizer_cull_mode(key.rasterizer),
+                ..Default::default()
+            },
+            depth_stencil: depth_stencil_state(key.depth_stencil, key.depth_bias),
+            multisample: Default::default(),
+            fragment: None,
             multiview: None,
             cache: None,
         }),
@@ -6499,11 +6787,30 @@ fn depth_bias_state(index: u8) -> wgpu::DepthBiasState {
     }
 }
 
-fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTargetResources {
+fn create_target_resources(
+    device: &wgpu::Device,
+    size: [u32; 2],
+    features: ModelTargetFeatures,
+) -> ModelTargetResources {
+    debug_assert!(
+        estimated_model_target_bytes(size, features) <= MAX_MODEL_TARGET_BYTES,
+        "model target allocation exceeded the renderer memory budget"
+    );
     let extent = wgpu::Extent3d {
         width: size[0],
         height: size[1],
         depth_or_array_layers: 1,
+    };
+    let optional_extent = |enabled: bool| {
+        if enabled {
+            extent
+        } else {
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            }
+        }
     };
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_color_target"),
@@ -6533,7 +6840,7 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
     let lit_color_view = lit_color.create_view(&Default::default());
     let scene_color_copy = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_scene_color_copy"),
-        size: extent,
+        size: optional_extent(features.distortion),
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -6544,7 +6851,7 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
     let scene_color_copy_view = scene_color_copy.create_view(&Default::default());
     let scene_normal_copy = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_scene_normal_copy"),
-        size: extent,
+        size: optional_extent(features.deferred_normal_copy),
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -6555,7 +6862,7 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
     let scene_normal_copy_view = scene_normal_copy.create_view(&Default::default());
     let distortion = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_distortion_payload"),
-        size: extent,
+        size: optional_extent(features.distortion),
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -6633,8 +6940,16 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
             view_formats: &[],
         })
     };
-    let bloom_half_size = [(size[0] / 2).max(1), (size[1] / 2).max(1)];
-    let bloom_quarter_size = [(size[0] / 4).max(1), (size[1] / 4).max(1)];
+    let bloom_half_size = if features.bloom {
+        [(size[0] / 2).max(1), (size[1] / 2).max(1)]
+    } else {
+        [1, 1]
+    };
+    let bloom_quarter_size = if features.bloom {
+        [(size[0] / 4).max(1), (size[1] / 4).max(1)]
+    } else {
+        [1, 1]
+    };
     let bloom_half = bloom_texture(
         "quicktag_model_bloom_half",
         bloom_half_size[0],
@@ -6655,6 +6970,7 @@ fn create_target_resources(device: &wgpu::Device, size: [u32; 2]) -> ModelTarget
     let bloom_blur_view = bloom_blur.create_view(&Default::default());
     ModelTargetResources {
         size,
+        features,
         _color: color,
         color_view,
         lit_color,
@@ -7358,9 +7674,6 @@ struct MaterialUniform {
     runner_layered_constants: array<vec4<f32>, 24>,
     runner_color_constants: array<vec4<f32>, 7>,
     alpha_mask_params: vec4<f32>,
-    tfx_meta: vec4<f32>,
-    tfx_vs_registers: array<vec4<f32>, 256>,
-    tfx_ps_registers: array<vec4<f32>, 256>,
 }
 @group(1) @binding(0) var color_texture: texture_2d<f32>;
 @group(1) @binding(3) var control_texture: texture_2d<f32>;
@@ -7523,6 +7836,98 @@ fn fs_main(input: ShadowVertexOutput) {
 }
 "#;
 
+const AUTHORED_DEPTH_SHADER: &str = r#"
+struct SceneUniform {
+    center: vec4<f32>,
+    params0: vec4<f32>,
+    params1: vec4<f32>,
+    uv_transform: vec4<f32>,
+    light_direction: vec4<f32>,
+    light_parameters: vec4<f32>,
+    light_position: vec4<f32>,
+    postprocess0: vec4<f32>,
+    postprocess1: vec4<f32>,
+    postprocess2: vec4<f32>,
+    postprocess3: vec4<f32>,
+    postprocess4: vec4<f32>,
+    postprocess5: vec4<f32>,
+    fidelity: vec4<f32>,
+    shadow_parameters: vec4<f32>,
+}
+
+struct AuthoredGeometryUniform {
+    geometry_scale: vec4<f32>,
+    geometry_offset: vec4<f32>,
+    attachment_rotation: vec4<f32>,
+    attachment_translation_scale: vec4<f32>,
+    uv_transform: vec4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> scene: SceneUniform;
+@group(1) @binding(0) var<uniform> authored_geometry: AuthoredGeometryUniform;
+
+fn rotate_view(value: vec3<f32>) -> vec3<f32> {
+    let z_up = vec3<f32>(value.x, value.z, value.y);
+    let cy = cos(scene.params0.y);
+    let sy = sin(scene.params0.y);
+    let cp = cos(scene.params0.z);
+    let sp = sin(scene.params0.z);
+    let yawed = vec3<f32>(
+        z_up.x * cy + z_up.z * sy,
+        z_up.y,
+        -z_up.x * sy + z_up.z * cy,
+    );
+    return vec3<f32>(
+        yawed.x,
+        yawed.y * cp - yawed.z * sp,
+        yawed.y * sp + yawed.z * cp,
+    );
+}
+
+fn rotate_authored_geometry(value: vec3<f32>, rotation: vec4<f32>) -> vec3<f32> {
+    let twice_cross = 2.0 * cross(rotation.xyz, value);
+    return value + rotation.w * twice_cross + cross(rotation.xyz, twice_cross);
+}
+
+fn authored_world_position(position: vec3<f32>) -> vec3<f32> {
+    let geometry_position =
+        position * authored_geometry.geometry_scale.xyz + authored_geometry.geometry_offset.xyz;
+    let scaled = geometry_position * authored_geometry.attachment_translation_scale.w;
+    return rotate_authored_geometry(scaled, authored_geometry.attachment_rotation)
+        + authored_geometry.attachment_translation_scale.xyz;
+}
+
+fn model_clip_position(position: vec3<f32>) -> vec4<f32> {
+    let view_position = rotate_view(position - scene.center.xyz);
+    let scale = 0.84 * scene.params0.w / max(scene.params0.x, 0.0001);
+    let depth = clamp(
+        0.5 - view_position.z * 0.21 / max(scene.params0.x, 0.0001),
+        0.0,
+        1.0,
+    );
+    return vec4<f32>(
+        -view_position.x * scale * scene.params1.x + scene.params1.y,
+        view_position.y * scale + scene.params1.z,
+        depth,
+        1.0,
+    );
+}
+
+@vertex
+fn vs_authored_depth_vec3(
+    @location(0) position: vec3<f32>,
+) -> @builtin(position) vec4<f32> {
+    return model_clip_position(authored_world_position(position));
+}
+
+@vertex
+fn vs_authored_depth_vec4(
+    @location(0) position: vec4<f32>,
+) -> @builtin(position) vec4<f32> {
+    return model_clip_position(authored_world_position(position.xyz));
+}
+"#;
+
 const MODEL_SHADER: &str = r#"
 struct SceneUniform {
     center: vec4<f32>,
@@ -7601,9 +8006,6 @@ struct MaterialUniform {
     runner_layered_constants: array<vec4<f32>, 24>,
     runner_color_constants: array<vec4<f32>, 7>,
     alpha_mask_params: vec4<f32>,
-    tfx_meta: vec4<f32>,
-    tfx_vs_registers: array<vec4<f32>, 256>,
-    tfx_ps_registers: array<vec4<f32>, 256>,
 }
 
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
@@ -11462,26 +11864,31 @@ mod lighting_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOOM_SHADER, GpuModelPreview, LIGHTING_SHADER, LightingModel, MAX_MODEL_TARGET_PIXELS,
-        MODEL_SHADER, MaterialLuminance, ModelEnvironment, ModelFrameResources, ModelPaintCallback,
-        ModelPipelineKey, ModelPipelineResources, PRESENT_SHADER, PreparedDraw, SHADOW_SHADER,
-        adapt_exposure, alpha_mode, blend_enabled, blend_state, bounded_target_size,
-        create_model_pipeline, create_model_sampler, create_pipeline_resources,
-        create_target_resources, decode_model_sampler_desc, exposure_target,
-        first_person_key_light, fitted_export_zoom, fitted_export_zoom_for_positions,
-        fitted_export_zoom_for_positions_around, fixed_light_direction_to_view, hiz_draw_visible,
-        is_distortion_payload_pass, light_cast_direction, light_source_position,
-        model_authored_shadow_draws, model_direction_to_view, model_draws,
-        model_orthographic_depth, model_orthographic_view_depth, model_view_depth,
-        normal_surface_write_mask, project_hiz_vertex, projected_export_bounds,
-        rasterizer_cull_mode, select_shadow_draws, shadow_pipeline_index, smooth_normals,
-        vertex_ambient_occlusion, view_direction_to_model,
+        AUTHORED_DEPTH_SHADER, BLOOM_SHADER, GpuModelPreview, LIGHTING_SHADER, LightingModel,
+        MAX_MODEL_TARGET_BYTES, MAX_MODEL_TARGET_PIXELS, MODEL_SHADER, MaterialLuminance,
+        MaterialUniform, ModelEnvironment, ModelFrameResources, ModelPaintCallback,
+        ModelPipelineKey, ModelPipelineResources, ModelTargetFeatures, PRESENT_SHADER,
+        PreparedDraw, SHADOW_SHADER, StrictDepthPipelineKey, adapt_exposure, alpha_mode,
+        blend_enabled, blend_state, bounded_target_size, create_model_pipeline,
+        create_model_sampler, create_pipeline_resources, create_strict_depth_pipeline,
+        create_target_resources, decode_model_sampler_desc, estimated_model_target_bytes,
+        exposure_target, first_person_key_light, fitted_export_zoom,
+        fitted_export_zoom_for_positions, fitted_export_zoom_for_positions_around,
+        fixed_light_direction_to_view, hiz_draw_visible, is_distortion_payload_pass,
+        light_cast_direction, light_source_position, model_authored_shadow_draws,
+        model_direction_to_view, model_draws, model_orthographic_depth,
+        model_orthographic_view_depth, model_view_depth, normal_surface_write_mask,
+        project_hiz_vertex, projected_export_bounds, rasterizer_cull_mode, select_shadow_draws,
+        shadow_pipeline_index, smooth_normals, vertex_ambient_occlusion, view_direction_to_model,
     };
     use crate::{
         geometry::{
-            GearDyeMaterial, GeometryPreviewKind, GeometryTagPreview, RunnerShellAssembly,
-            WeaponModPreviewAttachment, WeaponModRarity, WireframeAuthoredStageRange,
-            WireframeMaterialRange, WireframeMaterialTextures, WireframePreview,
+            AuthoredGeometryInput, AuthoredInputLayoutDescriptor, AuthoredStageInputLayout,
+            AuthoredVertexElementDescriptor, AuthoredVertexStreamLayoutDescriptor, GearDyeMaterial,
+            GeometryPreviewKind, GeometryTagPreview, RunnerShellAssembly,
+            WeaponModPreviewAttachment, WeaponModRarity, WireframeAuthoredDrawMetadata,
+            WireframeAuthoredStageRange, WireframeMaterialRange, WireframeMaterialTextures,
+            WireframePreview,
         },
         render::pass_plan::RenderPassKind,
         texture::{Texture, cache::TextureCache},
@@ -11849,6 +12256,7 @@ mod tests {
     fn validates_model_preview_shaders() {
         for source in [
             MODEL_SHADER,
+            AUTHORED_DEPTH_SHADER,
             PRESENT_SHADER,
             SHADOW_SHADER,
             BLOOM_SHADER,
@@ -11862,6 +12270,40 @@ mod tests {
             .validate(&module)
             .expect("WGSL should validate");
         }
+    }
+
+    #[test]
+    fn model_pipeline_does_not_require_authored_depth_bind_group() {
+        assert!(!MODEL_SHADER.contains("@group(3)"));
+        assert!(AUTHORED_DEPTH_SHADER.contains("@group(1) @binding(0)"));
+    }
+
+    #[test]
+    fn material_uniform_does_not_embed_unused_tfx_register_images() {
+        assert!(
+            std::mem::size_of::<MaterialUniform>() < 4096,
+            "material uniform regressed to {} bytes",
+            std::mem::size_of::<MaterialUniform>(),
+        );
+        assert!(!MODEL_SHADER.contains("tfx_vs_registers"));
+        assert!(!MODEL_SHADER.contains("tfx_ps_registers"));
+        assert!(!SHADOW_SHADER.contains("tfx_vs_registers"));
+        assert!(!SHADOW_SHADER.contains("tfx_ps_registers"));
+    }
+
+    #[test]
+    fn gpu_equivalent_pipeline_keys_ignore_technique_identity() {
+        let base = ModelPipelineKey::default();
+        let left = ModelPipelineKey {
+            technique: Some(TagHash(0x80A00001)),
+            ..base
+        };
+        let right = ModelPipelineKey {
+            technique: Some(TagHash(0x80A00002)),
+            ..base
+        };
+        assert_ne!(left, right);
+        assert!(left.gpu_equivalent(right));
     }
 
     #[test]
@@ -12046,6 +12488,7 @@ mod tests {
                 technique: None,
                 gear_dye_change_color_index: None,
                 authored_source: None,
+                authored_draw: None,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -12117,7 +12560,7 @@ mod tests {
             passes,
             authored_source: None,
             authored_stage: None,
-            strict_shadow_native_supported: false,
+            authored_native_vertex_supported: false,
         };
         let visible = vec![prepared(
             0..3,
@@ -12132,6 +12575,137 @@ mod tests {
         let fallback = select_shadow_draws(&visible, &[]);
         assert_eq!(fallback.len(), 1);
         assert_eq!(fallback[0].indices, 0..3);
+    }
+
+    #[test]
+    fn visible_draw_preserves_authored_depth_ia_metadata() {
+        let raw_stage = crate::render::adapter::GoliathAdapter::DEPTH_ONLY_STAGE;
+        let wireframe = WireframePreview {
+            rigid_indices: None,
+            source: "authored depth metadata".into(),
+            position_format: "f32x3 @ +0",
+            uv_format: None,
+            vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: None,
+            procedural_positions: None,
+            procedural_normals: None,
+            tangents: None,
+            uvs: None,
+            normal_format: None,
+            tangent_format: None,
+            indices: vec![0, 1, 2],
+            material_ranges: vec![WireframeMaterialRange {
+                index_start: 0,
+                index_count: 3,
+                raw_lod_category: Some(0),
+                render_stage: Some(raw_stage),
+                technique: None,
+                gear_dye_change_color_index: None,
+                authored_source: Some(0),
+                authored_draw: Some(WireframeAuthoredDrawMetadata {
+                    part_index: 4,
+                    source_index_start: 18,
+                    source_index_count: 3,
+                    primitive_type: 5,
+                    variant_shader_index: 9,
+                    flags: 0x55AA,
+                    lod_run: 1,
+                }),
+                procedural_scale: 1.0,
+                texture: None,
+                textures: WireframeMaterialTextures::default(),
+            }],
+            authored_inputs: vec![AuthoredGeometryInput {
+                geometry: TagHash(0x80A00001),
+                vertex_streams: vec![],
+                color_buffer: None,
+                skinning_buffer: None,
+                index_buffer: None,
+                stage_layouts: vec![AuthoredStageInputLayout {
+                    raw_stage,
+                    layout_id: 7,
+                    descriptor: None,
+                }],
+                position_transform: None,
+                uv_transform: None,
+                attachment_pose: None,
+            }],
+            authored_shadow_ranges: vec![],
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 1.0, 0.0],
+            vertex_count_total: 3,
+            index_count_total: 3,
+        };
+
+        let draws = model_draws(&wireframe, None);
+        assert_eq!(draws.len(), 1);
+        assert!(
+            draws[0]
+                .packet
+                .pass_plan
+                .passes
+                .contains(&RenderPassKind::DepthOnly)
+        );
+        let authored = draws[0].authored_stage.expect("authored depth metadata");
+        assert_eq!(authored.raw_stage, raw_stage);
+        assert_eq!(authored.input_layout_id, 7);
+        assert_eq!(authored.part_index, 4);
+        assert_eq!(authored.source_index_start, 18);
+        assert_eq!(authored.source_index_count, 3);
+        assert_eq!(authored.primitive_type, 5);
+        assert_eq!(authored.variant_shader_index, 9);
+        assert_eq!(authored.flags, 0x55AA);
+        assert_eq!(authored.lod_run, 1);
+    }
+
+    #[test]
+    #[ignore = "requires GPU"]
+    fn validates_authored_depth_pipeline_wgpu() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("GPU adapter");
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_sampled_textures_per_shader_stage = 18;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits,
+            ..Default::default()
+        }))
+        .expect("GPU device");
+
+        let resources = create_pipeline_resources(&device, &queue, wgpu::TextureFormat::Bgra8Unorm);
+        let descriptor = AuthoredInputLayoutDescriptor {
+            layout_id: 7,
+            streams: vec![AuthoredVertexStreamLayoutDescriptor {
+                stream_index: 0,
+                element_set_index: 0,
+                instanced: false,
+                elements: vec![AuthoredVertexElementDescriptor {
+                    semantic: 0,
+                    semantic_index: 0,
+                    format: 0x0B,
+                    offset: 0,
+                }],
+            }],
+        };
+        let mut stream_strides = [0_u16; 8];
+        stream_strides[0] = 8;
+        let pipeline = create_strict_depth_pipeline(
+            &device,
+            &resources.authored_depth_shader,
+            &resources.strict_depth_pipeline_layout,
+            &descriptor,
+            StrictDepthPipelineKey {
+                layout_id: 7,
+                primitive_type: 3,
+                rasterizer: 2,
+                depth_stencil: 2,
+                depth_bias: 0,
+                index_32bit: false,
+                stream_strides,
+            },
+        );
+        assert!(pipeline.is_some());
     }
 
     #[test]
@@ -12255,7 +12829,7 @@ mod tests {
         assert!(
             draws
                 .iter()
-                .all(|draw| !draw.strict_shadow_native_supported),
+                .all(|draw| !draw.authored_native_vertex_supported),
             "Conquest ShadowGenerate consumes SV_VertexID/t2 generated positions and must not use Quicktag's raw-POSITION compatibility VS"
         );
         assert!(draws.iter().all(|draw| {
@@ -12390,6 +12964,7 @@ mod tests {
                 technique: None,
                 gear_dye_change_color_index: None,
                 authored_source: None,
+                authored_draw: None,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -12438,6 +13013,7 @@ mod tests {
                     technique: None,
                     gear_dye_change_color_index: None,
                     authored_source: None,
+                    authored_draw: None,
                     procedural_scale: 1.0,
                     texture: None,
                     textures: runtime,
@@ -12450,6 +13026,7 @@ mod tests {
                     technique: None,
                     gear_dye_change_color_index: None,
                     authored_source: None,
+                    authored_draw: None,
                     procedural_scale: 1.0,
                     texture: None,
                     textures: WireframeMaterialTextures::default(),
@@ -12494,6 +13071,7 @@ mod tests {
                 technique: None,
                 gear_dye_change_color_index: None,
                 authored_source: None,
+                authored_draw: None,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -12529,7 +13107,15 @@ mod tests {
 
         let resources =
             create_pipeline_resources(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
-        let target = create_target_resources(&device, [640, 360]);
+        let target = create_target_resources(
+            &device,
+            [640, 360],
+            ModelTargetFeatures {
+                deferred_normal_copy: true,
+                distortion: true,
+                bloom: true,
+            },
+        );
         assert_eq!(
             target._distortion.size(),
             wgpu::Extent3d {
@@ -12693,9 +13279,21 @@ mod tests {
         let size = bounded_target_size(4096.0, 4096.0);
         assert!(size[0] as f32 * size[1] as f32 <= MAX_MODEL_TARGET_PIXELS);
         assert!((size[0] as f32 / size[1] as f32 - 1.0).abs() < 0.001);
-        assert_eq!(bounded_target_size(320.0, 180.0), [640, 360]);
-        assert_eq!(bounded_target_size(1280.0, 720.0), [2560, 1440]);
-        assert_eq!(bounded_target_size(1920.0, 1080.0), [3840, 2160]);
+        assert_eq!(bounded_target_size(320.0, 180.0), [320, 180]);
+        assert_eq!(bounded_target_size(1280.0, 720.0), [1280, 720]);
+        assert_eq!(bounded_target_size(1920.0, 1080.0), [1920, 1080]);
+        let four_k = bounded_target_size(3840.0, 2160.0);
+        assert!(four_k[0] as f32 * four_k[1] as f32 <= MAX_MODEL_TARGET_PIXELS);
+        assert!(
+            estimated_model_target_bytes(
+                four_k,
+                ModelTargetFeatures {
+                    deferred_normal_copy: true,
+                    distortion: true,
+                    bloom: true,
+                },
+            ) <= MAX_MODEL_TARGET_BYTES
+        );
     }
 
     #[test]

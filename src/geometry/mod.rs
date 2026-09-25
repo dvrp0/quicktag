@@ -353,6 +353,17 @@ pub struct WireframePreview {
     pub index_count_total: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireframeAuthoredDrawMetadata {
+    pub part_index: usize,
+    pub source_index_start: u32,
+    pub source_index_count: u32,
+    pub primitive_type: u8,
+    pub variant_shader_index: u16,
+    pub flags: u32,
+    pub lod_run: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct WireframeMaterialRange {
     pub index_start: usize,
@@ -364,6 +375,10 @@ pub struct WireframeMaterialRange {
     pub gear_dye_change_color_index: Option<u8>,
     /// Index into `WireframePreview::authored_inputs` for this draw.
     pub authored_source: Option<usize>,
+    /// Original package IA range before preview triangle-list reconstruction.
+    /// Geometry resources populate this so strict stage paths can bind the
+    /// authored index buffer/topology instead of the flattened preview copy.
+    pub authored_draw: Option<WireframeAuthoredDrawMetadata>,
     /// Rigid-model `position_offset.w` / skinning `offset_scale.w` consumed
     /// by common-surface procedural branches through `scope_skinning[5].w`.
     pub procedural_scale: f32,
@@ -5359,6 +5374,7 @@ fn merge_model_wireframes(
                 technique: None,
                 gear_dye_change_color_index: None,
                 authored_source: (authored_source_count != 0).then_some(authored_source_base),
+                authored_draw: None,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -5402,6 +5418,7 @@ fn merge_model_wireframes(
                     technique: range.technique,
                     gear_dye_change_color_index: range.gear_dye_change_color_index,
                     authored_source: range.authored_source,
+                    authored_draw: range.authored_draw,
                     procedural_scale: range.procedural_scale,
                     texture: range.texture,
                     textures: range.textures,
@@ -7768,6 +7785,7 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
             render_stage: None,
             technique: source.technique,
             gear_dye_change_color_index: None,
+            authored_draw: None,
         }],
         source.input_layout_index,
     )?;
@@ -7820,6 +7838,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
             render_stage: None,
             technique: source.technique,
             gear_dye_change_color_index: None,
+            authored_draw: None,
         }],
         source.input_layout_index,
     )?;
@@ -8147,6 +8166,7 @@ fn build_wireframe_from_refs(
                 technique: range.technique,
                 gear_dye_change_color_index: range.gear_dye_change_color_index,
                 authored_source: None,
+                authored_draw: range.authored_draw,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -8582,6 +8602,7 @@ struct PreviewIndexRange {
     render_stage: Option<u8>,
     technique: Option<TagHash>,
     gear_dye_change_color_index: Option<u8>,
+    authored_draw: Option<WireframeAuthoredDrawMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -9513,6 +9534,15 @@ fn index_ranges_from_geometry_ranges(
             technique: Some(range.technique),
             gear_dye_change_color_index: (range.gear_dye_change_color_index <= 5)
                 .then_some(range.gear_dye_change_color_index),
+            authored_draw: Some(WireframeAuthoredDrawMetadata {
+                part_index: range.part_index,
+                source_index_start: range.index_start,
+                source_index_count: range.index_count,
+                primitive_type: range.primitive_type,
+                variant_shader_index: range.variant_shader_index,
+                flags: range.flags,
+                lod_run: range.lod_run,
+            }),
         })
         .collect()
 }
@@ -18549,6 +18579,7 @@ mod tests {
             technique: None,
             gear_dye_change_color_index: None,
             authored_source: None,
+            authored_draw: None,
             procedural_scale: 1.0,
             texture: None,
             textures: WireframeMaterialTextures::default(),
