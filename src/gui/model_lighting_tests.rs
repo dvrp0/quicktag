@@ -30,6 +30,7 @@ fn panel(scale: f32, offset: [f32; 3]) -> WireframePreview {
             render_stage: Some(0),
             technique: None,
             gear_dye_change_color_index: None,
+            authored_source: None,
             procedural_scale: 1.0,
             texture: None,
             textures: WireframeMaterialTextures {
@@ -38,6 +39,8 @@ fn panel(scale: f32, offset: [f32; 3]) -> WireframePreview {
                 ..Default::default()
             },
         }],
+        authored_inputs: vec![],
+        authored_shadow_ranges: vec![],
         min: point([-0.5, 0.0, -0.5]),
         max: point([0.5, 0.0, 0.5]),
         vertex_count_total: 4,
@@ -150,7 +153,7 @@ fn uniformly_scaled_models_preserve_gpu_lighting() {
         assert_eq!(callback.scene.light_position[3], scale);
         assert_eq!(callback.scene.light_parameters[1], 4.0 * scale);
         let bytes = callback
-            .export_png_bytes(&state, [256, 256])
+            .export_image_bytes(&state, [256, 256], image::ImageFormat::Png)
             .expect("render panel");
         image::load_from_memory(&bytes).expect("PNG").to_rgba8()
     };

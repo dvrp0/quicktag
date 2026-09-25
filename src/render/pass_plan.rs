@@ -55,21 +55,21 @@ impl DrawPassPlan {
         }
         if raw_stage == Some(GoliathAdapter::AUXILIARY_STAGE) {
             return Self {
-                evidence: EvidenceLevel::Confirmed,
+                evidence: stage.map_or(EvidenceLevel::Unknown, |stage| stage.evidence),
                 passes: vec![RenderPassKind::Auxiliary],
                 warnings: vec![],
             };
         }
         if raw_stage == Some(GoliathAdapter::OCCLUSION_STAGE) {
             return Self {
-                evidence: EvidenceLevel::Confirmed,
+                evidence: stage.map_or(EvidenceLevel::Unknown, |stage| stage.evidence),
                 passes: vec![RenderPassKind::ForwardTransparent],
                 warnings: vec![],
             };
         }
         if raw_stage == Some(GoliathAdapter::DISTORTION_STAGE) {
             return Self {
-                evidence: EvidenceLevel::Confirmed,
+                evidence: stage.map_or(EvidenceLevel::Unknown, |stage| stage.evidence),
                 passes: vec![if material.family() == MaterialFamily::ForwardCoating {
                     RenderPassKind::ForwardCoating
                 } else {
@@ -82,7 +82,7 @@ impl DrawPassPlan {
             return Self {
                 evidence: EvidenceLevel::Confirmed,
                 passes: vec![RenderPassKind::InvestmentDecalCompatibility],
-                warnings: (raw_stage != Some(GoliathAdapter::DECAL_STAGE))
+                warnings: (raw_stage != Some(GoliathAdapter::INVESTMENT_DECAL_STAGE))
                     .then(|| format!("investment decal observed on raw stage {raw_stage:?}"))
                     .into_iter()
                     .collect(),
@@ -201,7 +201,34 @@ mod tests {
             &material,
         );
         assert_eq!(plan.passes, [RenderPassKind::Distortion]);
-        assert_eq!(plan.evidence, EvidenceLevel::Confirmed);
+        assert_eq!(plan.evidence, EvidenceLevel::StronglyCorrelated);
+    }
+
+    #[test]
+    fn transparent_and_distortion_stages_are_distinct() {
+        let material = MaterialIR::classify(&WireframeMaterialTextures::default());
+
+        let transparent = DrawPassPlan::derive(
+            Some(GoliathAdapter::TRANSPARENT_STAGE),
+            TechniqueRenderState {
+                blend: Some(8),
+                ..Default::default()
+            },
+            &material,
+        );
+        assert_eq!(GoliathAdapter::TRANSPARENT_STAGE, 8);
+        assert_eq!(transparent.passes, [RenderPassKind::ForwardTransparent]);
+
+        let distortion = DrawPassPlan::derive(
+            Some(GoliathAdapter::DISTORTION_STAGE),
+            TechniqueRenderState {
+                blend: Some(10),
+                ..Default::default()
+            },
+            &material,
+        );
+        assert_eq!(GoliathAdapter::DISTORTION_STAGE, 9);
+        assert_eq!(distortion.passes, [RenderPassKind::Distortion]);
     }
 
     #[test]

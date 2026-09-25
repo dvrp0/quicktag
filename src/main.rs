@@ -37,6 +37,10 @@ struct Args {
     /// Output directory for --export-implant-icons
     #[arg(long, default_value = "./implant_icons")]
     implant_icons_output: std::path::PathBuf,
+
+    /// Write the Marathon/Goliath render-stage ABI census as JSON and exit
+    #[arg(long, hide = true, value_name = "PATH")]
+    probe_render_stage_abi: Option<std::path::PathBuf>,
 }
 
 fn main() -> eframe::Result<()> {
@@ -80,6 +84,16 @@ fn main() -> eframe::Result<()> {
     tiger_pkg::initialize_package_manager(&Arc::new(pm));
 
     quicktag_core::classes::initialize_reference_names();
+
+    if let Some(output) = args.probe_render_stage_abi {
+        let report = crate::geometry::goliath_render_stage_abi_report();
+        let bytes = serde_json::to_vec_pretty(&report)
+            .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+        std::fs::write(&output, bytes)
+            .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+        println!("Wrote render-stage ABI census to {}", output.display());
+        return Ok(());
+    }
 
     if args.export_implant_icons {
         let render_state = create_headless_render_state()

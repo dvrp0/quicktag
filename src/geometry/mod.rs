@@ -225,6 +225,75 @@ struct VertexInputElement {
     format: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredVertexElementDescriptor {
+    pub semantic: u8,
+    pub semantic_index: u8,
+    pub format: u8,
+    pub offset: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredVertexStreamLayoutDescriptor {
+    pub stream_index: u8,
+    pub element_set_index: u32,
+    pub instanced: bool,
+    pub elements: Vec<AuthoredVertexElementDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredInputLayoutDescriptor {
+    pub layout_id: u8,
+    pub streams: Vec<AuthoredVertexStreamLayoutDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredVertexStreamRef {
+    pub stream_index: u8,
+    pub header_tag: TagHash,
+    pub data_tag: TagHash,
+    pub stride: u16,
+    pub vertex_type: u16,
+    pub data_size: u32,
+    pub element_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredIndexBufferRef {
+    pub header_tag: TagHash,
+    pub data_tag: TagHash,
+    pub is_32bit: bool,
+    pub data_size: u64,
+    pub index_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeometryPositionTransform {
+    pub scale: [f32; 3],
+    pub offset: [f32; 3],
+    pub procedural_scale: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredStageInputLayout {
+    pub raw_stage: u8,
+    pub layout_id: u8,
+    pub descriptor: Option<AuthoredInputLayoutDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredGeometryInput {
+    pub geometry: TagHash,
+    pub vertex_streams: Vec<AuthoredVertexStreamRef>,
+    pub color_buffer: Option<AuthoredVertexStreamRef>,
+    pub skinning_buffer: Option<AuthoredVertexStreamRef>,
+    pub index_buffer: Option<AuthoredIndexBufferRef>,
+    pub stage_layouts: Vec<AuthoredStageInputLayout>,
+    pub position_transform: Option<GeometryPositionTransform>,
+    pub uv_transform: Option<UvTransformPreview>,
+    pub attachment_pose: Option<WeaponModAttachmentPose>,
+}
+
 impl std::fmt::Display for InputLayoutFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
@@ -269,6 +338,15 @@ pub struct WireframePreview {
     pub tangent_format: Option<String>,
     pub indices: Vec<u32>,
     pub material_ranges: Vec<WireframeMaterialRange>,
+    /// Package-native vertex/input ABI retained for Strict Tiger rendering.
+    /// Pretty Preview may ignore this and continue using reconstructed arrays.
+    pub authored_inputs: Vec<AuthoredGeometryInput>,
+    /// Exact highest-detail parts authored for Marathon ShadowGenerate.
+    ///
+    /// These are deliberately kept separate from the visible preview ranges:
+    /// visible geometry deduplicates repeated stage records, while the strict
+    /// shadow renderer must retain the package-authored stage-4 draw contract.
+    pub authored_shadow_ranges: Vec<WireframeAuthoredStageRange>,
     pub min: [f32; 3],
     pub max: [f32; 3],
     pub vertex_count_total: usize,
@@ -284,9 +362,34 @@ pub struct WireframeMaterialRange {
     pub render_stage: Option<u8>,
     pub technique: Option<TagHash>,
     pub gear_dye_change_color_index: Option<u8>,
+    /// Index into `WireframePreview::authored_inputs` for this draw.
+    pub authored_source: Option<usize>,
     /// Rigid-model `position_offset.w` / skinning `offset_scale.w` consumed
     /// by common-surface procedural branches through `scope_skinning[5].w`.
     pub procedural_scale: f32,
+    pub texture: Option<TagHash>,
+    pub textures: WireframeMaterialTextures,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireframeAuthoredStageRange {
+    pub render_stage: u8,
+    pub input_layout_id: u8,
+    pub part_index: usize,
+    pub source_index_start: u32,
+    pub source_index_count: u32,
+    pub primitive_type: u8,
+    pub raw_lod_category: u8,
+    pub variant_shader_index: u16,
+    pub flags: u32,
+    pub lod_run: u8,
+    pub technique: Option<TagHash>,
+    pub gear_dye_change_color_index: Option<u8>,
+    /// Index into `WireframePreview::authored_inputs` for this authored draw.
+    pub authored_source: Option<usize>,
+    pub procedural_scale: f32,
+    /// Triangle-list indices into the parent WireframePreview vertex array.
+    pub indices: Vec<u32>,
     pub texture: Option<TagHash>,
     pub textures: WireframeMaterialTextures,
 }
@@ -4744,6 +4847,9 @@ fn apply_weapon_mod_attachment_poses(
         let Some(pose) = attachment_poses.get(tag) else {
             continue;
         };
+        for authored in &mut wireframe.authored_inputs {
+            authored.attachment_pose = Some(*pose);
+        }
         // Common-surface VS forwards raw shader-input POSITION/NORMAL directly
         // to PS procedural varyings. Preserve those before socket transforms.
         wireframe
@@ -5158,6 +5264,9 @@ fn merge_model_wireframes(
     let mut uvs = has_complete_uvs.then(Vec::new);
     let mut indices = Vec::new();
     let mut material_ranges = Vec::new();
+    let mut authored_inputs = Vec::new();
+    let mut authored_shadow_ranges = Vec::new();
+    let mut authored_shadow_index_count = 0usize;
 
     for (_tag, source, wireframe) in parts {
         let available_vertices = MAX_PREVIEW_VERTICES.saturating_sub(vertices.len());
@@ -5210,6 +5319,37 @@ fn merge_model_wireframes(
             }));
         }
 
+        let authored_source_base = authored_inputs.len();
+        let authored_source_count = wireframe.authored_inputs.len();
+        authored_inputs.extend(wireframe.authored_inputs.iter().cloned());
+
+        for mut range in wireframe.authored_shadow_ranges {
+            range.authored_source = range
+                .authored_source
+                .filter(|source| *source < authored_source_count)
+                .map(|source| authored_source_base + source);
+            let available = MAX_PREVIEW_INDICES.saturating_sub(authored_shadow_index_count);
+            if available < 3 {
+                break;
+            }
+            let mut remapped = Vec::new();
+            for triangle in range.indices.chunks_exact(3) {
+                if remapped.len() + 3 > available
+                    || triangle
+                        .iter()
+                        .any(|index| *index as usize >= copied_vertices)
+                {
+                    continue;
+                }
+                remapped.extend(triangle.iter().map(|index| index + vertex_base));
+            }
+            if !remapped.is_empty() {
+                authored_shadow_index_count += remapped.len();
+                range.indices = remapped;
+                authored_shadow_ranges.push(range);
+            }
+        }
+
         let ranges = if wireframe.material_ranges.is_empty() {
             vec![WireframeMaterialRange {
                 index_start: 0,
@@ -5218,6 +5358,7 @@ fn merge_model_wireframes(
                 render_stage: None,
                 technique: None,
                 gear_dye_change_color_index: None,
+                authored_source: (authored_source_count != 0).then_some(authored_source_base),
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -5225,7 +5366,11 @@ fn merge_model_wireframes(
         } else {
             wireframe.material_ranges
         };
-        for range in ranges {
+        for mut range in ranges {
+            range.authored_source = range
+                .authored_source
+                .filter(|source| *source < authored_source_count)
+                .map(|source| authored_source_base + source);
             let source = wireframe
                 .indices
                 .get(
@@ -5256,6 +5401,7 @@ fn merge_model_wireframes(
                     render_stage: range.render_stage,
                     technique: range.technique,
                     gear_dye_change_color_index: range.gear_dye_change_color_index,
+                    authored_source: range.authored_source,
                     procedural_scale: range.procedural_scale,
                     texture: range.texture,
                     textures: range.textures,
@@ -5283,6 +5429,8 @@ fn merge_model_wireframes(
         tangent_format,
         indices,
         material_ranges,
+        authored_inputs,
+        authored_shadow_ranges,
         min,
         max,
         vertex_count_total,
@@ -5487,12 +5635,26 @@ fn assign_wireframe_material_textures(
     cache: &TagCache,
     textures: &[(TagHash, UEntryHeader)],
 ) {
-    if wireframe.material_ranges.is_empty() {
+    if wireframe.material_ranges.is_empty() && wireframe.authored_shadow_ranges.is_empty() {
         return;
     }
 
     let mut materials = rustc_hash::FxHashMap::default();
     for range in &mut wireframe.material_ranges {
+        let Some(technique) = range.technique else {
+            range.texture = textures.first().map(|(tag, _entry)| *tag);
+            range.textures.color = range.texture;
+            continue;
+        };
+
+        range.textures = materials
+            .entry(technique)
+            .or_insert_with(|| material_textures_for_technique(technique, cache, textures))
+            .clone();
+        range.texture = range.textures.color;
+    }
+
+    for range in &mut wireframe.authored_shadow_ranges {
         let Some(technique) = range.technique else {
             range.texture = textures.first().map(|(tag, _entry)| *tag);
             range.textures.color = range.texture;
@@ -6500,8 +6662,8 @@ fn procedural_surface_material_for_technique(
     })
 }
 
-const WEAPON_MOD_AGE_CHANNEL: u32 = 0x138D_E801;
-const UNIQUE_ID_CHANNEL: u32 = 0xD358_3E54;
+pub(crate) const WEAPON_MOD_AGE_CHANNEL: u32 = 0x138D_E801;
+pub(crate) const UNIQUE_ID_CHANNEL: u32 = 0xD358_3E54;
 const WEAPON_MOD_SCRATCHES_PROJECTION_AGE_DELTA: usize = 10;
 const WEAPON_MOD_SCRATCHES_REMAP_BASE_AGE_DELTA: usize = 9;
 const WEAPON_MOD_SCRATCHES_REMAP_SCALE_AGE_DELTA: usize = 8;
@@ -7552,6 +7714,9 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
     let buffers = read_static_buffer_tuples(data, 0x28, endian);
     let group = groups
         .iter()
+        .filter(|group| {
+            group.render_stage == crate::render::stage::MarathonRenderStage::GenerateGbuffer.raw()
+        })
         .filter_map(|group| {
             parts
                 .get(group.part_index as usize)
@@ -7559,7 +7724,19 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         })
         .min_by_key(|(_group, part)| (lod_selection_rank(part.lod_category), part.index_start))
         .map(|(group, _part)| group)
-        .or_else(|| groups.first())?;
+        .or_else(|| {
+            groups
+                .iter()
+                .filter_map(|group| {
+                    parts
+                        .get(group.part_index as usize)
+                        .map(|part| (group, part))
+                })
+                .min_by_key(|(_group, part)| {
+                    (lod_selection_rank(part.lod_category), part.index_start)
+                })
+                .map(|(group, _part)| group)
+        })?;
     let part = parts.get(group.part_index as usize)?;
     let buffers = buffers.get(part.buffer_index as usize)?;
 
@@ -7705,6 +7882,24 @@ fn parse_geometry_resource_wireframe(
             index_ranges.as_slice(),
             source.input_layout_index,
         )?;
+        wireframe.authored_inputs = vec![authored_geometry_input(
+            tag,
+            mesh,
+            &data,
+            endian,
+            position_transform,
+            uv_transform,
+        )];
+        for range in &mut wireframe.material_ranges {
+            range.authored_source = Some(0);
+        }
+        wireframe.authored_shadow_ranges = geometry_authored_stage_ranges(
+            &data,
+            endian,
+            source.index_buffer,
+            wireframe.vertices.len(),
+            crate::render::stage::MarathonRenderStage::ShadowGenerate,
+        );
         if let Some(transform) = position_transform {
             apply_geometry_position_transform(&mut wireframe, transform);
         }
@@ -7746,6 +7941,47 @@ fn parse_geometry_resource_wireframe(
         index_ranges.as_slice(),
         source.input_layout_index,
     )?;
+    let stage_layouts = geometry_render_stage_abi(&data, endian)
+        .map(|abi| {
+            abi.input_layouts
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(raw_stage, layout_id)| AuthoredStageInputLayout {
+                    raw_stage: raw_stage as u8,
+                    layout_id,
+                    descriptor: authored_input_layout_descriptor(layout_id),
+                })
+                .collect_vec()
+        })
+        .unwrap_or_default();
+    wireframe.authored_inputs = vec![AuthoredGeometryInput {
+        geometry: tag,
+        vertex_streams: [
+            authored_vertex_stream_ref(0, source.vertex0_buffer),
+            authored_vertex_stream_ref(1, source.vertex1_buffer),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        color_buffer: None,
+        skinning_buffer: None,
+        index_buffer: authored_index_buffer_ref(source.index_buffer),
+        stage_layouts,
+        position_transform,
+        uv_transform,
+        attachment_pose: None,
+    }];
+    for range in &mut wireframe.material_ranges {
+        range.authored_source = Some(0);
+    }
+    wireframe.authored_shadow_ranges = geometry_authored_stage_ranges(
+        &data,
+        endian,
+        source.index_buffer,
+        wireframe.vertices.len(),
+        crate::render::stage::MarathonRenderStage::ShadowGenerate,
+    );
     if let Some(transform) = position_transform {
         apply_geometry_position_transform(&mut wireframe, transform);
     }
@@ -7910,6 +8146,7 @@ fn build_wireframe_from_refs(
                 render_stage: range.render_stage,
                 technique: range.technique,
                 gear_dye_change_color_index: range.gear_dye_change_color_index,
+                authored_source: None,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -8308,6 +8545,7 @@ struct StaticMeshPartPreview {
 #[derive(Debug, Clone)]
 struct StaticMeshGroupPreview {
     part_index: u16,
+    render_stage: u8,
     input_layout_index: u8,
 }
 
@@ -8385,6 +8623,7 @@ fn read_static_mesh_groups(
         .filter_map(|group| {
             Some(StaticMeshGroupPreview {
                 part_index: read_u16(group.get(0x0..0x2)?, endian),
+                render_stage: *group.get(0x2)?,
                 input_layout_index: *group.get(0x3)?,
             })
         })
@@ -8597,32 +8836,626 @@ fn geometry_primary_index_ranges(data: &[u8], endian: Endian) -> Vec<GeometryInd
     ranges
 }
 
-fn geometry_preview_part_indices(data: &[u8], endian: Endian) -> Option<Vec<usize>> {
-    // Marathon adds one render stage: 26 boundaries for 25 stage ranges.
-    const STAGE_BOUNDARY_COUNT: usize = 26;
+const GOLIATH_RENDER_STAGE_COUNT: usize = crate::render::stage::MARATHON_RENDER_STAGE_COUNT;
+const GOLIATH_RENDER_STAGE_BOUNDARY_COUNT: usize = GOLIATH_RENDER_STAGE_COUNT + 1;
+const GOLIATH_RENDER_STAGE_BOUNDARY_OFFSET: usize = 0x30;
+const GOLIATH_RENDER_STAGE_LAYOUT_OFFSET: usize = 0x64;
 
-    let part_count = scan_arrays(data, endian)
-        .into_iter()
+#[derive(Debug, Clone)]
+struct GeometryRenderStageAbi {
+    boundaries: [usize; GOLIATH_RENDER_STAGE_BOUNDARY_COUNT],
+    input_layouts: [u8; GOLIATH_RENDER_STAGE_COUNT],
+    part_count: usize,
+}
+
+impl GeometryRenderStageAbi {
+    fn part_range(&self, stage: usize) -> Option<std::ops::Range<usize>> {
+        (stage < GOLIATH_RENDER_STAGE_COUNT)
+            .then(|| self.boundaries[stage]..self.boundaries[stage + 1])
+    }
+}
+
+fn geometry_render_stage_abi(data: &[u8], endian: Endian) -> Option<GeometryRenderStageAbi> {
+    let arrays = scan_arrays(data, endian);
+    let part_count = arrays
+        .iter()
         .find(|array| array.class == CLASS_GEOMETRY_PART)?
         .count;
-    let buffer_set = scan_arrays(data, endian)
-        .into_iter()
+    let buffer_set = arrays
+        .iter()
         .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)?;
-    let boundaries = (0..STAGE_BOUNDARY_COUNT)
+    let record = data.get(
+        buffer_set.data_offset
+            ..(buffer_set.data_offset + 0x80)
+                .min(buffer_set.end_offset)
+                .min(data.len()),
+    )?;
+    if record.len() < GOLIATH_RENDER_STAGE_LAYOUT_OFFSET + GOLIATH_RENDER_STAGE_COUNT {
+        return None;
+    }
+
+    let boundaries: [usize; GOLIATH_RENDER_STAGE_BOUNDARY_COUNT] = (0
+        ..GOLIATH_RENDER_STAGE_BOUNDARY_COUNT)
         .map(|index| {
-            data.get(buffer_set.data_offset + 0x30 + index * 2..)
+            record
+                .get(GOLIATH_RENDER_STAGE_BOUNDARY_OFFSET + index * 2..)
                 .map(|bytes| read_u16(bytes, endian) as usize)
         })
-        .collect::<Option<Vec<_>>>()?;
-    preview_part_indices_from_boundaries(&boundaries, part_count)
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()?;
+    if boundaries.windows(2).any(|pair| pair[0] > pair[1])
+        || boundaries.last().copied()? > part_count
+    {
+        return None;
+    }
+
+    let input_layouts: [u8; GOLIATH_RENDER_STAGE_COUNT] = record
+        .get(
+            GOLIATH_RENDER_STAGE_LAYOUT_OFFSET
+                ..GOLIATH_RENDER_STAGE_LAYOUT_OFFSET + GOLIATH_RENDER_STAGE_COUNT,
+        )?
+        .try_into()
+        .ok()?;
+
+    Some(GeometryRenderStageAbi {
+        boundaries,
+        input_layouts,
+        part_count,
+    })
+}
+
+fn geometry_authored_stage_ranges(
+    data: &[u8],
+    endian: Endian,
+    index_tag: TagHash,
+    vertex_count: usize,
+    stage: crate::render::stage::MarathonRenderStage,
+) -> Vec<WireframeAuthoredStageRange> {
+    let Some(abi) = geometry_render_stage_abi(data, endian) else {
+        return vec![];
+    };
+    let stage_index = stage.raw() as usize;
+    let Some(part_range) = abi.part_range(stage_index) else {
+        return vec![];
+    };
+
+    let mut candidates = geometry_index_range_candidates_raw(data, endian)
+        .into_iter()
+        .filter(|range| part_range.contains(&range.part_index))
+        .collect_vec();
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    let has_highest_detail = candidates
+        .iter()
+        .any(|range| is_highest_detail_lod(range.lod_category));
+    if has_highest_detail {
+        candidates.retain(|range| is_highest_detail_lod(range.lod_category));
+    } else if let Some(fallback_lod) = candidates
+        .iter()
+        .min_by_key(|range| lod_selection_rank(range.lod_category))
+        .map(|range| range.lod_category)
+    {
+        candidates.retain(|range| range.lod_category == fallback_lod);
+    }
+
+    let Some(index_entry) = package_manager().get_entry(index_tag) else {
+        return vec![];
+    };
+    let Ok(index_header) = package_manager().read_tag(index_tag) else {
+        return vec![];
+    };
+    let Ok(index_preview) =
+        load_index_buffer_preview_for_tag(index_tag, &index_entry, &index_header)
+    else {
+        return vec![];
+    };
+
+    candidates
+        .into_iter()
+        .filter_map(|range| {
+            let source = index_preview.indices.get(
+                range.index_start as usize
+                    ..range.index_start.saturating_add(range.index_count) as usize,
+            )?;
+            let indices = preview_triangles_from_indices(source, range.primitive_type)
+                .chunks_exact(3)
+                .filter(|triangle| {
+                    triangle
+                        .iter()
+                        .all(|index| (*index as usize) < vertex_count)
+                })
+                .flat_map(|triangle| triangle.iter().copied())
+                .collect_vec();
+            (!indices.is_empty()).then_some(WireframeAuthoredStageRange {
+                render_stage: stage.raw(),
+                input_layout_id: abi.input_layouts[stage_index],
+                part_index: range.part_index,
+                source_index_start: range.index_start,
+                source_index_count: range.index_count,
+                primitive_type: range.primitive_type,
+                raw_lod_category: range.lod_category,
+                variant_shader_index: range.variant_shader_index,
+                flags: range.flags,
+                lod_run: range.lod_run,
+                technique: range.technique.is_some().then_some(range.technique),
+                gear_dye_change_color_index: Some(range.gear_dye_change_color_index),
+                authored_source: Some(0),
+                procedural_scale: 1.0,
+                indices,
+                texture: None,
+                textures: WireframeMaterialTextures::default(),
+            })
+        })
+        .collect()
+}
+
+fn goliath_stage_technique_signature(technique: TagHash, cache: &TagCache) -> serde_json::Value {
+    let Some(entry) = package_manager().get_entry(technique) else {
+        return serde_json::json!({
+            "tag": technique.to_string(),
+            "status": "missing",
+        });
+    };
+    let Ok(data) = package_manager().read_tag(technique) else {
+        return serde_json::json!({
+            "tag": technique.to_string(),
+            "status": "unreadable",
+        });
+    };
+    let Some(preview) = MaterialTagPreview::load(&entry, &data) else {
+        return serde_json::json!({
+            "tag": technique.to_string(),
+            "status": "unparsed",
+        });
+    };
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let shaders = preview
+        .stages
+        .iter()
+        .map(|stage| {
+            let shader_strings = stage
+                .shader
+                .and_then(|shader| cache.hashes.get(&shader))
+                .map(|scan| scan.raw_strings.iter().take(8).cloned().collect_vec())
+                .unwrap_or_default();
+            serde_json::json!({
+                "stage": stage.stage,
+                "shader": stage.shader.map(|shader| shader.to_string()),
+                "shader_strings": shader_strings,
+                "texture_count": stage.textures.len(),
+                "sampler_count": stage.samplers.len(),
+                "constant_count": stage.constants.len(),
+                "inline_constant_count": stage.inline_constants.len(),
+                "bytecode_len": stage.bytecode_len,
+                "constant_buffer_slot": stage.constant_buffer_slot,
+                "constant_buffer": stage.constant_buffer.map(|tag| tag.to_string()),
+            })
+        })
+        .collect_vec();
+
+    let technique_strings = cache
+        .hashes
+        .get(&technique)
+        .map(|scan| scan.raw_strings.iter().take(12).cloned().collect_vec())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "tag": technique.to_string(),
+        "status": "parsed",
+        "strings": technique_strings,
+        "bind_mode": preview.bind_mode,
+        "state_selection": format!("0x{:08X}", preview.state_selection),
+        "used_scopes": format!("0x{:016X}", preview.used_scopes),
+        "compatible_scopes": format!("0x{:016X}", preview.compatible_scopes),
+        "shaders": shaders,
+    })
+}
+
+pub fn goliath_render_stage_abi_report() -> serde_json::Value {
+    #[derive(Default)]
+    struct StageStats {
+        geometries: rustc_hash::FxHashSet<TagHash>,
+        parts: usize,
+        indices: usize,
+        overlap0_parts: usize,
+        overlap0_indices: usize,
+        layouts: std::collections::BTreeMap<u8, usize>,
+        lods: std::collections::BTreeMap<u8, usize>,
+        primitives: std::collections::BTreeMap<u8, usize>,
+        states: std::collections::BTreeMap<(Option<u8>, Option<u8>, Option<u8>, Option<u8>), usize>,
+        examples: Vec<TagHash>,
+        techniques: std::collections::BTreeMap<TagHash, serde_json::Value>,
+    }
+
+    let endian = package_manager().version.endian();
+    let cache = quicktag_scanner::load_tag_cache();
+    let mut stats = std::collections::BTreeMap::<u8, StageStats>::new();
+    let mut geometries_scanned = 0usize;
+    let mut geometries_with_abi = 0usize;
+    let mut shadow_layout_pairs = std::collections::BTreeMap::<(u8, u8), usize>::new();
+    let mut shadow_layout_same = 0usize;
+    let mut shadow_layout_different = 0usize;
+    let mut shadow_layout_difference_examples = Vec::<TagHash>::new();
+    let mut shadow_shader_sets_equal = 0usize;
+    let mut shadow_shader_sets_partial = 0usize;
+    let mut shadow_shader_sets_disjoint = 0usize;
+    let mut shadow_shader_disjoint_examples = Vec::<TagHash>::new();
+    let mut vertex_shader_cache = rustc_hash::FxHashMap::<TagHash, Option<TagHash>>::default();
+    let mut static_group_stage_counts = std::collections::BTreeMap::<u8, usize>::new();
+    let mut static_group_stage_examples = std::collections::BTreeMap::<u8, Vec<TagHash>>::new();
+    let mut static_special_stage_counts = std::collections::BTreeMap::<u8, usize>::new();
+    let mut static_special_stage_examples = std::collections::BTreeMap::<u8, Vec<TagHash>>::new();
+    let mut static_special_stage_techniques =
+        std::collections::BTreeMap::<u8, rustc_hash::FxHashSet<TagHash>>::new();
+
+    let mut vertex_shader_for = |technique: TagHash| {
+        *vertex_shader_cache.entry(technique).or_insert_with(|| {
+            let entry = package_manager().get_entry(technique)?;
+            let data = package_manager().read_tag(technique).ok()?;
+            let preview = MaterialTagPreview::load(&entry, &data)?;
+            let MaterialPreviewKind::Technique(preview) = preview.kind;
+            preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "VS")
+                .and_then(|stage| stage.shader)
+        })
+    };
+
+    for (tag, _entry) in package_manager().get_all_by_reference(CLASS_GEOMETRY_RESOURCE) {
+        geometries_scanned += 1;
+        let Ok(data) = package_manager().read_tag(tag) else {
+            continue;
+        };
+        let Some(abi) = geometry_render_stage_abi(&data, endian) else {
+            continue;
+        };
+        geometries_with_abi += 1;
+
+        let candidates = geometry_index_range_candidates_raw(&data, endian);
+        let stage0_parts = abi
+            .part_range(0)
+            .into_iter()
+            .flatten()
+            .filter_map(|part_index| candidates.iter().find(|part| part.part_index == part_index))
+            .filter(|part| is_highest_detail_lod(part.lod_category))
+            .collect_vec();
+        let stage0 = stage0_parts
+            .iter()
+            .map(|part| (part.index_start, part.index_count))
+            .collect::<rustc_hash::FxHashSet<_>>();
+
+        let shadow_stage = crate::render::stage::MarathonRenderStage::ShadowGenerate.raw() as usize;
+        let shadow_parts = abi
+            .part_range(shadow_stage)
+            .into_iter()
+            .flatten()
+            .filter_map(|part_index| candidates.iter().find(|part| part.part_index == part_index))
+            .filter(|part| is_highest_detail_lod(part.lod_category))
+            .collect_vec();
+        if !stage0_parts.is_empty() && !shadow_parts.is_empty() {
+            let visible_layout = abi.input_layouts[0];
+            let shadow_layout = abi.input_layouts[shadow_stage];
+            *shadow_layout_pairs
+                .entry((visible_layout, shadow_layout))
+                .or_default() += 1;
+            if visible_layout == shadow_layout {
+                shadow_layout_same += 1;
+            } else {
+                shadow_layout_different += 1;
+                if shadow_layout_difference_examples.len() < 32 {
+                    shadow_layout_difference_examples.push(tag);
+                }
+            }
+
+            let visible_shaders = stage0_parts
+                .iter()
+                .filter_map(|part| vertex_shader_for(part.technique))
+                .collect::<rustc_hash::FxHashSet<_>>();
+            let shadow_shaders = shadow_parts
+                .iter()
+                .filter_map(|part| vertex_shader_for(part.technique))
+                .collect::<rustc_hash::FxHashSet<_>>();
+            if !visible_shaders.is_empty() && !shadow_shaders.is_empty() {
+                if visible_shaders == shadow_shaders {
+                    shadow_shader_sets_equal += 1;
+                } else if visible_shaders.is_disjoint(&shadow_shaders) {
+                    shadow_shader_sets_disjoint += 1;
+                    if shadow_shader_disjoint_examples.len() < 32 {
+                        shadow_shader_disjoint_examples.push(tag);
+                    }
+                } else {
+                    shadow_shader_sets_partial += 1;
+                }
+            }
+        }
+
+        for stage in 0..GOLIATH_RENDER_STAGE_COUNT {
+            let Some(part_range) = abi.part_range(stage) else {
+                continue;
+            };
+            let stage_parts = candidates
+                .iter()
+                .filter(|part| {
+                    part_range.contains(&part.part_index)
+                        && is_highest_detail_lod(part.lod_category)
+                })
+                .collect_vec();
+            if stage_parts.is_empty() {
+                continue;
+            }
+
+            let stat = stats.entry(stage as u8).or_default();
+            stat.geometries.insert(tag);
+            *stat.layouts.entry(abi.input_layouts[stage]).or_default() += 1;
+            if stat.examples.len() < 16 && !stat.examples.contains(&tag) {
+                stat.examples.push(tag);
+            }
+
+            for part in stage_parts {
+                stat.parts += 1;
+                stat.indices += part.index_count as usize;
+                *stat.lods.entry(part.lod_category).or_default() += 1;
+                *stat.primitives.entry(part.primitive_type).or_default() += 1;
+
+                if stage0.contains(&(part.index_start, part.index_count)) {
+                    stat.overlap0_parts += 1;
+                    stat.overlap0_indices += part.index_count as usize;
+                }
+
+                let state = render_state_for_technique(part.technique);
+                *stat
+                    .states
+                    .entry((
+                        state.blend,
+                        state.depth_stencil,
+                        state.rasterizer,
+                        state.depth_bias,
+                    ))
+                    .or_default() += 1;
+
+                if stat.techniques.len() < 64 && !stat.techniques.contains_key(&part.technique) {
+                    stat.techniques.insert(
+                        part.technique,
+                        goliath_stage_technique_signature(part.technique, &cache),
+                    );
+                }
+            }
+        }
+    }
+
+    for (tag, _entry) in package_manager().get_all_by_reference(0x80808620) {
+        let Ok(data) = package_manager().read_tag(tag) else {
+            continue;
+        };
+        for group in read_static_mesh_groups(&data, 0x8, endian) {
+            *static_group_stage_counts
+                .entry(group.render_stage)
+                .or_default() += 1;
+            let examples = static_group_stage_examples
+                .entry(group.render_stage)
+                .or_default();
+            if examples.len() < 16 && !examples.contains(&tag) {
+                examples.push(tag);
+            }
+        }
+    }
+
+    for (tag, _entry) in package_manager().get_all_by_reference(0x80808635) {
+        let Ok(data) = package_manager().read_tag(tag) else {
+            continue;
+        };
+        for record in read_array(&data, 0x20, 0x24, endian)
+            .into_iter()
+            .flat_map(|array| array.chunks_exact(0x24))
+        {
+            let Some(&stage) = record.first() else {
+                continue;
+            };
+            if stage as usize >= GOLIATH_RENDER_STAGE_COUNT {
+                continue;
+            }
+            *static_special_stage_counts.entry(stage).or_default() += 1;
+            let examples = static_special_stage_examples.entry(stage).or_default();
+            if examples.len() < 16 && !examples.contains(&tag) {
+                examples.push(tag);
+            }
+            if let Some(technique) = read_tag_at(record, 0x20, endian).filter(|tag| tag.is_some()) {
+                static_special_stage_techniques
+                    .entry(stage)
+                    .or_default()
+                    .insert(technique);
+            }
+        }
+    }
+
+    let stages = (0..GOLIATH_RENDER_STAGE_COUNT as u8)
+        .map(|stage| {
+            let typed_stage = crate::render::stage::MarathonRenderStage::try_from(stage).ok();
+            let semantic_name =
+                typed_stage.and_then(crate::render::stage::MarathonRenderStage::semantic_name);
+            let evidence = typed_stage
+                .map(crate::render::stage::MarathonRenderStage::evidence)
+                .unwrap_or(crate::render::evidence::EvidenceLevel::Unknown);
+            let Some(stat) = stats.get(&stage) else {
+                return serde_json::json!({
+                    "raw_stage": stage,
+                    "semantic_name": semantic_name,
+                    "evidence": format!("{evidence:?}"),
+                    "empty": true,
+                });
+            };
+            let overlap_part_percent = if stat.parts == 0 {
+                0.0
+            } else {
+                stat.overlap0_parts as f64 * 100.0 / stat.parts as f64
+            };
+            let overlap_index_percent = if stat.indices == 0 {
+                0.0
+            } else {
+                stat.overlap0_indices as f64 * 100.0 / stat.indices as f64
+            };
+            let layouts = stat
+                .layouts
+                .iter()
+                .map(|(layout, geometries)| {
+                    serde_json::json!({
+                        "layout_id": layout,
+                        "geometries": geometries,
+                    })
+                })
+                .collect_vec();
+            let lods = stat
+                .lods
+                .iter()
+                .map(|(lod, parts)| {
+                    serde_json::json!({
+                        "lod": lod,
+                        "parts": parts,
+                    })
+                })
+                .collect_vec();
+            let primitives = stat
+                .primitives
+                .iter()
+                .map(|(primitive, parts)| {
+                    serde_json::json!({
+                        "primitive_type": primitive,
+                        "parts": parts,
+                    })
+                })
+                .collect_vec();
+            let render_states = stat
+                .states
+                .iter()
+                .map(|((blend, depth_stencil, rasterizer, depth_bias), parts)| {
+                    serde_json::json!({
+                        "blend": blend,
+                        "depth_stencil": depth_stencil,
+                        "rasterizer": rasterizer,
+                        "depth_bias": depth_bias,
+                        "parts": parts,
+                    })
+                })
+                .collect_vec();
+
+            serde_json::json!({
+                "raw_stage": stage,
+                "semantic_name": semantic_name,
+                "evidence": format!("{evidence:?}"),
+                "empty": false,
+                "geometry_count": stat.geometries.len(),
+                "part_count": stat.parts,
+                "index_count": stat.indices,
+                "stage0_overlap": {
+                    "parts": stat.overlap0_parts,
+                    "part_percent": overlap_part_percent,
+                    "indices": stat.overlap0_indices,
+                    "index_percent": overlap_index_percent,
+                },
+                "input_layouts": layouts,
+                "lod_categories": lods,
+                "primitive_types": primitives,
+                "render_states": render_states,
+                "geometry_examples": stat.examples.iter().map(ToString::to_string).collect_vec(),
+                "technique_examples": stat.techniques.values().cloned().collect_vec(),
+            })
+        })
+        .collect_vec();
+
+    let shadow_layout_pairs = shadow_layout_pairs
+        .into_iter()
+        .map(|((visible, shadow), geometries)| {
+            serde_json::json!({
+                "visible_layout": visible,
+                "shadow_layout": shadow,
+                "geometries": geometries,
+            })
+        })
+        .collect_vec();
+    let static_stage_evidence = (0..GOLIATH_RENDER_STAGE_COUNT as u8)
+        .filter_map(|stage| {
+            let group_count = static_group_stage_counts.get(&stage).copied().unwrap_or(0);
+            let special_count = static_special_stage_counts
+                .get(&stage)
+                .copied()
+                .unwrap_or(0);
+            (group_count != 0 || special_count != 0).then(|| {
+                serde_json::json!({
+                    "raw_stage": stage,
+                    "semantic_name": crate::render::stage::MarathonRenderStage::try_from(stage)
+                        .ok()
+                        .and_then(crate::render::stage::MarathonRenderStage::semantic_name),
+                    "static_group_count": group_count,
+                    "static_special_count": special_count,
+                    "static_group_examples": static_group_stage_examples
+                        .get(&stage)
+                        .into_iter()
+                        .flatten()
+                        .map(ToString::to_string)
+                        .collect_vec(),
+                    "static_special_examples": static_special_stage_examples
+                        .get(&stage)
+                        .into_iter()
+                        .flatten()
+                        .map(ToString::to_string)
+                        .collect_vec(),
+                    "static_special_techniques": static_special_stage_techniques
+                        .get(&stage)
+                        .into_iter()
+                        .flatten()
+                        .take(32)
+                        .map(|technique| goliath_stage_technique_signature(*technique, &cache))
+                        .collect_vec(),
+                })
+            })
+        })
+        .collect_vec();
+
+    serde_json::json!({
+        "schema": "quicktag.goliath-render-stage-abi.v1",
+        "game": package_manager().version.name(),
+        "stage_count": GOLIATH_RENDER_STAGE_COUNT,
+        "boundary_count": GOLIATH_RENDER_STAGE_BOUNDARY_COUNT,
+        "geometry_record_size": 0x80,
+        "boundary_offset": GOLIATH_RENDER_STAGE_BOUNDARY_OFFSET,
+        "input_layout_offset": GOLIATH_RENDER_STAGE_LAYOUT_OFFSET,
+        "geometries_scanned": geometries_scanned,
+        "geometries_with_valid_stage_abi": geometries_with_abi,
+        "static_stage_evidence": static_stage_evidence,
+        "shadow_generate_relation": {
+            "input_layout_pairs": shadow_layout_pairs,
+            "same_layout_geometries": shadow_layout_same,
+            "different_layout_geometries": shadow_layout_different,
+            "different_layout_examples": shadow_layout_difference_examples
+                .iter()
+                .map(ToString::to_string)
+                .collect_vec(),
+            "vertex_shader_sets_equal": shadow_shader_sets_equal,
+            "vertex_shader_sets_partial_overlap": shadow_shader_sets_partial,
+            "vertex_shader_sets_disjoint": shadow_shader_sets_disjoint,
+            "vertex_shader_disjoint_examples": shadow_shader_disjoint_examples
+                .iter()
+                .map(ToString::to_string)
+                .collect_vec(),
+        },
+        "stages": stages,
+    })
+}
+
+fn geometry_preview_part_indices(data: &[u8], endian: Endian) -> Option<Vec<usize>> {
+    let abi = geometry_render_stage_abi(data, endian)?;
+    preview_part_indices_from_boundaries(&abi.boundaries, abi.part_count)
 }
 
 fn preview_part_indices_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<usize>> {
-    let preview_stages = 0..25;
-    if boundaries.len() < 26
+    if boundaries.len() < GOLIATH_RENDER_STAGE_BOUNDARY_COUNT
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -8630,7 +9463,7 @@ fn preview_part_indices_from_boundaries(
     }
 
     Some(
-        preview_stages
+        (0..GOLIATH_RENDER_STAGE_COUNT)
             .flat_map(|stage| boundaries[stage]..boundaries[stage + 1])
             .unique()
             .collect(),
@@ -8641,7 +9474,7 @@ fn preview_part_stages_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<Option<u8>>> {
-    if boundaries.len() < 26
+    if boundaries.len() < GOLIATH_RENDER_STAGE_BOUNDARY_COUNT
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -8649,7 +9482,7 @@ fn preview_part_stages_from_boundaries(
     }
 
     let mut stages = vec![None; part_count];
-    for stage in 0..25 {
+    for stage in 0..GOLIATH_RENDER_STAGE_COUNT {
         for part in boundaries[stage]..boundaries[stage + 1] {
             stages[part] = Some(stage as u8);
         }
@@ -8658,22 +9491,8 @@ fn preview_part_stages_from_boundaries(
 }
 
 fn geometry_preview_part_stages(data: &[u8], endian: Endian) -> Option<Vec<Option<u8>>> {
-    const STAGE_BOUNDARY_COUNT: usize = 26;
-    let arrays = scan_arrays(data, endian);
-    let part_count = arrays
-        .iter()
-        .find(|array| array.class == CLASS_GEOMETRY_PART)?
-        .count;
-    let buffer_set = arrays
-        .iter()
-        .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)?;
-    let boundaries = (0..STAGE_BOUNDARY_COUNT)
-        .map(|index| {
-            data.get(buffer_set.data_offset + 0x30 + index * 2..)
-                .map(|bytes| read_u16(bytes, endian) as usize)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    preview_part_stages_from_boundaries(&boundaries, part_count)
+    let abi = geometry_render_stage_abi(data, endian)?;
+    preview_part_stages_from_boundaries(&abi.boundaries, abi.part_count)
 }
 
 fn is_highest_detail_lod(lod: u8) -> bool {
@@ -8736,7 +9555,10 @@ fn preview_triangles_from_indices(indices: &[u32], primitive_type: u8) -> Vec<u3
     out
 }
 
-fn geometry_index_range_candidates(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
+fn geometry_index_range_candidates_raw(
+    data: &[u8],
+    endian: Endian,
+) -> Vec<GeometryIndexRangePreview> {
     let mut candidates = Vec::<GeometryIndexRangePreview>::new();
     let part_stages = geometry_preview_part_stages(data, endian).unwrap_or_default();
     let exact_offsets = scan_arrays(data, endian)
@@ -8822,6 +9644,10 @@ fn geometry_index_range_candidates(data: &[u8], endian: Endian) -> Vec<GeometryI
     }
 
     candidates
+}
+
+fn geometry_index_range_candidates(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
+    geometry_index_range_candidates_raw(data, endian)
         .into_iter()
         .unique_by(|range| {
             (
@@ -8884,13 +9710,6 @@ fn read_geometry_uv_transform(data: &[u8], endian: Endian) -> Option<UvTransform
         .all(|value| value.is_finite())
         && scale.iter().any(|value| value.abs() > 0.000001))
     .then_some(UvTransformPreview { scale, offset })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct GeometryPositionTransform {
-    scale: [f32; 3],
-    offset: [f32; 3],
-    procedural_scale: f32,
 }
 
 fn read_geometry_position_transform(
@@ -8956,6 +9775,9 @@ fn apply_geometry_position_transform(
     for range in &mut wireframe.material_ranges {
         range.procedural_scale = transform.procedural_scale;
     }
+    for range in &mut wireframe.authored_shadow_ranges {
+        range.procedural_scale = transform.procedural_scale;
+    }
     if let Some((min, max)) = bounds(&wireframe.vertices) {
         wireframe.min = min;
         wireframe.max = max;
@@ -8999,17 +9821,22 @@ fn array_records<'a>(data: &'a [u8], array: TagArray, stride: usize) -> Vec<&'a 
         .collect()
 }
 
-fn vertex_layout_stream_sets_for_any_mapping(layout_id: u8) -> Option<Vec<usize>> {
+fn vertex_layout_stream_bindings_for_any_mapping(
+    layout_id: u8,
+) -> Option<Vec<(usize, usize, bool)>> {
     for layout_tag in tags_by_class(CLASS_VERTEX_INPUT_LAYOUT_MAPPING) {
-        if let Some(stream_sets) = vertex_layout_stream_sets(layout_tag, layout_id) {
-            return Some(stream_sets);
+        if let Some(bindings) = vertex_layout_stream_bindings(layout_tag, layout_id) {
+            return Some(bindings);
         }
     }
 
     None
 }
 
-fn vertex_layout_stream_sets(layout_tag: TagHash, layout_id: u8) -> Option<Vec<usize>> {
+fn vertex_layout_stream_bindings(
+    layout_tag: TagHash,
+    layout_id: u8,
+) -> Option<Vec<(usize, usize, bool)>> {
     let endian = package_manager().version.endian();
     let data = package_manager().read_tag(layout_tag).ok()?;
     for array in scan_arrays(&data, endian) {
@@ -9023,17 +9850,39 @@ fn vertex_layout_stream_sets(layout_tag: TagHash, layout_id: u8) -> Option<Vec<u
                 continue;
             }
 
-            let stream_sets = [0x8, 0xc, 0x10, 0x14]
-                .into_iter()
-                .filter_map(|offset| read_u32_at(record, offset, endian))
-                .filter(|set_index| *set_index != u32::MAX)
-                .map(|set_index| set_index as usize)
+            let bindings = (0..4usize)
+                .filter_map(|stream_index| {
+                    let set_index = read_u32_at(record, 0x8 + stream_index * 4, endian)?;
+                    (set_index != u32::MAX).then_some((
+                        stream_index,
+                        set_index as usize,
+                        record.get(0x18 + stream_index).copied().unwrap_or(0) != 0,
+                    ))
+                })
                 .collect_vec();
-            return (!stream_sets.is_empty()).then_some(stream_sets);
+            return (!bindings.is_empty()).then_some(bindings);
         }
     }
 
     None
+}
+
+fn vertex_layout_stream_sets_for_any_mapping(layout_id: u8) -> Option<Vec<usize>> {
+    Some(
+        vertex_layout_stream_bindings_for_any_mapping(layout_id)?
+            .into_iter()
+            .map(|(_stream_index, set_index, _instanced)| set_index)
+            .collect(),
+    )
+}
+
+fn vertex_layout_stream_sets(layout_tag: TagHash, layout_id: u8) -> Option<Vec<usize>> {
+    Some(
+        vertex_layout_stream_bindings(layout_tag, layout_id)?
+            .into_iter()
+            .map(|(_stream_index, set_index, _instanced)| set_index)
+            .collect(),
+    )
 }
 
 fn vertex_input_element_sets(tag: TagHash) -> Vec<Vec<VertexInputElement>> {
@@ -9057,6 +9906,138 @@ fn vertex_input_element_sets(tag: TagHash) -> Vec<Vec<VertexInputElement>> {
                 .collect()
         })
         .collect()
+}
+
+fn authored_input_layout_descriptor(layout_id: u8) -> Option<AuthoredInputLayoutDescriptor> {
+    let bindings = vertex_layout_stream_bindings_for_any_mapping(layout_id)?;
+    for element_tag in tags_by_class(CLASS_VERTEX_INPUT_ELEMENT_SETS) {
+        let sets = vertex_input_element_sets(element_tag);
+        if !bindings
+            .iter()
+            .all(|(_stream_index, set_index, _instanced)| *set_index < sets.len())
+        {
+            continue;
+        }
+
+        let streams = bindings
+            .iter()
+            .map(|(stream_index, set_index, instanced)| {
+                let mut offset = 0usize;
+                let mut elements = Vec::new();
+                for element in sets.get(*set_index)? {
+                    elements.push(AuthoredVertexElementDescriptor {
+                        semantic: element.semantic,
+                        semantic_index: element.semantic_index,
+                        format: element.format,
+                        offset: u16::try_from(offset).ok()?,
+                    });
+                    offset = offset.checked_add(vertex_input_element_size(*element)?)?;
+                }
+                Some(AuthoredVertexStreamLayoutDescriptor {
+                    stream_index: u8::try_from(*stream_index).ok()?,
+                    element_set_index: u32::try_from(*set_index).ok()?,
+                    instanced: *instanced,
+                    elements,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        return Some(AuthoredInputLayoutDescriptor { layout_id, streams });
+    }
+
+    None
+}
+
+fn authored_vertex_stream_ref(
+    stream_index: u8,
+    header_tag: TagHash,
+) -> Option<AuthoredVertexStreamRef> {
+    let entry = package_manager().get_entry(header_tag)?;
+    let header_data = package_manager().read_tag(header_tag).ok()?;
+    let header =
+        VertexBufferHeader::parse(&header_data, package_manager().version.endian()).ok()?;
+    let data_tag = TagHash(entry.reference);
+    let element_count = (header.stride != 0)
+        .then(|| header.data_size / u32::from(header.stride))
+        .unwrap_or(0);
+
+    Some(AuthoredVertexStreamRef {
+        stream_index,
+        header_tag,
+        data_tag,
+        stride: header.stride,
+        vertex_type: header.vtype,
+        data_size: header.data_size,
+        element_count,
+    })
+}
+
+fn authored_index_buffer_ref(header_tag: TagHash) -> Option<AuthoredIndexBufferRef> {
+    let entry = package_manager().get_entry(header_tag)?;
+    let header_data = package_manager().read_tag(header_tag).ok()?;
+    let header = IndexBufferHeader::parse(&header_data, package_manager().version.endian()).ok()?;
+    let data_tag = TagHash(entry.reference);
+    let index_width = if header.is_32bit { 4 } else { 2 };
+    let index_count = u32::try_from(header.data_size / index_width).ok()?;
+
+    Some(AuthoredIndexBufferRef {
+        header_tag,
+        data_tag,
+        is_32bit: header.is_32bit,
+        data_size: header.data_size,
+        index_count,
+    })
+}
+
+fn authored_geometry_input(
+    geometry: TagHash,
+    mesh: &[u8],
+    data: &[u8],
+    endian: Endian,
+    position_transform: Option<GeometryPositionTransform>,
+    uv_transform: Option<UvTransformPreview>,
+) -> AuthoredGeometryInput {
+    let vertex_streams = [0x0usize, 0x4, 0x8, 0xc]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(stream_index, offset)| {
+            authored_vertex_stream_ref(
+                stream_index as u8,
+                read_tag_at(mesh, offset, endian).unwrap_or(TagHash(0)),
+            )
+        })
+        .collect_vec();
+    let color_buffer =
+        authored_vertex_stream_ref(4, read_tag_at(mesh, 0x14, endian).unwrap_or(TagHash(0)));
+    let skinning_buffer =
+        authored_vertex_stream_ref(5, read_tag_at(mesh, 0x18, endian).unwrap_or(TagHash(0)));
+    let index_buffer = read_tag_at(mesh, 0x10, endian).and_then(authored_index_buffer_ref);
+    let stage_layouts = geometry_render_stage_abi(data, endian)
+        .map(|abi| {
+            abi.input_layouts
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(raw_stage, layout_id)| AuthoredStageInputLayout {
+                    raw_stage: raw_stage as u8,
+                    layout_id,
+                    descriptor: authored_input_layout_descriptor(layout_id),
+                })
+                .collect_vec()
+        })
+        .unwrap_or_default();
+
+    AuthoredGeometryInput {
+        geometry,
+        vertex_streams,
+        color_buffer,
+        skinning_buffer,
+        index_buffer,
+        stage_layouts,
+        position_transform,
+        uv_transform,
+        attachment_pose: None,
+    }
 }
 
 fn vertex_input_element_size(element: VertexInputElement) -> Option<usize> {
@@ -9589,6 +10570,8 @@ fn build_vertex_wireframe(
         tangent_format: None,
         indices: vec![],
         material_ranges: vec![],
+        authored_inputs: vec![],
+        authored_shadow_ranges: vec![],
         min,
         max,
     })
@@ -9909,6 +10892,17 @@ mod tests {
         assert!((placed.translation[2] - 0.0811943).abs() < 0.000_001);
         assert_eq!(placed.rotation, socket.rotation);
         assert_eq!(placed.scale, socket.scale);
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_shadow_input_layouts() {
+        init_goliath_test_package_manager();
+        for layout_id in [7u8, 12, 13, 26] {
+            let descriptor =
+                authored_input_layout_descriptor(layout_id).expect("authored layout descriptor");
+            eprintln!("GOLIATH_SHADOW_LAYOUT {descriptor:#?}");
+        }
     }
 
     #[test]
@@ -10810,120 +11804,329 @@ mod tests {
     #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
     fn probes_goliath_render_stage_abi() {
         init_goliath_test_package_manager();
+        let report = goliath_render_stage_abi_report();
+
+        assert_eq!(report["stage_count"], GOLIATH_RENDER_STAGE_COUNT);
+        assert_eq!(
+            report["geometries_scanned"],
+            report["geometries_with_valid_stage_abi"]
+        );
+        assert_eq!(report["stages"][2]["semantic_name"], "investment_decals");
+        assert_eq!(report["stages"][4]["semantic_name"], "shadow_generate");
+        assert_eq!(report["stages"][13]["semantic_name"], "depth_prepass");
+        assert_eq!(report["stages"][17]["semantic_name"], "reticle");
+        assert_eq!(report["stages"][24]["semantic_name"], "compute_skinning");
+
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("serialize render-stage ABI report")
+        );
+    }
+
+    #[test]
+    fn probes_embedded_render_stage_wordlist() {
+        let needles = [
+            "render_stage",
+            "shadow_generate",
+            "investment_decals",
+            "health_overlay",
+            "mask_sun_light",
+            "compute_skinning",
+            "light_shaft_occlusion",
+            "skin_prepass",
+            "depth_prepass",
+            "world_forces",
+            "goliath",
+        ];
+        let mut matches = Vec::new();
+        quicktag_strings::wordlist::load_wordlist(|value, _hash| {
+            let lower = value.to_ascii_lowercase();
+            if needles.iter().any(|needle| lower.contains(needle)) {
+                matches.push(value.to_string());
+            }
+        });
+        matches.sort();
+        matches.dedup();
+        for value in &matches {
+            eprintln!("GOLIATH_STAGE_WORD {value}");
+        }
+        assert!(
+            matches.iter().any(|value| value == "shadow_generate"),
+            "embedded wordlist should include known Tiger stage vocabulary"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_decal_stage_candidates() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
         let endian = package_manager().version.endian();
-        let mut stats = std::collections::BTreeMap::<u8, (usize, usize, usize, usize)>::new();
-        let mut states = std::collections::BTreeMap::<
-            u8,
-            std::collections::BTreeMap<(Option<u8>, Option<u8>, Option<u8>, Option<u8>), usize>,
-        >::new();
-        let mut technique_examples = std::collections::BTreeMap::<
-            u8,
-            std::collections::BTreeMap<TagHash, (Vec<&'static str>, usize, usize)>,
-        >::new();
-        for (tag, _entry) in package_manager().get_all_by_reference(CLASS_GEOMETRY_RESOURCE) {
-            let Ok(data) = package_manager().read_tag(tag) else {
-                continue;
-            };
-            let arrays = scan_arrays(&data, endian);
-            let Some(part_array) = arrays
+        let mut candidates =
+            std::collections::BTreeMap::<u32, std::collections::BTreeMap<u8, Vec<TagHash>>>::new();
+
+        let is_vertex_buffer = |tag: TagHash| {
+            package_manager().get_entry(tag).is_some_and(|entry| {
+                matches!(
+                    TagType::from_type_subtype(entry.file_type, entry.file_subtype),
+                    TagType::VertexBuffer { is_header: true }
+                )
+            })
+        };
+
+        for (tag, scan) in &cache.hashes {
+            let Some(vb0) = scan
+                .file_hashes
                 .iter()
-                .find(|array| array.class == CLASS_GEOMETRY_PART)
+                .find(|item| item.offset == 0x28)
+                .map(|item| item.hash)
             else {
                 continue;
             };
-            let Some(buffer_set) = arrays
+            let Some(vb1) = scan
+                .file_hashes
                 .iter()
-                .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
+                .find(|item| item.offset == 0x2c)
+                .map(|item| item.hash)
             else {
                 continue;
             };
-            let Some(boundaries) = (0..26)
-                .map(|i| {
-                    data.get(buffer_set.data_offset + 0x30 + i * 2..)
-                        .map(|b| read_u16(b, endian) as usize)
-                })
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            if boundaries.windows(2).any(|p| p[0] > p[1])
-                || boundaries.last().copied().unwrap_or_default() > part_array.count
-            {
+            if !is_vertex_buffer(vb0) || !is_vertex_buffer(vb1) {
                 continue;
             }
-            let candidates = geometry_index_range_candidates(&data, endian);
-            let stage0 = candidates
-                .iter()
-                .filter(|p| {
-                    is_highest_detail_lod(p.lod_category)
-                        && boundaries[0] <= p.part_index
-                        && p.part_index < boundaries[1]
-                })
-                .map(|p| (p.index_start, p.index_count))
-                .collect::<rustc_hash::FxHashSet<_>>();
-            for part in candidates
-                .into_iter()
-                .filter(|p| is_highest_detail_lod(p.lod_category))
-            {
-                let Some(stage) = (0..25).find(|s| {
-                    boundaries[*s] <= part.part_index && part.part_index < boundaries[*s + 1]
-                }) else {
-                    continue;
-                };
-                let stat = stats.entry(stage as u8).or_default();
-                stat.0 += 1;
-                stat.1 += part.index_count as usize;
-                if stage0.contains(&(part.index_start, part.index_count)) {
-                    stat.2 += 1;
-                    stat.3 += part.index_count as usize;
-                }
-                let state = render_state_for_technique(part.technique);
-                *states
-                    .entry(stage as u8)
-                    .or_default()
-                    .entry((
-                        state.blend,
-                        state.depth_stencil,
-                        state.rasterizer,
-                        state.depth_bias,
+            let Some(entry) = package_manager().get_entry(*tag) else {
+                continue;
+            };
+            let Ok(data) = package_manager().read_tag(*tag) else {
+                continue;
+            };
+            let Some(&stage) = data.get(0x36) else {
+                continue;
+            };
+            if stage as usize >= GOLIATH_RENDER_STAGE_COUNT {
+                continue;
+            }
+            candidates
+                .entry(entry.reference)
+                .or_default()
+                .entry(stage)
+                .or_default()
+                .push(*tag);
+        }
+
+        for (class, stages) in candidates {
+            eprintln!(
+                "GOLIATH_DECAL_CANDIDATE class={class:08X} stages={:?}",
+                stages
+                    .iter()
+                    .map(|(stage, tags)| (
+                        *stage,
+                        tags.len(),
+                        tags.iter().take(8).copied().collect_vec()
                     ))
-                    .or_default() += 1;
-                technique_examples
-                    .entry(stage as u8)
-                    .or_default()
-                    .entry(part.technique)
-                    .or_insert_with(|| {
-                        let Some(entry) = package_manager().get_entry(part.technique) else {
-                            return (vec![], 0, 0);
-                        };
-                        let Ok(data) = package_manager().read_tag(part.technique) else {
-                            return (vec![], 0, 0);
-                        };
-                        let Some(preview) =
-                            crate::material::MaterialTagPreview::load(&entry, &data)
-                        else {
-                            return (vec![], 0, 0);
-                        };
-                        let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-                        (
-                            preview.stages.iter().map(|s| s.stage).collect(),
-                            preview.stages.iter().map(|s| s.textures.len()).sum(),
-                            preview.stages.iter().map(|s| s.bytecode_len).sum(),
-                        )
-                    });
+                    .collect_vec()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_explicit_render_stage_features() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let endian = package_manager().version.endian();
+
+        for class in [0x8080695B, 0x80806E68, 0x80801B40] {
+            let entries = package_manager().get_all_by_reference(class);
+            eprintln!(
+                "GOLIATH_EXPLICIT_STAGE class={class:08X} entries={}",
+                entries.len()
+            );
+            for (tag, entry) in entries.into_iter().take(64) {
+                let data = package_manager().read_tag(tag).expect("feature data");
+                let stage36 = data.get(0x36).copied();
+                let stage34 = data.get(0x34).copied();
+                let strings = cache
+                    .hashes
+                    .get(&tag)
+                    .map(|scan| scan.raw_strings.iter().take(12).cloned().collect_vec())
+                    .unwrap_or_default();
+                eprintln!(
+                    "GOLIATH_EXPLICIT_STAGE tag={tag} len={} stage34={stage34:?} stage36={stage36:?} strings={strings:?}",
+                    entry.file_size
+                );
             }
         }
-        for (stage, (parts, indices, overlap_parts, overlap_indices)) in stats {
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_decal_feature_classes() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let mut classes =
+            std::collections::BTreeMap::<u32, (usize, Vec<TagHash>, Vec<String>)>::new();
+
+        for (tag, scan) in &cache.hashes {
+            if !scan
+                .raw_strings
+                .iter()
+                .any(|value| value.to_ascii_lowercase().contains("decal"))
+            {
+                continue;
+            }
+            let Some(entry) = package_manager().get_entry(*tag) else {
+                continue;
+            };
+            let class = entry.reference;
+            let row = classes.entry(class).or_default();
+            row.0 += 1;
+            if row.1.len() < 12 {
+                row.1.push(*tag);
+            }
+            for value in scan
+                .raw_strings
+                .iter()
+                .filter(|value| value.to_ascii_lowercase().contains("decal"))
+            {
+                if row.2.len() < 24 && !row.2.contains(value) {
+                    row.2.push(value.clone());
+                }
+            }
+        }
+
+        for (class, (count, tags, strings)) in classes {
             eprintln!(
-                "stage_abi={stage:02} parts={parts} indices={indices} overlap0_parts={overlap_parts} overlap0_indices={overlap_indices} states={:?}",
-                states.get(&stage)
+                "GOLIATH_DECAL_CLASS class={class:08X} count={count} tags={tags:?} strings={strings:?}"
             );
-            eprintln!(
-                "stage_tech={stage:02} examples={:?}",
-                technique_examples
-                    .get(&stage)
-                    .map(|rows| rows.iter().take(32).collect_vec())
-            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_health_overlay_pipeline_users() {
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let endian = package_manager().version.endian();
+
+        let mut targets = Vec::<(TagHash, usize)>::new();
+        for (globals, _entry) in package_manager().get_all_by_reference(0x80808070) {
+            let Ok(data) = package_manager().read_tag(globals) else {
+                continue;
+            };
+            let Some(scan) = cache.hashes.get(&globals) else {
+                continue;
+            };
+            let pipeline_strings = scan
+                .raw_strings
+                .iter()
+                .filter(|value| {
+                    !matches!(
+                        value.as_str(),
+                        "frame"
+                            | "view"
+                            | "rigid_model"
+                            | "editor_mesh"
+                            | "editor_terrain"
+                            | "cui_view"
+                            | "cui_object"
+                            | "skinning"
+                            | "speedtree"
+                            | "chunk_model"
+                            | "decal"
+                            | "instances"
+                            | "speedtree_lod_drawcall_data"
+                            | "transparent"
+                            | "transparent_advanced"
+                            | "sdsm_bias_and_scale_textures"
+                            | "terrain"
+                            | "postprocess"
+                            | "cui_bitmap"
+                            | "cui_standard"
+                            | "ui_font"
+                            | "cui_hud"
+                            | "particle_transforms"
+                            | "particle_location_metadata"
+                            | "cubemap_volume"
+                            | "gear_plated_textures"
+                            | "gear_dye_0"
+                            | "gear_dye_1"
+                            | "gear_dye_2"
+                            | "gear_dye_decal"
+                            | "generic_array"
+                            | "gear_dye_skin"
+                            | "gear_dye_lips"
+                            | "gear_dye_hair"
+                            | "gear_dye_facial_layer_0_mask"
+                            | "gear_dye_facial_layer_0_material"
+                            | "gear_dye_facial_layer_1_mask"
+                            | "gear_dye_facial_layer_1_material"
+                            | "player_centered_cascaded_grid"
+                            | "gear_dye_012"
+                            | "color_grading_ubershader"
+                            | "cui_drawing"
+                    )
+                })
+                .collect_vec();
+
+            for array in scan_arrays(&data, endian)
+                .into_iter()
+                .filter(|array| array.class == 0x80808074)
+            {
+                let records = array_records(&data, array, 0x10);
+                eprintln!(
+                    "GOLIATH_HEALTH_PIPELINES globals={globals} records={} strings={}",
+                    records.len(),
+                    pipeline_strings.len()
+                );
+                for (index, record) in records.into_iter().enumerate() {
+                    let Some(name) = pipeline_strings.get(index) else {
+                        continue;
+                    };
+                    if !name.contains("health_overlay") {
+                        continue;
+                    }
+                    let technique = read_tag_at(record, 0x0C, endian).unwrap_or(TagHash(0));
+                    eprintln!(
+                        "GOLIATH_HEALTH_PIPELINE globals={globals} index={index} name={name} technique={technique}"
+                    );
+                    if technique.is_some() {
+                        targets.push((technique, index));
+                    }
+                }
+            }
+        }
+
+        for (technique, _index) in targets {
+            for (parent, scan) in &cache.hashes {
+                let hits = scan
+                    .file_hashes
+                    .iter()
+                    .filter(|item| item.hash == technique)
+                    .map(|item| item.offset)
+                    .collect_vec();
+                if hits.is_empty() {
+                    continue;
+                }
+                let Some(entry) = package_manager().get_entry(*parent) else {
+                    continue;
+                };
+                let data = package_manager().read_tag(*parent).ok();
+                let nearby = data.as_deref().map(|data| {
+                    hits.iter()
+                        .flat_map(|offset| {
+                            let start = (*offset as usize).saturating_sub(16);
+                            let end = ((*offset as usize) + 20).min(data.len());
+                            data[start..end].to_vec()
+                        })
+                        .collect_vec()
+                });
+                eprintln!(
+                    "GOLIATH_HEALTH_USER technique={technique} parent={parent} class={:08X} hits={hits:?} strings={:?} nearby={nearby:?}",
+                    entry.reference,
+                    scan.raw_strings.iter().take(16).collect_vec(),
+                );
+            }
         }
     }
 
@@ -12798,6 +14001,86 @@ mod tests {
         .expect("package manager");
         tiger_pkg::initialize_package_manager(&Arc::new(pm));
         quicktag_core::classes::initialize_reference_names();
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_conquest_shadow_buffer_set() {
+        init_goliath_test_package_manager();
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let weapon = TagHash(0x80B7C031);
+        let owner = TagHash(0x80A7ACCA);
+        let entry = package_manager().get_entry(weapon).expect("Conquest LMG");
+        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache,
+            weapon,
+            &entry,
+            weapon,
+            owner,
+            &[],
+        )
+        .expect("Conquest preview");
+        let GeometryPreviewKind::Model(model) = preview.kind else {
+            panic!("Conquest must resolve to model");
+        };
+
+        for geometry in model.geometry_parts {
+            let data = package_manager().read_tag(geometry).expect("geometry data");
+            for array in scan_arrays(&data, package_manager().version.endian())
+                .into_iter()
+                .filter(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
+            {
+                for (record_index, record) in
+                    array_records(&data, array, 0x80).into_iter().enumerate()
+                {
+                    let refs = [
+                        ("vertex0", 0x00usize),
+                        ("vertex1", 0x04),
+                        ("buffer2", 0x08),
+                        ("buffer3", 0x0C),
+                        ("index", 0x10),
+                        ("color", 0x14),
+                        ("skinning", 0x18),
+                    ]
+                    .into_iter()
+                    .map(|(name, offset)| {
+                        let tag = read_tag_at(record, offset, package_manager().version.endian())
+                            .unwrap_or(TagHash(0));
+                        let details = package_manager().get_entry(tag).map(|entry| {
+                            let header = package_manager().read_tag(tag).ok();
+                            let vertex = header.as_deref().and_then(|data| {
+                                VertexBufferHeader::parse(data, package_manager().version.endian())
+                                    .ok()
+                            });
+                            let payload_len = package_manager()
+                                .read_tag(TagHash(entry.reference))
+                                .ok()
+                                .map(|data| data.len());
+                            (
+                                entry.reference,
+                                entry.file_type,
+                                entry.file_subtype,
+                                vertex.map(|header| {
+                                    (
+                                        header.stride,
+                                        header.vtype,
+                                        header.data_size,
+                                        (header.stride != 0)
+                                            .then(|| header.data_size / u32::from(header.stride)),
+                                    )
+                                }),
+                                payload_len,
+                            )
+                        });
+                        (name, offset, tag, details)
+                    })
+                    .collect_vec();
+                    eprintln!(
+                        "CONQUEST_BUFFER_SET geometry={geometry} record={record_index} refs={refs:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -17265,6 +18548,7 @@ mod tests {
             render_stage: None,
             technique: None,
             gear_dye_change_color_index: None,
+            authored_source: None,
             procedural_scale: 1.0,
             texture: None,
             textures: WireframeMaterialTextures::default(),
@@ -17284,6 +18568,8 @@ mod tests {
             tangent_format: None,
             indices: vec![],
             material_ranges: vec![material_range],
+            authored_inputs: vec![],
+            authored_shadow_ranges: vec![],
             min: [-32767.0, 0.0, 32767.0],
             max: [-32767.0, 0.0, 32767.0],
             vertex_count_total: 1,
@@ -17338,6 +18624,8 @@ mod tests {
             tangent_format: None,
             indices: vec![],
             material_ranges: vec![],
+            authored_inputs: vec![],
+            authored_shadow_ranges: vec![],
             min: [1.0, 0.0, 0.0],
             max: [1.0, 0.0, 0.0],
             vertex_count_total: 1,

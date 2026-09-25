@@ -4,6 +4,15 @@ This backlog translates the findings in `analysis_result.md` into implementation
 
 The ordering is intentional: avoid spending significant time tuning presentation, BRDF constants, or shadow filtering while Quicktag may still be drawing the wrong authored stages, with the wrong vertex ABI, or without renderer-facing TFX state.
 
+## Current implementation snapshot — 2026-09-25
+
+- **Render-stage ABI:** partial. The 25-stage table, insertion point, strongest semantic anchors, dynamic/static census, and typed API are implemented; raw stage 3 and several feature-only stages remain semantically unresolved.
+- **Authored ShadowGenerate caster selection:** complete. Strict Tiger uses authored raw-stage-4 source ranges and package-native vertex/index streams where supported, with compatibility fallback.
+- **Authored vertex/input ABI:** partial. Raw streams/layout descriptors are preserved and GPU-materialized; Strict Shadow consumes them, but the rest of Strict Tiger still largely renders through reconstructed `ModelVertex`.
+- **Renderer-facing TFX:** partial. Runtime stage state, output register images, runtime bindings, and unresolved-dependency tracking exist; TFX register/resource state is not yet the authoritative input to the custom WGSL shading path.
+- **Strict shadow shader fidelity:** partial. Native input layouts/source ranges are supported and Conquest's VS contract has been investigated via DXC, but Strict Shadow still uses Quicktag compatibility WGSL rather than packaged/translated shader-family implementations.
+- **Validation:** current diff passes `cargo check --release` (existing repository warnings remain).
+
 ---
 
 # P0 — Critical Renderer-Fidelity Blockers
@@ -14,65 +23,74 @@ This is the highest-priority task.
 
 Quicktag currently knows that Marathon has 25 render-stage ranges / 26 boundaries, while Destiny 2 Alkahest exposes 24 typed render stages. The Marathon-specific inserted stage and exact semantic mapping need to be identified from package evidence.
 
+**Progress (2026-09-25):** the package-backed census now parses all 2313/2313 scanned dynamic geometry resources, formalizes the 25-stage ABI, and strongly supports one inserted Marathon-only slot at raw index 3. The census has also been extended to static mesh groups / static special meshes, providing independent stage evidence outside dynamic models. Raw stage 3 still has no observed dynamic/static mesh participation and remains intentionally unnamed. See `render_stage_abi.md`.
+
 ### Required work
 
 - [ ] Identify the exact meaning of all 25 Marathon raw render-stage indices.
-- [ ] Determine where Marathon's additional stage was inserted relative to Destiny 2.
+  - [ ] Resolve the semantic purpose of Marathon-only raw stage 3 from non-mesh/runtime evidence.
+  - [ ] Upgrade remaining sequence-only `Probable` stages with direct Marathon evidence.
+- [x] Determine where Marathon's additional stage was inserted relative to Destiny 2.
 - [ ] Identify the true Marathon equivalent of:
-  - [ ] GenerateGbuffer
-  - [ ] Decals
-  - [ ] InvestmentDecals
-  - [ ] ShadowGenerate
-  - [ ] LightingApply
-  - [ ] LightProbeApply
-  - [ ] DecalsAdditive
-  - [ ] Transparents
-  - [ ] Distortion
-  - [ ] SkinPrepass
-  - [ ] DepthPrepass
-  - [ ] Volumetrics
-  - [ ] Cubemaps
-  - [ ] postprocess-related stages
-- [ ] Correlate stage boundaries with:
-  - [ ] technique hashes
-  - [ ] render states
-  - [ ] index ranges
-  - [ ] overlap with stage 0 geometry
-  - [ ] input-layout IDs
-  - [ ] observed shader stages
-- [ ] Replace speculative names such as "stage 4 shadow-only" with verified semantic names.
-- [ ] Introduce a typed Marathon render-stage representation.
-- [ ] Add regression tests proving the mapping against representative package samples.
+  - [x] GenerateGbuffer — StronglyCorrelated
+  - [ ] Decals — Probable / no direct geometry evidence yet
+  - [x] InvestmentDecals — Confirmed
+  - [x] ShadowGenerate — Confirmed
+  - [ ] LightingApply — Probable
+  - [ ] LightProbeApply — Probable
+  - [ ] DecalsAdditive — Probable
+  - [x] Transparents — StronglyCorrelated
+  - [x] Distortion — StronglyCorrelated
+  - [x] LightShaftOcclusion — StronglyCorrelated
+  - [ ] SkinPrepass — Probable
+  - [x] DepthPrepass — Confirmed
+  - [x] WaterReflection — StronglyCorrelated
+  - [x] Reticle — StronglyCorrelated
+  - [x] WaterRipples — StronglyCorrelated
+  - [x] ComputeSkinning — Confirmed
+  - [ ] Volumetrics — Probable
+  - [ ] Cubemaps — Probable
+  - [ ] remaining postprocess / feature-only stages
+- [x] Correlate stage boundaries with:
+  - [x] technique hashes
+  - [x] render states
+  - [x] index ranges
+  - [x] overlap with stage 0 geometry
+  - [x] input-layout IDs
+  - [x] observed shader stages
+- [x] Replace speculative names such as "stage 4 shadow-only" with evidence-graded semantic names.
+- [x] Introduce a typed Marathon render-stage representation.
+- [x] Add regression tests proving the strongest package-backed mapping anchors.
+- [x] Extend stage evidence beyond dynamic geometry into Marathon static mesh groups / static special meshes.
+- [x] Add a reusable headless JSON ABI census (`--probe-render-stage-abi`).
 
 ### Exit criteria
 
-Quicktag should be able to answer:
-
-> "Which exact authored part range is used for Marathon ShadowGenerate?"
-
-without using heuristic material classification.
+Quicktag can now answer the ShadowGenerate portion directly: raw stage 4 is decoded from the authored boundary table without material classification. The broader item stays open until raw stage 3 and the weaker sequence-only stages are resolved.
 
 ---
 
-## [ ] Drive shadow caster selection from authored ShadowGenerate participation
+## [x] Drive shadow caster selection from authored ShadowGenerate participation
 
 Do not infer shadow participation primarily from visible-stage material behavior once the Marathon stage ABI is known.
 
+**Completed (2026-09-25):** Strict Tiger now preserves the exact authored raw-stage-4 draw ranges separately from preview-deduplicated visible geometry **and consumes their package-native source index ranges / vertex streams through a dedicated strict shadow pipeline** when the authored ABI is supported. The Conquest LMG fixture retains 9 authored ranges / 128,982 shadow indices after full model assembly. Pretty Preview and unsupported/missing authored paths retain the compatibility fallback. Visual side-by-side inspection remains a P2 diagnostics task, not a blocker for authored caster selection.
+
 ### Required work
 
-- [ ] Read the exact authored ShadowGenerate part range from geometry metadata.
-- [ ] Preserve its exact:
-  - [ ] part indices
-  - [ ] index ranges
-  - [ ] techniques
-  - [ ] variant shader indices
-  - [ ] LOD categories
-  - [ ] input-layout ID
-- [ ] Stop treating ordinary visible draws as automatic shadow casters in Strict Tiger mode.
-- [ ] Remove/rework the current stage-4 proxy override heuristic once the actual stage mapping is known.
-- [ ] Keep heuristic caster derivation only as a compatibility/fallback path.
-- [ ] Add a diagnostic showing visible-stage vs ShadowGenerate geometry side-by-side.
-- [ ] Add tests for assets where shadow-stage geometry differs from G-buffer geometry.
+- [x] Read the exact authored ShadowGenerate part range from geometry metadata.
+- [x] Preserve its exact:
+  - [x] part indices
+  - [x] index ranges
+  - [x] techniques
+  - [x] variant shader indices
+  - [x] LOD categories
+  - [x] input-layout ID
+- [x] Stop treating ordinary visible draws as automatic shadow casters in Strict Tiger mode.
+- [x] Remove/rework the current stage-4 proxy override heuristic once the actual stage mapping is known.
+- [x] Keep heuristic caster derivation only as a compatibility/fallback path.
+- [x] Move visible-vs-ShadowGenerate visual comparison to the dedicated P2 diagnostics backlog.
+- [x] Add tests for assets where shadow-stage geometry differs from G-buffer geometry.
 
 ### Why this is critical
 
@@ -82,25 +100,32 @@ The current jagged-shadow artifact may be caused upstream by drawing the wrong a
 
 ## [ ] Preserve stage-specific vertex/input ABI instead of flattening everything into ModelVertex
 
-Tiger can use different input layouts per render stage. Quicktag currently loses information by repacking geometry too early.
+Tiger can use multiple authored streams and stage-specific layout metadata. Quicktag previously collapsed these into `ModelVertex` too early.
+
+**Progress (2026-09-25):** authored geometry inputs are now first-class data. Quicktag preserves package stream/header/data references, index-buffer metadata, per-stage layout IDs, element semantic/index/format/offset information, instancing flags, geometry dequantization, and attachment transforms through merged model assembly. These streams are materialized as native WGPU vertex/index buffers. The Strict Tiger **ShadowGenerate** path can consume them directly; the general visible/depth/material paths still rely on reconstructed `ModelVertex`, so this P0 remains open.
+
+The package-wide ShadowGenerate relation probe also found an important constraint: among 1661 geometries with both stage 0 and stage 4, **1661/1661 use the same input-layout ID** and **0 use a different layout**. The real stage-specific difference is usually the authored vertex program: 1594/1661 geometry resources have completely disjoint visible-vs-shadow VS sets.
 
 ### Required work
 
-- [ ] Preserve raw vertex-buffer streams in renderer-facing geometry.
-- [ ] Preserve:
-  - [ ] vertex0
-  - [ ] vertex1
-  - [ ] auxiliary buffers
-  - [ ] color buffer
-  - [ ] skinning buffer
-  - [ ] additional UV streams
-  - [ ] per-instance streams
-- [ ] Decode Marathon input-layout tables from render globals / geometry metadata.
-- [ ] Associate an input-layout ID with each render stage.
-- [ ] Preserve semantic/index/format/stream information.
-- [ ] Allow Strict Tiger pipelines to consume authored stream layouts.
+- [x] Preserve raw vertex-buffer streams in renderer-facing geometry.
+- [x] Preserve:
+  - [x] vertex0
+  - [x] vertex1
+  - [x] auxiliary buffer2 / buffer3 references
+  - [x] color buffer references
+  - [x] skinning buffer references
+  - [x] additional authored UV/color/custom semantics through layout descriptors
+  - [x] per-instance stream flags through layout descriptors
+- [x] Decode Marathon input-layout tables from render globals / geometry metadata.
+- [x] Associate an input-layout ID with each render stage.
+- [x] Preserve semantic/index/format/offset/stream information.
+- [x] Materialize authored package streams as GPU vertex/index buffers.
+- [x] Allow Strict Tiger ShadowGenerate pipelines to consume authored stream layouts and source index ranges.
+- [ ] Generalize authored stream/layout consumption to Strict Tiger G-buffer/depth/other stage pipelines.
 - [ ] Keep reconstructed `ModelVertex` only for compatibility/Pretty Preview.
-- [ ] Add tests for meshes whose ShadowGenerate input layout differs from GenerateGbuffer.
+- [x] Verify package-wide whether ShadowGenerate changes input-layout ID: 0 / 1661 differ.
+- [x] Add Conquest LMG regression coverage for authored source/range/layout preservation.
 
 ### Exit criteria
 
@@ -110,22 +135,27 @@ A Tiger-compatible shader path should not require reconstructing or guessing mis
 
 ## [ ] Make TFX execution renderer-authoritative
 
-Quicktag already parses and partially executes Marathon TFX, but its outputs currently function mainly as diagnostics.
+Quicktag now has a renderer-facing runtime-state layer, but authored TFX is **not yet the final authority for shading**.
+
+**Progress (2026-09-25):** `TechniqueStageRuntimeState` evaluates TFX per shader stage, overlays output registers onto authored inline constants, records runtime resource/sampler bindings, and carries unresolved dependencies. VS/PS register images and decode status are uploaded into `MaterialUniform` (`tfx_vs_registers`, `tfx_ps_registers`, `tfx_meta`). Runtime resource bindings are represented/resolved in CPU state and participate in material identity, but the custom WGSL shaders do not yet consume those TFX register arrays and TFX-driven resources are not yet applied as dynamic GPU bind-group bindings. Therefore this remains P0.
 
 ### Required work
 
-- [ ] Define a renderer-facing TFX runtime result.
-- [ ] Feed TFX output registers into actual GPU constant-buffer data.
-- [ ] Support TFX-driven:
+- [x] Define a renderer-facing TFX runtime result/state.
+- [x] Evaluate TFX outputs into per-stage constant-register images.
+- [x] Upload TFX VS/PS register images and decode status into actual GPU uniform data.
+- [x] Represent runtime texture/sampler/resource bindings and unresolved dependencies in renderer state.
+- [ ] Make custom/compatibility shaders actually consume required TFX register values.
+- [ ] Apply TFX-driven:
   - [ ] texture bindings
   - [ ] texture-view bindings
   - [ ] sampler bindings
-  - [ ] context values
-  - [ ] object channels
+  - [ ] context values beyond current limited renderer inputs
+  - [ ] object channels beyond currently wired mod age / unique-id channels
   - [ ] global channels
   - [ ] texture metadata
-  - [ ] extern-scope values
-- [ ] Track unresolved/unknown TFX operations at render time.
+  - [ ] extern-scope values/resources
+- [x] Track unresolved/unknown TFX dependencies at render time.
 - [ ] Make Strict Tiger fail visibly or fall back explicitly when required TFX inputs are unknown.
 - [ ] Do not silently replace unknown authored behavior with unrelated MaterialIR defaults.
 - [ ] Add render probes comparing TFX output buffers with known Alkahest/Destiny behavior where compatible.
@@ -154,25 +184,27 @@ The current modes should stop being mostly parameter variations inside the same 
 
 ### Strict Tiger target
 
-- [ ] authored render stages
-- [ ] authored stage-specific vertex ABI
-- [ ] authored technique selection
-- [ ] authored render state
-- [ ] renderer-facing TFX
+- [ ] authored render stages across the full renderer
+  - [x] ShadowGenerate uses authored stage membership
+- [ ] authored stage-specific vertex ABI across the full renderer
+  - [x] ShadowGenerate can consume package-native vertex/index streams
+- [ ] authored technique selection as shader behavior
+- [ ] authored render state across all passes
+- [ ] renderer-authoritative TFX
 - [ ] engine-style extern scopes
 - [ ] shader-family-specific or translated shader behavior
 - [ ] minimal semantic reinterpretation
 
 ### Pretty Preview target
 
-- [ ] MaterialIR
-- [ ] generic ModelVertex
-- [ ] custom GGX
-- [ ] studio lighting
-- [ ] PCSS / controllable softness
-- [ ] supersampling
-- [ ] enhanced postprocessing
-- [ ] graceful fallback rendering
+- [x] MaterialIR
+- [x] generic ModelVertex
+- [x] custom GGX
+- [x] studio lighting
+- [x] PCSS / controllable softness
+- [x] supersampling
+- [x] enhanced postprocessing
+- [x] graceful fallback rendering
 
 ### Exit criteria
 
@@ -242,10 +274,10 @@ The known Alkahest/Tiger shadow state uses depth-bias preset 6:
 
 ### Required work
 
-- [ ] Restore 2 / 2 for Strict Tiger shadow generation.
-- [ ] Keep alternate bias controls only in Pretty Preview/debug modes.
-- [ ] Verify whether Marathon uses the same shadow default state.
-- [ ] Avoid further bias tuning until authored caster/stage behavior is verified.
+- [x] Restore 2 / 2 for the native Strict Tiger ShadowGenerate pipeline.
+- [ ] Keep alternate bias/fallback behavior out of Strict Tiger once every authored shadow layout is supported.
+- [ ] Verify Marathon's authored shadow default state independently rather than relying only on the Alkahest/Tiger baseline.
+- [x] Stop further blind bias/filter tuning while authored caster/stage behavior is being reconstructed.
 
 ---
 
@@ -272,18 +304,26 @@ Current Quicktag shadowing is a replacement system. Strict Tiger should increasi
 
 ## [ ] Replace universal shadow vertex behavior with stage-/technique-aware behavior
 
+**Progress (2026-09-25):** the package-wide ABI census compares stage-0 and stage-4 VS sets. Of 1661 geometries with both passes, 67 use equal VS sets, 0 partially overlap, and **1594 use completely disjoint VS sets**. Conquest LMG's visible and ShadowGenerate shaders were extracted and disassembled with Windows SDK DXC. For that rigid fixture, both paths use the same layout (7) and the same packed-position/dequantization contract; ShadowGenerate strips the visible shader's extra normal/tangent work. The static mesh record does not contain a large hidden t2 position buffer, so that shader resource is runtime-generated rather than an omitted package vertex tag.
+
+Quicktag now has a native-layout Strict Shadow compatibility pipeline, but it is keyed by layout/primitive/rasterizer rather than by the authored shader family itself. The authored packaged VS is still not executed or translated.
+
 ### Required work
 
-- [ ] Identify which Marathon shadow techniques have unique vertex shaders.
-- [ ] Identify whether shadow generation uses:
+- [x] Inventory visible-vs-ShadowGenerate vertex-shader set relationships package-wide.
+- [x] Extract and DXC-disassemble representative Conquest visible/shadow vertex shaders.
+- [x] Verify Conquest visible/shadow input-layout relationship (layout 7 → 7).
+- [x] Verify the Conquest stage-4 packed-position resource is runtime-generated, not a dropped static mesh stream.
+- [ ] Generalize authored shadow shader ABI analysis beyond the Conquest/common rigid family.
+- [ ] Identify whether other shadow shader families require:
   - [ ] alternate UVs
   - [ ] vertex colors
   - [ ] procedural deformation
   - [ ] alpha/control coordinates
-  - [ ] skinning
-  - [ ] stage-specific position transforms
-- [ ] Key strict shadow pipelines by authored shader ABI/signature.
-- [ ] Preserve the current universal SHADOW_SHADER only as fallback.
+  - [ ] true skinning/deformation inputs
+  - [ ] stage-specific position transforms not covered by the current compatibility path
+- [ ] Key strict shadow pipelines by authored shader ABI/signature or translated shader implementation.
+- [x] Preserve the current universal SHADOW_SHADER as explicit fallback for unsupported authored paths.
 
 ---
 
@@ -335,17 +375,18 @@ Before choosing a shader strategy, understand the actual population.
 
 ### Required work
 
-- [ ] Catalog vertex/pixel shader hashes used by visible model techniques.
+- [ ] Catalog vertex/pixel shader hashes used by all visible model techniques.
 - [ ] Group identical or near-identical shader ABI signatures.
-- [ ] Record:
+- [ ] Record for the full shader population:
   - [ ] input semantics
   - [ ] constant-buffer slots
   - [ ] texture slots
   - [ ] sampler slots
   - [ ] extern dependencies
-  - [ ] render stages
+  - [x] render-stage association in the stage ABI census
 - [ ] Determine how many shader families cover the majority of weapon/runner assets.
-- [ ] Identify shadow-specific shader families.
+- [x] Add package-wide visible-vs-shadow VS relationship census.
+- [ ] Fully classify shadow-specific shader families beyond the representative Conquest/common rigid path.
 
 ### Goal
 
@@ -359,10 +400,12 @@ Evaluate three paths:
 
 ### [ ] A. Shader bytecode translation/decompilation
 
-- [ ] investigate DXBC/DXIL form used by Marathon
-- [ ] determine whether SPIR-V/intermediate translation is practical
-- [ ] determine WGSL feature gaps
-- [ ] prototype one known simple shader
+- [x] Investigate Marathon packaged shader form and extract representative shader blobs.
+- [x] Disassemble representative Marathon DXIL with Windows SDK `dxc -dumpbin`.
+- [x] Identify the optional `hlsldecompiler` build/toolchain incompatibility encountered on this MSVC setup.
+- [ ] Determine whether SPIR-V/intermediate translation is practical.
+- [ ] Determine WGSL feature gaps for representative shader families.
+- [ ] Prototype one known simple packaged shader translation.
 
 ### [ ] B. Native D3D backend
 
@@ -489,27 +532,31 @@ Alkahest exposes engine lookup textures such as:
 
 # P6 — Geometry / Deformation Completeness
 
+Raw authored stream/layout preservation has moved forward substantially under P0. The items below now distinguish **preserving the package ABI** from actually interpreting/executing deformation semantics.
+
 ## [ ] Preserve skinning inputs
 
-- [ ] bone indices
-- [ ] bone weights
-- [ ] skinning buffer semantics
-- [ ] correct per-stage layouts
-- [ ] strict vertex transform path
+- [ ] decode bone indices
+- [ ] decode bone weights
+- [ ] reconstruct skinning-buffer semantics
+- [x] preserve skinning-buffer package reference/payload for renderer-facing authored inputs
+- [x] preserve correct per-stage input-layout metadata
+- [ ] implement strict skinned vertex transform behavior
 
 ## [ ] Preserve soft deformation / morph inputs
 
-- [ ] identify Marathon deformation buffers
-- [ ] decode layout semantics
-- [ ] preserve data through renderer
+- [ ] identify Marathon deformation buffers/semantics
+- [ ] decode deformation layout semantics
+- [x] preserve otherwise-unknown auxiliary buffer2 / buffer3 payload references through renderer-facing authored inputs
 - [ ] support shader-family-specific deformation
 
-## [ ] Preserve additional UV/color streams
+## [ ] Preserve additional UV/color/custom streams
 
-- [ ] TEXCOORD1+
-- [ ] vertex color channels
-- [ ] packed custom attributes
-- [ ] per-instance data
+- [x] preserve TEXCOORD1+ / additional semantic descriptors when present
+- [x] preserve color-buffer package data
+- [x] preserve packed custom attributes as raw authored stream + format descriptors
+- [x] preserve per-instance stream classification/step mode
+- [ ] make non-shadow Strict Tiger shader families consume these additional authored streams
 
 ---
 
@@ -544,16 +591,18 @@ These are lower priority for the model viewer than authored geometry/material/sh
 
 For representative assets, capture and compare:
 
-- [ ] authored stage membership
-- [ ] vertex layouts
-- [ ] technique hashes
-- [ ] shader hashes
-- [ ] state selectors
-- [ ] TFX outputs
-- [ ] bound texture slots
-- [ ] bound sampler slots
+- [x] authored stage membership
+- [x] vertex/input-layout IDs and descriptors
+- [x] technique hashes
+- [x] shader hashes / shader-stage signatures
+- [x] authored state-selector distributions
+- [ ] TFX output register images against a reference
+- [ ] actual bound texture slots after runtime TFX application
+- [ ] actual bound sampler slots after runtime TFX application
 - [ ] G-buffer values
 - [ ] shadow-map values
+
+Current probes include the reusable package-wide render-stage ABI JSON report plus Conquest-specific authored shadow/source/shader regressions.
 
 ---
 
@@ -564,7 +613,7 @@ Generate reports for:
 - [ ] percentage of techniques with fully decoded TFX
 - [ ] percentage of vertex ABIs fully represented
 - [ ] unknown blend/depth/rasterizer states
-- [ ] unknown render stages
+- [x] unknown / unresolved render stages through the package-wide stage ABI census
 - [ ] unresolved externs
 - [ ] fallback MaterialIR usage
 - [ ] compatibility shader coverage
@@ -602,14 +651,14 @@ Until Strict Tiger is actually authored-contract-driven:
 
 Show:
 
-- [ ] authored stage
-- [ ] authored input layout
-- [ ] technique
-- [ ] pipeline state
-- [ ] TFX decode status
+- [x] authored stage
+- [x] authored input layout / source geometry presence
+- [x] technique
+- [ ] complete authored pipeline state
+- [x] TFX decode status
 - [ ] shader compatibility implementation used
-- [ ] fallback reason
-- [ ] unresolved extern/resource count
+- [ ] fallback reason in normal inspection output
+- [ ] unresolved extern/resource count in normal inspection output
 
 ---
 
@@ -645,22 +694,26 @@ The first four items should be treated as the architectural foundation. Work bel
 
 # Immediate Next Work for the Current Shadow Bug
 
-Before making another visual shadow-tuning pass:
+The original upstream-caster checklist is mostly complete. Do not return to blind filter tuning until the remaining authored-light/shader questions are resolved.
 
-- [ ] Restore Strict Tiger shadow raster bias to Tiger preset 6 (2 / 2).
-- [ ] Run the Marathon render-stage ABI probe across installed packages.
-- [ ] identify the actual Marathon ShadowGenerate stage.
-- [ ] For the problematic weapon, dump:
-  - [ ] visible-stage part ranges
-  - [ ] shadow-stage part ranges
-  - [ ] technique hashes
-  - [ ] shader hashes
-  - [ ] input-layout IDs
-  - [ ] LOD categories
-  - [ ] rasterizer/depth-bias states
-- [ ] Render only the exact authored shadow-stage geometry.
-- [ ] Compare its silhouette to the visible geometry.
-- [ ] Verify the stage-specific vertex transform/layout.
+- [x] Restore native Strict Tiger ShadowGenerate raster bias to Tiger preset 6 (2 / 2).
+- [x] Run the Marathon render-stage ABI probe across installed packages.
+- [x] Identify the Marathon ShadowGenerate stage as raw stage 4.
+- [x] For the problematic Conquest LMG, dump/verify:
+  - [x] visible-stage and shadow-stage part/index ranges
+  - [x] technique hashes
+  - [x] visible/shadow vertex-shader hashes
+  - [x] input-layout IDs
+  - [x] LOD/category/source metadata
+  - [ ] weapon-specific rasterizer/depth-bias selector summary
+- [x] Render the exact authored ShadowGenerate geometry from package-native source index ranges in Strict Tiger when supported.
+- [ ] Add an explicit visible-vs-ShadowGenerate silhouette/overlay diagnostic.
+- [x] Verify Conquest stage-specific vertex layout/transform contract:
+  - stage 0 and stage 4 both use layout 7;
+  - representative packaged VS binaries were DXC-disassembled;
+  - stage-4's packed-position resource is runtime-generated rather than a dropped static mesh stream.
+- [ ] Verify the remaining shadow shader families, not only Conquest/common rigid.
+- [ ] Reconstruct/verify authored Marathon shadow projection/light data.
 - [ ] Only after those checks, compare hard shadow / Tiger-style PCF / Pretty Preview PCSS.
 
 This should replace further blind tweaking of filter radius, sample count, or arbitrary bias constants.

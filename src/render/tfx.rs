@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
+use tiger_pkg::TagHash;
+
 use crate::material::{
     TfxBytecodePreview, TfxDecodeStatus, interpret_tfx_stack_with_runtime_values,
 };
@@ -21,6 +23,10 @@ pub struct TfxRuntimeInputs {
     pub global_channels: BTreeMap<u32, TfxValue>,
     pub gear_channels: BTreeMap<u32, TfxValue>,
     pub context_values: BTreeMap<u32, TfxValue>,
+    /// Typed resource externs keyed by Tiger scope name + byte offset.
+    /// Numeric externs stay in the scope maps above; texture/UAV/resource
+    /// externs live here so renderer binding state does not collapse into vec4s.
+    pub extern_resources: BTreeMap<(String, u32), TagHash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,10 +45,19 @@ pub struct TfxTraceStep {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TfxRuntimeBinding {
+    pub kind: &'static str,
+    pub stage: &'static str,
+    pub slot: u8,
+    pub source: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct TfxExecutionResult {
     pub status: TfxDecodeStatus,
     pub outputs: BTreeMap<String, TfxValue>,
+    pub bindings: Vec<TfxRuntimeBinding>,
     pub dependencies: Vec<TfxDependency>,
     pub trace: Vec<TfxTraceStep>,
     pub undecoded_offset: Option<usize>,
@@ -62,7 +77,11 @@ pub fn execute_preview(
             scope: external.scope.clone(),
             byte_offset: external.byte_offset,
             resolved: resolve_external(inputs, &external.scope, external.byte_offset as u32)
-                .is_some(),
+                .is_some()
+                || matches!(external.value_type, "texture" | "uav" | "resource")
+                    && inputs
+                        .extern_resources
+                        .contains_key(&(external.scope.clone(), external.byte_offset as u32)),
         })
         .collect();
     let vectors = |values: &BTreeMap<u32, TfxValue>| {
@@ -112,6 +131,15 @@ pub fn execute_preview(
                 .unwrap_or_else(|| TfxValue::Unknown(expression.expression.clone())),
         );
     }
+    let runtime_bindings = bindings
+        .iter()
+        .map(|binding| TfxRuntimeBinding {
+            kind: binding.kind,
+            stage: binding.stage,
+            slot: binding.slot,
+            source: binding.source.clone(),
+        })
+        .collect();
     for binding in &bindings {
         outputs.insert(
             format!("{} {}", binding.kind, binding.slot),
@@ -124,6 +152,7 @@ pub fn execute_preview(
     TfxExecutionResult {
         status: program.status,
         outputs,
+        bindings: runtime_bindings,
         dependencies,
         trace: program
             .ops

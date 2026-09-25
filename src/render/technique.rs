@@ -1,6 +1,8 @@
 use tiger_pkg::{TagHash, package_manager};
 
-use crate::render::tfx::{TfxExecutionResult, TfxRuntimeInputs, execute_preview};
+use crate::render::tfx::{
+    TfxExecutionResult, TfxRuntimeBinding, TfxRuntimeInputs, TfxValue, execute_preview,
+};
 use crate::{
     geometry::WireframePreview,
     material::{
@@ -131,6 +133,25 @@ pub struct TechniqueStageDescriptor {
     pub tfx_execution: TfxExecutionResult,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TechniqueRuntimeBinding {
+    pub kind: &'static str,
+    pub stage: ShaderStage,
+    pub slot: u8,
+    pub source: String,
+    pub resolved: Option<TagHash>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TechniqueStageRuntimeState {
+    pub stage: ShaderStage,
+    pub constant_buffer_slot: Option<i32>,
+    pub constant_registers: Vec<[f32; 4]>,
+    pub bindings: Vec<TechniqueRuntimeBinding>,
+    pub unresolved_dependencies: Vec<String>,
+    pub status: crate::material::TfxDecodeStatus,
+}
+
 #[derive(Debug, Clone)]
 pub struct TechniqueDescriptor {
     pub technique_hash: TagHash,
@@ -141,6 +162,140 @@ pub struct TechniqueDescriptor {
     pub stages: Vec<TechniqueStageDescriptor>,
 }
 
+impl TechniqueStageDescriptor {
+    pub fn runtime_state(&self, inputs: &TfxRuntimeInputs) -> TechniqueStageRuntimeState {
+        let execution = execute_preview(&self.tfx, &self.constants, inputs);
+        let mut constant_registers = self.inline_constants.clone();
+        for (target, value) in &execution.outputs {
+            let Some(index) = target
+                .strip_prefix("output[")
+                .and_then(|target| target.strip_suffix(']'))
+                .and_then(|index| index.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let TfxValue::Vector(value) = value else {
+                continue;
+            };
+            if constant_registers.len() <= index {
+                constant_registers.resize(index + 1, [0.0; 4]);
+            }
+            constant_registers[index] = *value;
+        }
+
+        let mut bindings = self
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                Some(TechniqueRuntimeBinding {
+                    kind: "texture",
+                    stage: self.stage,
+                    slot: u8::try_from(resource.slot).ok()?,
+                    source: "authored_resource".into(),
+                    resolved: resource.resolved,
+                })
+            })
+            .collect::<Vec<_>>();
+        for binding in &execution.bindings {
+            let stage = ShaderStage::from_label(binding.stage);
+            let resolved = resolve_tfx_runtime_binding(self, binding, inputs);
+            if let Some(existing) = bindings
+                .iter_mut()
+                .find(|existing| existing.kind == binding.kind && existing.slot == binding.slot)
+            {
+                *existing = TechniqueRuntimeBinding {
+                    kind: binding.kind,
+                    stage,
+                    slot: binding.slot,
+                    source: binding.source.clone(),
+                    resolved,
+                };
+            } else {
+                bindings.push(TechniqueRuntimeBinding {
+                    kind: binding.kind,
+                    stage,
+                    slot: binding.slot,
+                    source: binding.source.clone(),
+                    resolved,
+                });
+            }
+        }
+        bindings.sort_by_key(|binding| (binding.stage as u8, binding.slot));
+
+        let mut unresolved_dependencies = execution
+            .dependencies
+            .iter()
+            .filter(|dependency| !dependency.resolved)
+            .map(|dependency| {
+                format!(
+                    "{}+0x{:X} at byte {}",
+                    dependency.scope, dependency.byte_offset, dependency.byte_offset
+                )
+            })
+            .collect::<Vec<_>>();
+        unresolved_dependencies.extend(
+            bindings
+                .iter()
+                .filter(|binding| binding.resolved.is_none())
+                .map(|binding| {
+                    format!(
+                        "{} {:?} slot {} <- {}",
+                        binding.kind, binding.stage, binding.slot, binding.source
+                    )
+                }),
+        );
+        unresolved_dependencies.sort();
+        unresolved_dependencies.dedup();
+
+        TechniqueStageRuntimeState {
+            stage: self.stage,
+            constant_buffer_slot: self.constant_buffer_slot,
+            constant_registers,
+            bindings,
+            unresolved_dependencies,
+            status: execution.status,
+        }
+    }
+}
+
+fn resolve_tfx_runtime_binding(
+    stage: &TechniqueStageDescriptor,
+    binding: &TfxRuntimeBinding,
+    inputs: &TfxRuntimeInputs,
+) -> Option<TagHash> {
+    if binding.kind == "sampler" {
+        let index = binding
+            .source
+            .strip_prefix("sampler[")?
+            .strip_suffix(']')?
+            .parse::<usize>()
+            .ok()?;
+        return stage.samplers.get(index).and_then(|sampler| {
+            sampler
+                .resolved
+                .or_else(|| sampler.raw.raw32.is_some().then_some(sampler.raw.raw32))
+        });
+    }
+
+    for prefix in ["extern_texture(", "extern_uav(", "extern_resource("] {
+        let Some(inner) = binding
+            .source
+            .strip_prefix(prefix)
+            .and_then(|source| source.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let (scope, offset) = inner.split_once("+0x")?;
+        let offset = u32::from_str_radix(offset, 16).ok()?;
+        return inputs
+            .extern_resources
+            .get(&(scope.to_string(), offset))
+            .copied();
+    }
+
+    None
+}
+
 impl TechniqueDescriptor {
     pub fn load(tag: TagHash) -> Option<Self> {
         let entry = package_manager().get_entry(tag)?;
@@ -148,6 +303,13 @@ impl TechniqueDescriptor {
         let preview = MaterialTagPreview::load(&entry, &data)?;
         let MaterialPreviewKind::Technique(preview) = preview.kind;
         Some(Self::from_preview(tag, preview))
+    }
+
+    pub fn runtime_states(&self, inputs: &TfxRuntimeInputs) -> Vec<TechniqueStageRuntimeState> {
+        self.stages
+            .iter()
+            .map(|stage| stage.runtime_state(inputs))
+            .collect()
     }
 
     pub fn from_preview(tag: TagHash, preview: TechniquePreview) -> Self {

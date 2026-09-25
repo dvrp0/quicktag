@@ -3,6 +3,7 @@ pub mod evidence;
 pub mod material;
 pub mod pass_plan;
 pub mod preview_scene;
+pub mod stage;
 pub mod technique;
 pub mod tfx;
 
