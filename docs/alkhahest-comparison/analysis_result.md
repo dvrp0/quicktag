@@ -1103,17 +1103,13 @@ Quicktag's current semantic renderer remains very useful as:
 
 This path can intentionally prioritize usability and attractive asset previews over exact engine fidelity.
 
-## 16.3 Clean distinction
+## 16.3 Renderer direction update — 2026-09-25
 
-Eventually the two modes could be conceptually:
+The two-mode proposal is no longer the chosen direction.
 
-    Strict Tiger
-        "render the authored contract"
+`Pretty Preview` has been removed as a separate fidelity mode. Quicktag now exposes one renderer whose goal is to follow the authored Tiger/Marathon contract as closely as possible. Heuristic rendering remains useful only as an explicit internal compatibility fallback when an authored shader/state/input ABI has not yet been reconstructed.
 
-    Pretty Preview
-        "render the asset well"
-
-This would make both modes clearer and more maintainable.
+This simplifies the architecture: there is no longer a user-facing choice between “engine-faithful” and “looks good.” Fidelity work should improve the single renderer directly.
 
 ---
 
@@ -1233,9 +1229,9 @@ The comparison strongly supports keeping the following Quicktag work:
 - current technique/state parsing
 - exact depth-bias table
 - diagnostic probes/tests
-- custom pretty-preview renderer
-- supersampling
-- studio-light controls
+- compatibility/fallback rendering for unresolved authored paths
+- supersampling where it does not alter authored semantics
+- diagnostic lighting controls where useful for inspection
 
 These are complementary to a strict renderer rather than wasted work.
 
@@ -1271,18 +1267,22 @@ Alkahest demonstrates the opposite approach:
 
 For future engine-level fidelity, Quicktag should move incrementally in that direction.
 
-The current shadow artifact is a good example of why. High resolution, PCSS, careful alpha discard, and bias tweaking cannot guarantee a correct result if the wrong stage, input ABI, caster set, vertex behavior, or shadow-space contract is being rendered.
+The shadow artifact became a concrete example of why. High resolution, PCSS, careful alpha discard, and bias tweaking did not fix it while the shadow-space contract was still wrong.
 
-The immediate shadow investigation should therefore prioritize:
+### 2026-09-25 shadow resolution
 
-    Marathon render-stage ABI
-            ↓
-    exact ShadowGenerate participation
-            ↓
-    stage-specific input/vertex behavior
-            ↓
-    Tiger shadow state/projection
-            ↓
-    only then filtering/tuning
+The reported smooth-surface spike/teeth artifact disappeared in the live model viewer after the active shadow path stopped using the finite spotlight perspective transform and switched to an affine directional Tiger-style shadow space. The active receiver filter was also simplified to a small 9-tap rotated Poisson comparison kernel, and the old `Pretty Preview`/controllable-PCSS path was removed.
 
-rather than continuing to treat the problem primarily as a shadow-filter-quality issue.
+This does **not** mean Marathon's exact authored shadow projection has been fully reconstructed. Alkahest still demonstrates the stronger target: feed an engine-derived world-to-shadow projection/DeferredShadow scope. Quicktag's current affine directional transform is a compatibility approximation that fixes the geometric artifact and better matches the engine contract than the previous preview spotlight.
+
+The remaining shadow-fidelity order is therefore:
+
+    exact Marathon authored shadow projection / DeferredShadow data
+            ↓
+    authored ShadowGenerate shader-family behavior
+            ↓
+    runtime-generated shadow VS resources where required
+            ↓
+    reference validation and diagnostics
+
+Filtering is no longer the primary correctness suspect.

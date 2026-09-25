@@ -339,7 +339,7 @@ pub struct WireframePreview {
     pub indices: Vec<u32>,
     pub material_ranges: Vec<WireframeMaterialRange>,
     /// Package-native vertex/input ABI retained for Strict Tiger rendering.
-    /// Pretty Preview may ignore this and continue using reconstructed arrays.
+    /// Unsupported authored paths may fall back to reconstructed arrays.
     pub authored_inputs: Vec<AuthoredGeometryInput>,
     /// Exact highest-detail parts authored for Marathon ShadowGenerate.
     ///

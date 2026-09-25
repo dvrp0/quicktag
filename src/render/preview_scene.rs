@@ -1,5 +1,3 @@
-use crate::render::evidence::FidelityMode;
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CameraParameters {
     pub yaw_degrees: f32,
@@ -15,7 +13,6 @@ pub struct PreviewScene {
     pub exposure: f32,
     pub environment_rotation_degrees: f32,
     pub background: [f32; 4],
-    pub fidelity_mode: FidelityMode,
 }
 
 impl PreviewScene {
@@ -31,7 +28,6 @@ impl PreviewScene {
             exposure: 1.0,
             environment_rotation_degrees: 0.0,
             background: [0.005, 0.009, 0.018, 1.0],
-            fidelity_mode: FidelityMode::StrictTiger,
         }
     }
 }

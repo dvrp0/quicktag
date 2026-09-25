@@ -32,8 +32,7 @@ use crate::{
     render::{
         TigerDrawPacket,
         evidence::{
-            EvidenceLevel, FidelityMode, ProvenanceId, ProvenanceRecord, ProvenanceStore,
-            SourceSpan,
+            EvidenceLevel, ProvenanceId, ProvenanceRecord, ProvenanceStore, SourceSpan,
         },
         material::MaterialIR,
         pass_plan::{DrawPassPlan, RenderPassKind},
@@ -132,6 +131,11 @@ struct ModelDraw {
     procedural_scale: f32,
     authored_source: Option<usize>,
     authored_stage: Option<AuthoredStageMetadata>,
+    /// Whether Quicktag's raw-stream compatibility VS can honor the authored
+    /// ShadowGenerate vertex contract. Shader families that consume runtime
+    /// vertex resources (for example SV_VertexID -> t2 packed positions) must
+    /// use the reconstructed-position fallback until that resource ABI exists.
+    strict_shadow_native_supported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -267,6 +271,9 @@ struct StrictShadowPipelineKey {
     primitive_type: u8,
     rasterizer: u8,
     index_32bit: bool,
+    /// Package vertex-buffer strides are part of the IA contract. Layout
+    /// element extents are not a substitute because authored buffers may pad.
+    stream_strides: [u16; 8],
 }
 
 struct GpuAuthoredGeometryInput {
@@ -326,6 +333,26 @@ impl GpuAuthoredGeometryInput {
             uv_transform: [uv.scale[0], uv.scale[1], uv.offset[0], uv.offset[1]],
         }
     }
+}
+
+fn strict_shadow_stream_strides(
+    source: &GpuAuthoredGeometryInput,
+    descriptor: &AuthoredInputLayoutDescriptor,
+) -> Option<[u16; 8]> {
+    let mut strides = [0u16; 8];
+    for stream in &descriptor.streams {
+        let slot = usize::from(stream.stream_index);
+        let output = strides.get_mut(slot)?;
+        let gpu_stream = source
+            .vertex_streams
+            .iter()
+            .find(|candidate| candidate.stream_index == stream.stream_index)?;
+        if gpu_stream.stride == 0 {
+            return None;
+        }
+        *output = gpu_stream.stride;
+    }
+    Some(strides)
 }
 
 fn authored_vertex_format(format: u8) -> Option<wgpu::VertexFormat> {
@@ -692,6 +719,36 @@ struct ModelDrawSource<'a> {
     authored_stage: Option<AuthoredStageMetadata>,
 }
 
+fn shader_payload_contains_ascii(shader: TagHash, needle: &[u8]) -> bool {
+    let Some(entry) = package_manager().get_entry(shader) else {
+        return false;
+    };
+    let Ok(data) = package_manager().read_tag(TagHash(entry.reference)) else {
+        return false;
+    };
+    data.windows(needle.len()).any(|window| window == needle)
+}
+
+fn strict_shadow_native_vertex_supported(technique: Option<&TechniqueDescriptor>) -> bool {
+    let Some(vertex_shader) = technique
+        .into_iter()
+        .flat_map(|technique| technique.stages.iter())
+        .find(|stage| stage.stage == ShaderStage::Vertex)
+        .and_then(|stage| stage.shader)
+    else {
+        return false;
+    };
+
+    // Marathon's common depth-only/ShadowGenerate VS family can ignore the
+    // IA POSITION entirely. It indexes a runtime-generated packed-position
+    // buffer (t2) with SV_VertexID instead. Quicktag does not reconstruct that
+    // resource yet, so binding raw POSITION to our compatibility VS produces
+    // the wrong caster geometry. Reconstructed ModelVertex positions already
+    // contain the CPU dequantization/assembly transform and are the faithful
+    // fallback until the runtime resource ABI is implemented.
+    !shader_payload_contains_ascii(vertex_shader, b"SV_VertexID")
+}
+
 fn model_draw_from_source(
     source: ModelDrawSource<'_>,
     technique_descriptors: &mut HashMap<TagHash, Option<TechniqueDescriptor>>,
@@ -734,6 +791,8 @@ fn model_draw_from_source(
         &pass_plan,
         source.technique,
     );
+    let strict_shadow_native_supported = source.authored_stage.is_some()
+        && strict_shadow_native_vertex_supported(technique.as_ref());
 
     ModelDraw {
         indices: source.indices.clone(),
@@ -787,6 +846,7 @@ fn model_draw_from_source(
         procedural_scale: source.procedural_scale,
         authored_source: source.authored_source,
         authored_stage: source.authored_stage,
+        strict_shadow_native_supported,
     }
 }
 
@@ -874,6 +934,7 @@ fn model_draws(
             procedural_scale: draw_range_procedural_scale(wireframe, 0, index_len),
             authored_source: None,
             authored_stage: None,
+            strict_shadow_native_supported: false,
         });
     }
 
@@ -1131,7 +1192,6 @@ struct SceneUniform {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ModelEnvironment {
-    pub fidelity_mode: FidelityMode,
     pub lighting_model: LightingModel,
     pub tfx_time_seconds: f32,
     pub tfx_paused: bool,
@@ -1174,9 +1234,6 @@ pub(crate) struct ModelEnvironment {
     pub light_model_frame: Option<ModelCameraFrame>,
     pub light_gizmo: bool,
     pub shadow_strength: f32,
-    /// Normalized area-shadow softness: 0.0 is hard; larger values widen
-    /// penumbrae according to caster/receiver separation.
-    pub shadow_softness: f32,
     pub brightness: f32,
     pub contrast: f32,
     pub saturation: f32,
@@ -1202,7 +1259,6 @@ pub(crate) enum LightingModel {
 impl Default for ModelEnvironment {
     fn default() -> Self {
         Self {
-            fidelity_mode: FidelityMode::StrictTiger,
             lighting_model: LightingModel::TigerGgxApproximation,
             tfx_time_seconds: 0.0,
             tfx_paused: true,
@@ -1240,7 +1296,6 @@ impl Default for ModelEnvironment {
             light_model_frame: None,
             light_gizmo: false,
             shadow_strength: 1.0,
-            shadow_softness: 0.5,
             brightness: 1.4,
             contrast: 1.01,
             saturation: 1.2,
@@ -1276,44 +1331,6 @@ fn first_person_key_light(
         ],
         sun_height,
     )
-}
-
-fn shadow_source_radius(light_scale: f32, light_size: f32, shadow_softness: f32) -> f32 {
-    // Keep the established default appearance while giving each control one
-    // physical job: light_size is the source extent; shadow_softness blends
-    // from a point source toward that area-light extent.
-    light_scale.max(0.0001) * 0.002 * light_size.clamp(0.0, 10.0) * shadow_softness.clamp(0.0, 1.0)
-}
-
-fn shadow_depth_range(
-    light_position_view: [f32; 3],
-    light_direction_view: [f32; 3],
-    shadow_radius: f32,
-    light_scale: f32,
-    light_range: f32,
-) -> [f32; 2] {
-    let axis = [
-        -light_direction_view[0],
-        -light_direction_view[1],
-        -light_direction_view[2],
-    ];
-    let axis_length = axis.iter().map(|value| value * value).sum::<f32>().sqrt();
-    let axis = if axis_length > 0.0001 {
-        axis.map(|value| value / axis_length)
-    } else {
-        [0.0, 0.0, 1.0]
-    };
-    let center_depth = (-light_position_view[0]) * axis[0]
-        + (-light_position_view[1]) * axis[1]
-        + (-light_position_view[2]) * axis[2];
-
-    let scale = light_scale.max(0.0001);
-    let minimum_near = 0.02 * scale;
-    let minimum_span = 0.02 * scale;
-    let maximum_far = light_range.max(minimum_near + minimum_span);
-    let near_plane = (center_depth - shadow_radius).clamp(minimum_near, maximum_far - minimum_span);
-    let far_plane = (center_depth + shadow_radius).clamp(near_plane + minimum_span, maximum_far);
-    [near_plane, far_plane]
 }
 
 pub(crate) fn light_source_position(environment: &ModelEnvironment) -> [f32; 3] {
@@ -1626,14 +1643,14 @@ struct PreparedDraw {
     passes: Vec<RenderPassKind>,
     authored_source: Option<usize>,
     authored_stage: Option<AuthoredStageMetadata>,
+    strict_shadow_native_supported: bool,
 }
 
 fn select_shadow_draws(
-    fidelity_mode: FidelityMode,
     visible_draws: &[PreparedDraw],
     authored_shadow_draws: &[PreparedDraw],
 ) -> Vec<PreparedDraw> {
-    if fidelity_mode == FidelityMode::StrictTiger && !authored_shadow_draws.is_empty() {
+    if !authored_shadow_draws.is_empty() {
         authored_shadow_draws.to_vec()
     } else {
         visible_draws
@@ -2094,6 +2111,7 @@ impl ModelPaintCallback {
                 passes,
                 authored_source: draw.authored_source,
                 authored_stage: draw.authored_stage,
+                strict_shadow_native_supported: draw.strict_shadow_native_supported,
             };
             if is_authored_shadow {
                 authored_shadow_draws.push(prepared);
@@ -2101,8 +2119,7 @@ impl ModelPaintCallback {
                 draws.push(prepared);
             }
         }
-        let shadow_draws =
-            select_shadow_draws(environment.fidelity_mode, &draws, &authored_shadow_draws);
+        let shadow_draws = select_shadow_draws(&draws, &authored_shadow_draws);
 
         draws.sort_by(|left, right| {
             let left_blended = blend_enabled(left.pipeline.blend);
@@ -2180,20 +2197,6 @@ impl ModelPaintCallback {
         let (outer_cone_cosine, inner_cone_cosine) =
             light_cone_cosines(environment.light_cone_angle);
         let light_range = environment.light_range.max(0.05) * light_transform.scale;
-        let source_radius = shadow_source_radius(
-            light_transform.scale,
-            environment.light_size,
-            environment.shadow_softness,
-        );
-        let [near_plane, far_plane] = shadow_depth_range(
-            light_position_view,
-            light_direction[..3]
-                .try_into()
-                .expect("light direction xyz"),
-            shadow_radius,
-            light_transform.scale,
-            light_range,
-        );
         Self {
             preview,
             target_format: texture_cache.render_state.target_format,
@@ -2208,7 +2211,7 @@ impl ModelPaintCallback {
                     aspect,
                     pan.x * 2.0 / rect.width().max(1.0),
                     -pan.y * 2.0 / rect.height().max(1.0),
-                    environment.shadow_softness.clamp(0.0, 1.0),
+                    0.0,
                 ],
                 uv_transform: [
                     transform.scale[0],
@@ -2266,7 +2269,7 @@ impl ModelPaintCallback {
                     environment.gamma,
                 ],
                 fidelity: [
-                    (environment.fidelity_mode == FidelityMode::PrettyPreview) as u8 as f32,
+                    0.0,
                     match environment.lighting_model {
                         LightingModel::TigerGgxCompatibility => 0.0,
                         LightingModel::TigerGgxApproximation => 1.0,
@@ -2280,7 +2283,7 @@ impl ModelPaintCallback {
                     environment.tfx_time_seconds,
                     environment.tfx_speed,
                 ],
-                shadow_parameters: [source_radius, near_plane, far_plane, 0.0],
+                shadow_parameters: [0.0; 4],
             },
             materials,
             draws,
@@ -2500,19 +2503,6 @@ impl ModelPaintCallback {
             camera.frame.center[2],
             shadow_radius,
         ];
-        let [near_plane, far_plane] = shadow_depth_range(
-            self.scene.light_position[..3]
-                .try_into()
-                .expect("light position xyz"),
-            self.scene.light_direction[..3]
-                .try_into()
-                .expect("light direction xyz"),
-            shadow_radius,
-            self.scene.light_position[3],
-            self.scene.light_parameters[1],
-        );
-        self.scene.shadow_parameters[1] = near_plane;
-        self.scene.shadow_parameters[2] = far_plane;
         self.scene.params0[0] = camera.frame.radius;
         self.scene.params0[3] = camera.zoom;
         self.scene.params1[1] = camera.pan[0];
@@ -3550,6 +3540,9 @@ impl CallbackTrait for ModelPaintCallback {
             .shadow_draws
             .iter()
             .filter_map(|draw| {
+                if !draw.strict_shadow_native_supported {
+                    return None;
+                }
                 let source_index = draw.authored_source?;
                 let authored = draw.authored_stage?;
                 let source = self.preview.authored_inputs.get(source_index)?.as_ref()?;
@@ -3559,6 +3552,7 @@ impl CallbackTrait for ModelPaintCallback {
                     return None;
                 }
                 let descriptor = layout.descriptor.clone()?;
+                let stream_strides = strict_shadow_stream_strides(source, &descriptor)?;
                 let index = source.index_buffer.as_ref()?;
                 let end = authored
                     .source_index_start
@@ -3572,6 +3566,7 @@ impl CallbackTrait for ModelPaintCallback {
                         primitive_type: authored.primitive_type,
                         rasterizer: draw.pipeline.rasterizer,
                         index_32bit: matches!(index.format, wgpu::IndexFormat::Uint32),
+                        stream_strides,
                     },
                     descriptor,
                 ))
@@ -4834,6 +4829,9 @@ impl CallbackTrait for ModelPaintCallback {
                 );
 
                 let rendered_authored = (|| {
+                    if !draw.strict_shadow_native_supported {
+                        return None;
+                    }
                     let source_index = draw.authored_source?;
                     let authored = draw.authored_stage?;
                     let source = self.preview.authored_inputs.get(source_index)?.as_ref()?;
@@ -4844,6 +4842,7 @@ impl CallbackTrait for ModelPaintCallback {
                         return None;
                     }
                     let descriptor = stage_layout.descriptor.as_ref()?;
+                    let stream_strides = strict_shadow_stream_strides(source, descriptor)?;
                     let index = source.index_buffer.as_ref()?;
                     let transform_bind_group = frame
                         .authored_shadow_bind_groups
@@ -4860,6 +4859,7 @@ impl CallbackTrait for ModelPaintCallback {
                         primitive_type: authored.primitive_type,
                         rasterizer: draw.pipeline.rasterizer,
                         index_32bit: matches!(index.format, wgpu::IndexFormat::Uint32),
+                        stream_strides,
                     };
                     let pipeline = pipelines
                         .strict_shadow_pipelines
@@ -6071,14 +6071,10 @@ fn create_strict_shadow_pipeline(
             .streams
             .iter()
             .find(|stream| stream.stream_index == stream_index)?;
-        let stride = stream
-            .elements
-            .iter()
-            .filter_map(|element| {
-                authored_vertex_format_size(element.format)
-                    .map(|size| u64::from(element.offset) + size)
-            })
-            .max()?;
+        let stride = u64::from(*key.stream_strides.get(usize::from(stream_index))?);
+        if stride == 0 {
+            return None;
+        }
         let mut attributes = Vec::new();
         for element in &stream.elements {
             let shader_location = if element.semantic == 0 && element.semantic_index == 0 {
@@ -6091,8 +6087,13 @@ fn create_strict_shadow_pipeline(
             let Some(shader_location) = shader_location else {
                 continue;
             };
+            let format = authored_vertex_format(element.format)?;
+            let attribute_end = u64::from(element.offset) + authored_vertex_format_size(element.format)?;
+            if attribute_end > stride {
+                return None;
+            }
             attributes.push(wgpu::VertexAttribute {
-                format: authored_vertex_format(element.format)?,
+                format,
                 offset: u64::from(element.offset),
                 shader_location,
             });
@@ -6796,28 +6797,23 @@ fn reconstruct_object_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 }
 
 fn light_clip(position: vec3<f32>) -> vec4<f32> {
-    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
-    let light_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
+    // Tiger/Alkahest-style directional shadow space. Marathon's exact
+    // authored world-to-shadow matrix is still a follow-up target, but this
+    // affine projection preserves the engine contract and avoids the old
+    // finite-spotlight perspective distortion that produced shadow spikes.
+    let light = normalize(view_direction_to_world(scene.light_direction.xyz));
     let up = select(
         vec3<f32>(0.0, 0.0, 1.0),
         vec3<f32>(0.0, 1.0, 0.0),
-        abs(light_axis.z) > 0.95,
+        abs(light.z) > 0.95,
     );
-    let right = normalize(cross(up, light_axis));
-    let vertical = cross(light_axis, right);
-    let source_to_surface = position - light_position;
-    let light_depth = dot(source_to_surface, light_axis);
-    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
-    let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
-    let near_plane = scene.shadow_parameters.y;
-    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
-    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
-    let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
-    let perspective_denominator = max(light_depth * tangent, 0.0001 * scene.light_position.w);
+    let right = normalize(cross(up, light));
+    let vertical = cross(light, right);
+    let relative = (position - scene.center.xyz) / max(scene.center.w, 0.0001);
     return vec4<f32>(
-        dot(source_to_surface, right) / perspective_denominator,
-        dot(source_to_surface, vertical) / perspective_denominator,
-        depth_clip / perspective_denominator,
+        dot(relative, right),
+        dot(relative, vertical),
+        0.5 - dot(relative, light) * 0.5,
         1.0,
     );
 }
@@ -6838,6 +6834,48 @@ fn spotlight_factor_world(position: vec3<f32>) -> f32 {
     let rig_distance = distance / scene.light_position.w;
     let distance_falloff = 1.0 / max(1.0, rig_distance * rig_distance);
     return cone * range_fade * distance_falloff;
+}
+
+const STRICT_SHADOW_SAMPLE_COUNT = 9u;
+const STRICT_SHADOW_DISK = array<vec2<f32>, 9>(
+    vec2<f32>( 0.0,  0.0),
+    vec2<f32>(-0.45570818, -0.80781116),
+    vec2<f32>( 0.89600897, -0.35694158),
+    vec2<f32>(-0.19807512,  0.92104191),
+    vec2<f32>( 0.25952172, -0.80905122),
+    vec2<f32>( 0.59722185,  0.77891493),
+    vec2<f32>(-0.80889258,  0.45309126),
+    vec2<f32>(-0.91679038, -0.21303266),
+    vec2<f32>( 0.67728304,  0.18318819),
+);
+
+fn strict_tiger_shadow(shadow_position: vec3<f32>, position_screen: vec2<f32>) -> f32 {
+    let dimensions = vec2<f32>(textureDimensions(sun_shadow));
+    let texel = 1.0 / dimensions;
+    let magic = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
+    let angle = fract(magic.z * fract(dot(position_screen, magic.xy))) * 6.28318530718;
+    let sine = sin(angle);
+    let cosine = cos(angle);
+    var visibility = 0.0;
+    for (var sample = 0u; sample < STRICT_SHADOW_SAMPLE_COUNT; sample++) {
+        let poisson = STRICT_SHADOW_DISK[sample];
+        let rotated = vec2<f32>(
+            cosine * poisson.x - sine * poisson.y,
+            sine * poisson.x + cosine * poisson.y,
+        );
+        let sample_uv = shadow_position.xy + rotated * texel * 2.5;
+        if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
+            visibility += 1.0;
+            continue;
+        }
+        visibility += textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            sample_uv,
+            shadow_position.z - 0.0001,
+        );
+    }
+    return visibility / f32(STRICT_SHADOW_SAMPLE_COUNT);
 }
 
 const SHADOW_SAMPLE_COUNT = 32u;
@@ -7003,8 +7041,6 @@ fn deferred_shadow(uv: vec2<f32>, normal: vec3<f32>) -> f32 {
     let pixel = clamp(vec2<i32>(uv * vec2<f32>(dimensions)), vec2<i32>(0), dimensions - vec2<i32>(1));
     let depth = textureLoad(scene_depth, pixel, 0);
     let position = reconstruct_object_position(uv, depth);
-    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
-    let light_world = normalize(light_position - position);
     let light_clip_position = light_clip(position);
     let shadow_position = vec3<f32>(
         light_clip_position.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5),
@@ -7016,9 +7052,7 @@ fn deferred_shadow(uv: vec2<f32>, normal: vec3<f32>) -> f32 {
         || shadow_position.z >= 1.0 {
         return 1.0;
     }
-    let n_dot_light =
-        max(dot(view_direction_to_world(normal), light_world), 0.0);
-    return pcss_shadow(shadow_position, n_dot_light);
+    return strict_tiger_shadow(shadow_position, uv * scene.postprocess1.xy);
 }
 
 @fragment
@@ -7361,34 +7395,24 @@ fn view_direction_to_world(value: vec3<f32>) -> vec3<f32> {
 }
 
 fn light_clip(position: vec3<f32>) -> vec4<f32> {
-    // The source position is stored in view space so the forward and deferred
-    // lighting paths can compute a per-fragment vector. Convert it back here
-    // for the shadow pass, whose vertex positions are model/world space.
-    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
-    let light_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
+    // Tiger/Alkahest-style directional shadow space. Marathon's exact
+    // authored world-to-shadow matrix is still a follow-up target, but this
+    // affine projection preserves the engine contract and avoids the old
+    // finite-spotlight perspective distortion that produced shadow spikes.
+    let light = normalize(view_direction_to_world(scene.light_direction.xyz));
     let up = select(
         vec3<f32>(0.0, 0.0, 1.0),
         vec3<f32>(0.0, 1.0, 0.0),
-        abs(light_axis.z) > 0.95,
+        abs(light.z) > 0.95,
     );
-    let right = normalize(cross(up, light_axis));
-    let vertical = cross(light_axis, right);
-    let source_to_surface = position - light_position;
-    let light_depth = dot(source_to_surface, light_axis);
-    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
-    let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
-    // Keep light projection homogeneous. Rasterizer performs perspective
-    // divide, preserving correct depth interpolation in shadow map.
-    let near_plane = scene.shadow_parameters.y;
-    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
-    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
-    let perspective_denominator = light_depth * tangent;
-    let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
+    let right = normalize(cross(up, light));
+    let vertical = cross(light, right);
+    let relative = (position - scene.center.xyz) / max(scene.center.w, 0.0001);
     return vec4<f32>(
-        dot(source_to_surface, right),
-        dot(source_to_surface, vertical),
-        depth_clip,
-        perspective_denominator,
+        dot(relative, right),
+        dot(relative, vertical),
+        0.5 - dot(relative, light) * 0.5,
+        1.0,
     );
 }
 
@@ -7647,31 +7671,24 @@ fn view_direction_to_world(value: vec3<f32>) -> vec3<f32> {
 }
 
 fn light_clip(position: vec3<f32>) -> vec4<f32> {
-    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
-    let light_axis = normalize(-view_direction_to_world(scene.light_direction.xyz));
+    // Tiger/Alkahest-style directional shadow space. Marathon's exact
+    // authored world-to-shadow matrix is still a follow-up target, but this
+    // affine projection preserves the engine contract and avoids the old
+    // finite-spotlight perspective distortion that produced shadow spikes.
+    let light = normalize(view_direction_to_world(scene.light_direction.xyz));
     let up = select(
         vec3<f32>(0.0, 0.0, 1.0),
         vec3<f32>(0.0, 1.0, 0.0),
-        abs(light_axis.z) > 0.95,
+        abs(light.z) > 0.95,
     );
-    let right = normalize(cross(up, light_axis));
-    let vertical = cross(light_axis, right);
-    let source_to_surface = position - light_position;
-    let light_depth = dot(source_to_surface, light_axis);
-    let outer_cosine = clamp(scene.light_parameters.z, 0.01, 0.9999);
-    let tangent = sqrt(max(1.0 - outer_cosine * outer_cosine, 0.0)) / outer_cosine;
-    // Keep light projection homogeneous so rasterizer performs perspective
-    // divide and depth interpolation remains correct for finite spotlight.
-    let near_plane = scene.shadow_parameters.y;
-    let range = max(scene.shadow_parameters.z, near_plane + 0.01 * scene.light_position.w);
-    let depth_scale = range / max(range - near_plane, 0.01 * scene.light_position.w);
-    let perspective_denominator = light_depth * tangent;
-    let depth_clip = (depth_scale * light_depth - depth_scale * near_plane) * tangent;
+    let right = normalize(cross(up, light));
+    let vertical = cross(light, right);
+    let relative = (position - scene.center.xyz) / max(scene.center.w, 0.0001);
     return vec4<f32>(
-        dot(source_to_surface, right),
-        dot(source_to_surface, vertical),
-        depth_clip,
-        perspective_denominator,
+        dot(relative, right),
+        dot(relative, vertical),
+        0.5 - dot(relative, light) * 0.5,
+        1.0,
     );
 }
 
@@ -9564,27 +9581,9 @@ fn mapped_normal(input: VertexOutput) -> vec3<f32> {
     return normalize(mat3x3<f32>(tangent, bitangent, base_normal) * sampled);
 }
 
-fn fallback_surface(albedo: vec3<f32>) -> vec2<f32> {
-    // Strict Tiger uses a neutral dielectric fallback. Pretty Preview retains
-    // legacy luma/chroma guesses, but never presents them as authored values.
-    if scene.fidelity.x < 0.5 {
-        return vec2<f32>(0.82, 0.0);
-    }
-    let luma = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let chroma = max(albedo.r, max(albedo.g, albedo.b))
-        - min(albedo.r, min(albedo.g, albedo.b));
-    // Conservative class defaults for shader families without a proven
-    // packed material channel: dark coatings, dusty coloured coatings, pale
-    // metal, then rough dielectric polymer.
-    if luma < 0.055 {
-        return vec2<f32>(0.86, 0.0);
-    }
-    if luma < 0.18 && albedo.r > albedo.g * 1.12 && albedo.b > albedo.g * 1.06 {
-        return vec2<f32>(0.80, 0.0);
-    }
-    if luma > 0.28 && chroma < 0.14 {
-        return vec2<f32>(0.68, 0.08);
-    }
+fn fallback_surface(_albedo: vec3<f32>) -> vec2<f32> {
+    // Unknown material families stay neutral rather than inventing surface
+    // properties from albedo. Authored/Tiger evidence should replace this.
     return vec2<f32>(0.82, 0.0);
 }
 
@@ -9764,6 +9763,49 @@ fn clamp_specular_luminance(value: vec3<f32>, maximum: f32) -> vec3<f32> {
     return value * min(1.0, maximum / max(luminance, 0.000001));
 }
 
+// Small Tiger/Alkahest-style comparison kernel for the engine-faithful path.
+const STRICT_SHADOW_SAMPLE_COUNT = 9u;
+const STRICT_SHADOW_DISK = array<vec2<f32>, 9>(
+    vec2<f32>( 0.0,  0.0),
+    vec2<f32>(-0.45570818, -0.80781116),
+    vec2<f32>( 0.89600897, -0.35694158),
+    vec2<f32>(-0.19807512,  0.92104191),
+    vec2<f32>( 0.25952172, -0.80905122),
+    vec2<f32>( 0.59722185,  0.77891493),
+    vec2<f32>(-0.80889258,  0.45309126),
+    vec2<f32>(-0.91679038, -0.21303266),
+    vec2<f32>( 0.67728304,  0.18318819),
+);
+
+fn strict_tiger_shadow(shadow_position: vec3<f32>, position_screen: vec2<f32>) -> f32 {
+    let dimensions = vec2<f32>(textureDimensions(sun_shadow));
+    let texel = 1.0 / dimensions;
+    let magic = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
+    let angle = fract(magic.z * fract(dot(position_screen, magic.xy))) * 6.28318530718;
+    let sine = sin(angle);
+    let cosine = cos(angle);
+    var visibility = 0.0;
+    for (var sample = 0u; sample < STRICT_SHADOW_SAMPLE_COUNT; sample++) {
+        let poisson = STRICT_SHADOW_DISK[sample];
+        let rotated = vec2<f32>(
+            cosine * poisson.x - sine * poisson.y,
+            sine * poisson.x + cosine * poisson.y,
+        );
+        let sample_uv = shadow_position.xy + rotated * texel * 2.5;
+        if any(sample_uv < vec2<f32>(0.0)) || any(sample_uv > vec2<f32>(1.0)) {
+            visibility += 1.0;
+            continue;
+        }
+        visibility += textureSampleCompare(
+            sun_shadow,
+            sun_shadow_sampler,
+            sample_uv,
+            shadow_position.z - 0.0001,
+        );
+    }
+    return visibility / f32(STRICT_SHADOW_SAMPLE_COUNT);
+}
+
 // Stable Vogel disk for blocker search and final comparison filtering.
 // The radius is no longer a fixed screen-space blur: blocker distance drives
 // the penumbra so contact shadows remain attached and naturally hard.
@@ -9934,11 +9976,7 @@ fn spotlight_shadow(input: VertexOutput) -> f32 {
         return 1.0;
     }
 
-    let light_position = scene.center.xyz + view_direction_to_world(scene.light_position.xyz);
-    let light_world = normalize(light_position - (scene.center.xyz + input.world_relative));
-    let geometric_normal = normalize(input.world_normal);
-    let n_dot_light = max(dot(geometric_normal, light_world), 0.0);
-    return pcss_shadow(shadow_position, n_dot_light);
+    return strict_tiger_shadow(shadow_position, input.clip_position.xy);
 }
 
 fn investment_decal_mask(uv: vec2<f32>) -> f32 {
@@ -11436,8 +11474,8 @@ mod tests {
         model_authored_shadow_draws, model_direction_to_view, model_draws,
         model_orthographic_depth, model_orthographic_view_depth, model_view_depth,
         normal_surface_write_mask, project_hiz_vertex, projected_export_bounds,
-        rasterizer_cull_mode, select_shadow_draws, shadow_depth_range, shadow_pipeline_index,
-        shadow_source_radius, smooth_normals, vertex_ambient_occlusion, view_direction_to_model,
+        rasterizer_cull_mode, select_shadow_draws, shadow_pipeline_index, smooth_normals,
+        vertex_ambient_occlusion, view_direction_to_model,
     };
     use crate::{
         geometry::{
@@ -11445,7 +11483,7 @@ mod tests {
             WeaponModPreviewAttachment, WeaponModRarity, WireframeAuthoredStageRange,
             WireframeMaterialRange, WireframeMaterialTextures, WireframePreview,
         },
-        render::{evidence::FidelityMode, pass_plan::RenderPassKind},
+        render::pass_plan::RenderPassKind,
         texture::{Texture, cache::TextureCache},
     };
     use eframe::{
@@ -11665,13 +11703,11 @@ mod tests {
         light_range: f32,
         light_cone_angle: f32,
         light_size: f32,
-        shadow_softness: f32,
         exposure: f32,
         ambient_intensity: f32,
         specular_ibl_intensity: f32,
         tone_mapping: bool,
         auto_exposure: bool,
-        fidelity: String,
         lighting_model: String,
         debug_channel: String,
         draws: Vec<VisualCaptureDraw>,
@@ -11891,18 +11927,6 @@ mod tests {
             }
         }
 
-        assert!((shadow_source_radius(1.0, 5.0, 0.5) - 0.005).abs() < 0.000_001);
-        assert!(shadow_source_radius(1.0, 10.0, 0.5) > shadow_source_radius(1.0, 5.0, 0.5));
-        assert_eq!(shadow_source_radius(1.0, 0.0, 0.5), 0.0);
-        assert_eq!(shadow_source_radius(1.0, 5.0, 0.0), 0.0);
-        assert_eq!(
-            shadow_depth_range([0.0, 0.0, 2.0], [0.0, 0.0, 1.0], 0.5, 1.0, 4.0),
-            [1.5, 2.5]
-        );
-        let close_range = shadow_depth_range([0.0, 0.0, 0.1], [0.0, 0.0, 1.0], 1.0, 1.0, 4.0);
-        assert!((close_range[0] - 0.02).abs() < 0.000_001);
-        assert!((close_range[1] - 1.1).abs() < 0.000_001);
-
         assert_eq!(defaults.light_orbit_radius, 1.0);
         assert_eq!(defaults.light_orbit_center, [0.174, -0.045, -0.117]);
         assert_eq!(defaults.light_target, [-0.183, 0.017, -0.483]);
@@ -11971,70 +11995,19 @@ mod tests {
     }
 
     #[test]
-    fn uses_finite_spotlight_depth_and_stable_shadow_filtering() {
-        for shader in [MODEL_SHADER, SHADOW_SHADER] {
-            assert!(shader.contains("scene.light_position.xyz"));
-            assert!(shader.contains("scene.shadow_parameters.y"));
-            assert!(shader.contains("scene.shadow_parameters.z"));
-            assert!(shader.contains("perspective_denominator"));
+    fn uses_directional_tiger_shadow_projection_and_small_pcf() {
+        for shader in [MODEL_SHADER, SHADOW_SHADER, LIGHTING_SHADER] {
+            assert!(shader.contains("let relative = (position - scene.center.xyz)"));
+            assert!(shader.contains("0.5 - dot(relative, light) * 0.5"));
+            assert!(!shader.contains("perspective_denominator"));
         }
-        assert!(SHADOW_SHADER.contains("depth_clip,\n        perspective_denominator"));
         assert!(MODEL_SHADER.contains("light_clip(scene.center.xyz + input.world_relative)"));
         assert!(!MODEL_SHADER.contains("@location(5) shadow_position"));
         for shader in [MODEL_SHADER, LIGHTING_SHADER] {
-            assert!(shader.contains("const SHADOW_BLOCKER_SAMPLE_COUNT = 16u"));
-            assert!(shader.contains("const SHADOW_SAMPLE_COUNT = 32u"));
-            assert!(shader.contains("fn shadow_receiver_gradient"));
-            assert!(shader.contains("fn shadow_reference_depth"));
-            assert!(shader.contains("fn shadow_linear_depth"));
-            assert!(shader.contains("blocker_depth_sum"));
-            assert!(shader.contains("penumbra_ratio"));
-            assert!(shader.contains("source_radius"));
-            assert!(shader.contains("max_filter_radius"));
-            assert!(!shader.contains("receiver_bias = shadow_texel.x"));
-            assert!(!shader.contains("softness * softness * 48.0"));
+            assert!(shader.contains("const STRICT_SHADOW_SAMPLE_COUNT = 9u"));
+            assert!(shader.contains("fn strict_tiger_shadow"));
+            assert!(shader.contains("shadow_position.z - 0.0001"));
         }
-    }
-
-    #[test]
-    fn finite_spotlight_depth_stays_perspective_over_depth_varying_triangle() {
-        let near_plane = 0.05_f32;
-        let range = 4.0_f32;
-        let tangent = 0.8_f32;
-        let clip_w = |depth: f32| depth * tangent;
-        let clip_z = |depth: f32| range * (depth - near_plane) * tangent / (range - near_plane);
-        let ndc_depth = |depth: f32| clip_z(depth) / clip_w(depth);
-
-        // Barycentric interpolation across a triangle must remain affine in
-        // homogeneous clip depth, while post-divide depth remains nonlinear.
-        let depths = [0.5_f32, 1.75, 3.5];
-        let weights = [0.2_f32, 0.35, 0.45];
-        let depth_at_sample = depths
-            .into_iter()
-            .zip(weights)
-            .map(|(depth, weight)| depth * weight)
-            .sum::<f32>();
-        let interpolated_clip_z = depths
-            .into_iter()
-            .zip(weights)
-            .map(|(depth, weight)| clip_z(depth) * weight)
-            .sum::<f32>();
-        let interpolated_clip_w = depths
-            .into_iter()
-            .zip(weights)
-            .map(|(depth, weight)| clip_w(depth) * weight)
-            .sum::<f32>();
-        assert!((interpolated_clip_z - clip_z(depth_at_sample)).abs() < 0.000_001);
-        assert!((interpolated_clip_w - clip_w(depth_at_sample)).abs() < 0.000_001);
-        assert!(
-            (interpolated_clip_z / interpolated_clip_w - ndc_depth(depth_at_sample)).abs()
-                < 0.000_001
-        );
-
-        // Old affine normalized depth would visibly disagree toward near
-        // vertices; this catches regressions back to linear depth packing.
-        let old_linear_depth = (depth_at_sample - near_plane) / (range - near_plane);
-        assert!((ndc_depth(depth_at_sample) - old_linear_depth).abs() > 0.08);
     }
 
     #[test]
@@ -12144,6 +12117,7 @@ mod tests {
             passes,
             authored_source: None,
             authored_stage: None,
+            strict_shadow_native_supported: false,
         };
         let visible = vec![prepared(
             0..3,
@@ -12151,17 +12125,13 @@ mod tests {
         )];
         let authored = vec![prepared(3..6, vec![RenderPassKind::Shadow])];
 
-        let strict = select_shadow_draws(FidelityMode::StrictTiger, &visible, &authored);
-        assert_eq!(strict.len(), 1);
-        assert_eq!(strict[0].indices, 3..6);
+        let authored_selected = select_shadow_draws(&visible, &authored);
+        assert_eq!(authored_selected.len(), 1);
+        assert_eq!(authored_selected[0].indices, 3..6);
 
-        let pretty = select_shadow_draws(FidelityMode::PrettyPreview, &visible, &authored);
-        assert_eq!(pretty.len(), 1);
-        assert_eq!(pretty[0].indices, 0..3);
-
-        let strict_fallback = select_shadow_draws(FidelityMode::StrictTiger, &visible, &[]);
-        assert_eq!(strict_fallback.len(), 1);
-        assert_eq!(strict_fallback[0].indices, 0..3);
+        let fallback = select_shadow_draws(&visible, &[]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].indices, 0..3);
     }
 
     #[test]
@@ -12282,6 +12252,12 @@ mod tests {
             draw.packet.pass_plan.passes == [RenderPassKind::Shadow]
                 && draw.authored_stage.is_some()
         }));
+        assert!(
+            draws
+                .iter()
+                .all(|draw| !draw.strict_shadow_native_supported),
+            "Conquest ShadowGenerate consumes SV_VertexID/t2 generated positions and must not use Quicktag's raw-POSITION compatibility VS"
+        );
         assert!(draws.iter().all(|draw| {
             let Some(source_index) = draw.authored_source else {
                 return false;
@@ -12492,14 +12468,6 @@ mod tests {
         assert_eq!(draws[0].solid_color, Some([0.7, 0.3, 0.1, 1.0]));
         assert_eq!(draws[0].solid_surface, Some([0.5, 0.25]));
         assert_eq!(draws[0].iridescence_id, Some(0.375));
-    }
-
-    #[test]
-    fn package_fidelity_is_the_default_material_policy() {
-        assert_eq!(
-            ModelEnvironment::default().fidelity_mode,
-            super::FidelityMode::StrictTiger
-        );
     }
 
     #[test]
@@ -14753,15 +14721,6 @@ mod tests {
                 "QUICKTAG_PROBE_SPECULAR_IBL",
                 verification_environment.specular_ibl_intensity,
             );
-            verification_environment.fidelity_mode = match std::env::var("QUICKTAG_PROBE_FIDELITY")
-                .unwrap_or_else(|_| "strict".into())
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "strict" | "strict-tiger" => FidelityMode::StrictTiger,
-                "pretty" | "pretty-preview" => FidelityMode::PrettyPreview,
-                value => panic!("unknown QUICKTAG_PROBE_FIDELITY {value}"),
-            };
             verification_environment.lighting_model = probe_lighting_model;
             for (axis, variable) in [
                 (0, "QUICKTAG_PROBE_LIGHT_TARGET_X"),
@@ -14812,10 +14771,6 @@ mod tests {
             verification_environment.light_size = probe_f32(
                 "QUICKTAG_PROBE_LIGHT_SIZE",
                 verification_environment.light_size,
-            );
-            verification_environment.shadow_softness = probe_f32(
-                "QUICKTAG_PROBE_SHADOW_SOFTNESS",
-                verification_environment.shadow_softness,
             );
             let callback = ModelPaintCallback::new(
                 gpu,
@@ -15342,13 +15297,11 @@ mod tests {
                         "light_range": verification_environment.light_range,
                         "light_cone_angle": verification_environment.light_cone_angle,
                         "light_size": verification_environment.light_size,
-                        "shadow_softness": verification_environment.shadow_softness,
                         "exposure": verification_environment.exposure,
                         "ambient_intensity": verification_environment.ambient_intensity,
                         "specular_ibl_intensity": verification_environment.specular_ibl_intensity,
                         "tone_mapping": verification_environment.tone_mapping,
                         "auto_exposure": verification_environment.auto_exposure,
-                        "fidelity": format!("{:?}", verification_environment.fidelity_mode),
                         "lighting_model": format!("{:?}", verification_environment.lighting_model),
                     },
                     "geometry": {
@@ -15475,13 +15428,11 @@ mod tests {
                     light_range: verification_environment.light_range,
                     light_cone_angle: verification_environment.light_cone_angle,
                     light_size: verification_environment.light_size,
-                    shadow_softness: verification_environment.shadow_softness,
                     exposure: verification_environment.exposure,
                     ambient_intensity: verification_environment.ambient_intensity,
                     specular_ibl_intensity: verification_environment.specular_ibl_intensity,
                     tone_mapping: verification_environment.tone_mapping,
                     auto_exposure: verification_environment.auto_exposure,
-                    fidelity: format!("{:?}", verification_environment.fidelity_mode),
                     lighting_model: format!("{:?}", verification_environment.lighting_model),
                     debug_channel: diagnostic_name.clone(),
                     unknown_tfx_stages: draws.iter().map(|draw| draw.unknown_tfx_stages).sum(),

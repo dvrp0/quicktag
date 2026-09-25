@@ -10,8 +10,10 @@ The ordering is intentional: avoid spending significant time tuning presentation
 - **Authored ShadowGenerate caster selection:** complete. Strict Tiger uses authored raw-stage-4 source ranges and package-native vertex/index streams where supported, with compatibility fallback.
 - **Authored vertex/input ABI:** partial. Raw streams/layout descriptors are preserved and GPU-materialized; Strict Shadow consumes them, but the rest of Strict Tiger still largely renders through reconstructed `ModelVertex`.
 - **Renderer-facing TFX:** partial. Runtime stage state, output register images, runtime bindings, and unresolved-dependency tracking exist; TFX register/resource state is not yet the authoritative input to the custom WGSL shading path.
-- **Strict shadow shader fidelity:** partial. Native input layouts/source ranges are supported and Conquest's VS contract has been investigated via DXC, but Strict Shadow still uses Quicktag compatibility WGSL rather than packaged/translated shader-family implementations.
-- **Validation:** current diff passes `cargo check --release` (existing repository warnings remain).
+- **Shadow artifact:** resolved in the live model viewer on 2026-09-25. Replacing the finite spotlight perspective shadow transform with an affine directional Tiger-style shadow space removed the smooth-surface spike/teeth artifact. The exact Marathon authored shadow matrix is still not decoded, so projection fidelity remains a follow-up rather than a correctness blocker.
+- **Shadow shader fidelity:** partial. Native input layouts/source ranges are supported where the authored VS ABI is compatible; runtime-resource VS families such as Conquest's `SV_VertexID -> t2` path explicitly use the reconstructed-position compatibility path until that runtime buffer ABI is implemented.
+- **Renderer contract:** `Pretty Preview` has been removed as a separate fidelity mode. Quicktag now exposes one Tiger-faithful renderer contract; heuristic/custom behavior remains only as explicit internal compatibility fallback where authored behavior is still unresolved.
+- **Validation:** current diff passes `cargo check --release`, Tiger-shadow unit tests, and the Conquest GPU visual probe (existing repository warnings remain).
 
 ---
 
@@ -74,7 +76,7 @@ Quicktag can now answer the ShadowGenerate portion directly: raw stage 4 is deco
 
 Do not infer shadow participation primarily from visible-stage material behavior once the Marathon stage ABI is known.
 
-**Completed (2026-09-25):** Strict Tiger now preserves the exact authored raw-stage-4 draw ranges separately from preview-deduplicated visible geometry **and consumes their package-native source index ranges / vertex streams through a dedicated strict shadow pipeline** when the authored ABI is supported. The Conquest LMG fixture retains 9 authored ranges / 128,982 shadow indices after full model assembly. Pretty Preview and unsupported/missing authored paths retain the compatibility fallback. Visual side-by-side inspection remains a P2 diagnostics task, not a blocker for authored caster selection.
+**Completed (2026-09-25):** the renderer now preserves the exact authored raw-stage-4 draw ranges separately from preview-deduplicated visible geometry **and consumes their package-native source index ranges / vertex streams through a dedicated shadow pipeline** when the authored ABI is supported. The Conquest LMG fixture retains 9 authored ranges / 128,982 shadow indices after full model assembly. Unsupported/missing authored shader ABIs retain an explicit compatibility fallback. Visual side-by-side inspection remains a P2 diagnostics task, not a blocker for authored caster selection.
 
 ### Required work
 
@@ -123,7 +125,7 @@ The package-wide ShadowGenerate relation probe also found an important constrain
 - [x] Materialize authored package streams as GPU vertex/index buffers.
 - [x] Allow Strict Tiger ShadowGenerate pipelines to consume authored stream layouts and source index ranges.
 - [ ] Generalize authored stream/layout consumption to Strict Tiger G-buffer/depth/other stage pipelines.
-- [ ] Keep reconstructed `ModelVertex` only for compatibility/Pretty Preview.
+- [ ] Keep reconstructed `ModelVertex` only as an explicit compatibility fallback for unsupported authored paths.
 - [x] Verify package-wide whether ShadowGenerate changes input-layout ID: 0 / 1661 differ.
 - [x] Add Conquest LMG regression coverage for authored source/range/layout preservation.
 
@@ -176,18 +178,18 @@ rather than:
 
 ---
 
-# P1 — Core Strict-Tiger Rendering Architecture
+# P1 — Core Tiger Rendering Architecture
 
-## [ ] Separate Strict Tiger and Pretty Preview into genuinely different renderer contracts
+## [x] Remove Pretty Preview as a separate fidelity mode
 
-The current modes should stop being mostly parameter variations inside the same custom renderer.
+**Completed (2026-09-25):** Quicktag now exposes one renderer contract whose goal is to follow authored Tiger/Marathon behavior. The `FidelityMode` enum, UI toggle, Pretty-only shadow projection, controllable PCSS softness path, probe override, and Pretty-only material guessing have been removed from the active renderer. Unsupported authored behavior may still use explicit compatibility fallbacks, but those fallbacks are not presented as a second renderer mode.
 
-### Strict Tiger target
+### Remaining Tiger-fidelity targets
 
 - [ ] authored render stages across the full renderer
   - [x] ShadowGenerate uses authored stage membership
 - [ ] authored stage-specific vertex ABI across the full renderer
-  - [x] ShadowGenerate can consume package-native vertex/index streams
+  - [x] ShadowGenerate can consume package-native vertex/index streams when its VS ABI is supported
 - [ ] authored technique selection as shader behavior
 - [ ] authored render state across all passes
 - [ ] renderer-authoritative TFX
@@ -195,20 +197,7 @@ The current modes should stop being mostly parameter variations inside the same 
 - [ ] shader-family-specific or translated shader behavior
 - [ ] minimal semantic reinterpretation
 
-### Pretty Preview target
-
-- [x] MaterialIR
-- [x] generic ModelVertex
-- [x] custom GGX
-- [x] studio lighting
-- [x] PCSS / controllable softness
-- [x] supersampling
-- [x] enhanced postprocessing
-- [x] graceful fallback rendering
-
-### Exit criteria
-
-"Strict Tiger" should mean "follow authored engine behavior," not "use slightly less stylized Quicktag lighting."
+Compatibility rendering remains useful, but it is now an implementation fallback rather than a user-facing fidelity choice.
 
 ---
 
@@ -298,7 +287,7 @@ Current Quicktag shadowing is a replacement system. Strict Tiger should increasi
 - [ ] Populate a DeferredShadow-style scope.
 - [ ] Verify world/view/light matrix conventions against Alkahest.
 - [ ] Compare Quicktag shadow UV/depth values against a reference implementation on controlled geometry.
-- [ ] Separate authored shadow projection from Pretty Preview's custom spotlight controls.
+- [x] Remove the Pretty Preview finite-spotlight shadow projection from the Tiger path; current shadow space is affine/directional while exact authored Marathon projection data remains to be decoded.
 
 ---
 
@@ -327,22 +316,23 @@ Quicktag now has a native-layout Strict Shadow compatibility pipeline, but it is
 
 ---
 
-## [ ] Reduce shadow filtering complexity in Strict Tiger
+## [x] Reduce active shadow filtering to the Tiger-style path
 
-Do not use a more sophisticated filter as a substitute for an incorrect caster/projection contract.
+**Completed (2026-09-25):** the active renderer uses a small 9-tap rotated Poisson comparison kernel with a small texel radius and fixed compare bias. The PCSS/contact-hardening path is no longer user-selectable and `Shadow softness` has been removed. Combined with the affine directional shadow projection, this eliminated the reported smooth-surface spike/teeth artifact in the live viewer.
 
-### Required work
+### Completed work
 
-- [ ] Once stage/projection behavior is correct, compare simple PCF against current PCSS.
-- [ ] Add a strict filter patterned after known Tiger/Alkahest behavior:
-  - [ ] small Poisson kernel
-  - [ ] small texel radius
-  - [ ] simple compare bias
-- [ ] Keep PCSS/contact hardening as a Pretty Preview feature.
+- [x] Replace the active PCSS path with a small Tiger/Alkahest-style PCF kernel.
+- [x] Use a small Poisson kernel.
+- [x] Use a small texel radius.
+- [x] Use a simple compare bias.
+- [x] Remove the Pretty Preview / controllable-softness renderer path.
+
+### Optional diagnostics still useful
+
 - [ ] Add side-by-side diagnostic output:
   - [ ] raw hard shadow
   - [ ] Tiger-style PCF
-  - [ ] Pretty Preview PCSS
 
 ---
 

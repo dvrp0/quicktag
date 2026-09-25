@@ -60,13 +60,6 @@ impl ProvenanceStore {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum FidelityMode {
-    #[default]
-    StrictTiger,
-    PrettyPreview,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1689,19 +1689,6 @@ fn lighting_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label("Fidelity");
-                ui.selectable_value(
-                    &mut environment.fidelity_mode,
-                    crate::render::evidence::FidelityMode::StrictTiger,
-                    "Strict Tiger",
-                );
-                ui.selectable_value(
-                    &mut environment.fidelity_mode,
-                    crate::render::evidence::FidelityMode::PrettyPreview,
-                    "Pretty Preview",
-                );
-            });
-            ui.horizontal(|ui| {
                 ui.checkbox(&mut environment.light_gizmo, "Spotlight gizmo");
                 if ui.button("Reset lighting").clicked() {
                     let defaults = ModelEnvironment::default();
@@ -1714,7 +1701,6 @@ fn lighting_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
                     environment.light_size = defaults.light_size;
                     environment.light_scale_with_model = defaults.light_scale_with_model;
                     environment.shadow_strength = defaults.shadow_strength;
-                    environment.shadow_softness = defaults.shadow_softness;
                     environment.sun_intensity = defaults.sun_intensity;
                     environment.ambient_intensity = defaults.ambient_intensity;
                     environment.specular_ibl_intensity = defaults.specular_ibl_intensity;
@@ -1854,10 +1840,6 @@ fn lighting_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
                     MODEL_PARAMETER_RANGE.clone(),
                 )
                 .text("Shadows"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.shadow_softness, 0.0..=1.0)
-                    .text("Shadow softness"),
             );
             ui.add(
                 egui::Slider::new(
