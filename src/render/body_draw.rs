@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use super::{body_material::BodyPixelInputs, body_vertex};
+use super::body_vertex;
 
 pub(crate) struct BodyDrawPipeline {
     pixel_layout: wgpu::BindGroupLayout,
@@ -22,42 +22,7 @@ pub(crate) struct BodyDrawBindings {
     pub range: Range<u32>,
 }
 
-pub(crate) struct BodyDrawInputs<'a> {
-    pub pixel: BodyPixelInputs<'a>,
-    pub vertex: &'a wgpu::BindGroup,
-    pub source: &'a wgpu::Buffer,
-    pub uv: &'a wgpu::Buffer,
-    pub indices: &'a wgpu::Buffer,
-    /// Authored strip range, including fixed restart indices.
-    pub range: Range<u32>,
-}
-
 impl BodyDrawPipeline {
-    pub fn new(
-        device: &wgpu::Device,
-        vs: &wgpu::ShaderModule,
-        ps: &wgpu::ShaderModule,
-        vertex_layout: &wgpu::BindGroupLayout,
-        targets: [Option<wgpu::ColorTargetState>; 4],
-        front_face: wgpu::FrontFace,
-        cull_mode: Option<wgpu::Face>,
-        depth_stencil: Option<wgpu::DepthStencilState>,
-        index_format: wgpu::IndexFormat,
-    ) -> Self {
-        Self::new_dense(
-            device,
-            vs,
-            ps,
-            vertex_layout,
-            super::dense_pixel::SurfacePixelAbi::Body,
-            targets,
-            front_face,
-            cull_mode,
-            depth_stencil,
-            index_format,
-        )
-    }
-
     /// Independently verified PS families share raw body VS/IA submission.
     #[allow(clippy::too_many_arguments)]
     pub fn new_dense(
@@ -135,20 +100,6 @@ impl BodyDrawPipeline {
             pipeline,
             index_format,
         }
-    }
-
-    pub fn bind(&self, device: &wgpu::Device, inputs: BodyDrawInputs<'_>) -> BodyDrawBindings {
-        self.bind_dense(
-            device,
-            [inputs.pixel.cb0, inputs.pixel.cb1, inputs.pixel.cb12],
-            &inputs.pixel.textures,
-            inputs.pixel.samplers,
-            inputs.vertex,
-            inputs.source,
-            inputs.uv,
-            inputs.indices,
-            inputs.range,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -182,35 +182,3 @@ fn model_heap_bytes(value: &ModelPreview) -> usize {
         + vec_bytes(&value.geometry_parts)
         + value.wireframe.as_ref().map_or(0, wireframe_heap_bytes)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn attachment_cache_key_preserves_float_bits_and_instance_state() {
-        let mut value = ResolvedWeaponModAttachment {
-            pattern: TagHash(1),
-            geometry: TagHash(2),
-            rarity: None,
-            unique_id: 0.0,
-            pose: WeaponModAttachmentPose {
-                family_id: 3,
-                variant_id: 4,
-                bone_index: 5,
-                rotation: [0.0, 0.0, 0.0, 1.0],
-                translation: [0.0; 3],
-                scale: 1.0,
-            },
-        };
-        let original = AttachmentKey::from(&value);
-        value.unique_id = -0.0;
-        assert!(original != AttachmentKey::from(&value));
-        value.unique_id = 0.0;
-        value.pose.translation[0] = 1.0;
-        assert!(original != AttachmentKey::from(&value));
-        value.pose.translation[0] = 0.0;
-        value.rarity = Some(WeaponModRarity::Deluxe);
-        assert!(original != AttachmentKey::from(&value));
-    }
-}

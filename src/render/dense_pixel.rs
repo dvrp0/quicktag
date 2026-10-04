@@ -2,7 +2,7 @@
 //! Program identity selects the contract; resource counts never select a shader.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SurfacePixelAbi {
-    Audited { rows: u64, textures: u32, volume: Option<u32>, samplers: u32 },
+    Audited { rows: u64, textures: u32, volume: Option<u32>, cube: Option<u32>, samplers: u32 },
     Body,
     Layered,
     Hands,
@@ -10,8 +10,12 @@ pub(crate) enum SurfacePixelAbi {
 }
 
 pub(crate) fn create_layout(device: &wgpu::Device, abi: SurfacePixelAbi) -> wgpu::BindGroupLayout {
+    let cube_slot = match abi {
+        SurfacePixelAbi::Audited { cube, .. } => cube,
+        _ => None,
+    };
     let (rows, texture_count, volume_slot, sampler_count, label) = match abi {
-        SurfacePixelAbi::Audited { rows, textures, volume, samplers } => (rows, textures, volume, samplers, "audited opaque PS resource ABI"),
+        SurfacePixelAbi::Audited { rows, textures, volume, samplers, .. } => (rows, textures, volume, samplers, "audited opaque PS resource ABI"),
         SurfacePixelAbi::Body => (125, 8, Some(7), 3, "authored body PS dense ABI"),
         SurfacePixelAbi::Layered => (129, 9, Some(8), 3, "authored chest/sleeve nine-texture PS ABI"),
         SurfacePixelAbi::Hands => (138, 9, Some(7), 3, "authored hands PS dense ABI"),
@@ -32,6 +36,8 @@ pub(crate) fn create_layout(device: &wgpu::Device, abi: SurfacePixelAbi) -> wgpu
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: if Some(binding - 3) == volume_slot {
                         wgpu::TextureViewDimension::D3
+                    } else if Some(binding - 3) == cube_slot {
+                        wgpu::TextureViewDimension::Cube
                     } else {
                         wgpu::TextureViewDimension::D2
                     },

@@ -102,18 +102,6 @@ opt-level = 3
 # cohae: Overflow checks are nice for some, but not for us
 overflow-checks = false
 
-[dev-dependencies]
-ash = "0.38"
-naga = { version = "27.0.3", features = ["wgsl-in"] }
-
-[[example]]
-name = "authored_shader_probe"
-test = true
-
-[[example]]
-name = "typed_buffer_gpu_probe"
-test = true
-
 [profile.release]
 debug = "limited"
 

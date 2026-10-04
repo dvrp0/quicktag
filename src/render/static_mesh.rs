@@ -312,10 +312,6 @@ impl StaticMesh {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn constant_image(&self) -> &wgpu::Buffer {
-        &self.constants
-    }
 
     pub fn bind(
         &self,

@@ -38,9 +38,59 @@ struct Args {
     #[arg(long, default_value = "./implant_icons")]
     implant_icons_output: std::path::PathBuf,
 
-    /// Write the Marathon/Goliath render-stage ABI census as JSON and exit
-    #[arg(long, hide = true, value_name = "PATH")]
-    probe_render_stage_abi: Option<std::path::PathBuf>,
+    /// Decode one texture tag (hex) to a PNG at --render-output and exit
+    #[arg(long, value_name = "TAG", value_parser = parse_tag)]
+    export_texture: Option<tiger_pkg::TagHash>,
+
+    /// Write one shader tag's compiled payload to --render-output and exit
+    #[arg(long, value_name = "TAG", value_parser = parse_tag)]
+    export_shader: Option<tiger_pkg::TagHash>,
+
+    /// Print one technique's stages, TFX bytecode and evaluated constants and exit
+    #[arg(long, value_name = "TAG", value_parser = parse_tag)]
+    dump_technique: Option<tiger_pkg::TagHash>,
+
+    /// TFX time in seconds for --render-model and --dump-technique
+    #[arg(long, default_value_t = 0.0)]
+    render_time: f32,
+
+    /// Render one model tag (hex, e.g. 80B15334) to a PNG and exit
+    #[arg(long, value_name = "TAG", value_parser = parse_tag)]
+    render_model: Option<tiger_pkg::TagHash>,
+
+    /// Output file for --render-model
+    #[arg(long, default_value = "./model.png")]
+    render_output: std::path::PathBuf,
+
+    /// Camera yaw in degrees for --render-model
+    #[arg(long, default_value_t = -24.0, allow_negative_numbers = true)]
+    render_yaw: f32,
+
+    /// Camera pitch in degrees for --render-model
+    #[arg(long, default_value_t = 14.0, allow_negative_numbers = true)]
+    render_pitch: f32,
+
+    /// Key light, sky ambient and ground ambient colours for --render-model,
+    /// as nine linear values R,G,B,R,G,B,R,G,B
+    #[arg(long, value_delimiter = ',', default_values_t = [1.0; 9])]
+    render_lighting: Vec<f32>,
+
+    /// Output of --render-model: final, albedo, normals, properties (metal,
+    /// AO, roughness) or emissive
+    #[arg(long, default_value = "final")]
+    render_view: String,
+
+    /// Magnification of the fitted frame for --render-model
+    #[arg(long, default_value_t = 1.0)]
+    render_zoom: f32,
+
+    /// Point of the fitted frame to centre on, as X,Y in -1..1 (Y up)
+    #[arg(long, value_delimiter = ',', default_values_t = [0.0, 0.0], allow_negative_numbers = true)]
+    render_focus: Vec<f32>,
+}
+
+fn parse_tag(value: &str) -> Result<tiger_pkg::TagHash, std::num::ParseIntError> {
+    u32::from_str_radix(value.trim_start_matches("0x"), 16).map(tiger_pkg::TagHash)
 }
 
 fn main() -> eframe::Result<()> {
@@ -85,16 +135,6 @@ fn main() -> eframe::Result<()> {
 
     quicktag_core::classes::initialize_reference_names();
 
-    if let Some(output) = args.probe_render_stage_abi {
-        let report = crate::geometry::goliath_render_stage_abi_report();
-        let bytes = serde_json::to_vec_pretty(&report)
-            .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
-        std::fs::write(&output, bytes)
-            .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
-        println!("Wrote render-stage ABI census to {}", output.display());
-        return Ok(());
-    }
-
     if args.export_implant_icons {
         let render_state = create_headless_render_state()
             .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
@@ -107,6 +147,90 @@ fn main() -> eframe::Result<()> {
             "Exported {exported} implant icons to {}",
             args.implant_icons_output.display()
         );
+        return Ok(());
+    }
+
+    if let Some(tag) = args.export_shader {
+        let payload = package_manager()
+            .get_entry(tag)
+            .ok_or_else(|| std::io::Error::other("missing shader tag"))
+            .and_then(|entry| {
+                package_manager()
+                    .read_tag(tiger_pkg::TagHash(entry.reference))
+                    .map_err(std::io::Error::other)
+            })
+            .and_then(|payload| std::fs::write(&args.render_output, payload))
+            .map_err(|error| eframe::Error::AppCreation(Box::new(error)));
+        payload?;
+        println!("Exported shader {tag} to {}", args.render_output.display());
+        return Ok(());
+    }
+
+    if let Some(tag) = args.dump_technique {
+        let technique = crate::render::technique::TechniqueDescriptor::load(tag)
+            .ok_or_else(|| eframe::Error::AppCreation(Box::new(std::io::Error::other("not a technique"))))?;
+        let mut inputs = crate::render::tfx::TfxRuntimeInputs::default();
+        inputs.apply_marathon_global_defaults();
+        inputs.time_seconds = args.render_time;
+        for stage in &technique.stages {
+            println!(
+                "STAGE {:?} shader={:?} cb_slot={:?} constants={} inline_rows={}",
+                stage.stage,
+                stage.shader,
+                stage.constant_buffer_slot,
+                stage.constants.len(),
+                stage.inline_constants.len()
+            );
+            for (index, constant) in stage.constants.iter().enumerate() {
+                println!("  CONST {index} = {constant:?}");
+            }
+            for resource in &stage.resources {
+                println!("  TEXTURE slot={} {:?}", resource.slot, resource.resolved);
+            }
+            let execution = stage.execute(&inputs);
+            for step in &execution.trace {
+                println!("  OP {:04} {:02X} {} {}", step.byte_offset, step.opcode, step.operation, step.detail);
+            }
+            for (target, value) in &execution.outputs {
+                println!("  OUT {target} = {value:?}");
+            }
+            for (row, value) in stage.runtime_state(&inputs).constant_registers.iter().enumerate() {
+                println!("  ROW {row} = {value:?}");
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(tag) = args.export_texture {
+        let render_state = create_headless_render_state()
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        let image = crate::texture::Texture::load(&render_state, tag, false)
+            .and_then(|texture| texture.to_image(&render_state, 0))
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        image
+            .save(&args.render_output)
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        println!("Exported {tag} ({}x{}) to {}", image.width(), image.height(), args.render_output.display());
+        return Ok(());
+    }
+
+    if let Some(tag) = args.render_model {
+        let render_state = create_headless_render_state()
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        crate::gui::ModelsView::export_model_image(
+            &render_state,
+            tag,
+            args.render_yaw,
+            args.render_pitch,
+            args.render_zoom,
+            [args.render_focus[0], *args.render_focus.get(1).unwrap_or(&0.0)],
+            args.render_time,
+            std::array::from_fn(|index| args.render_lighting.get(index).copied().unwrap_or(1.0)),
+            &args.render_view,
+            &args.render_output,
+        )
+        .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        println!("Rendered {tag} to {}", args.render_output.display());
         return Ok(());
     }
 

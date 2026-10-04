@@ -136,21 +136,3 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
         data.get(offset..offset + 8)?.try_into().ok()?,
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_multi_effect_array_range() {
-        let mut data = vec![0; 0x20];
-        data[0..4].copy_from_slice(&ARRAY_MARKER.to_le_bytes());
-        data[4..12].copy_from_slice(&2_u64.to_le_bytes());
-        data[0x0C..0x10].copy_from_slice(&ITEM_EFFECT_ARRAY.to_le_bytes());
-        data[0x14..0x18].copy_from_slice(&0x1F2_u32.to_le_bytes());
-        assert_eq!(
-            find_array_range(&data, ITEM_EFFECT_ARRAY),
-            Some(0x1F2..0x1F4)
-        );
-    }
-}

@@ -57,7 +57,7 @@ use strings::StringViewVariant;
 use tiger_pkg::{TagHash, package_manager};
 
 pub(crate) use self::gear::GearView;
-use self::modellist::ModelsView;
+pub(crate) use self::modellist::ModelsView;
 use self::named_tags::NamedTagView;
 use self::packages::PackagesView;
 use self::raw_strings::RawStringsView;

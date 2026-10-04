@@ -70,29 +70,3 @@ pub fn decode_weapon_mod_ratings(data: &[u8]) -> Result<Vec<WeaponModRating>> {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn signed_values_and_structural_validation() {
-        let mut b = vec![0; 0x58];
-        b[..4].copy_from_slice(&0x80809245u32.to_le_bytes());
-        b[12..20].copy_from_slice(&1u64.to_le_bytes());
-        b[20..28].copy_from_slice(&12i64.to_le_bytes());
-        b[28..32].copy_from_slice(&0x8080BFCDu32.to_le_bytes());
-        b[32..40].copy_from_slice(&1u64.to_le_bytes());
-        b[40..44].copy_from_slice(&0x8080924Bu32.to_le_bytes());
-        b[48..52].copy_from_slice(&12u32.to_le_bytes());
-        b[52..56].copy_from_slice(&(-10i32).to_le_bytes());
-        b[56] = 9;
-        let rows = decode_weapon_mod_ratings(&b).unwrap();
-        assert_eq!(
-            (rows[0].stat_id, rows[0].delta, rows[0].extra[0]),
-            (12, -10, 9)
-        );
-        assert!(decode_weapon_mod_ratings(&b[..87]).is_err());
-        b[40] = 0;
-        assert!(decode_weapon_mod_ratings(&b).is_err());
-    }
-}

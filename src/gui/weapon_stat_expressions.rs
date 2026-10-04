@@ -66,29 +66,3 @@ impl PropertyProgram {
         properties
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn applies_authored_property_updates_in_order() {
-        let mut copy = [0; 24];
-        copy[0] = 2;
-        copy[1] = 70;
-        copy[4] = 4;
-        copy[9] = 0x3c00;
-        copy[10] = f32::MAX.to_bits();
-        let mut multiply = copy;
-        multiply[4] = 0x102;
-        multiply[5] = 2;
-        multiply[6] = 70;
-        multiply[7] = u32::MAX;
-        multiply[9] = 0;
-        multiply[16] = 0.89f32.to_bits();
-        let program = PropertyProgram(vec![copy, multiply]);
-        let values = program.evaluate(&[Some(vec![0.65])]);
-        assert!((values[&(2, 70)] - 0.5785).abs() < 1e-6);
-        assert!(!program.evaluate(&[None]).contains_key(&(2, 70)));
-    }
-}

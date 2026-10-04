@@ -10,6 +10,7 @@ pub(super) struct NativeDecalSource {
     pub program: crate::render::authored_program::DescriptorAbi,
     pub vertex_program: crate::render::authored_program::DescriptorAbi,
     pub constants: Vec<[f32; 4]>,
+    pub animation: Option<super::model_surfaces::AnimatedConstants>,
     pub textures: Vec<TagHash>,
     pub samplers: Vec<ModelSamplerDesc>,
 }
@@ -73,27 +74,15 @@ pub(super) fn resolve_source(
     if ps.constant_buffer_slot != Some(0) || state.constant_registers.len() != rows {
         return Err("constant buffer slot/row count mismatch");
     }
-    let (expected_dependencies, metadata_rows): (&[&str], &[(usize, Option<usize>)]) = match program {
-        D::RunnerDecal(index) => {
-            let contract=&crate::render::runner_decal_programs::DECALS[index as usize];
-            (contract.unresolved_dependencies, contract.metadata_rows)
-        },
-        _ => (&["Decal+0x30 at byte 48", "Decal+0x8 at byte 8", "output[0] <- unresolved numeric value", "texture Pixel slot 2 <- extern_texture(Decal+0x8)"], &[]),
-    };
-    if state.unresolved_dependencies.iter().map(String::as_str).collect::<Vec<_>>() != expected_dependencies {
-        return Err("unresolved runtime dependencies differ from audited decal contract");
-    }
+    // The viewer owns the Decal scope: its viewport row and scene-normal view.
+    let viewer_owned: fn(&str) -> bool = |dependency| dependency.starts_with("Decal+0x")
+        || dependency == "texture Pixel slot 2 <- extern_texture(Decal+0x8)";
     if pixel_contract.scene_normal && !state.bindings.iter().any(|b| {
         b.kind == "texture" && b.slot == 2 && b.source == "extern_texture(Decal+0x8)" && b.resolved.is_none()
     }) { return Err("missing scene-normal extern binding"); }
     let mut constants=state.constant_registers;
-    for &(row,gate) in metadata_rows {
-        if row>=rows || gate.is_some_and(|g|g>=rows || metadata_rows.iter().any(|&(r,_)|r==g)) {
-            return Err("invalid decal metadata proof");
-        }
-        if gate.is_some_and(|g|constants[g][0]!=0.0) { return Err("decal metadata gate active"); }
-        constants[row]=[0.0;4];
-    }
+    super::model_surfaces::zero_unresolved_rows(&mut constants, &state.unresolved_dependencies, viewer_owned)?;
+    let animation = super::model_surfaces::AnimatedConstants::new(ps, inputs, viewer_owned);
     let textures = texture_slots
         .iter()
         .map(|&slot| {
@@ -136,14 +125,16 @@ pub(super) fn resolve_source(
         program,
         vertex_program,
         constants,
+        animation,
         textures,
         samplers,
     })
 }
 
 impl NativeDecalSource {
-    pub fn globals(&self, size: [u32; 2]) -> Vec<[f32; 4]> {
-        let mut constants = self.constants.clone();
+    pub fn globals(&self, size: [u32; 2], time_seconds: f32) -> Vec<[f32; 4]> {
+        let mut constants = self.animation.as_ref().and_then(|animation| animation.at(time_seconds))
+            .unwrap_or_else(|| self.constants.clone());
         // Original PS reads trunc(row0.xy * View16.zw * SV_Position.xy + row0.zw).
         // Paired viewer viewport rows address the same receiver pixel.
         if contract(self.program).unwrap().scene_normal {

@@ -75,50 +75,6 @@ pub(super) struct WeaponStatResolver<'a> {
 }
 
 impl<'a> WeaponStatResolver<'a> {
-    #[cfg(test)]
-    pub(super) fn dump_mod_curve_evidence(&self, tag: TagHash) {
-        let data = package_manager().read_tag(tag).unwrap();
-        println!("BASE {tag} {:?}", parse_ratings(&data));
-        let Some(index) = definition_pattern_index(&data) else {
-            return;
-        };
-        let Some(patterns) = self
-            .pattern_globals
-            .get(index as usize)
-            .and_then(|id| self.assignments.get(id))
-        else {
-            return;
-        };
-        for pattern in patterns {
-            for component in model_gameplay_components(self.cache, *pattern) {
-                let bytes = package_manager().read_tag(component).unwrap();
-                if let Some(curves) = CurveSet::parse(&bytes) {
-                    println!(
-                        "CURVES {tag} pattern={pattern} component={component} score={}",
-                        curves.layout_score()
-                    );
-                    if let Some(a) = arrays(&bytes)
-                        .into_iter()
-                        .find(|a| a.class == CURVE_SEMANTIC_ARRAY)
-                    {
-                        for i in 0..a.count {
-                            let r = a.start + i * 0x38;
-                            println!(
-                                "DESCRIPTOR {i} {:08X?}",
-                                (r..r + 0x38)
-                                    .step_by(4)
-                                    .map(|o| read_u32(&bytes, o).unwrap())
-                                    .collect::<Vec<_>>()
-                            );
-                        }
-                    }
-                    for group in curves.0 {
-                        println!("CURVE {} {:?}", group.semantic, group.values);
-                    }
-                }
-            }
-        }
-    }
     pub(super) fn load(cache: &'a quicktag_scanner::TagCache) -> Self {
         let mut assignments = FxHashMap::<u32, Vec<TagHash>>::default();
         for (tag, _) in package_manager().get_all_by_reference(PATTERN_ASSIGNMENT_TABLE_REFERENCE) {

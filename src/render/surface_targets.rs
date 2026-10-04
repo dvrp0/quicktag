@@ -536,10 +536,15 @@ pub(crate) struct SourceColorProjection {
 pub(crate) struct ViewerMaterialProjection {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
+    emissive_pipeline: wgpu::RenderPipeline,
 }
 
 impl ViewerMaterialProjection {
-    pub fn new(device: &wgpu::Device, formats: [wgpu::TextureFormat; 3]) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        formats: [wgpu::TextureFormat; 3],
+        emissive_format: wgpu::TextureFormat,
+    ) -> Self {
         let mut entries: Vec<_> = (0..3)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -612,7 +617,28 @@ impl ViewerMaterialProjection {
             multiview: None,
             cache: None,
         });
-        Self { layout, pipeline }
+        let emissive_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("authored material emission into viewer light rigs"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_emissive"),
+                compilation_options: Default::default(),
+                targets: &[Some(emissive_format.into())],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        Self { layout, pipeline, emissive_pipeline }
     }
 
     pub fn bind(
@@ -643,6 +669,12 @@ impl ViewerMaterialProjection {
             layout: &self.layout,
             entries: &entries,
         })
+    }
+
+    pub fn encode_emissive(&self, pass: &mut wgpu::RenderPass<'_>, inputs: &wgpu::BindGroup) {
+        pass.set_pipeline(&self.emissive_pipeline);
+        pass.set_bind_group(0, inputs, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     pub fn encode(&self, pass: &mut wgpu::RenderPass<'_>, inputs: &wgpu::BindGroup) {
@@ -696,6 +728,17 @@ struct Output {
     output.properties=vec4<f32>(clamp(props.r,0.0,1.0),ao,0,0);
     output.albedo=vec4<f32>(color.rgb,1);
     return output;
+}
+// Emission shares RT2.G with AO. This is the decode of the packaged
+// debug_emissive program; its Frame-scope exposure factors are left at one.
+@fragment fn fs_emissive(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let pixel = vec2<i32>(p.xy);
+    if all(textureLoad(packed_normal,pixel,0) == vec4<f32>(0.0))
+        || all(textureLoad(receiver_coverage,pixel,0) == vec4<f32>(0.0)) { discard; }
+    let color = textureLoad(source_color,pixel,0);
+    let encoded = clamp(2.0*textureLoad(native_properties,pixel,0).g-1.007843,0.0,1.0);
+    let intensity = exp2(13.0*encoded-7.0)-0.0078125;
+    return vec4<f32>(color.rgb*intensity,1.0);
 }
 "#;
 

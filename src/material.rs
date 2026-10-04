@@ -95,14 +95,6 @@ pub struct TechniqueTextureBinding {
     pub tag: TagHash,
 }
 
-#[derive(Debug, Clone)]
-pub struct TechniqueTfxTextureBinding {
-    pub stage: &'static str,
-    pub slot: u8,
-    pub source_scope: Option<String>,
-    pub source_offset: Option<usize>,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TechniqueMaterialConstants {
     pub color_tint: Option<[f32; 4]>,
@@ -250,13 +242,6 @@ pub fn render_state_for_technique(tag: TagHash) -> TechniqueRenderState {
         .unwrap_or_default()
 }
 
-pub fn texture_tags_for_technique(entry: &UEntryHeader, data: &[u8]) -> Vec<TagHash> {
-    texture_bindings_for_technique(entry, data)
-        .into_iter()
-        .map(|binding| binding.tag)
-        .collect()
-}
-
 pub fn texture_bindings_for_technique(
     entry: &UEntryHeader,
     data: &[u8],
@@ -352,76 +337,6 @@ pub fn sampler_for_technique_slot(
         .resolved
         .and_then(sampler_header_tag)
         .or_else(|| sampler_header_tag(sampler.raw32))
-}
-
-pub fn tfx_texture_bindings_for_technique(
-    entry: &UEntryHeader,
-    data: &[u8],
-) -> Vec<TechniqueTfxTextureBinding> {
-    if !is_technique_entry(entry) {
-        return vec![];
-    }
-
-    parse_technique(data)
-        .map(|technique| {
-            technique
-                .stages
-                .into_iter()
-                .flat_map(|stage| {
-                    stage
-                        .bytecode
-                        .bindings
-                        .into_iter()
-                        .filter(|binding| binding.kind == "texture")
-                        .map(|binding| {
-                            let (source_scope, source_offset) =
-                                parse_tfx_texture_source(&binding.source)
-                                    .map(|(scope, offset)| (Some(scope), Some(offset)))
-                                    .unwrap_or((None, None));
-                            TechniqueTfxTextureBinding {
-                                stage: binding.stage,
-                                slot: binding.slot,
-                                source_scope,
-                                source_offset,
-                            }
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-pub fn scope_stages(entry: &UEntryHeader, data: &[u8]) -> Vec<TechniqueStagePreview> {
-    if !get_class_by_id(entry.reference).is_some_and(|class| class.name.as_ref() == "s_scope") {
-        return vec![];
-    }
-    let endian = package_manager().version.endian();
-    let (stage_base, stage_stride, marathon_tfx) = match package_manager().version {
-        GameVersion::Marathon(_) => (0x40usize, 0x80usize, true),
-        GameVersion::Destiny(_) => (0x48usize, 0x80usize, false),
-    };
-    ["PS", "VS", "GS", "HS", "CS", "DS"]
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, stage)| {
-            parse_technique_stage(
-                data,
-                stage,
-                stage_base + index * stage_stride,
-                endian,
-                marathon_tfx,
-            )
-        })
-        .filter(|stage| {
-            stage.shader.is_some()
-                || !stage.textures.is_empty()
-                || !stage.constants.is_empty()
-                || !stage.indexed_resources.is_empty()
-                || !stage.inline_constants.is_empty()
-                || stage.bytecode_len != 0
-                || stage.constant_buffer.is_some()
-        })
-        .collect()
 }
 
 pub fn material_constants_for_technique(
@@ -527,12 +442,6 @@ fn is_luminance_weights(value: [f32; 4]) -> bool {
         .zip(value)
         .take(3)
         .all(|(expected, actual)| (expected - actual).abs() < 0.03)
-}
-
-fn parse_tfx_texture_source(source: &str) -> Option<(String, usize)> {
-    let inner = source.strip_prefix("extern_texture(")?.strip_suffix(')')?;
-    let (scope, offset) = inner.split_once("+0x")?;
-    Some((scope.to_string(), usize::from_str_radix(offset, 16).ok()?))
 }
 
 fn texture_header_tag(tag: TagHash) -> Option<TagHash> {
@@ -732,16 +641,6 @@ fn parse_vec4_array(data: &[u8], endian: Endian) -> Vec<[f32; 4]> {
         .collect()
 }
 
-#[cfg(test)]
-fn parse_tfx_bytecode(data: &[u8]) -> TfxBytecodePreview {
-    parse_tfx_bytecode_with_constants(data, &[])
-}
-
-#[cfg(test)]
-fn parse_tfx_bytecode_with_constants(data: &[u8], constants: &[[f32; 4]]) -> TfxBytecodePreview {
-    parse_tfx_bytecode_with_constants_dialect(data, constants, false)
-}
-
 fn parse_tfx_bytecode_with_constants_dialect(
     data: &[u8],
     constants: &[[f32; 4]],
@@ -846,18 +745,9 @@ fn parse_marathon_tfx_bytecode_op(
         0x3f => Some(("compare_equal", String::new())),
         0x40 => Some(("compare_not_equal", String::new())),
         0x41 => Some(("compare_not_zero_ternary", String::new())),
-        0x51 => Some((
-            "marathon_context_value",
-            format!("index={}", read_u8(cursor)?),
-        )),
-        0x57 => Some((
-            "push_marathon_indexed_value",
-            format!("index={}", read_u8(cursor)?),
-        )),
-        0x58 => Some((
-            "marathon_texture_view",
-            format!("index={}", read_u8(cursor)?),
-        )),
+        0x51 => Some(("push_from_output", format!("element={}", read_u8(cursor)?))),
+        0x57 => Some(("push_temp", format!("slot={}", read_u8(cursor)?))),
+        0x58 => Some(("pop_temp", format!("slot={}", read_u8(cursor)?))),
         0x5b => {
             let value = read_u8(cursor)?;
             Some((
@@ -865,12 +755,8 @@ fn parse_marathon_tfx_bytecode_op(
                 format!("{} slot={}", tfx_shader_stage_name(value), value & 0x1f),
             ))
         }
-        // Historical diagnostic label only: the one-byte runtime selector is
-        // proven, but its producer/metadata field remains unidentified.
-        0x64 => Some((
-            "push_marathon_texture_metadata",
-            format!("index={}", read_u8(cursor)?),
-        )),
+        // Tiger's second indexed global push; it reads the same global table.
+        0x64 => Some(("push_global_channel", format!("index={}", read_u8(cursor)?))),
         0x67..=0x69 => {
             let index = read_u8(cursor)?;
             let fields = read_u8(cursor)?;
@@ -897,7 +783,7 @@ fn parse_marathon_tfx_bytecode_op(
         });
     }
 
-    if matches!(opcode, 0x21..=0x27 | 0x36..=0x3a) {
+    if matches!(opcode, 0x10..=0x12 | 0x24..=0x27 | 0x36..=0x3a) {
         return Some(TfxBytecodeOpPreview {
             offset,
             opcode,
@@ -916,7 +802,10 @@ fn parse_marathon_tfx_bytecode_op(
 
 fn marathon_tfx_legacy_opcode(opcode: u8) -> Option<u8> {
     match opcode {
-        0x01..=0x20 => Some(opcode),
+        0x01..=0x0f => Some(opcode),
+        // Marathon keeps three operations at 0x10..0x12 that the older table
+        // lacks, so lerp..vector_rotations_sin_cos sit three higher.
+        0x13..=0x23 => Some(opcode - 3),
         0x28..=0x35 => Some(opcode - 7),
         0x42..=0x49 => Some(opcode - 0x0e),
         0x4a => Some(0x3c),
@@ -1052,7 +941,6 @@ pub(crate) fn interpret_tfx_stack_with_object_channels(
         object_channels,
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
         &std::collections::BTreeMap::new(),
     )
 }
@@ -1063,7 +951,6 @@ pub(crate) fn interpret_tfx_stack_with_runtime_values(
     object_channels: &std::collections::HashMap<u32, [f32; 4]>,
     extern_values: &std::collections::HashMap<(String, u32), [f32; 4]>,
     global_channels: &std::collections::HashMap<u32, [f32; 4]>,
-    context_values: &std::collections::HashMap<u32, [f32; 4]>,
     texture_metadata: &std::collections::BTreeMap<u8, crate::texture::TextureExpressionMetadata>,
 ) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
     let mut stack = Vec::<TfxStackValue>::new();
@@ -1083,16 +970,12 @@ pub(crate) fn interpret_tfx_stack_with_runtime_values(
             | "push_extern_uav"
             | "push_object_channel"
             | "push_global_channel"
-            | "push_tex_dimensions"
-            | "push_marathon_texture_metadata"
-            | "push_marathon_indexed_value"
-            | "marathon_context_value" => stack.push(format_tfx_runtime_value(
+            | "push_tex_dimensions" => stack.push(format_tfx_runtime_value(
                 op,
                 constants,
                 object_channels,
                 extern_values,
                 global_channels,
-                context_values,
             )),
             "push_tex_tiling_params" | "push_tex_tile_layer_count" => {
                 let value = op.detail.split_once(" fields=0x").and_then(|(index, fields)| {
@@ -1259,7 +1142,11 @@ pub(crate) fn interpret_tfx_stack_with_runtime_values(
             | "vector_rotations_sin"
             | "vector_rotations_cos"
             | "vector_rotations_sin_cos"
-            | "triangle" => collapse_stack(&mut stack, op.name, 1),
+            | "triangle"
+            | "jitter"
+            | "wander"
+            | "rand"
+            | "rand_smooth" => collapse_stack(&mut stack, op.name, 1),
             "normalize3" => collapse_stack(&mut stack, op.name, 1),
             _ => {}
         }
@@ -1311,11 +1198,12 @@ fn collapse_permute(stack: &mut Vec<TfxStackValue>, op: &TfxBytecodeOpPreview) {
         });
         return;
     };
+    // Selectors are read high-to-low: the top two bits choose output x.
     let lanes = [
-        (fields & 0b0000_0011) as usize,
-        ((fields >> 2) & 0b0000_0011) as usize,
-        ((fields >> 4) & 0b0000_0011) as usize,
         ((fields >> 6) & 0b0000_0011) as usize,
+        ((fields >> 4) & 0b0000_0011) as usize,
+        ((fields >> 2) & 0b0000_0011) as usize,
+        (fields & 0b0000_0011) as usize,
     ];
     let suffix = lanes
         .iter()
@@ -1354,13 +1242,13 @@ fn collapse_lerp_constant(
     let value = input.value.and_then(|input| {
         let a = constants.get(start).copied()?;
         let b = constants.get(start + 1).copied()?;
-        Some(vec4_zip(a, b, |a, b| {
+        Some(std::array::from_fn(|lane| {
             let t = if op.name == "lerp_constant_saturated" {
-                input[0].clamp(0.0, 1.0)
+                input[lane].clamp(0.0, 1.0)
             } else {
-                input[0]
+                input[lane]
             };
-            a + (b - a) * t
+            a[lane] + (b[lane] - a[lane]) * t
         }))
     });
     stack.push(TfxStackValue {
@@ -1499,7 +1387,8 @@ fn masked_spline_sum(values: [f32; 4], mask: [f32; 4]) -> f32 {
 }
 
 fn eval_spline4(x: [f32; 4], constants: &[[f32; 4]]) -> Option<[f32; 4]> {
-    let [c0, c1, c2, c3, thresholds] = constants.try_into().ok()?;
+    // Coefficients are stored cubic first, like spline8.
+    let [c3, c2, c1, c0, thresholds] = constants.try_into().ok()?;
     let result = masked_spline_sum(
         eval_spline_polynomial(x, c3, c2, c1, c0),
         spline_channel_mask(x, thresholds),
@@ -1627,7 +1516,6 @@ fn format_tfx_runtime_value(
     object_channels: &std::collections::HashMap<u32, [f32; 4]>,
     extern_values: &std::collections::HashMap<(String, u32), [f32; 4]>,
     global_channels: &std::collections::HashMap<u32, [f32; 4]>,
-    context_values: &std::collections::HashMap<u32, [f32; 4]>,
 ) -> TfxStackValue {
     let runtime_value = if op.name.starts_with("push_extern_") {
         op.detail.split_once("+0x").and_then(|(scope, offset)| {
@@ -1639,14 +1527,6 @@ fn format_tfx_runtime_value(
             .strip_prefix("index=")
             .and_then(|index| index.parse::<u32>().ok())
             .and_then(|index| global_channels.get(&index).copied())
-    } else if matches!(
-        op.name,
-        "marathon_context_value" | "push_marathon_indexed_value"
-    ) {
-        op.detail
-            .strip_prefix("index=")
-            .and_then(|index| index.parse::<u32>().ok())
-            .and_then(|index| context_values.get(&index).copied())
     } else {
         None
     };
@@ -1740,16 +1620,64 @@ fn evaluate_stack_op(name: &str, args: &[TfxStackValue]) -> Option<[f32; 4]> {
             Some(tfx_sin_rotations([a[0], a[1] + 0.25, a[2], a[3] + 0.25]))
         }
         ("triangle", [a]) => Some(a.map(|value| (value - value.round()).abs() * 2.0)),
+        ("jitter", [a]) => {
+            let rotations = [4.67, 2.99, 1.08, 1.35]
+                .iter()
+                .zip([0.52, 0.37, 0.16, 0.79])
+                .map(|(scale, offset)| a[0] * scale + offset);
+            // Scaled sum of parabolic sines, then a Hermite smooth step.
+            let v = rotations
+                .map(|rotation| {
+                    let wrapped = rotation - rotation.round();
+                    wrapped * 0.25 * (wrapped.abs() * -16.0 + 8.0)
+                })
+                .sum::<f32>()
+                + 0.5;
+            Some([(-2.0 * v + 3.0) * v * v; 4])
+        }
+        ("wander", [a]) => {
+            let pseudo_sin = |rotation: f32| {
+                let wrapped = rotation - rotation.round();
+                wrapped * (wrapped.abs() * -16.0 + 8.0)
+            };
+            let first = [(4.08, 0.92), (1.02, 0.33), (3.0 / 5.37, 0.26), (3.0 / 9.67, 0.54)];
+            let second = [(1.83, 0.12, 0.02), (3.09, 0.37, 0.02), (0.39, 0.16, 0.28), (0.87, 0.79, 0.28)];
+            let sum = first
+                .iter()
+                .zip(second)
+                .map(|((scale0, offset0), (scale1, offset1, weight))| {
+                    pseudo_sin(a[0] * scale0 + offset0) * pseudo_sin(a[0] * scale1 + offset1) * weight
+                })
+                .sum::<f32>();
+            Some([0.5 + sum; 4])
+        }
+        ("rand", [a]) => Some([tfx_rand(a[0].floor()); 4]),
+        ("rand_smooth", [a]) => {
+            let base = a[0].round();
+            let f = a[0] - base;
+            let smooth = (-2.0 * f + 3.0) * f * f;
+            let (from, to) = (tfx_rand(base), tfx_rand(base + 1.0));
+            Some([from + (to - from) * smooth; 4])
+        }
+        // All four lanes are scaled by the reciprocal xyz length; a zero
+        // vector stays zero.
         ("normalize3", [a]) => {
-            let length = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
-            Some(if length.is_finite() && length > 0.0 {
-                [a[0] / length, a[1] / length, a[2] / length, a[3]]
-            } else {
-                [0.0, 0.0, 0.0, a[3]]
-            })
+            let scale = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().recip();
+            Some(if scale.is_finite() { a.map(|value| value * scale) } else { [0.0; 4] })
         }
         _ => None,
     }
+}
+
+/// Tiger's hash: the seed dotted with reciprocal primes, then one
+/// Blum-Blum-Shub style squaring step.
+fn tfx_rand(seed: f32) -> f32 {
+    let dot = [1.0 / 1.043501, 1.0 / 0.794471, 1.0 / 0.113777, 1.0 / 0.015101]
+        .iter()
+        .map(|scale: &f32| seed * scale)
+        .sum::<f32>();
+    let value = dot.fract();
+    (value * value * 251.0).fract()
 }
 
 fn tfx_sin_rotations(value: [f32; 4]) -> [f32; 4] {
@@ -1827,7 +1755,7 @@ fn parse_tfx_bytecode_op(
         0x19 => ("round", String::new()),
         0x1a => ("frac", String::new()),
         0x1b => ("unk1b", String::new()),
-        0x1c => ("unk1c", String::new()),
+        0x1c => ("normalize3", String::new()),
         0x1d => ("negate", String::new()),
         0x1e => ("vector_rotations_sin", String::new()),
         0x1f => ("vector_rotations_cos", String::new()),
@@ -2274,714 +2202,3 @@ fn read_i64(data: &[u8], endian: Endian) -> i64 {
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "material_piecewise_reference_tests.rs"]
 mod piecewise_reference_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn marathon_constant_buffer_binding_uses_its_authored_stage_layout() {
-        let mut data = [0u8; 0x80];
-        data[0x68..0x6c].copy_from_slice(&3i32.to_le_bytes());
-        data[0x6c..0x70].copy_from_slice(&0x80A9D945u32.to_le_bytes());
-        data[0x70..0x74].copy_from_slice(&7i32.to_le_bytes());
-        data[0x74..0x78].copy_from_slice(&0x80A9D0E9u32.to_le_bytes());
-        assert_eq!(
-            constant_buffer_binding(&data, 0, Endian::Little, true),
-            (Some(3), Some(TagHash(0x80A9D945)))
-        );
-        assert_eq!(
-            constant_buffer_binding(&data, 0, Endian::Little, false),
-            (Some(7), Some(TagHash(0x80A9D0E9)))
-        );
-    }
-
-    #[test]
-    fn constant_buffer_retains_partial_final_register_in_both_endians() {
-        for endian in [Endian::Little, Endian::Big] {
-            let data = (0..34)
-                .flat_map(|i| match endian {
-                    Endian::Little => (i as f32).to_le_bytes(),
-                    Endian::Big => (i as f32).to_be_bytes(),
-                })
-                .collect::<Vec<_>>();
-            let values = parse_constant_buffer_values(&data, endian).unwrap();
-            assert_eq!(values.len(), 9);
-            assert_eq!(values[8], [32.0, 33.0, 0.0, 0.0]);
-        }
-        assert!(parse_constant_buffer_values(&[0; 3], Endian::Little).is_none());
-    }
-
-    fn stack_value(value: [f32; 4]) -> TfxStackValue {
-        TfxStackValue {
-            expression: "test".to_string(),
-            value: Some(value),
-        }
-    }
-
-    #[test]
-    fn evaluates_alkahest_tfx_vector_semantics() {
-        let lerp = evaluate_stack_op(
-            "lerp",
-            &[
-                stack_value([0.0; 4]),
-                stack_value([10.0, 20.0, 30.0, 40.0]),
-                stack_value([0.25, 0.5, 0.75, 1.0]),
-            ],
-        );
-        assert_eq!(lerp, Some([2.5, 10.0, 22.5, 40.0]));
-
-        let merged = evaluate_stack_op(
-            "merge_3_1",
-            &[stack_value([1.0, 2.0, 3.0, 4.0]), stack_value([9.0; 4])],
-        );
-        assert_eq!(merged, Some([1.0, 2.0, 3.0, 9.0]));
-
-        let transformed = evaluate_stack_op(
-            "transform_vec4",
-            &[
-                stack_value([1.0, 0.0, 0.0, 0.0]),
-                stack_value([0.0, 1.0, 0.0, 0.0]),
-                stack_value([0.0, 0.0, 1.0, 0.0]),
-                stack_value([5.0, 6.0, 7.0, 1.0]),
-                stack_value([1.0, 2.0, 3.0, 1.0]),
-            ],
-        );
-        assert_eq!(transformed, Some([6.0, 8.0, 10.0, 1.0]));
-    }
-
-    #[test]
-    fn decodes_technique_render_state_selection() {
-        let state = TechniqueRenderState::from_raw(0x85838281);
-        assert_eq!(state.blend, Some(1));
-        assert_eq!(state.depth_stencil, Some(2));
-        assert_eq!(state.rasterizer, Some(3));
-        assert_eq!(state.depth_bias, Some(5));
-
-        assert_eq!(
-            TechniqueRenderState::from_raw(0x00000000),
-            TechniqueRenderState::default()
-        );
-    }
-
-    #[test]
-    fn reads_wide_hash32() {
-        let mut data = vec![0; 0x10];
-        data[0x0..0x4].copy_from_slice(&0x80806DCF_u32.to_le_bytes());
-        data[0x4..0x8].copy_from_slice(&1_u32.to_le_bytes());
-
-        let hash = read_wide_hash(&data, Endian::Little).unwrap();
-
-        assert!(hash.is_hash32);
-        assert_eq!(hash.raw32.0, 0x80806DCF);
-        assert_eq!(hash.resolved.unwrap().0, 0x80806DCF);
-    }
-
-    #[test]
-    fn reads_relative_array_payload() {
-        let mut data = vec![0; 0x50];
-        data[0x10..0x18].copy_from_slice(&2_u64.to_le_bytes());
-        data[0x18..0x20].copy_from_slice(&0x18_i64.to_le_bytes());
-        data[0x30..0x38].copy_from_slice(&2_u64.to_le_bytes());
-        data[0x40..0x42].copy_from_slice(&0x1122_u16.to_le_bytes());
-        data[0x42..0x44].copy_from_slice(&0x3344_u16.to_le_bytes());
-
-        let array = read_array(&data, 0x10, 2, Endian::Little).unwrap();
-
-        assert_eq!(u16::from_le_bytes([array[0], array[1]]), 0x1122);
-        assert_eq!(u16::from_le_bytes([array[2], array[3]]), 0x3344);
-    }
-
-    #[test]
-    fn decodes_tfx_binding_opcodes() {
-        let bytecode = [
-            0x34, 0x02, // push_const_vec4 constant 2
-            0x4d, 0x01, // push_sampler index 1
-            0x4a, 0x20, // set_shader_sampler PS slot 0
-            0x48, 0x40, // set_shader_texture VS slot 0
-            0x4e, 0x12, 0x34, 0x56, 0x78, // push_object_channel
-        ];
-
-        let decoded = parse_tfx_bytecode(&bytecode);
-
-        assert_eq!(decoded.decoded_ops, 5);
-        assert_eq!(decoded.unknown_ops, 0);
-        assert_eq!(decoded.bindings.len(), 2);
-        assert_eq!(decoded.bindings[0].kind, "sampler");
-        assert_eq!(decoded.bindings[0].stage, "PS");
-        assert_eq!(decoded.bindings[0].slot, 0);
-        assert_eq!(decoded.bindings[0].source, "sampler[1]");
-        assert_eq!(decoded.bindings[1].kind, "texture");
-        assert_eq!(decoded.bindings[1].stage, "VS");
-        assert!(decoded.externs.is_empty());
-        assert_eq!(decoded.ops[0].name, "push_const_vec4");
-        assert_eq!(decoded.ops[2].detail, "PS slot=0");
-        assert_eq!(decoded.ops[3].detail, "VS slot=0");
-        assert_eq!(decoded.ops[4].detail, "0x12345678");
-    }
-
-    #[test]
-    fn parses_vec4_constants() {
-        let mut data = vec![];
-        for value in [1.0_f32, -2.5, 3.25, 4.5, 5.0, 6.0, 7.0, 8.0] {
-            data.extend_from_slice(&value.to_le_bytes());
-        }
-
-        let constants = parse_vec4_array(&data, Endian::Little);
-
-        assert_eq!(constants.len(), 2);
-        assert_eq!(constants[0], [1.0, -2.5, 3.25, 4.5]);
-        assert_eq!(constants[1], [5.0, 6.0, 7.0, 8.0]);
-    }
-
-    #[test]
-    fn selects_clear_chromatic_mask_tint() {
-        let values = [
-            [0.3, 0.59, 0.11, 0.0],
-            [1.0, 1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.7694378, 0.260424, 0.054473493, 0.0],
-            [0.5, 0.5, 0.5, 1.0],
-        ];
-
-        assert_eq!(
-            select_confident_mask_tint(&values),
-            Some([0.7694378, 0.260424, 0.054473493, 1.0])
-        );
-    }
-
-    #[test]
-    fn extracts_compact_shader_mask_palette_at_authored_registers() {
-        let mut values = vec![[0.0; 4]; 56];
-        values[53] = [0.22, 0.16, 0.09, 1.0];
-        values[54] = [0.23, 0.35, 0.23, 0.0];
-
-        assert_eq!(
-            compact_mask_palette(&values),
-            Some([values[53], values[54]])
-        );
-        assert_eq!(compact_mask_palette(&values[..54]), None);
-    }
-
-    #[test]
-    fn rejects_ambiguous_mask_tints() {
-        let values = [[0.8, 0.1, 0.1, 0.0], [0.1, 0.8, 0.1, 0.0]];
-
-        assert_eq!(select_confident_mask_tint(&values), None);
-    }
-
-    #[test]
-    fn maps_tfx_constant_refs_to_values() {
-        let constants = vec![
-            [1.0, 2.0, 3.0, 4.0],
-            [5.0, 6.0, 7.0, 8.0],
-            [9.0, 10.0, 11.0, 12.0],
-        ];
-        let decoded = parse_tfx_bytecode_with_constants(
-            &[
-                0x34, 0x01, // push_const_vec4 constant 1
-                0x35, 0x00, // lerp_constant constants 0..2
-                0x3a,
-                0x02, // gradient4_const constants 2..8, truncated by available constants
-            ],
-            &constants,
-        );
-
-        assert_eq!(decoded.constant_refs.len(), 3);
-        assert_eq!(decoded.constant_refs[0].start, 1);
-        assert_eq!(decoded.constant_refs[0].count, 1);
-        assert_eq!(decoded.constant_refs[0].values, vec![[5.0, 6.0, 7.0, 8.0]]);
-        assert_eq!(decoded.constant_refs[1].values.len(), 2);
-        assert_eq!(decoded.constant_refs[2].start, 2);
-        assert_eq!(decoded.constant_refs[2].count, 6);
-        assert_eq!(
-            decoded.constant_refs[2].values,
-            vec![[9.0, 10.0, 11.0, 12.0]]
-        );
-    }
-
-    #[test]
-    fn interprets_tfx_temp_and_output_expressions() {
-        let constants = vec![[2.0, -3.0, 4.0, -5.0], [10.0, 20.0, 30.0, 40.0]];
-        let decoded = parse_tfx_bytecode_with_constants(
-            &[
-                0x34, 0x00, // push_const_vec4 constant 0
-                0x34, 0x01, // push_const_vec4 constant 1
-                0x03, // multiply
-                0x47, 0x02, // pop_temp slot 2
-                0x46, 0x02, // push_temp slot 2
-                0x15, // abs
-                0x44, 0x03, // pop_output element 3
-            ],
-            &constants,
-        );
-
-        assert_eq!(decoded.expressions.len(), 2);
-        assert_eq!(decoded.expressions[0].target, "temp[2]");
-        assert_eq!(
-            decoded.expressions[0].expression,
-            "multiply(constant[0], constant[1])"
-        );
-        assert_eq!(
-            decoded.expressions[0].value,
-            Some([20.0, -60.0, 120.0, -200.0])
-        );
-        assert_eq!(decoded.expressions[1].target, "output[3]");
-        assert_eq!(
-            decoded.expressions[1].expression,
-            "abs(multiply(constant[0], constant[1]))"
-        );
-        assert_eq!(
-            decoded.expressions[1].value,
-            Some([20.0, 60.0, 120.0, 200.0])
-        );
-    }
-
-    #[test]
-    fn retains_full_tfx_program_beyond_inspector_display_cap() {
-        let mut bytecode = Vec::new();
-        for output in 0_u8..100 {
-            bytecode.extend([0x34, 0x00, 0x44, output]);
-        }
-
-        let decoded = parse_tfx_bytecode_with_constants(&bytecode, &[[0.25; 4]]);
-
-        assert!(
-            decoded.truncated,
-            "inspector must report display truncation"
-        );
-        assert_eq!(decoded.ops.len(), 200, "render interpreter needs every op");
-        assert_eq!(decoded.expressions.len(), 100);
-        assert_eq!(decoded.expressions[99].target, "output[99]");
-        assert_eq!(decoded.expressions[99].value, Some([0.25; 4]));
-    }
-
-    #[test]
-    fn unknown_extern_scopes_retain_identity_and_resolve_independently() {
-        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
-        let decoded = parse_tfx_bytecode_with_constants_dialect(
-            &[0x4b, 108, 7, 0x53, 0, 0x4b, 109, 7, 0x53, 1],
-            &[],
-            true,
-        );
-        assert_eq!(decoded.externs[0].scope, "Extern[108]");
-        assert_eq!(decoded.externs[1].scope, "Extern[109]");
-        let mut inputs = TfxRuntimeInputs::default();
-        inputs
-            .scoped_externs
-            .insert((108, 0x70), TfxValue::Vector([1.0; 4]));
-        inputs
-            .scoped_externs
-            .insert((109, 0x70), TfxValue::Vector([2.0; 4]));
-        let result = execute_preview(&decoded, &[], &inputs, &Default::default());
-        assert_eq!(result.outputs["output[0]"], TfxValue::Vector([1.0; 4]));
-        assert_eq!(result.outputs["output[1]"], TfxValue::Vector([2.0; 4]));
-        assert!(
-            result
-                .dependencies
-                .iter()
-                .all(|dependency| dependency.resolved)
-        );
-        inputs
-            .scoped_externs
-            .insert((109, 0x70), TfxValue::Vector([3.0; 4]));
-        let changed = execute_preview(&decoded, &[], &inputs, &Default::default());
-        assert_eq!(changed.outputs["output[0]"], result.outputs["output[0]"]);
-        assert_eq!(changed.outputs["output[1]"], TfxValue::Vector([3.0; 4]));
-        inputs.scoped_externs.insert(
-            (108, 0x70),
-            TfxValue::Unknown("missing skinning input".into()),
-        );
-        let missing = execute_preview(&decoded, &[], &inputs, &Default::default());
-        assert!(!missing.dependencies[0].resolved);
-        assert!(matches!(missing.outputs["output[0]"], TfxValue::Unknown(_)));
-    }
-
-    #[test]
-    fn marathon_matrix_store_preserves_order_stack_and_missing_row_status() {
-        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
-        let program = parse_tfx_bytecode_with_constants_dialect(
-            &[
-                0x42, 0x00, // scalar/vector beneath matrix stays on stack
-                0x4c, 0x02, 0x1a, // actual View scope matrix source +0x1A0
-                0x55, 0x04, // actual Marathon four-row output store
-                0x53, 0x03,
-            ],
-            &[[91.0; 4]],
-            true,
-        );
-        assert_eq!(program.status, TfxDecodeStatus::Complete);
-        assert_eq!(program.ops[2].name, "pop_output_mat4");
-        let columns = [
-            [1.0, 2.0, 3.0, 4.0],
-            [5.0, 6.0, 7.0, 8.0],
-            [9.0, 10.0, 11.0, 12.0],
-            [13.0, 14.0, 15.0, 16.0],
-        ];
-        let mut inputs = TfxRuntimeInputs::default();
-        for (row, column) in columns.into_iter().enumerate() {
-            inputs
-                .view
-                .insert(0x1a0 + row as u32 * 16, TfxValue::Vector(column));
-        }
-        let result = execute_preview(&program, &[[91.0; 4]], &inputs, &Default::default());
-        assert_eq!(result.outputs.len(), 5);
-        assert_eq!(result.outputs["output[3]"], TfxValue::Vector([91.0; 4]));
-        for (row, column) in columns.into_iter().enumerate() {
-            assert_eq!(
-                result.outputs[&format!("output[{}]", row + 4)],
-                TfxValue::Vector(column)
-            );
-        }
-        assert!(result.dependencies[0].resolved);
-        // A scoped unknown must override a named row and invalidate the whole
-        // matrix dependency, without silently replacing it with another row.
-        inputs
-            .scoped_externs
-            .insert((2, 0x1c0), TfxValue::Unknown("missing column".into()));
-        let missing = execute_preview(&program, &[[91.0; 4]], &inputs, &Default::default());
-        assert!(!missing.dependencies[0].resolved);
-        assert!(matches!(missing.outputs["output[6]"], TfxValue::Unknown(_)));
-        assert_eq!(missing.outputs["output[4]"], result.outputs["output[4]"]);
-        inputs
-            .scoped_externs
-            .insert((2, 0x1c0), TfxValue::Vector([37.0; 4]));
-        let changed = execute_preview(&program, &[[91.0; 4]], &inputs, &Default::default());
-        assert!(changed.dependencies[0].resolved);
-        assert_eq!(changed.outputs["output[6]"], TfxValue::Vector([37.0; 4]));
-    }
-
-    #[test]
-    fn external_matrix_transform_consumes_four_columns() {
-        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
-        let program = parse_tfx_bytecode_with_constants_dialect(
-            &[0x4c, 0x02, 0x1a, 0x42, 0x00, 0x35, 0x53, 0x00],
-            &[[2.0, 3.0, 5.0, 7.0]],
-            true,
-        );
-        let mut inputs = TfxRuntimeInputs::default();
-        for row in 0..4 {
-            inputs.scoped_externs.insert(
-                (2, 0x1a0 + row * 16),
-                TfxValue::Vector(std::array::from_fn(|lane| {
-                    (row * 4 + lane as u32 + 1) as f32
-                })),
-            );
-        }
-        let result = execute_preview(&program, &[[2.0, 3.0, 5.0, 7.0]], &inputs, &Default::default());
-        assert_eq!(
-            result.outputs["output[0]"],
-            TfxValue::Vector([153.0, 170.0, 187.0, 204.0])
-        );
-        assert!(result.dependencies[0].resolved);
-    }
-
-    #[test]
-    fn marathon_unverified_matrix_opcode_remains_explicit() {
-        for opcode in [0x54, 0x56] {
-            let program = parse_tfx_bytecode_with_constants_dialect(&[opcode, 0x00], &[], true);
-            assert_eq!(program.status, TfxDecodeStatus::StoppedAtUnknown);
-            assert_eq!(program.undecoded_bytes, [opcode, 0x00]);
-        }
-    }
-
-    #[test]
-    fn decodes_extern_refs() {
-        let decoded = parse_tfx_bytecode(&[
-            0x3d, 0x02, 0x03, // push_extern_vec4 View+0x30
-            0x3f, 0x26, 0x04, // push_extern_texture TextureSet+0x20
-        ]);
-
-        assert_eq!(decoded.externs.len(), 2);
-        assert_eq!(decoded.externs[0].value_type, "vec4");
-        assert_eq!(decoded.externs[0].scope, "View");
-        assert_eq!(decoded.externs[0].byte_offset, 0x30);
-        assert_eq!(decoded.externs[0].hint, "camera/view runtime constant");
-        assert_eq!(decoded.externs[1].value_type, "texture");
-        assert_eq!(decoded.externs[1].scope, "TextureSet");
-        assert_eq!(decoded.externs[1].byte_offset, 0x20);
-        assert_eq!(
-            decoded.externs[1].hint,
-            "material texture-set runtime binding"
-        );
-    }
-
-    #[test]
-    fn marathon_frame_and_view_inputs_resolve_with_matching_dependency_status() {
-        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
-        let program = parse_tfx_bytecode_with_constants_dialect(
-            &[
-                0x4a, 1, 0, 0x53, 0, // authored Frame float at0 -> output0
-                0x4b, 2, 3, 0x53, 1, // authored View vec4 at0x30 -> output1
-                0x4a, 1, 1, 0x53, 2, // authored Frame render time at4 -> output2
-            ],
-            &[],
-            true,
-        );
-        assert_eq!(program.externs[0].scope, "Frame");
-        assert_eq!(program.externs[1].scope, "View");
-        let mut inputs = TfxRuntimeInputs {
-            time_seconds: 2.5,
-            ..Default::default()
-        };
-        let missing_view = execute_preview(&program, &[], &inputs, &Default::default());
-        assert!(missing_view.dependencies[0].resolved);
-        assert!(!missing_view.dependencies[1].resolved);
-        assert!(missing_view.dependencies[2].resolved);
-        assert_eq!(missing_view.outputs["output[2]"], TfxValue::Vector([2.5; 4]));
-        assert_eq!(
-            missing_view.outputs["output[0]"],
-            TfxValue::Vector([2.5; 4])
-        );
-        inputs
-            .view
-            .insert(0x30, TfxValue::Vector([1.0, 2.0, 3.0, 4.0]));
-        inputs.time_seconds = 3.5;
-        let live = execute_preview(&program, &[], &inputs, &Default::default());
-        assert!(live.dependencies.iter().all(|d| d.resolved));
-        assert_eq!(live.outputs["output[0]"], TfxValue::Vector([3.5; 4]));
-        assert_eq!(live.outputs["output[2]"], TfxValue::Vector([3.5; 4]));
-        inputs.frame.insert(4, TfxValue::Scalar(19.0));
-        let separate_clock = execute_preview(&program, &[], &inputs, &Default::default());
-        assert_eq!(separate_clock.outputs["output[0]"], TfxValue::Vector([3.5; 4]));
-        assert_eq!(separate_clock.outputs["output[2]"], TfxValue::Vector([19.0; 4]));
-        inputs.scoped_externs.insert((1, 4), TfxValue::Unknown("missing render time".into()));
-        let missing_render_time = execute_preview(&program, &[], &inputs, &Default::default());
-        assert!(!missing_render_time.dependencies[2].resolved);
-        assert!(matches!(missing_render_time.outputs["output[2]"], TfxValue::Unknown(_)));
-        inputs.scoped_externs.remove(&(1, 4));
-        assert_eq!(
-            live.outputs["output[1]"],
-            TfxValue::Vector([1.0, 2.0, 3.0, 4.0])
-        );
-        inputs
-            .frame
-            .insert(0, TfxValue::Unknown("explicit missing frame".into()));
-        let missing_frame = execute_preview(&program, &[], &inputs, &Default::default());
-        assert!(!missing_frame.dependencies[0].resolved);
-        assert!(matches!(
-            missing_frame.outputs["output[0]"],
-            TfxValue::Unknown(_)
-        ));
-        inputs.frame.insert(0, TfxValue::Scalar(7.0));
-        let explicit_frame = execute_preview(&program, &[], &inputs, &Default::default());
-        assert!(explicit_frame.dependencies[0].resolved);
-        assert_eq!(
-            explicit_frame.outputs["output[0]"],
-            TfxValue::Vector([7.0; 4])
-        );
-        inputs.scoped_externs.insert(
-            (1, 0),
-            TfxValue::Unknown("numeric ID explicitly missing".into()),
-        );
-        let scoped_missing = execute_preview(&program, &[], &inputs, &Default::default());
-        assert!(!scoped_missing.dependencies[0].resolved);
-        assert!(matches!(
-            scoped_missing.outputs["output[0]"],
-            TfxValue::Unknown(_)
-        ));
-        let coverage=parse_tfx_bytecode_with_constants_dialect(&[0x4b,1,0x1e,0x53,2],&[],true);
-        let mut inputs=TfxRuntimeInputs::default();
-        assert!(!execute_preview(&coverage,&[],&inputs, &Default::default()).dependencies[0].resolved);
-        inputs.apply_static_preview_coverage();
-        let analytic=execute_preview(&coverage,&[],&inputs, &Default::default());
-        assert!(analytic.dependencies[0].resolved);
-        assert_eq!(analytic.outputs["output[2]"],TfxValue::Vector([0.0;4]));
-        inputs.frame.insert(0x1e0,TfxValue::Vector([1.0;4]));
-        inputs.apply_static_preview_coverage();
-        assert_eq!(execute_preview(&coverage,&[],&inputs, &Default::default()).outputs["output[2]"],TfxValue::Vector([1.0;4]));
-        inputs.scoped_externs.insert((1,0x1e0),TfxValue::Unknown("explicit missing coverage".into()));
-        assert!(!execute_preview(&coverage,&[],&inputs, &Default::default()).dependencies[0].resolved);
-        inputs.scoped_externs.clear();
-        inputs.frame.insert(0x1e0,TfxValue::Unknown("explicit missing frame coverage".into()));
-        inputs.apply_static_preview_coverage();
-        assert!(!execute_preview(&coverage,&[],&inputs, &Default::default()).dependencies[0].resolved);
-    }
-
-    #[test]
-    fn decodes_marathon_extern_indices_after_cui_drawing_shader_insert() {
-        let decoded = parse_tfx_bytecode_with_constants_dialect(
-            &[
-                0x4d, 24, 0, // push_extern_texture CuiDrawingShader+0x0
-                0x4b, 45, 3, // push_extern_vec4 Decal+0x30
-                0x4d, 45, 1, // push_extern_texture Decal+0x8
-                0x4b, 46, 0, // push_extern_vec4 DecalSetTransform+0x0
-                0x4b, 87, 0, // push_extern_vec4 UberDepth+0x0
-                0x4b, 88, 0, // push_extern_vec4 GearDye+0x0
-                0x4b, 98, 0, // push_extern_vec4 ParticleMeshEmissionCompute+0x0
-            ],
-            &[],
-            true,
-        );
-
-        assert_eq!(decoded.unknown_ops, 0);
-        assert_eq!(
-            decoded
-                .externs
-                .iter()
-                .map(|external| (external.scope.as_str(), external.byte_offset))
-                .collect::<Vec<_>>(),
-            vec![
-                ("CuiDrawingShader", 0x00),
-                ("Decal", 0x30),
-                ("Decal", 0x08),
-                ("DecalSetTransform", 0x00),
-                ("UberDepth", 0x00),
-                ("GearDye", 0x00),
-                ("ParticleMeshEmissionCompute", 0x00),
-            ]
-        );
-        assert!(tfx_has_marathon_decal_abi(&decoded));
-
-        let legacy = parse_tfx_bytecode(&[0x3d, 45, 0]);
-        assert_eq!(legacy.externs[0].scope, "DecalSetTransform");
-        assert!(!tfx_has_marathon_decal_abi(&legacy));
-    }
-
-    #[test]
-    fn decodes_tfx_texture_bind_source() {
-        let decoded = parse_tfx_bytecode(&[
-            0x3f, 0x26, 0x02, // push_extern_texture TextureSet+0x10
-            0x48, 0x20, // set_shader_texture PS slot 0
-        ]);
-
-        assert_eq!(decoded.bindings.len(), 1);
-        assert_eq!(decoded.bindings[0].kind, "texture");
-        assert_eq!(decoded.bindings[0].stage, "PS");
-        assert_eq!(decoded.bindings[0].slot, 0);
-        assert_eq!(
-            parse_tfx_texture_source(&decoded.bindings[0].source),
-            Some(("TextureSet".to_string(), 0x10))
-        );
-    }
-
-    #[test]
-    fn decodes_marathon_tfx_sampler_and_extern_prefix() {
-        let decoded = parse_tfx_bytecode_with_constants_dialect(
-            &[
-                0x61, 0x00, // push_sampler 0
-                0x5d, 0x21, // set_shader_sampler PS slot 1
-                0x4b, 0x02, 0x47, // push_extern_vec4 RigidModel+0x470
-                0x53, 0x05, // pop_output 5
-                0x63, 0xca, // push_global_channel 0xca
-                0x29, 0x00, // permute .xxxx
-                0x2a, // saturate
-                0x53, 0x48, // pop_output 72
-                0x62, 0x8c, 0x5e, 0xa3, 0x44, // push_object_channel 0x8c5ea344
-                0x53, 0x49, // pop_output 73
-            ],
-            &[],
-            true,
-        );
-
-        assert_eq!(decoded.unknown_ops, 0);
-        assert_eq!(decoded.decoded_ops, 10);
-        assert_eq!(decoded.bindings.len(), 1);
-        assert_eq!(decoded.bindings[0].kind, "sampler");
-        assert_eq!(decoded.bindings[0].stage, "PS");
-        assert_eq!(decoded.bindings[0].slot, 1);
-        assert_eq!(decoded.expressions.len(), 3);
-    }
-
-    #[test]
-    fn preserves_unknown_tfx_tail_and_reports_status() {
-        let stopped = parse_tfx_bytecode(&[0xff, 0x12, 0x34]);
-        assert_eq!(stopped.status, TfxDecodeStatus::StoppedAtUnknown);
-        assert_eq!(stopped.undecoded_offset, Some(0));
-        assert_eq!(stopped.undecoded_bytes, [0xff, 0x12, 0x34]);
-
-        let partial = parse_tfx_bytecode_with_constants_dialect(&[0x6d, 0x53, 0x00], &[], true);
-        assert_eq!(partial.status, TfxDecodeStatus::Partial);
-        assert_eq!(partial.unknown_ops, 1);
-        assert_eq!(partial.decoded_ops, 2);
-        assert!(partial.undecoded_bytes.is_empty());
-    }
-
-    #[test]
-    fn propagates_lerp_constant_expression_values() {
-        let constants = vec![
-            [0.25, 0.25, 0.25, 0.25],
-            [10.0, 20.0, 30.0, 40.0],
-            [20.0, 40.0, 60.0, 80.0],
-        ];
-        let decoded = parse_tfx_bytecode_with_constants(
-            &[
-                0x34, 0x00, // push_const_vec4 constant 0
-                0x35, 0x01, // lerp_constant constants 1..3
-                0x44, 0x00, // pop_output element 0
-            ],
-            &constants,
-        );
-
-        assert_eq!(decoded.expressions.len(), 1);
-        assert_eq!(
-            decoded.expressions[0].expression,
-            "lerp_constant(constant[1..3], constant[0])"
-        );
-        assert_eq!(decoded.expressions[0].value, Some([12.5, 25.0, 37.5, 50.0]));
-    }
-
-    #[test]
-    fn reuses_outputs_and_evaluates_swizzles() {
-        let constants = vec![[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]];
-        let decoded = parse_tfx_bytecode_with_constants(
-            &[
-                0x34, 0x00, // push_const_vec4 constant 0
-                0x22, 0x1b, // permute .wzyx
-                0x44, 0x01, // pop_output element 1
-                0x43, 0x01, // push_from_output element 1
-                0x34, 0x01, // push_const_vec4 constant 1
-                0x02, // subtract
-                0x07, // is_zero
-                0x44, 0x02, // pop_output element 2
-            ],
-            &constants,
-        );
-
-        assert_eq!(decoded.expressions.len(), 2);
-        assert_eq!(decoded.expressions[0].expression, "constant[0].wzyx");
-        assert_eq!(decoded.expressions[0].value, Some([4.0, 3.0, 2.0, 1.0]));
-        assert_eq!(
-            decoded.expressions[1].expression,
-            "is_zero(subtract(constant[0].wzyx, constant[1]))"
-        );
-        assert_eq!(decoded.expressions[1].value, Some([1.0, 1.0, 1.0, 1.0]));
-    }
-
-    #[test]
-    fn evaluates_tfx_spline4_constants() {
-        let constants = [
-            [2.0, 0.0, 0.0, 0.0],
-            [0.0; 4],
-            [0.0; 4],
-            [0.0; 4],
-            [0.0, 1.0, 1.0, 1.0],
-        ];
-
-        assert_eq!(eval_spline4([0.5; 4], &constants), Some([2.0; 4]));
-    }
-
-    #[test]
-    fn evaluates_tfx_gradient4_constants() {
-        let constants = [
-            [0.0; 4],
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.25, 0.5, 0.75],
-        ];
-
-        assert_eq!(
-            eval_gradient4([0.125; 4], &constants),
-            Some([0.5, 0.0, 0.0, 0.0])
-        );
-    }
-
-    #[test]
-    fn decodes_scope_bits() {
-        let names = tfx_scope_names((1 << 0) | (1 << 2) | (1 << 40));
-
-        assert_eq!(names, vec!["Frame", "RigidModel", "ColorGradingUbershader"]);
-    }
-}

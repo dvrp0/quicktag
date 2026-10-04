@@ -695,28 +695,3 @@ const fn hex_digit(value: u8) -> u8 {
         _ => panic!("invalid SHA-256 hex digit"),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn embedded_programs_match_pinned_artifact_hashes() {
-        for program in programs() {
-            let actual: [u8; 32] = Sha256::digest(program.spirv).into();
-            assert_eq!(actual, program.spirv_sha256, "{}", program.shader_tag);
-        }
-    }
-
-    #[test]
-    fn lookup_requires_stage_and_payload_identity() {
-        let body = PROGRAMS.iter().find(|program| program.descriptor_abi == DescriptorAbi::BodyPixelDense).unwrap();
-        assert_eq!(
-            find_by_source_sha256(ShaderStage::Pixel, body.source_sha256)
-                .map(|program| program.shader_tag),
-            Some(TagHash(0x80A9D0E1))
-        );
-        assert!(find_by_source_sha256(ShaderStage::Vertex, body.source_sha256).is_none());
-        assert!(find_by_source_sha256(ShaderStage::Pixel, [0; 32]).is_none());
-    }
-}

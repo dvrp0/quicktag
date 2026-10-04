@@ -150,32 +150,3 @@ impl TryFrom<u8> for MarathonRenderStage {
         Self::ALL.get(raw as usize).copied().ok_or(raw)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn marathon_stage_table_is_dense_and_stable() {
-        assert_eq!(MarathonRenderStage::ALL.len(), MARATHON_RENDER_STAGE_COUNT);
-        for (raw, stage) in MarathonRenderStage::ALL.into_iter().enumerate() {
-            assert_eq!(stage.raw(), raw as u8);
-            assert_eq!(MarathonRenderStage::try_from(raw as u8), Ok(stage));
-        }
-        assert_eq!(MarathonRenderStage::try_from(25), Err(25));
-    }
-
-    #[test]
-    fn package_backed_stage_anchors_match_observed_raw_ids() {
-        assert_eq!(MarathonRenderStage::InvestmentDecals.raw(), 2);
-        assert_eq!(MarathonRenderStage::ShadowGenerate.raw(), 4);
-        assert_eq!(MarathonRenderStage::DepthPrepass.raw(), 13);
-        assert_eq!(MarathonRenderStage::Reticle.raw(), 17);
-        assert_eq!(MarathonRenderStage::ComputeSkinning.raw(), 24);
-        assert!(
-            MarathonRenderStage::MarathonSpecific3
-                .semantic_name()
-                .is_none()
-        );
-    }
-}

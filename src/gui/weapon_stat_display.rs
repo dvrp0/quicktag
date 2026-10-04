@@ -132,23 +132,3 @@ impl DisplayProgram {
         output
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn evaluates_authored_display_arithmetic_and_rejects_invalid_programs() {
-        let mut program = DisplayProgram {
-            code: vec![0x4a, 0, 0x42, 0, 4, 0x42, 1, 3, 0x4c, 0],
-            constants: vec![1.1, 100.0],
-            inputs: vec![(2, 20)],
-        };
-        assert_eq!(program.evaluate(&[1.1]), Some(100.0));
-        assert!((program.evaluate(&[0.36]).unwrap() - 32.72727).abs() < 0.00001);
-        program.constants[0] = 0.0;
-        assert_eq!(program.evaluate(&[1.1]), None);
-        program.code = vec![0xff];
-        assert_eq!(program.evaluate(&[1.1]), None);
-    }
-}

@@ -1,5 +1,83 @@
 # Tiger renderer roadmap
 
+### Lighting parameters — October 5
+
+- [x] Lighting panel: key light colour, sky ambient colour, ground ambient
+  colour. The deferred lighting of original-shader surfaces multiplies direct
+  light by the key colour and uses Tiger's global-light ambient weights
+  (`(0.5 ± 0.5·N.z)²` for sky and ground).
+- [ ] Forward-lit programs read their sun from global channels 100 (direction)
+  and 9/8/136 (colour and intensity), ambient from irradiance volumes. Feed
+  these same parameters there once a forward pass runs original shaders.
+
+### Transparents: refractive glass — October 5
+
+- [x] Assassin Vox Nocturna arm shell / finger guards (PS `80B14F45`, stage 8).
+  The source samples the scene behind it (nine taps, distorted), multiplies by
+  `lerp(cb0[28], cb0[29], thickness)` and `cb0[24].x`, and blends at
+  `cb0[31].x`. The viewer now draws that as a multiplicative transmittance
+  using those rows (`REFRACTIVE_GLASS_PROGRAMS`), replacing the generic path
+  that used its noise texture as albedo.
+- [ ] This is a viewer port of the material term, not the original shader. The
+  original needs world lighting volumes, fog and shadow scopes (cb2/cb3/cb8,
+  t11..t26) and a vertex program the lowering tool cannot adapt (its source
+  tree is not in the repo). Blur, thickness tint, marking layer `t4`, specular
+  and environment reflection are not reproduced.
+- [ ] Destroyer Emerald Impact's stage-8 program (`80A9F4D0`) is untouched.
+
+### Runner catalogue audit — October 5
+
+Measured over all 116 runner skins with `--render-model` (it now prints every
+package draw record and every technique stage). Highest-detail records only.
+
+- GenerateGbuffer: 1,810 of 1,813 draws run original shaders. The 3 left need
+  unregistered vertex programs and their compute producers (KASHA draw 9,
+  Vandal Achromatic Rush, Vandal White Rabbit). New pixel shaders are added
+  with `scripts/admit_runner_surface.py`.
+- InvestmentDecals: 606 of 606 on original shaders.
+- ShadowGenerate: 1,480 records drawn with the viewer's own caster shader;
+  none of the 289 vertex / 54 pixel programs is run, 12 of them read the clock.
+- Transparents: 2 records (Emerald Impact, Assassin Vox Nocturna), generic.
+- LightShaftOcclusion (2) and DepthPrepass (1,339) are not drawn.
+- ComputeSkinning: 1,242 of 1,266 producers registered; all run with a static
+  bind pose. Scope 108 (skinning) externs are host-supplied, and 86 producers
+  that read the clock (hair, cloth, procedural body) are evaluated once.
+- Pixel inputs still not real: `View+0x470..0x4E0` (zero planes, 195 programs),
+  `push_tex_dimensions` (2 programs, min cube LOD row zeroed), opcode 0x2D
+  (1 pixel, 37 compute programs).
+- Lighting, emission exposure, shadows and post-processing are the viewer's.
+
+### TFX runtime and animation — October 5
+
+- [x] Marathon expression opcodes follow the current Tiger numbering, not the
+  older table: `lerp`..`vector_rotations_sin_cos` are 0x13..0x23, 0x57/0x58
+  are temp push/pop, and 0x64 is a second global-channel push. Checked on 38
+  real pixel stages: every stack balances under this table; 9 did not before.
+- [x] Operator math matched to Alkahest's interpreter: `jitter`, `wander`,
+  `rand`, `rand_smooth` added; `permute` selectors read high-to-low;
+  `lerp_constant` is per lane; `spline4_const` stores the cubic term first.
+- [x] Pixel constants of original-shader surfaces and decals whose program
+  reads `Frame+0x0`/`Frame+0x4` are re-evaluated every frame at the viewer
+  clock (`AnimatedConstants`). The clock now runs by default.
+- [x] Decals use the same general unresolved-row rule as surfaces; the
+  per-decal dependency lists are gone.
+- [ ] Vertex- and compute-stage programs are still evaluated once at load.
+- [ ] Opcodes 0x10..0x12, 0x17, 0x1E, 0x1F, 0x24..0x27 and 0x51 are unverified.
+
+### Runner eyes — October 5
+
+- [x] Cube inputs in the opaque pixel ABI. The Acid Abyss eyeball PS `80B145BA`
+  reads an environment cube at t0; the registry only knew 2D and 3D slots, so
+  the shader was skipped and the eye fell back to plain white.
+- [x] Authored emission. Emission shares RT2.G with AO; the viewer now decodes
+  it with the formula of the packaged `debug_emissive` program
+  (`2^(13*saturate(2g-1.007843)-7) - 1/128`, times RT0 colour) into an HDR
+  emissive target. Before this no original-shader surface emitted at all.
+- [ ] The packaged emissive consumer also multiplies by Frame-scope exposure
+  factors (`cb13[1]`, `Frame+0x1F0.w`); the viewer leaves them at one.
+- [ ] Opcode `0x64` in the eye PS feeds the minimum cube LOD (row 5), which
+  suggests it is a per-texture mip/metadata value. Still zero.
+
 ### Open KASHA chest-mask follow-up — October 4
 
 - [x] Reproduce with the current production-renderer probe. Isolate opaque
@@ -12,13 +90,16 @@
   edge rejection, original composition order, and the explicit raw-position
   `TEXCOORD6.y <= 0` gate. Current chest draws remain `StandardSurface`;
   recent B152BE draw8 admission did not integrate this chest shader.
-- [ ] Integrate the complete authored chest layer-mask/composition contract
+- [x] Integrate the complete authored chest layer-mask/composition contract
   by source shader ABI, with packaged parameters/resources and exact input
   coordinates. Prove the reported side mask in displayed output. Full opaque
   shading's unresolved high View provider is separate from these known masks.
   Finding one side gate is not permission to cut primary color or every decal.
-- [ ] Ship and verify that mask fix. No renderer change/build delivered by
-  this investigation; this defect remains open.
+- [x] Admit every translated runner pixel shader under two engine-wide rules:
+  zero high-View highlight planes and zero for constant rows TFX cannot
+  evaluate. All KASHA jacket draws now run their original shaders and match
+  the in-game side mask.
+- [ ] Recover the real `View+0x470..0x4E0` planes and opcode `0x64`.
 
 ### Delivered Channel view — October 4
 

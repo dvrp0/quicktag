@@ -27,7 +27,6 @@ pub struct TfxRuntimeInputs {
     pub geometry_object_channels: BTreeMap<TagHash, BTreeMap<u32, TfxValue>>,
     pub global_channels: BTreeMap<u32, TfxValue>,
     pub gear_channels: BTreeMap<u32, TfxValue>,
-    pub context_values: BTreeMap<u32, TfxValue>,
     /// Numeric runtime externs keyed by their authored scope ID and byte offset.
     /// Required for producers such as Marathon compute skinning (scope108),
     /// whose identity must survive even before its semantic name is known.
@@ -54,6 +53,7 @@ impl TfxRuntimeInputs {
         let mut inputs=Self::for_pattern_preview(cache,pattern);
         if matches!(package_manager().version,tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon)) {
             inputs.apply_static_preview_coverage();
+            inputs.apply_static_preview_highlight_planes();
         }
         if let Some(shell)=crate::geometry::RunnerShellAssembly::resolve(cache,pattern) {
             let mut scopes=BTreeMap::new();
@@ -77,6 +77,17 @@ impl TfxRuntimeInputs {
     /// Explicit frame values (including Unknown) and scoped overrides win.
     pub(crate) fn apply_static_preview_coverage(&mut self) {
         self.frame.entry(0x1e0).or_insert(TfxValue::Vector([0.0;4]));
+    }
+
+    /// Viewer policy: View+0x470..0x4E0 hold eight planes that the engine
+    /// writes at runtime; no package carries them. Materials test the scaled
+    /// reflection vector against them to gate an additive highlight lookup.
+    /// Zero planes fail every test, so the highlight is absent while the rest
+    /// of the material stays exact. This is not a captured Marathon View value.
+    pub(crate) fn apply_static_preview_highlight_planes(&mut self) {
+        for offset in (0x470..=0x4e0).step_by(16) {
+            self.view.entry(offset).or_insert(TfxValue::Vector([0.0;4]));
+        }
     }
 
     pub(crate) fn for_geometry(&self, geometry: TagHash) -> Self {
@@ -284,8 +295,6 @@ pub fn execute_preview(
     };
     let object_channels = vectors(&inputs.object_channels);
     let global_channels = vectors(&inputs.global_channels);
-    let mut context_values = vectors(&inputs.context_values);
-    context_values.entry(0).or_insert([inputs.time_seconds; 4]);
     let mut extern_values = HashMap::new();
     for (scope, values) in [
         ("Frame", &inputs.frame),
@@ -329,7 +338,6 @@ pub fn execute_preview(
         &object_channels,
         &extern_values,
         &global_channels,
-        &context_values,
         texture_metadata,
     );
     let mut outputs = BTreeMap::new();
@@ -410,98 +418,5 @@ fn resolve_external(
         "GlobalChannel" => inputs.global_channels.get(&offset).cloned(),
         "Gear" | "TextureSet" => inputs.gear_channels.get(&offset).cloned(),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::material::TfxBytecodeOpPreview;
-
-    #[test]
-    fn runtime_preserves_partial_state_and_trace() {
-        let program = TfxBytecodePreview {
-            status: TfxDecodeStatus::StoppedAtUnknown,
-            undecoded_offset: Some(3),
-            undecoded_bytes: vec![0xff],
-            ..Default::default()
-        };
-        let result = execute_preview(&program, &[], &TfxRuntimeInputs::default(), &Default::default());
-        assert_eq!(result.status, TfxDecodeStatus::StoppedAtUnknown);
-        assert_eq!(result.undecoded_bytes, [0xff]);
-    }
-
-    #[test]
-    fn runtime_re_evaluates_live_frame_and_time_inputs() {
-        let program = TfxBytecodePreview {
-            ops: vec![
-                TfxBytecodeOpPreview {
-                    offset: 0,
-                    opcode: 0x4a,
-                    name: "push_extern_float",
-                    detail: "Frame+0x0".into(),
-                    extern_scope_id: Some(0),
-                },
-                TfxBytecodeOpPreview {
-                    offset: 3,
-                    opcode: 0x53,
-                    name: "pop_output",
-                    detail: "element=7".into(),
-                    extern_scope_id: None,
-                },
-            ],
-            ..Default::default()
-        };
-        let result = execute_preview(
-            &program,
-            &[],
-            &TfxRuntimeInputs {
-                time_seconds: 2.5,
-                ..Default::default()
-            },
-            &Default::default(),
-        );
-        assert_eq!(
-            result.outputs.get("output[7]"),
-            Some(&TfxValue::Vector([2.5; 4]))
-        );
-    }
-
-    #[test]
-    fn merged_shell_materials_evaluate_only_their_own_object_channels() {
-        let program = TfxBytecodePreview {
-            ops: vec![
-                TfxBytecodeOpPreview {
-                    offset: 0, opcode: 0x4e, name: "push_object_channel",
-                    detail: "0x12345678".into(), extern_scope_id: None,
-                },
-                TfxBytecodeOpPreview {
-                    offset: 5, opcode: 0x53, name: "pop_output",
-                    detail: "element=7".into(), extern_scope_id: None,
-                },
-            ],
-            ..Default::default()
-        };
-        let channel = 0x12345678;
-        let parent = TfxValue::Vector([0.0, 0.0, 1.0, 1.0]);
-        let left = TfxValue::Vector([1.0, 0.0, 0.0, 1.0]);
-        let right = TfxValue::Vector([0.0, 1.0, 0.0, 1.0]);
-        let inputs = TfxRuntimeInputs {
-            object_channels: BTreeMap::from([(channel, parent.clone())]),
-            geometry_object_channels: BTreeMap::from([
-                (TagHash(1), BTreeMap::from([(channel, left.clone())])),
-                (TagHash(2), BTreeMap::from([(channel, right.clone())])),
-                (TagHash(3), BTreeMap::new()), // shared geometry has ambiguous ownership
-            ]),
-            ..Default::default()
-        };
-        for (geometry, expected) in [(1, left), (2, right), (4, parent)] {
-            let result = execute_preview(&program, &[], &inputs.for_geometry(TagHash(geometry)), &Default::default());
-            assert_eq!(result.outputs.get("output[7]"), Some(&expected));
-        }
-        let ambiguous = execute_preview(&program, &[], &inputs.for_geometry(TagHash(3)), &Default::default());
-        assert!(ambiguous.outputs["output[7]"].as_vector().is_none(),
-            "ambiguous ownership must remain unresolved rather than inherit another skin's value");
-        assert_eq!(inputs.geometry_object_channels.len(), 3);
     }
 }

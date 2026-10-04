@@ -18,15 +18,6 @@ pub struct RunnerShellPart {
 }
 
 impl RunnerShellAssembly {
-    #[cfg(test)]
-    pub fn contains(&self, tag: TagHash) -> bool {
-        self.pattern == tag
-            || self.nested_patterns.contains(&tag)
-            || self
-                .parts
-                .iter()
-                .any(|part| part.component == tag || part.geometry.contains(&tag))
-    }
     pub fn resolve(cache: &TagCache, model: TagHash) -> Option<Self> {
         if package_manager().get_entry(model)?.reference != CLASS_PATTERN {
             return None;
@@ -153,23 +144,4 @@ impl RunnerShellAssembly {
             kind: GeometryPreviewKind::Model(model),
         })
     }
-}
-
-#[cfg(test)]
-pub fn runner_shell_assemblies(
-    cache: &TagCache,
-    containers: &[TagHash],
-) -> Vec<RunnerShellAssembly> {
-    containers
-        .iter()
-        .copied()
-        .filter(|tag| {
-            package_manager()
-                .get_entry(*tag)
-                .is_some_and(|entry| entry.reference == CLASS_PATTERN)
-        })
-        .filter(|tag| ancestor_pattern_roots(cache, *tag).is_empty())
-        .filter_map(|tag| RunnerShellAssembly::resolve(cache, tag))
-        .filter(|shell| !shell.nested_patterns.is_empty())
-        .collect()
 }

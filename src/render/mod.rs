@@ -3,7 +3,6 @@ pub mod authored_program;
 pub(crate) mod runner_surface_programs;
 pub(crate) mod runner_decal_programs;
 pub(crate) mod body_draw;
-pub(crate) mod body_material;
 pub(crate) mod body_mesh;
 pub(crate) mod body_vertex;
 pub(crate) mod displacement_vertex;
@@ -14,24 +13,15 @@ pub(crate) mod c827_draw;
 pub(crate) mod decal_draw;
 pub(crate) mod dense_pixel;
 pub mod evidence;
-pub(crate) mod global_light;
-pub(crate) mod layered_material;
 pub mod material;
 pub mod pass_plan;
-pub mod preview_scene;
 pub mod stage;
 pub(crate) mod static_mesh;
 pub(crate) mod surface_targets;
 pub mod technique;
 pub mod tfx;
 pub(crate) mod channels;
-#[cfg(test)]
-mod channel_probe;
 
-#[cfg(test)]
-mod authored_shader_probe;
-#[cfg(test)]
-mod compute_shader_probe;
 
 use std::ops::Range;
 

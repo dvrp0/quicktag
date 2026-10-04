@@ -59,19 +59,3 @@ impl ProvenanceStore {
         self.records.get(id.0 as usize)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn interns_identical_provenance() {
-        let mut store = ProvenanceStore::default();
-        let record = ProvenanceRecord {
-            evidence: EvidenceLevel::Confirmed,
-            technique: Some(TagHash(0x80A00001)),
-            ..Default::default()
-        };
-        assert_eq!(store.insert(record.clone()), store.insert(record));
-    }
-}

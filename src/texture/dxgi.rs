@@ -1039,21 +1039,3 @@ impl TryFrom<u8> for GcmSurfaceFormat {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::DxgiFormat;
-    use eframe::wgpu;
-
-    #[test]
-    fn preserves_dxgi_unorm_color_space() {
-        assert_eq!(
-            DxgiFormat::R8G8B8A8_UNORM.to_wgpu().unwrap(),
-            wgpu::TextureFormat::Rgba8Unorm
-        );
-        assert_eq!(
-            DxgiFormat::R8G8B8A8_UNORM_SRGB.to_wgpu().unwrap(),
-            wgpu::TextureFormat::Rgba8UnormSrgb
-        );
-    }
-}

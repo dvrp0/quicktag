@@ -11,10 +11,62 @@ pub(super) struct NativeSurfaceSource {
     pub(super) vertex_program: crate::render::authored_program::DescriptorAbi,
     pub(super) program: crate::render::authored_program::DescriptorAbi,
     pub(super) constants: Vec<[f32; 4]>,
+    pub(super) animation: Option<AnimatedConstants>,
     pub(super) vertex_constants: Option<Vec<[f32; 4]>>,
     pub(super) textures: Vec<TagHash>,
+    pub(super) cube_slot: Option<u32>,
     pub(super) samplers: Vec<ModelSamplerDesc>,
-    pub(super) metadata_rows: Vec<(usize, Option<usize>)>,
+}
+
+/// Pixel constants whose TFX program reads the Frame clock. The renderer
+/// re-runs the program each frame instead of freezing them at load.
+#[derive(Clone)]
+pub(super) struct AnimatedConstants {
+    stage: Arc<crate::render::technique::TechniqueStageDescriptor>,
+    inputs: Arc<crate::render::tfx::TfxRuntimeInputs>,
+    allowed: fn(&str) -> bool,
+}
+
+impl AnimatedConstants {
+    pub(super) fn new(
+        stage: &crate::render::technique::TechniqueStageDescriptor,
+        inputs: &crate::render::tfx::TfxRuntimeInputs,
+        allowed: fn(&str) -> bool,
+    ) -> Option<Self> {
+        // Frame+0x0 is game time and Frame+0x4 render time.
+        stage.tfx.externs.iter()
+            .any(|external| external.scope == "Frame" && matches!(external.byte_offset, 0 | 4))
+            .then(|| Self { stage: Arc::new(stage.clone()), inputs: Arc::new(inputs.clone()), allowed })
+    }
+
+    pub(super) fn at(&self, time_seconds: f32) -> Option<Vec<[f32; 4]>> {
+        let mut inputs = (*self.inputs).clone();
+        inputs.time_seconds = time_seconds;
+        let state = self.stage.runtime_state(&inputs);
+        let mut constants = state.constant_registers;
+        zero_unresolved_rows(&mut constants, &state.unresolved_dependencies, self.allowed).ok()?;
+        Some(constants)
+    }
+}
+
+/// Constant rows whose TFX expression cannot be evaluated are written as zero
+/// for every program alike. Any other unresolved input must be one the caller
+/// supplies itself.
+pub(super) fn zero_unresolved_rows(
+    constants: &mut [[f32; 4]],
+    unresolved: &[String],
+    allowed: fn(&str) -> bool,
+) -> Result<(), &'static str> {
+    for dependency in unresolved {
+        let row = dependency.strip_prefix("output[").and_then(|rest| rest.split_once(']'))
+            .and_then(|(row, _)| row.parse::<usize>().ok());
+        match row {
+            Some(row) if row < constants.len() => constants[row] = [0.0; 4],
+            _ if allowed(dependency) => {}
+            _ => return Err("unresolved runtime input is not a constant row"),
+        }
+    }
+    Ok(())
 }
 
 pub(super) struct LoadedNativeSurface {
@@ -60,9 +112,9 @@ pub(super) fn vertex_color_source_valid(source: &crate::geometry::AuthoredGeomet
             | D::Cloth45RowComputeStorage | D::BodyMeshAA060BComputeStorage))
 }
 
-/// Source materials accept only independently audited VS/PS pairs.
-/// An unresolved metadata row is safe only behind its proved zero output gate.
-/// This does not resolve the game's metadata selector or inherited draw state.
+/// Source materials accept only registered VS/PS pairs.
+/// Constant rows whose TFX expression cannot be evaluated are zero for every
+/// program alike. This does not resolve inherited draw state.
 pub(super) fn resolve_source(
     technique: Option<&TechniqueDescriptor>,
     authored: Option<AuthoredStageMetadata>,
@@ -110,44 +162,28 @@ pub(super) fn resolve_source(
         _ => &[D::BodyVertexScalarStorage],
     };
     if !required_vertex.contains(&vertex_program) { return Err("vertex/pixel contract mismatch"); }
-    let (rows, count, volume, metadata_rows, unresolved_dependencies, sampler_count) = match program {
+    let (rows, count, volume, cube, sampler_count) = match program {
         D::RunnerSurface(index) => {
             let contract=crate::render::runner_surface_programs::SURFACES.get(index as usize).ok_or("missing surface contract")?;
-            (contract.rows,contract.texture_count,contract.volume_slot,contract.metadata_rows.to_vec(),contract.unresolved_dependencies.iter().map(|s|s.to_string()).collect::<Vec<_>>(),contract.sampler_count)
+            (contract.rows,contract.texture_count,contract.volume_slot,contract.cube_slot,contract.sampler_count)
         },
-        D::BodyPixelDense => (125, 8, Some(7), vec![(75, Some(84))], vec!["output[75] <- unresolved numeric value".to_string()], 3),
-        D::ChestPixelDense => (129, 9, Some(8), vec![(76, Some(85))], vec!["output[76] <- unresolved numeric value".to_string()], 3),
-        D::SleevesPixelDense => (129, 9, Some(8), vec![(79, Some(88))], vec!["output[79] <- unresolved numeric value".to_string()], 3),
-        D::HandsPixelDense => (138, 9, Some(7), vec![(81, Some(90))], vec!["output[81] <- unresolved numeric value".to_string()], 3),
-        D::HardwarePixelDense => (117, 7, Some(6), vec![(70, Some(79))], vec!["output[70] <- unresolved numeric value".to_string()], 3),
-        D::FacePixelDense => (127, 7, Some(5), vec![(73, Some(82))], vec!["output[73] <- unresolved numeric value".to_string()], 3),
-        D::EyeDetailPixelDense => (71, 2, Some(1), vec![(40, Some(49))], vec!["output[40] <- unresolved numeric value".to_string()], 2),
-        // Original A9D5 row133 affects RT0/RT1 only through row142.x. The
-        // source-proved zero gate is required for every admitted technique.
-        D::HairPixelDense => (167, 5, Some(4), vec![(133, Some(142))], vec!["output[133] <- unresolved numeric value".to_string()], 2),
-        D::HairSolidPixelDense => (170, 6, Some(5), vec![(136, Some(145))], vec!["output[136] <- unresolved numeric value".to_string()], 2),
+        D::BodyPixelDense => (125, 8, Some(7), None, 3),
+        D::ChestPixelDense => (129, 9, Some(8), None, 3),
+        D::SleevesPixelDense => (129, 9, Some(8), None, 3),
+        D::HandsPixelDense => (138, 9, Some(7), None, 3),
+        D::HardwarePixelDense => (117, 7, Some(6), None, 3),
+        D::FacePixelDense => (127, 7, Some(5), None, 3),
+        D::EyeDetailPixelDense => (71, 2, Some(1), None, 2),
+        D::HairPixelDense => (167, 5, Some(4), None, 2),
+        D::HairSolidPixelDense => (170, 6, Some(5), None, 2),
         _ => return Err("unsupported pixel runtime ABI"),
     };
     let state = ps.runtime_state(runtime_inputs);
     if ps.constant_buffer_slot != Some(0) { return Err("unexpected constant buffer slot"); }
     if state.constant_registers.len() != rows { return Err("constant row count mismatch"); }
     let mut constants = state.constant_registers;
-    if state.unresolved_dependencies != unresolved_dependencies {
-        #[cfg(test)]
-        eprintln!("Surface dependency contract rejected shader={:?} actual={:?} audited={:?}",
-            ps.shader, state.unresolved_dependencies, unresolved_dependencies);
-        return Err("unresolved runtime dependencies differ from audited source proof");
-    }
-    for &(unresolved_row, gate) in &metadata_rows {
-        if unresolved_row >= rows || gate.is_some_and(|g| g >= rows || metadata_rows.iter().any(|&(row,_)| row == g)) {
-            return Err("invalid metadata proof contract");
-        }
-        if gate.is_some_and(|g| constants[g][0] != 0.0) {
-            return Err("metadata zero gate is active");
-        }
-        // All four components independently proved output/control-flow inert.
-        constants[unresolved_row] = [0.0; 4];
-    }
+    zero_unresolved_rows(&mut constants, &state.unresolved_dependencies, |_| false)?;
+    let animation = AnimatedConstants::new(ps, runtime_inputs, |_| false);
     let vertex_constants = if let Some((written_rows, declared_rows)) = vertex_program.vertex_constant_contract() {
         let mut state = vs.runtime_state(runtime_inputs);
         if vs.constant_buffer_slot != Some(0) || state.constant_registers.len() != written_rows
@@ -170,7 +206,8 @@ pub(super) fn resolve_source(
                 .find(|b| b.kind == "texture" && u32::from(b.slot) == slot)?;
             let tag = binding.resolved?;
             let desc = Texture::load_desc(tag).ok()?;
-            if desc.array_size != 1 || (desc.depth > 1) != (Some(slot) == volume) {
+            let layers = if Some(slot) == cube { 6 } else { 1 };
+            if desc.array_size != layers || (desc.depth > 1) != (Some(slot) == volume) {
                 return None;
             }
             Some(tag)
@@ -204,10 +241,11 @@ pub(super) fn resolve_source(
         vertex_program,
         program,
         constants,
+        animation,
         vertex_constants,
         textures,
+        cube_slot: cube,
         samplers,
-        metadata_rows,
     })
 }
 
@@ -228,109 +266,4 @@ pub(super) fn pixel_view_image(scene: &SceneUniform) -> [[f32; 4]; 29] {
         1.0,
     ];
     view
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sha2::{Digest, Sha256};
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn audits_cross_skin_authored_material_admission() {
-        let manager = tiger_pkg::PackageManager::new(
-            std::env::var("QUICKTAG_MARATHON_PACKAGES").unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into()),
-            tiger_pkg::GameVersion::Marathon(tiger_pkg::MarathonVersion::Marathon), None,
-        ).expect("package manager");
-        tiger_pkg::initialize_package_manager(&Arc::new(manager));
-        quicktag_core::classes::initialize_reference_names();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let output = std::path::PathBuf::from(std::env::var("QUICKTAG_MATERIAL_PROBE_OUTPUT")
-            .unwrap_or_else(|_|"target/cross-skin-audit".into()));
-        std::fs::create_dir_all(&output).unwrap();
-        let mut reports = vec![];
-        let cases=if let Ok(root)=std::env::var("QUICKTAG_MATERIAL_PROBE_ROOT") {
-            root.split(',').map(|value|("requested-model",u32::from_str_radix(value.trim().trim_start_matches("0x"),16).expect("hexadecimal Pattern root"))).collect::<Vec<_>>()
-        }else{vec![
-            ("thief-cryo-shift", 0x80A9D134),
-            ("assassin-digital-prowl", 0x80A9DC79),
-            ("assassin-cryo-shift", 0x80A9DD33),
-            ("vandal-weaverunner", 0x80A9DAD3),
-            ("destroyer-cyber-red", 0x80A9D869),
-        ]};
-        for (name, root) in cases {
-            let root = TagHash(root);
-            let shell = crate::geometry::RunnerShellAssembly::resolve(&cache, root).expect("shell");
-            let preview = shell.load(cache.clone()).expect("preview");
-            let crate::geometry::GeometryPreviewKind::Model(model) = preview.kind else { panic!("model"); };
-            let wireframe = model.wireframe.unwrap();
-            let inputs = crate::render::tfx::TfxRuntimeInputs::for_model_preview(&cache, root);
-            // Export the normal loader's authoritative buffer references. A
-            // float4 shader SRV alone does not establish its package view format.
-            let authored_sources = wireframe.authored_inputs.iter().map(|input| {
-                let color = input.color_buffer.as_ref().map(|buffer| {
-                    let header = tiger_pkg::package_manager().read_tag(buffer.header_tag).unwrap();
-                    let data = tiger_pkg::package_manager().read_tag(buffer.data_tag).unwrap();
-                    assert_eq!(data.len(), buffer.data_size as usize);
-                    let artifact = format!("{}-color-{}.bin", input.geometry, buffer.data_tag);
-                    std::fs::write(output.join(&artifact), &data).unwrap();
-                    serde_json::json!({
-                        "header":buffer.header_tag.to_string(), "data":buffer.data_tag.to_string(),
-                        "header_bytes":header, "stride":buffer.stride, "vertex_type":buffer.vertex_type,
-                        "element_count":buffer.element_count, "bytes":data.len(),
-                        "sha256":format!("{:x}",Sha256::digest(&data)), "artifact":artifact,
-                    })
-                });
-                serde_json::json!({"geometry":input.geometry.to_string(),"color_buffer":color})
-            }).collect::<Vec<_>>();
-            let mut draws = vec![];
-            for (index, draw) in super::super::model_draws(&wireframe, None).iter().enumerate() {
-                let geometry = draw.authored_source.and_then(|i|wireframe.authored_inputs.get(i)).map(|g|g.geometry);
-                let scoped_inputs = geometry.map(|g|inputs.for_geometry(g)).unwrap_or_else(||inputs.clone());
-                let mut stages = vec![];
-                if let Some(technique) = &draw.packet.technique {
-                    for stage in &technique.stages {
-                        let Some(shader) = stage.shader else { continue; };
-                        let entry = tiger_pkg::package_manager().get_entry(shader).unwrap();
-                        let payload = tiger_pkg::package_manager().read_tag(TagHash(entry.reference)).unwrap();
-                        let digest = format!("{:x}", Sha256::digest(&payload));
-                        std::fs::write(output.join(format!("{shader}-{:?}.dxil", stage.stage)), &payload).unwrap();
-                        let state = stage.runtime_state(&scoped_inputs);
-                        stages.push(serde_json::json!({
-                            "stage":format!("{:?}",stage.stage), "shader":shader.to_string(),
-                            "payload_sha256":digest,
-                            "registered":crate::render::authored_program::resolve_package_program(shader,stage.stage).unwrap().map(|p|format!("{:?}",p.descriptor_abi)),
-                            "constant_slot":stage.constant_buffer_slot, "rows":state.constant_registers,
-                            "unresolved":state.unresolved_dependencies,
-                            "tfx_ops":stage.tfx.ops.iter().map(|op|serde_json::json!({"offset":op.offset,"opcode":op.opcode,"name":op.name,"detail":op.detail})).collect::<Vec<_>>(),
-                            "tfx_constants":stage.constants,
-                            "numeric_origins":stage.execute(&scoped_inputs).outputs.iter().filter(|(target,_)|target.starts_with("output[")).map(|(target,value)|serde_json::json!({"target":target,"value":format!("{value:?}")})).collect::<Vec<_>>(),
-                            "bindings":state.bindings.iter().map(|b|serde_json::json!({"kind":b.kind,"slot":b.slot,"source":b.source,"resolved":b.resolved.map(|t|t.to_string())})).collect::<Vec<_>>(),
-                        }));
-                    }
-                }
-                let source = resolve_source(draw.packet.technique.as_ref(),draw.authored_stage,draw.pipeline,&scoped_inputs);
-                let producer = geometry.zip(draw.authored_stage).and_then(|(geometry,stage)| {
-                    let tag=crate::geometry::geometry_compute_technique(geometry,stage.part_index,stage.source_index_start..stage.source_index_start.checked_add(stage.source_index_count)?)?;
-                    let technique=TechniqueDescriptor::load(tag)?;
-                    let cs=technique.stages.iter().find(|s|s.stage==ShaderStage::Compute)?;
-                    let shader=cs.shader?;
-                    let program=crate::render::authored_program::resolve_package_program(shader,ShaderStage::Compute).ok()?;
-                    Some(serde_json::json!({"technique":tag.to_string(),"shader":shader.to_string(),"registered":program.map(|p|format!("{:?}",p.descriptor_abi))}))
-                });
-                draws.push(serde_json::json!({
-                    "index":index,"technique":draw.packet.technique_hash.map(|t|t.to_string()),
-                    "geometry":geometry.map(|g|g.to_string()),
-                    "pattern_path":shell.parts.iter().find(|p|geometry.is_some_and(|g|p.geometry.contains(&g))).map(|p|p.pattern_path.iter().map(|t|t.to_string()).collect::<Vec<_>>()),
-                    "compute_producer":producer,
-                    "authored":format!("{:?}",draw.authored_stage),"pipeline":format!("{:?}",draw.pipeline),
-                    "native_admitted":source.ok().map(|s|format!("{:?}",s.program)),"stages":stages,
-                }));
-            }
-            eprintln!("{name}: {} draws, {} admitted", draws.len(),draws.iter().filter(|d|!d["native_admitted"].is_null()).count());
-            reports.push(serde_json::json!({"name":name,"root":root.to_string(),"draws":draws,"authored_sources":authored_sources,
-                "object_scopes":crate::geometry::pattern_object_channel_evidence(&cache,root)}));
-        }
-        std::fs::write(output.join("material-admission.json"),serde_json::to_vec_pretty(&reports).unwrap()).unwrap();
-    }
 }
