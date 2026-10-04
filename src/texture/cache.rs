@@ -28,7 +28,7 @@ pub(crate) type TextureCacheMap = LinkedHashMap<
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaterialTextureKey {
-    pub color: TagHash,
+    pub color: Option<TagHash>,
     pub normal: Option<TagHash>,
     pub emissive: Option<TagHash>,
     pub color_tint: [u8; 4],
@@ -94,6 +94,10 @@ impl TextureCache {
 
     pub(crate) fn get_or_load_material(&self, hash: TagHash) -> Option<LoadedTexture> {
         self.get_or_load_with_alpha_mode(hash, false)
+    }
+
+    pub(crate) fn material_texture_failed(&self, hash: TagHash) -> bool {
+        matches!(self.cache.read().get(&(hash, false)), Some(Either::Left(None)))
     }
 
     fn get_or_load_with_alpha_mode(
@@ -168,7 +172,7 @@ impl TextureCache {
 
     pub fn get_material_or_load(&self, key: MaterialTextureKey) -> Option<LoadedTexture> {
         if !key.has_composite_layers() {
-            return self.get_or_load(key.color);
+            return self.get_or_load(key.color?);
         }
 
         {
@@ -179,7 +183,7 @@ impl TextureCache {
             }
         }
 
-        let color = self.get_or_load(key.color)?;
+        let color = self.get_or_load(key.color?)?;
         let normal = match key.normal {
             Some(tag) => self.get_or_load(tag),
             None => None,
@@ -256,7 +260,7 @@ impl TextureCache {
             height,
             out,
             Some(format!(
-                "composited material color={} normal={:?} emissive={:?} tint={:?} emissive_strength={}",
+                "composited material color={:?} normal={:?} emissive={:?} tint={:?} emissive_strength={}",
                 key.color, key.normal, key.emissive, key.color_tint, key.emissive_strength
             )),
         )

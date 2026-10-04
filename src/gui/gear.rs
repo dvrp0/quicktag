@@ -664,9 +664,7 @@ impl GearView {
             })
             .collect::<Vec<_>>();
         charms.sort_by_cached_key(|charm| (charm.model_tag, charm.name.to_lowercase()));
-        charms.dedup_by(|left, right| {
-            left.model_tag == right.model_tag && left.name == right.name
-        });
+        charms.dedup_by(|left, right| left.model_tag == right.model_tag && left.name == right.name);
 
         ModelWeaponCatalog {
             weapons,
@@ -6290,10 +6288,13 @@ mod tests {
                 .filter(|item| item.name == name)
                 .collect::<Vec<_>>();
             assert_eq!(matching.len(), 2, "expected both rarity rows for {name}");
-            assert!(matching.iter().all(|item| {
-                item.mod_family.as_deref() == Some(family)
-                    && item.subcategory.as_deref() == Some(subcategory)
-            }), "wrong authored optic family for {name}: {matching:?}");
+            assert!(
+                matching.iter().all(|item| {
+                    item.mod_family.as_deref() == Some(family)
+                        && item.subcategory.as_deref() == Some(subcategory)
+                }),
+                "wrong authored optic family for {name}: {matching:?}"
+            );
         }
     }
 

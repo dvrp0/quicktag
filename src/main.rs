@@ -126,7 +126,7 @@ fn main() -> eframe::Result<()> {
         wgpu_options: WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(WgpuSetupCreateNew {
                 instance_descriptor: wgpu::InstanceDescriptor {
-                    backends: wgpu::Backends::PRIMARY,
+                    backends: wgpu::Backends::VULKAN,
                     ..Default::default()
                 },
                 device_descriptor: Arc::new(|_adapter| {
@@ -134,12 +134,20 @@ fn main() -> eframe::Result<()> {
                     // The material ABI binds sixteen 2D inputs plus a local
                     // coating cube; the scene contributes one more cube.
                     required_limits.max_sampled_textures_per_shader_stage = 18;
+                    required_limits.max_storage_buffers_per_shader_stage = 12;
+                    required_limits.max_color_attachment_bytes_per_sample = 64;
                     wgpu::DeviceDescriptor {
                         required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
+                            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
                             | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
                             | wgpu::Features::TEXTURE_BINDING_ARRAY
-                            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+                            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+                            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                            | wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS,
                         required_limits,
+                        // SAFETY: authored modules are embedded, hash-pinned and
+                        // validated before entering Vulkan passthrough.
+                        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                         ..Default::default()
                     }
                 }),
@@ -158,7 +166,7 @@ fn main() -> eframe::Result<()> {
 
 fn create_headless_render_state() -> Result<eframe::egui_wgpu::RenderState, String> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends: wgpu::Backends::VULKAN,
         ..Default::default()
     });
     let adapter =
@@ -166,12 +174,19 @@ fn create_headless_render_state() -> Result<eframe::egui_wgpu::RenderState, Stri
             .map_err(|error| format!("Could not find a GPU adapter: {error}"))?;
     let mut required_limits = wgpu::Limits::default();
     required_limits.max_sampled_textures_per_shader_stage = 18;
+    required_limits.max_storage_buffers_per_shader_stage = 12;
+    required_limits.max_color_attachment_bytes_per_sample = 64;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
             | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
             | wgpu::Features::TEXTURE_BINDING_ARRAY
-            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+            | wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS,
         required_limits,
+        // SAFETY: same validated authored-program contract as the UI device.
+        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
         ..Default::default()
     }))
     .map_err(|error| format!("Could not create a GPU device: {error}"))?;

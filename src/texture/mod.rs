@@ -7,6 +7,7 @@ mod headers_xbox;
 mod metadata;
 mod swizzle;
 pub use capture::capture_texture;
+pub use metadata::TextureExpressionMetadata;
 
 use anyhow::Context;
 use binrw::BinReaderExt;
@@ -38,6 +39,7 @@ pub struct TextureHeaderGeneric {
 
     pub deswizzle: bool,
     pub psformat: Option<GcnSurfaceFormat>,
+    pub expression_metadata: Option<TextureExpressionMetadata>,
 }
 
 impl TryFrom<TextureHeaderD2Ps4> for TextureHeaderGeneric {
@@ -55,6 +57,7 @@ impl TryFrom<TextureHeaderD2Ps4> for TextureHeaderGeneric {
 
             deswizzle: (v.flags1 & 0xc00) != 0x400,
             psformat: Some(v.format),
+            expression_metadata: None,
         })
     }
 }
@@ -74,6 +77,10 @@ impl TryFrom<TextureHeaderPC> for TextureHeaderGeneric {
 
             deswizzle: false,
             psformat: None,
+            expression_metadata: v.has_tiling_params.then_some(TextureExpressionMetadata {
+                tiling_params: v.tiling_params,
+                tile_count: v.tile_count,
+            }),
         })
     }
 }
@@ -81,6 +88,7 @@ impl TryFrom<TextureHeaderPC> for TextureHeaderGeneric {
 pub struct Texture {
     pub view: wgpu::TextureView,
     pub handle: wgpu::Texture,
+    preview_2d_texture: Option<wgpu::Texture>,
     pub full_cubemap_texture: Option<wgpu::Texture>,
     pub aspect_ratio: f32,
     pub desc: TextureDesc,
@@ -177,7 +185,7 @@ fn compressed_format_with_alpha(format: wgpu::TextureFormat) -> bool {
     )
 }
 
-fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32) -> usize {
+fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32, depth: u32) -> usize {
     let extent = wgpu::Extent3d {
         width: width.max(1),
         height: height.max(1),
@@ -186,7 +194,8 @@ fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32) -> 
     .physical_size(format);
     let (block_width, block_height) = format.block_dimensions();
     let block_size = format.block_copy_size(None).unwrap_or(4);
-    ((extent.width / block_width) * (extent.height / block_height) * block_size) as usize
+    ((extent.width / block_width) * (extent.height / block_height) * depth.max(1) * block_size)
+        as usize
 }
 
 /// Infer how much of the tightly packed Tiger mip chain is present.
@@ -206,6 +215,7 @@ fn available_mip_level_count(desc: &TextureDesc, data_len: usize) -> u32 {
             desc.format,
             desc.width.checked_shr(level).unwrap_or(0).max(1),
             desc.height.checked_shr(level).unwrap_or(0).max(1),
+            desc.depth.checked_shr(level).unwrap_or(0).max(1),
         ));
         if per_layer_bytes.saturating_mul(layers) > data_len {
             break;
@@ -249,26 +259,34 @@ impl Texture {
     pub(crate) fn estimated_gpu_bytes(&self) -> u64 {
         let mut width = self.desc.width.max(1);
         let mut height = self.desc.height.max(1);
+        let mut depth = self.desc.depth.max(1);
         let mut per_layer = 0u64;
         loop {
             per_layer =
-                per_layer
-                    .saturating_add(mip_level_byte_size(self.desc.format, width, height) as u64);
-            if width == 1 && height == 1 {
+                per_layer.saturating_add(
+                    mip_level_byte_size(self.desc.format, width, height, depth) as u64,
+                );
+            if width == 1 && height == 1 && depth == 1 {
                 break;
             }
             width = (width / 2).max(1);
             height = (height / 2).max(1);
+            depth = (depth / 2).max(1);
         }
 
-        // create_texture() always retains the ordinary one-layer handle. Array
+        // create_texture() retains one ordinary 2D or 3D allocation. Array
         // textures additionally retain the full array/cubemap allocation.
         let retained_layers = 1u64
             + self
                 .full_cubemap_texture
                 .as_ref()
                 .map_or(0, |_| u64::from(self.desc.array_size.max(1)));
-        per_layer.saturating_mul(retained_layers)
+        let preview_bytes = self.preview_2d_texture.as_ref().map_or(0, |_| {
+            mip_level_byte_size(self.desc.format, self.desc.width, self.desc.height, 1) as u64
+        });
+        per_layer
+            .saturating_mul(retained_layers)
+            .saturating_add(preview_bytes)
     }
 
     /// Raw texel view for UI presentation and extraction.
@@ -278,10 +296,13 @@ impl Texture {
     /// darker and changing saturation. A format-compatible linear view keeps
     /// the stored channel values identical to a direct package decode.
     pub(crate) fn raw_view(&self) -> wgpu::TextureView {
-        self.handle.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(linear_texture_format(self.desc.format)),
-            ..Default::default()
-        })
+        self.preview_2d_texture
+            .as_ref()
+            .unwrap_or(&self.handle)
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(linear_texture_format(self.desc.format)),
+                ..Default::default()
+            })
     }
 
     /// Reuse a successfully validated D2/Marathon descriptor without retaining pixels.
@@ -873,7 +894,7 @@ impl Texture {
         let image_size = wgpu::Extent3d {
             width: desc.width,
             height: desc.height,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: desc.depth.max(1),
         };
 
         {
@@ -902,13 +923,14 @@ impl Texture {
             &rs.queue,
             &wgpu::TextureDescriptor {
                 label: Some(&*format!("Texture {hash}")),
-                size: wgpu::Extent3d {
-                    depth_or_array_layers: 1,
-                    ..image_size
-                },
+                size: wgpu::Extent3d { ..image_size },
                 mip_level_count,
                 sample_count: 1,
-                dimension: TextureDimension::D2,
+                dimension: if desc.depth > 1 {
+                    TextureDimension::D3
+                } else {
+                    TextureDimension::D2
+                },
                 format: desc.format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &view_formats,
@@ -919,6 +941,31 @@ impl Texture {
 
         let view = handle.create_view(&wgpu::TextureViewDescriptor {
             ..Default::default()
+        });
+
+        // egui accepts only D2 user textures. Preserve its historical
+        // first-slice preview without collapsing the shader-facing resource.
+        let preview_2d_texture = (desc.depth > 1).then(|| {
+            let byte_count = mip_level_byte_size(desc.format, desc.width, desc.height, 1);
+            rs.device.create_texture_with_data(
+                &rs.queue,
+                &wgpu::TextureDescriptor {
+                    label: Some(&format!("Texture {hash} (D3 preview slice)")),
+                    size: wgpu::Extent3d {
+                        width: desc.width,
+                        height: desc.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: desc.format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &view_formats,
+                },
+                wgpu::util::TextureDataOrder::default(),
+                &data[..byte_count],
+            )
         });
 
         if desc.premultiply_alpha
@@ -933,7 +980,7 @@ impl Texture {
             return Self::premultiply_compressed_texture(rs, hash, &raw_view, desc, comment);
         }
 
-        let full_texture = if desc.array_size > 1 {
+        let full_texture = if desc.array_size > 1 && desc.depth <= 1 {
             let handle = rs.device.create_texture_with_data(
                 &rs.queue,
                 &wgpu::TextureDescriptor {
@@ -961,6 +1008,7 @@ impl Texture {
         Ok(Texture {
             view,
             handle,
+            preview_2d_texture,
             full_cubemap_texture: full_texture,
             aspect_ratio: desc.width as f32 / desc.height as f32,
             desc,
@@ -1136,6 +1184,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         Ok(Texture {
             view,
             handle,
+            preview_2d_texture: None,
             full_cubemap_texture: None,
             aspect_ratio: desc.width as f32 / desc.height as f32,
             desc,
@@ -1214,6 +1263,119 @@ mod tests {
     use eframe::wgpu;
     use std::{path::PathBuf, sync::Arc};
     use tiger_pkg::{GameVersion, MarathonVersion, TagHash};
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; exports authored body shader texture bytes"]
+    fn exports_thief_body_shader_texture_payloads() {
+        use sha2::{Digest, Sha256};
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into());
+        let manager = tiger_pkg::PackageManager::new(
+            packages,
+            GameVersion::Marathon(MarathonVersion::Marathon),
+            None,
+        )
+        .unwrap();
+        tiger_pkg::initialize_package_manager(&Arc::new(manager));
+        let output = std::path::Path::new("target/cryo-texture-audit");
+        std::fs::create_dir_all(output).unwrap();
+        let mut report = Vec::new();
+        for (slot, tag) in [
+            0x80A9D142, 0x80A60000, 0x80A9D147, 0x80A9D146, 0x80A613E7, 0x80A9D143, 0x80A46D44,
+            0x80A46D48,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (header, data, _) =
+                Texture::load_data_d2(TagHash(tag), true).expect("full packaged texture payload");
+            assert_eq!(header.array_size, 1);
+            assert_eq!(header.depth, if slot == 7 { 64 } else { 1 });
+            let filename = format!("{tag:08X}-full-mips.bin");
+            std::fs::write(output.join(&filename), &data).unwrap();
+            report.push(serde_json::json!({"slot":slot,"tag":TagHash(tag).to_string(),
+                "format":format!("{:?}",header.format),"width":header.width,"height":header.height,
+                "depth":header.depth,"array_size":header.array_size,"bytes":data.len(),
+                "sha256":format!("{:x}",Sha256::digest(&data)),"artifact":filename,
+                "proof":"production package/header/full-mip data loader; GPU view/sampling intent not proved"}));
+        }
+        std::fs::write(
+            output.join("thief-body-textures.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; exports exact layered decal color/mask"]
+    fn exports_thief_decal_shader_texture_payloads() {
+        use sha2::{Digest, Sha256};
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into());
+        let manager = tiger_pkg::PackageManager::new(
+            packages, GameVersion::Marathon(MarathonVersion::Marathon), None).unwrap();
+        tiger_pkg::initialize_package_manager(&Arc::new(manager));
+        let output = std::path::Path::new("target/cryo-texture-audit");
+        std::fs::create_dir_all(output).unwrap();
+        let mut report = Vec::new();
+        for (slot, tag, format, width) in [
+            (3, 0x80A9D137, wgpu::TextureFormat::Bc1RgbaUnormSrgb, 1024),
+            (4, 0x80A9D135, wgpu::TextureFormat::Bc4RUnorm, 512),
+        ] {
+            let (header, data, _) = Texture::load_data_d2(TagHash(tag), true).unwrap();
+            assert_eq!(header.format, format);
+            assert_eq!((header.width, header.height, header.depth, header.array_size),
+                (width, width, 1, 1));
+            let filename = format!("{tag:08X}-full-mips.bin");
+            std::fs::write(output.join(&filename), &data).unwrap();
+            report.push(serde_json::json!({"slot":slot,"tag":TagHash(tag).to_string(),
+                "format":format!("{:?}",header.format),"width":header.width,"height":header.height,
+                "depth":header.depth,"array_size":header.array_size,"bytes":data.len(),
+                "sha256":format!("{:x}",Sha256::digest(&data)),"artifact":filename,
+                "proof":"production package/header/full-mip loader; actual GPU sampling remains separate"}));
+        }
+        std::fs::write(output.join("thief-decal-textures.json"),
+            serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; exports exact chest/sleeve/hands/hardware texture graphs"]
+    fn exports_thief_layered_shader_texture_payloads() {
+        use sha2::{Digest, Sha256};
+        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
+            .unwrap_or_else(|_| r"D:\SteamLibrary\steamapps\common\Marathon\packages".into());
+        let manager = tiger_pkg::PackageManager::new(packages,
+            GameVersion::Marathon(MarathonVersion::Marathon), None).unwrap();
+        tiger_pkg::initialize_package_manager(&Arc::new(manager));
+        let output = std::path::Path::new("target/cryo-texture-audit");
+        std::fs::create_dir_all(output).unwrap();
+        for (family, tags, volume_slot) in [
+            ("chest", &[0x80A9D13B, 0x80A60000, 0x80A9D13D, 0x80A9D13F,
+                0x80A613FC, 0x80A613E7, 0x80A9D139, 0x80A46D44, 0x80A46D48][..], 8),
+            ("sleeves", &[0x80A9D157, 0x80A60000, 0x80A9D156, 0x80A9D151,
+                0x80A613FC, 0x80A613E7, 0x80A9D153, 0x80A46D44, 0x80A46D48][..], 8),
+            ("hands", &[0x80A9D160, 0x80A9D159, 0x80A9D15B, 0x80A613EF,
+                0x80A613FC, 0x80A9D15E, 0x80A46D44, 0x80A46D48, 0x80A60000][..], 7),
+            ("hardware", &[0x80A9D14B, 0x80A60000, 0x80A9D14A, 0x80A9D14D,
+                0x80A9D14F, 0x80A46D44, 0x80A46D48][..], 6),
+        ] {
+            let mut report = Vec::new();
+            for (slot, tag) in tags.iter().copied().enumerate() {
+                let (header, data, _) = Texture::load_data_d2(TagHash(tag), true).unwrap();
+                assert_eq!(header.array_size, 1);
+                assert_eq!(header.depth, if slot == volume_slot { 64 } else { 1 });
+                let filename = format!("{tag:08X}-full-mips.bin");
+                std::fs::write(output.join(&filename), &data).unwrap();
+                report.push(serde_json::json!({"slot":slot,"tag":TagHash(tag).to_string(),
+                    "format":format!("{:?}",header.format),"width":header.width,"height":header.height,
+                    "depth":header.depth,"array_size":header.array_size,"bytes":data.len(),
+                    "sha256":format!("{:x}",Sha256::digest(&data)),"artifact":filename,
+                    "proof":"production full-mip loader; native view intent remains separate"}));
+            }
+            std::fs::write(output.join(format!("thief-{family}-textures.json")),
+                serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+    }
 
     #[test]
     fn raw_ui_views_disable_srgb_decode_without_changing_storage_family() {
@@ -1433,5 +1595,22 @@ mod tests {
         assert_eq!(available_mip_level_count(&desc, 64 * 6), 1);
         assert_eq!(available_mip_level_count(&desc, (64 + 16) * 6), 2);
         assert_eq!(available_mip_level_count(&desc, (64 + 16 * 3) * 6), 4);
+    }
+
+    #[test]
+    fn infers_depth_shrinking_block_compressed_3d_mips() {
+        let desc = TextureDesc {
+            format: wgpu::TextureFormat::Bc7RgbaUnorm,
+            width: 8,
+            height: 8,
+            depth: 8,
+            array_size: 1,
+            premultiply_alpha: false,
+        };
+        // BC7: 2x2 blocks * 8 slices, then 1 block * 4/2/1 slices.
+        assert_eq!(available_mip_level_count(&desc, 512), 1);
+        assert_eq!(available_mip_level_count(&desc, 512 + 64), 2);
+        assert_eq!(available_mip_level_count(&desc, 512 + 64 + 32 + 16), 4);
+        assert_eq!(available_mip_level_count(&desc, 512 + 64 + 31), 2);
     }
 }

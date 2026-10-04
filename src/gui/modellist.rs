@@ -21,6 +21,7 @@ use crate::geometry::{
 use crate::gui::common::ResponseExt;
 use crate::gui::tag::format_tag_entry;
 use crate::material::is_sticker_proxy_technique;
+use crate::render::{channels::ModelChannels, tfx::TfxRuntimeInputs};
 use crate::texture::cache::{MaterialTextureKey, TextureCache};
 use crate::util::{format_file_size, ui_image_rotated};
 
@@ -151,6 +152,7 @@ struct ModdedExportJob {
     show_default_mods: bool,
     show_stickers: bool,
     environment: ModelEnvironment,
+    channels: Option<ModelChannels>,
     export_camera: Option<ModelExportCamera>,
     format: ModelExportFormat,
     path: PathBuf,
@@ -165,6 +167,7 @@ impl ModdedExportJob {
         show_default_mods: bool,
         show_stickers: bool,
         environment: ModelEnvironment,
+        channels: Option<ModelChannels>,
         export_camera: Option<ModelExportCamera>,
         format: ModelExportFormat,
         path: PathBuf,
@@ -183,6 +186,7 @@ impl ModdedExportJob {
             show_default_mods,
             show_stickers,
             environment,
+            channels,
             export_camera,
             format,
             path,
@@ -257,11 +261,14 @@ impl ModdedExportJob {
         let fallback_color = wireframe_preview_textures(wireframe, &model.textures)
             .first()
             .copied();
+        let mut runtime_inputs = TfxRuntimeInputs::for_model_preview(cache, self.weapon.owner_tag);
+        if let Some(channels) = &self.channels { channels.apply_overrides(&mut runtime_inputs); }
         let gpu = Arc::new(
             GpuModelPreview::create(
                 &texture_cache.render_state.device,
                 wireframe,
                 fallback_color,
+                &runtime_inputs,
             )
             .ok_or_else(|| {
                 anyhow::anyhow!("failed to create GPU preview for {}", self.model_tag)
@@ -320,6 +327,9 @@ pub struct ModelsView {
     selected_model: Option<TagHash>,
     preview: Option<GeometryTagPreview>,
     gpu_model_preview: Option<Arc<GpuModelPreview>>,
+    preview_channels: Option<ModelChannels>,
+    preview_runtime_inputs: Option<TfxRuntimeInputs>,
+    channel_render_error: Option<String>,
     preview_camera_frame: Option<ModelCameraFrame>,
     weapon_export_camera: Option<ModelExportCamera>,
     preview_yaw: f32,
@@ -374,6 +384,9 @@ impl ModelsView {
             selected_model: None,
             preview: None,
             gpu_model_preview: None,
+            preview_channels: None,
+            preview_runtime_inputs: None,
+            channel_render_error: None,
             preview_camera_frame: None,
             weapon_export_camera: None,
             preview_yaw: DEFAULT_WEAPON_YAW,
@@ -555,6 +568,9 @@ impl ModelsView {
             .collect();
         self.refresh_runner_models();
         self.selected_model = None;
+        self.preview_channels = None;
+        self.preview_runtime_inputs = None;
+        self.channel_render_error = None;
         self.preview = None;
         self.gpu_model_preview = None;
         self.preview_camera_frame = None;
@@ -575,6 +591,9 @@ impl ModelsView {
 
     fn load_model(&mut self, tag: TagHash) {
         self.selected_model = Some(tag);
+        self.preview_channels = None;
+        self.preview_runtime_inputs = None;
+        self.channel_render_error = None;
         self.preview_camera_frame = None;
         self.weapon_export_camera = None;
         self.detect_selected_weapon();
@@ -796,6 +815,8 @@ impl ModelsView {
     fn rebuild_model_preview(&mut self) {
         self.preview = None;
         self.gpu_model_preview = None;
+        self.preview_runtime_inputs = None;
+        self.channel_render_error = None;
 
         let Some(tag) = self.selected_model else {
             return;
@@ -841,6 +862,19 @@ impl ModelsView {
                     .map(ModelCameraFrame::from_wireframe)
             });
         }
+        let runtime_inputs = TfxRuntimeInputs::for_model_preview(&self.cache, weapon_pattern);
+        let previous_channels = self.preview_channels.take();
+        self.preview_channels = self.preview.as_ref().and_then(|preview| {
+            let GeometryPreviewKind::Model(model) = &preview.kind else { return None; };
+            let mut channels = ModelChannels::discover(model.wireframe.as_ref()?, &runtime_inputs);
+            if let Some(previous) = &previous_channels { channels.carry_overrides_from(previous); }
+            Some(channels)
+        });
+        self.preview_runtime_inputs = Some(runtime_inputs);
+        let mut evaluated_inputs = self.preview_runtime_inputs.clone();
+        if let (Some(channels), Some(inputs)) = (&self.preview_channels, &mut evaluated_inputs) {
+            channels.apply_overrides(inputs);
+        }
         self.gpu_model_preview = self.preview.as_ref().and_then(|preview| {
             let GeometryPreviewKind::Model(model) = &preview.kind else {
                 return None;
@@ -853,9 +887,26 @@ impl ModelsView {
                 &self.texture_cache.render_state.device,
                 wireframe,
                 fallback_color,
+                evaluated_inputs.as_ref()?,
             )
             .map(Arc::new)
         });
+    }
+
+    fn apply_preview_channels(&mut self) {
+        let (Some(channels), Some(base), Some(preview), Some(gpu)) = (
+            &self.preview_channels, &self.preview_runtime_inputs, &self.preview, &self.gpu_model_preview,
+        ) else { return; };
+        let GeometryPreviewKind::Model(model) = &preview.kind else { return; };
+        let Some(wireframe) = model.wireframe.as_ref() else { return; };
+        let mut inputs = base.clone();
+        channels.apply(&mut inputs);
+        if let Some(updated) = gpu.with_channels(&self.texture_cache.render_state.device, wireframe, &inputs) {
+            self.gpu_model_preview = Some(Arc::new(updated));
+            self.channel_render_error = None;
+        } else {
+            self.channel_render_error = Some("Channel values could not be rendered. Previous frame retained.".into());
+        }
     }
 }
 
@@ -1020,6 +1071,9 @@ impl View for ModelsView {
         let default_mods_before = self.preview_show_default_mods;
         let preview_show_default_mods = &mut self.preview_show_default_mods;
         let preview_environment = &mut self.preview_environment;
+        let channel_revision = self.preview_channels.as_ref().map(ModelChannels::revision);
+        let preview_channels = &mut self.preview_channels;
+        let channel_render_error = self.channel_render_error.as_deref();
         let export_all_mods = &mut self.export_all_mods;
         let export_format = &mut self.export_format;
         let active_weapon = self
@@ -1080,7 +1134,11 @@ impl View for ModelsView {
                     active_weapon.is_some().then_some(preview_show_default_mods),
                     preview_environment,
                     true,
+                    preview_channels.as_mut(),
                 );
+                if let Some(error) = channel_render_error {
+                    ui.colored_label(Color32::YELLOW, error);
+                }
                 if texture_action.is_some() {
                     action = texture_action;
                 }
@@ -1208,6 +1266,9 @@ impl View for ModelsView {
         }
         if rebuild_preview {
             self.rebuild_model_preview();
+        } else if self.preview_channels.as_ref().map(ModelChannels::revision) != channel_revision {
+            self.apply_preview_channels();
+            ui.ctx().request_repaint();
         }
         if let Some(result) = export_result {
             match result {
@@ -1230,6 +1291,7 @@ impl View for ModelsView {
                 defaults,
                 stickers,
                 environment,
+                self.preview_channels.clone(),
                 camera,
                 format,
                 path,
@@ -1944,6 +2006,7 @@ fn model_viewport_toolbar(
     gpu_preview: Option<&Arc<GpuModelPreview>>,
     environment: &mut ModelEnvironment,
     show_textures: bool,
+    channels: Option<&mut ModelChannels>,
 ) -> Option<ViewAction> {
     let mut action = None;
     egui::Area::new(egui::Id::new("model_viewport_toolbar"))
@@ -1958,6 +2021,16 @@ fn model_viewport_toolbar(
                         .align(egui::RectAlign::BOTTOM_END)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show(|ui| lighting_panel(ui, environment));
+
+                    let channel = ui.add_enabled(channels.is_some(), egui::Button::new("Channel"));
+                    egui::Popup::from_toggle_button_response(&channel)
+                        .align(egui::RectAlign::BOTTOM_END)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            if let Some(channels) = channels {
+                                model_channel_panel(ui, channels);
+                            }
+                        });
 
                     let image = ui.button("Image");
                     egui::Popup::from_toggle_button_response(&image)
@@ -1998,6 +2071,45 @@ fn model_viewport_toolbar(
             });
         });
     action
+}
+
+fn model_channel_panel(ui: &mut egui::Ui, channels: &mut ModelChannels) {
+    ui.set_min_width(490.0);
+    ui.label("Used channels · edits apply live");
+    ui.horizontal(|ui| {
+        if ui.button("Reset channels").clicked() { channels.reset(); }
+    });
+    if channels.rows().is_empty() {
+        ui.label("This model reads no channels.");
+        return;
+    }
+    let mut changed = false;
+    egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+        for row in channels.rows_mut() {
+            ui.push_id(row.key(), |ui| {
+                let name = row.hash.and_then(super::get_string_for_hash)
+                    .unwrap_or_else(|| row.hash.map_or_else(|| format!("Global {}", row.id), |hash| format!("unk_{hash:08X}")));
+                let label = row.hash.map_or(name.clone(), |hash| format!("{name} (0x{hash:08X})"));
+                ui.label(label).on_hover_text(format!("{:?} channel · binding {}", row.domain, row.id));
+                ui.horizontal(|ui| {
+                    for (lane, label) in ["X", "Y", "Z", "W"].iter().enumerate() {
+                        ui.label(*label);
+                        let response = ui.add(egui::TextEdit::singleline(&mut row.buffers[lane])
+                            .desired_width(75.0).hint_text("Unknown"));
+                        changed |= response.changed();
+                        if let Some(error) = &row.errors[lane] { response.on_hover_text(error); }
+                    }
+                });
+                if row.errors.iter().any(Option::is_some) {
+                    ui.colored_label(Color32::YELLOW, "Enter four finite numbers.");
+                } else if row.default_value.is_none() {
+                    ui.weak("No single default value in this model's scopes.");
+                }
+                ui.separator();
+            });
+        }
+    });
+    if changed { let _ = channels.commit(); }
 }
 
 fn model_view_options_toolbar(
@@ -2147,6 +2259,7 @@ pub(super) fn model_wireframe_ui(
     show_default_mods: Option<&mut bool>,
     environment: &mut ModelEnvironment,
     show_textures: bool,
+    channels: Option<&mut ModelChannels>,
 ) -> (egui::Rect, Option<ViewAction>) {
     if !environment.tfx_paused {
         environment.tfx_time_seconds += ui.input(|input| input.stable_dt) * environment.tfx_speed;
@@ -2165,6 +2278,7 @@ pub(super) fn model_wireframe_ui(
         gpu_preview,
         environment,
         show_textures,
+        channels,
     );
     model_view_options_toolbar(
         ui.ctx(),
@@ -2378,6 +2492,7 @@ pub(super) fn model_wireframe_ui(
             ui.ctx().pixels_per_point(),
             *environment,
         );
+        callback.show_loading_status(ui, rect);
         ui.painter()
             .add(Callback::new_paint_callback(rect, callback));
         true
@@ -2531,7 +2646,7 @@ fn draw_textured_model_mesh(
         let texture_id = texture_cache
             .get_material_or_load(key)
             .map(|(_texture, texture_id)| texture_id)
-            .unwrap_or_else(|| texture_cache.get_or_default(key.color).1);
+            .unwrap_or_else(|| texture_cache.get_or_default(key.color.expect("textured triangle")).1);
         let texture_triangles = triangles
             .iter()
             .copied()
@@ -2558,7 +2673,7 @@ fn triangle_material_key(
     fallback_texture: Option<TagHash>,
 ) -> Option<MaterialTextureKey> {
     Some(MaterialTextureKey {
-        color: triangle.texture.or(fallback_texture)?,
+        color: Some(triangle.texture.or(fallback_texture)?),
         normal: triangle.normal,
         emissive: triangle.emissive,
         color_tint: triangle.color_tint,
@@ -3130,6 +3245,7 @@ mod tests {
             true,
             false,
             ModelEnvironment::default(),
+            None,
             None,
             ModelExportFormat::Png,
             path.clone(),

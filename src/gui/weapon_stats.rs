@@ -187,13 +187,17 @@ impl<'a> WeaponStatResolver<'a> {
     }
 
     pub(super) fn extract(&self, definition_tag: TagHash) -> Option<WeaponStats> {
-        let mut stats = self.mod_weapon_context(definition_tag)
+        let mut stats = self
+            .mod_weapon_context(definition_tag)
             .ok()?
             .baseline(definition_tag, self.rating_metadata.as_deref()?)
             .ok()?;
         // WeaponStats stores a fraction; the authored UI program returns percent.
         stats.movement_accuracy_loss = stats.movement_accuracy_loss.and_then(|value| {
-            self.display_programs.as_ref()?.single_property((2, 0x14), value).map(|percent| percent / 100.0)
+            self.display_programs
+                .as_ref()?
+                .single_property((2, 0x14), value)
+                .map(|percent| percent / 100.0)
         });
         Some(stats)
     }

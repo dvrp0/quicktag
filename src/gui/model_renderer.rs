@@ -1,3 +1,14 @@
+#[path = "model_surfaces.rs"]
+mod model_surfaces;
+use model_surfaces::{LoadedNativeSurface, NativeSurfaceSource};
+#[path = "model_decals.rs"]
+mod model_decals;
+use model_decals::NativeDecalSource;
+
+#[cfg(test)]
+#[path = "model_runner_audit.rs"]
+mod model_runner_audit;
+
 use std::{
     collections::HashMap,
     ops::Range,
@@ -16,6 +27,7 @@ use eframe::{
 use itertools::Itertools;
 use rayon::prelude::*;
 use tiger_pkg::{TagHash, package_manager};
+use crate::render::body_vertex::layout7_vertex_state as authored_layout7_vertex_state;
 
 use crate::{
     geometry::{
@@ -42,6 +54,45 @@ use crate::{
         linear_texture_format, srgb_texture_format,
     },
 };
+
+#[cfg(test)]
+#[path = "model_manifest.rs"]
+mod model_manifest;
+
+#[cfg(test)]
+#[path = "model_binding_audit.rs"]
+mod model_binding_audit;
+
+#[cfg(test)]
+#[path = "model_color_domain_tests.rs"]
+mod color_domain_tests;
+
+#[cfg(test)]
+#[path = "model_decal_tests.rs"]
+mod decal_tests;
+#[cfg(test)]
+#[path = "model_channel_probe.rs"]
+mod channel_probe;
+
+fn create_model_texture_view(
+    texture: &wgpu::Texture,
+    descriptor: &wgpu::TextureViewDescriptor<'_>,
+) -> wgpu::TextureView {
+    let view = texture.create_view(descriptor);
+    #[cfg(test)]
+    model_binding_audit::record_view(texture, descriptor, &view);
+    view
+}
+
+fn create_model_bind_group(
+    device: &wgpu::Device,
+    descriptor: &wgpu::BindGroupDescriptor<'_>,
+) -> wgpu::BindGroup {
+    let group = device.create_bind_group(descriptor);
+    #[cfg(test)]
+    model_binding_audit::record(descriptor, &group);
+    group
+}
 
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DISTORTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -133,6 +184,10 @@ struct ModelDraw {
     /// vertex resources (for example SV_VertexID -> t2 packed positions) must
     /// use the reconstructed-position fallback until that resource ABI exists.
     authored_native_vertex_supported: bool,
+    native_c827: Option<[[f32; 4]; 9]>,
+    native_surface: Option<NativeSurfaceSource>,
+    native_decal: Option<NativeDecalSource>,
+    native_rejection: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -292,9 +347,23 @@ struct GpuAuthoredGeometryInput {
     position_transform: Option<GeometryPositionTransform>,
     uv_transform: Option<UvTransformPreview>,
     attachment_pose: Option<WeaponModAttachmentPose>,
+    static_meshes: Vec<crate::render::static_mesh::StaticMesh>,
+    static_mesh_parts: HashMap<usize, usize>,
+    vertex_colors: Option<GpuAuthoredVertexColors>,
+}
+
+struct GpuAuthoredVertexColors {
+    data_tag: TagHash,
+    count: u32,
+    buffer: wgpu::Buffer,
 }
 
 impl GpuAuthoredGeometryInput {
+    fn static_mesh(&self, stage: AuthoredStageMetadata) -> Option<(usize, &crate::render::static_mesh::StaticMesh)> {
+        let index = *self.static_mesh_parts.get(&stage.part_index)?;
+        Some((index, self.static_meshes.get(index)?))
+    }
+
     fn stage_layout(&self, raw_stage: u8) -> Option<&AuthoredStageInputLayout> {
         self.stage_layouts
             .iter()
@@ -388,12 +457,20 @@ fn create_gpu_authored_vertex_stream(
     stream: &AuthoredVertexStreamRef,
     buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
 ) -> Option<GpuAuthoredVertexStream> {
+    let byte_count = usize::try_from(stream.data_size).ok()?;
+    let required = u64::from(stream.stride).checked_mul(u64::from(stream.element_count))?;
+    if stream.stride == 0 || byte_count == 0 || required > u64::from(stream.data_size) {
+        log::error!("Invalid authored vertex view {}: stride={} elements={} bytes={}",
+            stream.header_tag, stream.stride, stream.element_count, stream.data_size);
+        return None;
+    }
     let buffer = if let Some(buffer) = buffer_cache.get(&stream.data_tag) {
         buffer.clone()
     } else {
         let data = package_manager().read_tag(stream.data_tag).ok()?;
-        let byte_count = data.len().min(stream.data_size as usize);
-        if byte_count == 0 {
+        if data.len() < byte_count {
+            log::error!("Truncated authored vertex payload {}: expected {byte_count}, got {}",
+                stream.data_tag, data.len());
             return None;
         }
         let label = format!(
@@ -425,12 +502,20 @@ fn create_gpu_authored_index_buffer(
     index: &AuthoredIndexBufferRef,
     buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
 ) -> Option<GpuAuthoredIndexBuffer> {
+    let byte_count = usize::try_from(index.data_size).ok()?;
+    let stride = if index.is_32bit { 4 } else { 2 };
+    if byte_count == 0 || u64::from(index.index_count).checked_mul(stride)? > index.data_size {
+        log::error!("Invalid authored index view {}: elements={} bytes={}",
+            index.header_tag, index.index_count, index.data_size);
+        return None;
+    }
     let buffer = if let Some(buffer) = buffer_cache.get(&index.data_tag) {
         buffer.clone()
     } else {
         let data = package_manager().read_tag(index.data_tag).ok()?;
-        let byte_count = data.len().min(index.data_size as usize);
-        if byte_count == 0 {
+        if data.len() < byte_count {
+            log::error!("Truncated authored index payload {}: expected {byte_count}, got {}",
+                index.data_tag, data.len());
             return None;
         }
         let label = format!("quicktag_authored_indices_{}", index.header_tag);
@@ -459,8 +544,12 @@ fn create_gpu_authored_geometry_input(
     device: &wgpu::Device,
     source: &AuthoredGeometryInput,
     required_stages: &[u8],
+    native_static_required: &[AuthoredStageMetadata],
+    vertex_color_required: bool,
     vertex_buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
     index_buffer_cache: &mut HashMap<TagHash, wgpu::Buffer>,
+    rigid_float_palette: &mut Option<wgpu::Buffer>,
+    runtime_inputs: &crate::render::tfx::TfxRuntimeInputs,
 ) -> Option<GpuAuthoredGeometryInput> {
     let required_streams = source
         .stage_layouts
@@ -475,23 +564,201 @@ fn create_gpu_authored_geometry_input(
         .vertex_streams
         .iter()
         .filter(|stream| required_streams.contains(&stream.stream_index))
-        .filter_map(|stream| create_gpu_authored_vertex_stream(device, stream, vertex_buffer_cache))
-        .collect_vec();
+        .map(|stream| create_gpu_authored_vertex_stream(device, stream, vertex_buffer_cache))
+        .collect::<Option<Vec<_>>>()?;
+    if required_streams.iter().any(|slot| !vertex_streams.iter().any(|stream| stream.stream_index == *slot)) {
+        log::error!("Missing required authored vertex stream for geometry {}", source.geometry);
+        return None;
+    }
+    let index_buffer = if required_stages.is_empty() { None } else {
+        Some(create_gpu_authored_index_buffer(device, source.index_buffer.as_ref()?, index_buffer_cache)?)
+    };
+    if !native_static_required.is_empty() {
+        let indices = index_buffer.as_ref()?;
+        if native_static_required.iter().any(|stage| {
+            stage.source_index_count == 0 || stage.source_index_start.checked_add(stage.source_index_count)
+                .is_none_or(|end| end > indices.index_count)
+        }) {
+            log::error!("Invalid native strip format/range for geometry {}", source.geometry);
+            return None;
+        }
+    }
 
+    let mut static_mesh_parts = HashMap::new();
+    // Direct float IA has no compute stage or generated storage buffers.
+    if source.stage_layouts.iter().any(|stage|stage.layout_id==13 && required_stages.contains(&stage.raw_stage)) {
+        let geometry = vertex_streams.iter().find(|stream|stream.stream_index == 0)?;
+        let uv = vertex_streams.iter().find(|stream|stream.stream_index == 1)?;
+        if geometry.stride != 48 || uv.stride != 4 || geometry.element_count != uv.element_count
+            || source.uv_transform.is_none() || source.position_transform.is_none()
+            || source.attachment_pose.is_some() {
+            log::error!("Invalid direct-IA native inputs for geometry {}", source.geometry);
+            return None;
+        }
+    }
+    let static_meshes = if !native_static_required.is_empty() {
+        use crate::render::authored_program::{DescriptorAbi, resolve_package_program};
+        // Producer selection follows the geometry's authored compute parts,
+        // independently of its visible VS. Never infer a CS from layout7.
+        if source.attachment_pose.is_some() { return None; }
+        let mut producers = Vec::new();
+        let mut producer_constants = Vec::<Option<Vec<[f32; 4]>>>::new();
+        for stage in native_static_required {
+            let tag=crate::geometry::geometry_compute_technique(source.geometry, stage.part_index,
+                stage.source_index_start..stage.source_index_start.checked_add(stage.source_index_count)?)?;
+            let technique = TechniqueDescriptor::load(tag)?;
+            let cs = technique.stages.iter().find(|s| s.stage == ShaderStage::Compute)?;
+            let abi=resolve_package_program(cs.shader?, ShaderStage::Compute).ok()??.descriptor_abi;
+            if !matches!(
+                abi,
+                DescriptorAbi::BodyMeshComputeStorage
+                    | DescriptorAbi::BodyMesh15RowComputeStorage
+                    | DescriptorAbi::HeadMeshComputeStorage
+                    | DescriptorAbi::HeadMeshEC0BComputeStorage
+                    | DescriptorAbi::HeadMesh15RowA60035ComputeStorage
+                    | DescriptorAbi::HeadMesh15RowB8BDComputeStorage
+                    | DescriptorAbi::HairMeshComputeStorage
+                    | DescriptorAbi::HairMesh133RowComputeStorage
+                    | DescriptorAbi::BodyProceduralComputeStorage
+                    | DescriptorAbi::BodyMeshB4CBComputeStorage
+                    | DescriptorAbi::Cloth45RowComputeStorage
+                    | DescriptorAbi::Cloth46RowComputeStorage
+                    | DescriptorAbi::BodyMeshAA060BComputeStorage
+                    | DescriptorAbi::BodyMeshB152BEComputeStorage
+            ) {
+                return None;
+            }
+            let constants = if let Some((rows,_)) = abi.deformation_constant_contract() {
+                let state=cs.runtime_state(runtime_inputs);
+                if cs.constant_buffer_slot != Some(0) || state.constant_registers.len()!=rows
+                    || state.constant_registers[14..].iter().flatten().any(|v|!v.is_finite())
+                    || state.unresolved_dependencies.iter().filter_map(|value|
+                        value.strip_prefix("output[").and_then(|s|s.split_once(']'))
+                            .and_then(|(row,_)|row.parse::<usize>().ok()))
+                        .any(|row| !matches!(row,0..=4 | 7..=13)) { return None; }
+                Some(state.constant_registers)
+            } else if matches!(abi, DescriptorAbi::HairMesh133RowComputeStorage
+                | DescriptorAbi::BodyProceduralComputeStorage) {
+                let state = cs.runtime_state(runtime_inputs);
+                let rows = if abi == DescriptorAbi::BodyProceduralComputeStorage { 81 } else { 133 };
+                if cs.constant_buffer_slot != Some(0) || state.constant_registers.len() != rows
+                    || state.unresolved_dependencies.iter().filter_map(|value|
+                        value.strip_prefix("output[").and_then(|s|s.split_once(']'))
+                            .and_then(|(row,_)|row.parse::<usize>().ok()))
+                        .any(|row| !matches!(row, 0 | 2 | 7..=20)) {
+                    return None;
+                }
+                Some(state.constant_registers)
+            } else { None };
+            // All source buffers/object inputs are shared within this geometry.
+            // Reuse a producer only when its exact shader ABI and complete
+            // evaluated constant image match, including signed zero/NaN bits.
+            let index = if let Some(index) = producers.iter().enumerate().find_map(|(index, &producer)| {
+                let equal = match (&producer_constants[index], &constants) {
+                    (None, None) => true,
+                    (Some(before), Some(after)) => before.len() == after.len()
+                        && before.iter().flatten().zip(after.iter().flatten())
+                            .all(|(a,b)| a.to_bits() == b.to_bits()),
+                    _ => false,
+                };
+                (producer == abi && equal).then_some(index)
+            }) {
+                index
+            } else {
+                producers.push(abi);
+                producer_constants.push(constants);
+                producers.len() - 1
+            };
+            static_mesh_parts.insert(stage.part_index, index);
+        }
+        let float_source=native_static_required.iter().any(|stage|stage.input_layout_id==13);
+        if native_static_required.iter().any(|stage|(stage.input_layout_id==13)!=float_source) {return None;}
+        if float_source && producers.iter().any(|p|!matches!(p,DescriptorAbi::BodyMeshComputeStorage|DescriptorAbi::BodyMesh15RowComputeStorage)) {return None;}
+        let stride=if float_source {48}else{24};
+        let stream = vertex_streams.iter().find(|s| s.stream_index == 0 && s.stride == stride)?;
+        let uv = vertex_streams.iter().find(|s| s.stream_index == 1 && s.stride == 4)?;
+        if stream.element_count == 0 || uv.element_count < stream.element_count
+            || stream.buffer.size() != u64::from(stream.element_count) * u64::from(stride) {
+            log::error!("Invalid native layout7 vertex views for geometry {}", source.geometry);
+            return None;
+        }
+        let palette=if float_source {
+            if source.skinning_buffer.is_some() {return None;}
+            let reference=source.vertex_streams.iter().find(|s|s.stream_index==0)?;
+            let raw=package_manager().read_tag(reference.data_tag).ok()?;
+            if raw.len()!=stream.element_count as usize*48 || raw.chunks_exact(48).any(|v| {
+                f32::from_le_bytes(v[12..16].try_into().unwrap())!=1.0
+                    || v.chunks_exact(4).any(|w|!f32::from_le_bytes(w.try_into().unwrap()).is_finite())
+            }) {return None;}
+            let p=source.position_transform?;
+            if p.scale.iter().any(|&s|s!=p.procedural_scale) {return None;}
+            Vec::new()
+        } else {
+            let palette_ref=source.skinning_buffer.as_ref()?;
+            let palette=package_manager().read_tag(palette_ref.data_tag).ok()?;
+            if palette.is_empty() || palette.len()%4!=0 || palette.len()!=palette_ref.data_size as usize {return None;}
+            palette
+        };
+        if source.position_transform.is_none() || source.uv_transform.is_none() {
+            log::error!("Invalid native producer palette/transform for geometry {}", source.geometry);
+            return None;
+        }
+        if producers.iter().any(|p|matches!(p,DescriptorAbi::HairMeshComputeStorage
+            | DescriptorAbi::HairMesh133RowComputeStorage | DescriptorAbi::BodyProceduralComputeStorage
+            | DescriptorAbi::Cloth45RowComputeStorage | DescriptorAbi::Cloth46RowComputeStorage
+            | DescriptorAbi::BodyMeshAA060BComputeStorage | DescriptorAbi::BodyMeshB152BEComputeStorage)) {
+            let reference = source.vertex_streams.iter().find(|s| s.stream_index == 0)?;
+            let raw = package_manager().read_tag(reference.data_tag).ok()?;
+            if !crate::render::static_mesh::hair_static_inputs_valid(&raw,palette.len()) {
+                log::error!("Invalid static packed palette/frame inputs for geometry {}", source.geometry);
+                return None;
+            }
+            for (&producer,constants) in producers.iter().zip(&mut producer_constants) {
+                if producer==DescriptorAbi::BodyMeshB152BEComputeStorage {
+                    let constants=constants.as_mut()?;
+                    constants[16][0]=crate::render::static_mesh::packed_rotation_static_radius(&raw,constants)?;
+                }
+            }
+        }
+        if float_source && rigid_float_palette.is_none() {
+            // Shared once per model, zero-initialized by WGPU. No 3.75MiB CPU
+            // upload per geometry; values are output-inert under proved mode0.
+            *rigid_float_palette=Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label:Some("bounded viewer Float48 inactive palette image"),size:245_760*16,
+                usage:wgpu::BufferUsages::STORAGE,mapped_at_creation:false,
+            }));
+        }
+        producers.into_iter().zip(producer_constants).map(|(producer, constants)| crate::render::static_mesh::StaticMesh::new(device, &stream.buffer, &palette, stream.element_count, producer,u32::from(stride),
+            if float_source {rigid_float_palette.as_ref()}else{None}, constants.as_deref())).collect()
+    } else { Vec::new() };
+
+    let vertex_colors = if vertex_color_required {
+        let color = source.color_buffer.as_ref()?;
+        if color.stride != 4 || color.vertex_type != 5
+            || color.element_count.checked_mul(4) != Some(color.data_size) { return None; }
+        let data = package_manager().read_tag(color.data_tag).ok()?;
+        let decoded = crate::render::color_vertex::decode(&data, color.element_count)?;
+        Some(GpuAuthoredVertexColors {
+            data_tag: color.data_tag, count: color.element_count,
+            buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("authored RGBA8 UNORM vertex-color static view"),
+                contents: bytemuck::cast_slice(&decoded),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+            }),
+        })
+    } else { None };
     Some(GpuAuthoredGeometryInput {
         geometry: source.geometry,
         vertex_streams,
-        index_buffer: (!required_stages.is_empty())
-            .then(|| {
-                source.index_buffer.as_ref().and_then(|index| {
-                    create_gpu_authored_index_buffer(device, index, index_buffer_cache)
-                })
-            })
-            .flatten(),
+        index_buffer,
         stage_layouts: source.stage_layouts.clone(),
         position_transform: source.position_transform,
         uv_transform: source.uv_transform,
         attachment_pose: source.attachment_pose,
+        static_meshes,
+        static_mesh_parts,
+        vertex_colors,
     })
 }
 
@@ -508,6 +775,11 @@ pub(crate) struct GpuModelPreview {
 }
 
 impl GpuModelPreview {
+    fn authored_index_format(&self, stable_index: usize) -> wgpu::IndexFormat {
+        let source = self.draws[stable_index].authored_source.expect("native source");
+        self.authored_inputs[source].as_ref().expect("resident native source")
+            .index_buffer.as_ref().expect("native index buffer").format
+    }
     #[cfg(test)]
     pub(crate) fn vertex_input_bytes(&self) -> Vec<u8> {
         bytemuck::cast_slice(&self.vertices).to_vec()
@@ -554,12 +826,17 @@ impl GpuModelPreview {
                     (Some(input), None) => format!("geometry={} layout=missing", input.geometry),
                     (None, _) => "missing".into(),
                 };
+                let evaluation=draw.native_surface.as_ref().map(|s|format!("source {:?}",s.program))
+                    .or_else(||draw.native_decal.as_ref().map(|s|format!("source {:?}",s.program)))
+                    .or_else(||draw.native_c827.map(|_|"source C827".to_string()))
+                    .unwrap_or_else(||format!("generic; {}",draw.native_rejection.unwrap_or("no authored material contract")));
                 format!(
-                    "#{index} lod={:?} stage={:?} tech={:?} family={:?} passes={:?} authored=[{}] source={} tfx=[{}] warnings={:?}",
+                    "#{index} lod={:?} stage={:?} tech={:?} family={:?} evaluation=[{}] passes={:?} authored=[{}] source={} tfx=[{}] warnings={:?}",
                     draw.packet.raw_lod_category,
                     draw.packet.raw_render_stage,
                     draw.packet.technique_hash,
                     draw.packet.material.family(),
+                    evaluation,
                     draw.packet.pass_plan.passes,
                     authored_status,
                     source,
@@ -599,12 +876,44 @@ impl GpuModelPreview {
         device: &wgpu::Device,
         wireframe: &WireframePreview,
         fallback_color: Option<tiger_pkg::TagHash>,
+        runtime_inputs: &crate::render::tfx::TfxRuntimeInputs,
+    ) -> Option<Self> {
+        Self::create_with_geometry(device, wireframe, fallback_color, runtime_inputs, None)
+    }
+
+    /// Reevaluate package programs without decoding, AO baking or reuploading mesh inputs.
+    pub(crate) fn with_channels(
+        &self,
+        device: &wgpu::Device,
+        wireframe: &WireframePreview,
+        runtime_inputs: &crate::render::tfx::TfxRuntimeInputs,
+    ) -> Option<Self> {
+        let updated = Self::create_with_geometry(device, wireframe, None, runtime_inputs, Some(self))?;
+        if self.draws.iter().zip(&updated.draws).any(|(before, after)|
+            (before.native_surface.is_some() && after.native_surface.is_none())
+                || (before.native_decal.is_some() && after.native_decal.is_none())
+                || (before.native_c827.is_some() && after.native_c827.is_none())) {
+            log::warn!("Channel edit requires a material branch without a supported preview contract");
+            return None;
+        }
+        Some(updated)
+    }
+
+    fn create_with_geometry(
+        device: &wgpu::Device,
+        wireframe: &WireframePreview,
+        fallback_color: Option<TagHash>,
+        runtime_inputs: &crate::render::tfx::TfxRuntimeInputs,
+        retained: Option<&Self>,
     ) -> Option<Self> {
         let uvs = wireframe.uvs.as_ref()?;
         if wireframe.vertices.is_empty() || wireframe.indices.len() < 3 {
             return None;
         }
 
+        let vertices = if let Some(retained) = retained {
+            retained.vertices.clone()
+        } else {
         let generated_normals;
         let normals = if let Some(normals) = wireframe
             .normals
@@ -630,7 +939,7 @@ impl GpuModelPreview {
             .procedural_normals
             .as_ref()
             .filter(|normals| normals.len() == wireframe.vertices.len());
-        let vertices = wireframe
+        wireframe
             .vertices
             .iter()
             .enumerate()
@@ -649,13 +958,48 @@ impl GpuModelPreview {
                     .and_then(|normals| normals.get(source_index).copied())
                     .unwrap_or(normals[source_index]),
             })
-            .collect::<Vec<_>>();
-        let mut draws = model_draws(wireframe, fallback_color);
+            .collect::<Vec<_>>()
+        };
+        let mut draws = retained.map(|preview| preview.draws.clone())
+            .unwrap_or_else(|| model_draws(wireframe, fallback_color));
+        for draw in &mut draws {
+            let scoped=draw.authored_source.and_then(|index|wireframe.authored_inputs.get(index))
+                .map(|source|runtime_inputs.for_geometry(source.geometry));
+            let surface=model_surfaces::resolve_source(draw.packet.technique.as_ref(),draw.authored_stage,draw.pipeline,
+                scoped.as_ref().unwrap_or(runtime_inputs));
+            let decal=model_decals::resolve_source(draw.packet.technique.as_ref(),draw.authored_stage,draw.pipeline,
+                scoped.as_ref().unwrap_or(runtime_inputs));
+            draw.native_rejection=match draw.packet.raw_render_stage {
+                Some(0)=>surface.as_ref().err().copied(),
+                Some(2)=>decal.as_ref().err().copied(),
+                _=>None,
+            };
+            draw.native_surface=surface.ok();
+            if draw.native_surface.as_ref().is_some_and(|surface|
+                surface.vertex_program.auxiliary_vertex_contract().is_some())
+                && !draw.authored_source.and_then(|index|wireframe.authored_inputs.get(index))
+                    .is_some_and(model_surfaces::packed_static_source_valid) {
+                draw.native_surface=None;
+                draw.native_rejection=Some("invalid static packed source inputs");
+            }
+            draw.native_decal=decal.ok();
+            if draw.native_surface.as_ref().is_some_and(|surface|
+                surface.vertex_program == crate::render::authored_program::DescriptorAbi::VertexColorStorage)
+                && !draw.authored_source.and_then(|index|wireframe.authored_inputs.get(index))
+                    .zip(draw.authored_stage).is_some_and(|(source,stage)|
+                        model_surfaces::vertex_color_source_valid(source,stage)) {
+                draw.native_surface=None;
+                draw.native_rejection=Some("unsupported vertex-color source/producer inputs");
+            }
+            draw.native_c827=native_c827_constants(draw.packet.technique.as_ref(),draw.authored_stage,draw.pipeline,
+                scoped.as_ref().unwrap_or(runtime_inputs));
+        }
         if draws.is_empty() {
             return None;
         }
-        let (authored_shadow_indices, mut authored_shadow_draws) =
-            model_authored_shadow_draws(wireframe, wireframe.indices.len());
+        let (authored_shadow_indices, mut authored_shadow_draws) = retained
+            .map(|preview| (Vec::new(), preview.authored_shadow_draws.clone()))
+            .unwrap_or_else(|| model_authored_shadow_draws(wireframe, wireframe.indices.len()));
         let mut provenance = ProvenanceStore::default();
         for draw in &mut draws {
             let source_tag = draw.packet.technique_hash.unwrap_or(TagHash(0));
@@ -699,28 +1043,28 @@ impl GpuModelPreview {
             });
         }
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let vertex_buffer = retained.map(|preview| preview.vertex_buffer.clone()).unwrap_or_else(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quicktag_model_preview_vertices"),
             contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
-        });
+        }));
         let mut gpu_indices = wireframe.indices.clone();
         gpu_indices.extend_from_slice(&authored_shadow_indices);
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let index_buffer = retained.map(|preview| preview.index_buffer.clone()).unwrap_or_else(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quicktag_model_preview_indices"),
             contents: bytemuck::cast_slice(&gpu_indices),
             usage: wgpu::BufferUsages::INDEX,
-        });
+        }));
         let mut required_stages = vec![Vec::<u8>::new(); wireframe.authored_inputs.len()];
         for draw in draws
             .iter()
             .filter(|draw| {
-                draw.authored_native_vertex_supported
+                draw.native_c827.is_some() || draw.native_surface.is_some() || draw.native_decal.is_some() || (draw.authored_native_vertex_supported
                     && draw
                         .packet
                         .pass_plan
                         .passes
-                        .contains(&RenderPassKind::DepthOnly)
+                        .contains(&RenderPassKind::DepthOnly))
             })
             .chain(
                 authored_shadow_draws
@@ -741,6 +1085,17 @@ impl GpuModelPreview {
 
         let mut vertex_buffer_cache = HashMap::<TagHash, wgpu::Buffer>::new();
         let mut index_buffer_cache = HashMap::<TagHash, wgpu::Buffer>::new();
+        if let Some(retained) = retained {
+            for source in retained.authored_inputs.iter().flatten() {
+                for stream in &source.vertex_streams {
+                    vertex_buffer_cache.insert(stream.data_tag, stream.buffer.clone());
+                }
+                if let Some(index) = &source.index_buffer {
+                    index_buffer_cache.insert(index.data_tag, index.buffer.clone());
+                }
+            }
+        }
+        let mut rigid_float_palette=None;
         let authored_inputs = wireframe
             .authored_inputs
             .iter()
@@ -753,11 +1108,37 @@ impl GpuModelPreview {
                         .get(source_index)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]),
+                    &draws.iter().filter(|draw| (draw.native_c827.is_some() || draw.native_surface.is_some() || draw.native_decal.is_some()) && draw.authored_source == Some(source_index))
+                        .filter(|draw|!draw.native_surface.as_ref().is_some_and(|s|s.vertex_program==crate::render::authored_program::DescriptorAbi::RigidVertexDirectIa))
+                        .filter_map(|draw|draw.authored_stage).collect_vec(),
+                    draws.iter().any(|draw| draw.authored_source == Some(source_index)
+                        && draw.native_surface.as_ref().is_some_and(|s| s.vertex_program
+                            == crate::render::authored_program::DescriptorAbi::VertexColorStorage)),
                     &mut vertex_buffer_cache,
                     &mut index_buffer_cache,
+                    &mut rigid_float_palette,
+                    &runtime_inputs.for_geometry(source.geometry),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if let Some(draw) = draws.iter().filter(|d| d.native_c827.is_some() || d.native_surface.is_some() || d.native_decal.is_some())
+            .filter(|d| !d.native_surface.as_ref().is_some_and(|surface|surface.vertex_program == crate::render::authored_program::DescriptorAbi::RigidVertexDirectIa)).find(|draw| {
+            let mesh=draw.authored_source.and_then(|i| authored_inputs.get(i)).and_then(Option::as_ref).and_then(|s| s.static_mesh(draw.authored_stage?));
+            mesh.is_none() || draw.native_surface.as_ref().is_some_and(|surface|
+                if let Some(producer)=surface.vertex_program.static_vertex_producer() {
+                    mesh.unwrap().1.producer != producer
+                } else { matches!(mesh.unwrap().1.producer,
+                    crate::render::authored_program::DescriptorAbi::HairMeshComputeStorage
+                    | crate::render::authored_program::DescriptorAbi::HairMesh133RowComputeStorage) })
+        }) {
+            log::error!("Native preview input rejected: technique={:?} source={:?} stage={:?}",
+                draw.packet.technique_hash, draw.authored_source, draw.authored_stage);
+            #[cfg(test)]
+            eprintln!("Native preview input rejected: technique={:?} source={:?} stage={:?} index_format={:?}",
+                draw.packet.technique_hash,draw.authored_source,draw.authored_stage,
+                draw.authored_source.and_then(|i|wireframe.authored_inputs.get(i)).and_then(|s|s.index_buffer.as_ref()).map(|i|if i.is_32bit {"Uint32"}else{"Uint16"}));
+            return None;
+        }
 
         Some(Self {
             vertex_buffer,
@@ -814,6 +1195,22 @@ fn authored_native_vertex_supported(technique: Option<&TechniqueDescriptor>) -> 
     // contain the CPU dequantization/assembly transform and are the faithful
     // fallback until the runtime resource ABI is implemented.
     !shader_payload_contains_ascii(vertex_shader, b"SV_VertexID")
+}
+
+fn native_c827_constants(technique: Option<&TechniqueDescriptor>, authored: Option<AuthoredStageMetadata>, pipeline: ModelPipelineKey,
+    runtime_inputs: &crate::render::tfx::TfxRuntimeInputs) -> Option<[[f32;4];9]> {
+    use crate::render::authored_program::{DescriptorAbi, resolve_package_program};
+    let authored = authored?;
+    if authored.input_layout_id != 7 || authored.primitive_type != 5 || authored.raw_stage != 2
+        || pipeline.blend != 76 || pipeline.depth_stencil != 15 || pipeline.depth_bias != 1 || pipeline.rasterizer != 2 { return None; }
+    let technique = technique?;
+    let vs = technique.stages.iter().find(|s| s.stage == ShaderStage::Vertex)?;
+    let ps = technique.stages.iter().find(|s| s.stage == ShaderStage::Pixel)?;
+    if resolve_package_program(vs.shader?, ShaderStage::Vertex).ok()??.descriptor_abi != DescriptorAbi::SharedLayout7VertexScalarStorage
+        || resolve_package_program(ps.shader?, ShaderStage::Pixel).ok()??.descriptor_abi != DescriptorAbi::C827Pixel { return None; }
+    let state = ps.runtime_state(runtime_inputs);
+    if ps.constant_buffer_slot != Some(0) || !state.unresolved_dependencies.is_empty() { return None; }
+    state.constant_registers.try_into().ok()
 }
 
 fn model_draw_from_source(
@@ -873,7 +1270,7 @@ fn model_draw_from_source(
             pass_plan,
             source: ProvenanceId(u32::MAX),
         },
-        material: color.map(|color| MaterialTextureKey {
+        material: (color.is_some() || material_inputs.normal.is_some() || material_inputs.emissive.is_some()).then_some(MaterialTextureKey {
             color,
             normal: material_inputs.normal,
             emissive: material_inputs.emissive,
@@ -914,6 +1311,10 @@ fn model_draw_from_source(
         authored_source: source.authored_source,
         authored_stage: source.authored_stage,
         authored_native_vertex_supported,
+        native_c827: None,
+        native_surface: None,
+        native_decal: None,
+        native_rejection: None,
     }
 }
 
@@ -1024,6 +1425,10 @@ fn model_draws(
             authored_source: None,
             authored_stage: None,
             authored_native_vertex_supported: false,
+            native_c827: None,
+            native_surface: None,
+            native_decal: None,
+            native_rejection: None,
         });
     }
 
@@ -1158,7 +1563,7 @@ fn draw_indices_center(vertices: &[[f32; 3]], indices: &[u32]) -> [f32; 3] {
 
 fn default_material(color: tiger_pkg::TagHash) -> MaterialTextureKey {
     MaterialTextureKey {
-        color,
+        color: Some(color),
         normal: None,
         emissive: None,
         color_tint: [255; 4],
@@ -1278,6 +1683,76 @@ struct SceneUniform {
     postprocess5: [f32; 4],
     fidelity: [f32; 4],
     shadow_parameters: [f32; 4],
+}
+
+/// The viewer owns its orthographic camera. These are native VS matrix columns,
+/// not captured game View scope values. Rebuilt on every camera/frame update.
+fn native_view_image(scene: &SceneUniform) -> [[f32;4];27] {
+    let [radius, yaw, pitch, zoom] = scene.params0;
+    let (sy,cy) = yaw.sin_cos();
+    let (sp,cp) = pitch.sin_cos();
+    let rotate = |p: [f32;3]| {
+        let x = p[0]*cy + p[1]*sy;
+        let z = -p[0]*sy + p[1]*cy;
+        [x, p[2]*cp-z*sp, p[2]*sp+z*cp]
+    };
+    let scale = 0.84 * zoom / radius.max(0.0001);
+    let project = |p: [f32;3]| {
+        let r = rotate(p);
+        [-r[0]*scale*scene.params1[0], r[1]*scale, -r[2]*0.21/radius.max(0.0001), 0.0]
+    };
+    let mut view = [[0.0;4];27];
+    for axis in 0..3 { let mut p=[0.0;3]; p[axis]=1.0; view[axis]=project(p); }
+    let center=project([scene.center[0],scene.center[1],scene.center[2]]);
+    view[19]=[-center[0]+scene.params1[1], -center[1]+scene.params1[2], 0.5-center[2], 1.0];
+    // C827 View20..22 are relative-world offsets, not another clip matrix.
+    // The viewer uses world coordinates directly, so those offsets stay zero.
+    view[7]=[scene.center[0],scene.center[1],scene.center[2],1.0];
+    view
+}
+
+fn c827_static_skinning(source: &GpuAuthoredGeometryInput, scene: &SceneUniform) -> [[f32;4];31] {
+    let p=source.position_transform.expect("native static position transform");
+    let uv=source.uv_transform.expect("native static UV transform");
+    let mut skin=[[0.0;4];31];
+    for start in [0,8] { for axis in 0..4 { skin[start+axis][axis]=1.0; } }
+    skin[6]=[uv.scale[0]*scene.uv_transform[0], uv.scale[1]*scene.uv_transform[1],
+        uv.offset[0]*scene.uv_transform[0]+scene.uv_transform[2], uv.offset[1]*scene.uv_transform[1]+scene.uv_transform[3]];
+    // Exact paired C827 VS reads offset.xyz and scale.w. Geometry metadata's
+    // separate scale/offset fields must be packed in that shader order.
+    skin[12]=[p.offset[0],p.offset[1],p.offset[2],p.procedural_scale];
+    skin[13]=skin[12];
+    skin[14]=[f32::from_bits(2),f32::from_bits(2),0.0,0.0];
+    // Viewer-owned object-space texture frequency. Native dynamic writer is
+    // unobserved; this fixed static-preview input is explicit in the ledger.
+    skin[5][3]=1.0;
+    skin
+}
+
+fn native_surface_object_image(
+    vertex: crate::render::authored_program::DescriptorAbi,
+    source: &GpuAuthoredGeometryInput, scene: &SceneUniform,
+) -> [[f32;4];31] {
+    let mut object=c827_static_skinning(source,scene);
+    if vertex == crate::render::authored_program::DescriptorAbi::VertexColorStorage {
+        // Explicit static preview policy: C107's UMin selects actual authored
+        // records and clamps to this buffer's final record, including sentinel.
+        object[4][3] = f32::from_bits(source.vertex_colors.as_ref()
+            .expect("authored vertex-color image").count - 1);
+    }
+    if vertex == crate::render::authored_program::DescriptorAbi::RigidVertexDirectIa {
+        // Raw float positions are retained. IA13 VS applies the geometry
+        // placement through cb1[0..3] exactly once, not via a compute producer.
+        let p=source.position_transform.expect("direct-IA placement");
+        for start in [0,8] {
+            for axis in 0..3 {
+                object[start+axis]=[0.0;4];
+                object[start+axis][axis]=p.scale[axis];
+            }
+            object[start+3]=[p.offset[0],p.offset[1],p.offset[2],1.0];
+        }
+    }
+    object
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1553,6 +2028,7 @@ struct ModelSamplerDesc {
     address_w: u32,
     mip_lod_bias: f32,
     max_anisotropy: u32,
+    border_color: [f32; 4],
     min_lod: f32,
     max_lod: f32,
 }
@@ -1621,6 +2097,16 @@ struct PreparedDraw {
     authored_source: Option<usize>,
     authored_stage: Option<AuthoredStageMetadata>,
     authored_native_vertex_supported: bool,
+    native_c827: bool,
+    native_surface: bool,
+    native_decal: bool,
+}
+
+fn is_generic_opaque_receiver(draw: &PreparedDraw) -> bool {
+    !draw.native_surface && !draw.native_decal && !draw.native_c827
+        && draw.passes.iter().any(|pass| matches!(pass,
+            RenderPassKind::OpaqueCompatibility | RenderPassKind::AlphaTestedCompatibility
+                | RenderPassKind::UnknownCompatibility))
 }
 
 fn select_shadow_draws(
@@ -1645,6 +2131,10 @@ pub(crate) struct ModelPaintCallback {
     scene: SceneUniform,
     export_camera: Option<ModelExportCamera>,
     materials: Vec<LoadedMaterial>,
+    native_surfaces: Vec<LoadedNativeSurface>,
+    native_decals: Vec<LoadedNativeSurface>,
+    native_resources_pending: bool,
+    native_resource_failures: Vec<TagHash>,
     draws: Vec<PreparedDraw>,
     shadow_draws: Vec<PreparedDraw>,
     cubemap: Option<Arc<Texture>>,
@@ -1804,18 +2294,33 @@ impl ModelPaintCallback {
             scale: [1.0; 2],
             offset: [0.0; 2],
         });
-        let target_size = bounded_target_size(
+        let mut target_size = bounded_target_size(
             rect.width() * pixels_per_point,
             rect.height() * pixels_per_point,
         );
 
         let mut materials = Vec::<LoadedMaterial>::new();
+        let mut native_surfaces = Vec::new();
+        let mut native_decals = Vec::new();
+        let mut native_resources_pending = false;
+        let mut native_resource_failures = Vec::new();
         let mut draws = Vec::with_capacity(preview.draws.len());
         let mut authored_shadow_draws = Vec::with_capacity(preview.authored_shadow_draws.len());
         #[cfg(test)]
-        let probe_draw_range = std::env::var("QUICKTAG_PROBE_DRAW_RANGE")
+        let probe_draw_ranges = std::env::var("QUICKTAG_PROBE_DRAW_RANGE")
             .ok()
-            .and_then(|value| value.parse::<usize>().ok());
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| {
+                        value.parse::<usize>().expect(
+                            "QUICKTAG_PROBE_DRAW_RANGE must contain comma-separated draw indices",
+                        )
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
         let visible_draw_count = preview.draws.len();
         let draw_sources = preview
             .draws
@@ -1831,42 +2336,74 @@ impl ModelPaintCallback {
             );
         for (is_authored_shadow, stable_index, draw) in draw_sources {
             #[cfg(test)]
-            if !is_authored_shadow && probe_draw_range.is_some() {
+            if !is_authored_shadow && probe_draw_ranges.is_some() {
                 eprintln!(
                     "PROBE_DRAW index={stable_index} indices={:?} color={:?} shared={} pipeline={:?}",
                     draw.indices,
-                    draw.material.map(|material| material.color),
+                    draw.material.and_then(|material| material.color),
                     draw.authored_shared_atlas,
                     draw.pipeline,
                 );
             }
             #[cfg(test)]
             if !is_authored_shadow
-                && probe_draw_range.is_some_and(|requested| requested != stable_index)
+                && probe_draw_ranges
+                    .as_ref()
+                    .is_some_and(|requested| !requested.contains(&stable_index))
             {
                 continue;
             }
             if !is_authored_shadow && draw.sticker_proxy && !show_stickers {
                 continue;
             }
-            // Shared engine/debug atlases are bound by many material scopes but
-            // are not visible model surfaces. The runner pass accidentally
-            // removed this rejection, exposing those ranges as flat neon cards.
-            // Explicit runner/character ABIs and shader-proven shared atlases
-            // remain visible because their use is authored and decoded.
-            if !is_authored_shadow
-                && draw.material.is_some_and(|material| {
-                    !draw.authored_shared_atlas
-                        && draw.character_surface.is_none()
-                        && draw.runner_layered_surface.is_none()
-                        && draw.investment_decal.is_none()
-                        && draw.forward_coating.is_none()
-                        && is_debug_placeholder_texture(texture_cache, material.color)
-                })
-            {
+            if !is_authored_shadow && draw.native_c827.is_some() {
+                draws.push(PreparedDraw {
+                    indices: draw.indices.clone(), material_index: usize::MAX,
+                    pipeline: draw.pipeline, view_depth: model_view_depth(draw.center,center,yaw,pitch),
+                    stable_index, passes: draw.packet.pass_plan.passes.clone(),
+                    authored_source: draw.authored_source, authored_stage: draw.authored_stage,
+                    authored_native_vertex_supported: false, native_c827: true, native_surface: false, native_decal: false,
+                });
                 continue;
             }
             let solid_color = draw.solid_color;
+            let native_surface = !is_authored_shadow
+                && (environment.lighting_model == LightingModel::SurfaceAlbedo || environment.diagnostic_pass == 1
+                    || (environment.diagnostic_pass == 0 && matches!(environment.lighting_model,
+                        LightingModel::TigerGgxCompatibility | LightingModel::TigerGgxApproximation | LightingModel::DebugLambert)))
+                && draw.native_surface.is_some();
+            if native_surface {
+                let spec = draw.native_surface.as_ref().expect("audited surface");
+                // Retain complete shader resources through the existing bounded
+                // texture cache. A pending resource is not replaced by a dummy.
+                // Request every resource before checking readiness: short-circuiting
+                // Option collection would serialize uploads across UI frames.
+                let requested = spec.textures.iter().map(|&tag| texture_cache.get_or_load_material(tag).map(|t|t.0))
+                    .collect::<Vec<_>>();
+                let textures = requested.into_iter().collect::<Option<Vec<_>>>();
+                if let Some(textures) = textures {
+                    native_surfaces.push(LoadedNativeSurface { stable_index, textures });
+                } else {
+                    native_resources_pending=true;
+                    native_resource_failures.extend(spec.textures.iter().copied()
+                        .filter(|&tag| texture_cache.material_texture_failed(tag)));
+                }
+            }
+            let native_decal = !is_authored_shadow && draw.native_decal.is_some()
+                && (environment.lighting_model == LightingModel::SurfaceAlbedo || environment.diagnostic_pass == 1
+                    || (environment.diagnostic_pass == 0 && matches!(environment.lighting_model,
+                        LightingModel::TigerGgxCompatibility | LightingModel::TigerGgxApproximation | LightingModel::DebugLambert)));
+            if native_decal {
+                let spec=draw.native_decal.as_ref().unwrap();
+                let requested=spec.textures.iter().map(|&tag|texture_cache.get_or_load_material(tag).map(|t|t.0)).collect::<Vec<_>>();
+                if let Some(textures)=requested.into_iter().collect::<Option<Vec<_>>>() {
+                    native_decals.push(LoadedNativeSurface {stable_index,textures});
+                } else {
+                    native_resources_pending=true;
+                    native_resource_failures.extend(spec.textures.iter().copied()
+                        .filter(|&tag| texture_cache.material_texture_failed(tag)));
+                }
+            }
             let material_index = materials
                 .iter()
                 .position(|material| {
@@ -1902,7 +2439,7 @@ impl ModelPaintCallback {
                     let color = draw
                         .forward_coating
                         .map(|coating| coating.detail)
-                        .or_else(|| draw.material.map(|material| material.color))
+                        .or_else(|| draw.material.and_then(|material| material.color))
                         .map(|tag| texture_cache.get_or_default_material(tag).0)
                         .and_then(usable_2d_texture);
                     let normal = draw
@@ -2082,6 +2619,9 @@ impl ModelPaintCallback {
                 authored_source: draw.authored_source,
                 authored_stage: draw.authored_stage,
                 authored_native_vertex_supported: draw.authored_native_vertex_supported,
+                native_c827: draw.native_c827.is_some(),
+                native_surface,
+                native_decal,
             };
             if is_authored_shadow {
                 authored_shadow_draws.push(prepared);
@@ -2096,8 +2636,11 @@ impl ModelPaintCallback {
             let right_blended = blend_enabled(right.pipeline.blend);
             left_blended.cmp(&right_blended).then_with(|| {
                 if left_blended && right_blended {
-                    left.view_depth
-                        .total_cmp(&right.view_depth)
+                    let stage2=|draw:&PreparedDraw|draw.authored_stage.is_some_and(|stage|stage.raw_stage==2);
+                    stage2(left).cmp(&stage2(right)).then_with(|| {
+                        if stage2(left) && stage2(right) {std::cmp::Ordering::Equal}
+                        else {left.view_depth.total_cmp(&right.view_depth)}
+                    })
                         .then_with(|| left.stable_index.cmp(&right.stable_index))
                 } else {
                     std::cmp::Ordering::Equal
@@ -2132,7 +2675,7 @@ impl ModelPaintCallback {
             .chain(
                 materials
                     .iter()
-                    .filter_map(|material| material.key.map(|key| key.color)),
+                    .filter_map(|material| material.key.and_then(|key| key.color)),
             )
             .find_map(|tag| {
                 texture_cache
@@ -2167,6 +2710,20 @@ impl ModelPaintCallback {
         let (outer_cone_cosine, inner_cone_cosine) =
             light_cone_cosines(environment.light_cone_angle);
         let light_range = environment.light_range.max(0.05) * light_transform.scale;
+        if draws.iter().any(|draw|draw.native_surface || draw.native_decal) {
+            // Bound the complete graph, including four retained FP32 native
+            // outputs. Other views retain their existing resolution budget.
+            let mixed_receivers=draws.iter().any(|draw|draw.native_decal || draw.native_c827)
+                && draws.iter().any(is_generic_opaque_receiver);
+            let bytes_per_pixel=123+(if draws.iter().any(|draw|draw.native_decal) {16}else{0})
+                +(if mixed_receivers {80}else{0});
+            let max_pixels=(MAX_MODEL_TARGET_BYTES-u64::from(SHADOW_MAP_SIZE).pow(2)*4)/bytes_per_pixel;
+            let pixels=u64::from(target_size[0])*u64::from(target_size[1]);
+            if pixels>max_pixels {
+                let scale=(max_pixels as f64/pixels as f64).sqrt();
+                target_size=target_size.map(|v|((v as f64*scale).floor() as u32).max(1));
+            }
+        }
         Self {
             preview,
             target_format: texture_cache.render_state.target_format,
@@ -2239,7 +2796,8 @@ impl ModelPaintCallback {
                     environment.gamma,
                 ],
                 fidelity: [
-                    0.0,
+                    ((!native_surfaces.is_empty() || !native_decals.is_empty()) && environment.diagnostic_pass == 0 && matches!(environment.lighting_model,
+                        LightingModel::TigerGgxCompatibility | LightingModel::TigerGgxApproximation | LightingModel::DebugLambert)) as u8 as f32,
                     match environment.lighting_model {
                         LightingModel::TigerGgxCompatibility => 0.0,
                         LightingModel::TigerGgxApproximation => 1.0,
@@ -2256,6 +2814,10 @@ impl ModelPaintCallback {
                 shadow_parameters: [0.0; 4],
             },
             materials,
+            native_surfaces,
+            native_decals,
+            native_resources_pending,
+            native_resource_failures,
             draws,
             shadow_draws,
             cubemap,
@@ -2270,6 +2832,19 @@ impl ModelPaintCallback {
     pub(crate) fn with_export_camera(mut self, camera: Option<ModelExportCamera>) -> Self {
         self.export_camera = camera;
         self
+    }
+
+    pub(crate) fn show_loading_status(&self, ui: &egui::Ui, rect: egui::Rect) {
+        if !self.native_resources_pending { return; }
+        let (message, color) = if self.native_resource_failures.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            ("Loading material textures…".to_string(), egui::Color32::WHITE)
+        } else {
+            let tags=self.native_resource_failures.iter().unique().map(ToString::to_string).join(", ");
+            (format!("Material textures failed to load: {tags}"), egui::Color32::LIGHT_RED)
+        };
+        ui.painter().text(rect.center(),egui::Align2::CENTER_CENTER,message,
+            egui::FontId::proportional(14.0),color);
     }
 
     pub(crate) fn export_image(
@@ -2293,6 +2868,8 @@ impl ModelPaintCallback {
         format: image::ImageFormat,
     ) -> anyhow::Result<Vec<u8>> {
         const FRAME_FILL: f32 = 0.88;
+        anyhow::ensure!(self.native_resource_failures.is_empty(), "Authored material texture loading failed: {:?}", self.native_resource_failures);
+        anyhow::ensure!(!self.native_resources_pending, "Authored material textures are not ready for export");
         anyhow::ensure!(
             output_size.into_iter().all(|dimension| dimension > 0),
             "model export dimensions must be non-zero"
@@ -2363,7 +2940,7 @@ impl ModelPaintCallback {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
-        let output_view = output.create_view(&Default::default());
+        let output_view = create_model_texture_view(&output, &Default::default());
         let unpadded_bytes_per_row = size[0] * 4;
         let bytes_per_row = unpadded_bytes_per_row.div_ceil(256) * 256;
         let readback = render_state.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2492,7 +3069,7 @@ impl ModelPaintCallback {
                 let key = material.key;
                 let tint = key.map_or(0, |key| u32::from_le_bytes(key.color_tint));
                 let mut values = vec![
-                    key.map_or(0, |key| u64::from(key.color.0)),
+                    key.and_then(|key| key.color).map_or(0, |tag| u64::from(tag.0)),
                     key.and_then(|key| key.normal)
                         .map_or(0, |tag| u64::from(tag.0)),
                     key.and_then(|key| key.emissive)
@@ -2728,7 +3305,11 @@ impl ModelPaintCallback {
         FrameResourceKey {
             preview: Arc::as_ptr(&self.preview) as usize,
             size: self.target_size,
-            materials,
+            materials: self.native_surfaces.iter().chain(&self.native_decals).fold(materials, |hash, surface| {
+                surface.textures.iter().fold(hash ^ surface.stable_index as u64, |hash,t| {
+                    (hash ^ Arc::as_ptr(t) as usize as u64).wrapping_mul(0x100000001b3)
+                })
+            }) ^ (self.draws.iter().any(|d|d.native_surface) as u64).rotate_left(17),
             cubemap: self
                 .cubemap
                 .as_ref()
@@ -2865,6 +3446,9 @@ fn estimated_model_target_bytes(size: [u32; 2], features: ModelTargetFeatures) -
     // HDR compatibility color + lit color (16 B), five 4-byte logical MRTs
     // (20 B), and depth (4 B).
     let mut bytes = pixels.saturating_mul(40);
+    if features.native_surface { bytes=bytes.saturating_add(pixels.saturating_mul(64)); }
+    if features.native_decals { bytes=bytes.saturating_add(pixels.saturating_mul(16)); }
+    if features.mixed_receivers { bytes=bytes.saturating_add(pixels.saturating_mul(80)); }
     if features.deferred_normal_copy {
         bytes = bytes.saturating_add(pixels.saturating_mul(4));
     }
@@ -2933,7 +3517,7 @@ static ADAPTED_EXPOSURE: LazyLock<Mutex<HashMap<Vec<u32>, AdaptedExposure>>> =
 fn estimate_material_exposure(texture_cache: &TextureCache, materials: &[LoadedMaterial]) -> f32 {
     let mut tags = materials
         .iter()
-        .filter_map(|material| material.key.map(|key| key.color))
+        .filter_map(|material| material.key.and_then(|key| key.color))
         .unique()
         .collect_vec();
     tags.sort_unstable_by_key(|tag| tag.0);
@@ -3028,53 +3612,6 @@ fn texture_luminance(texture_cache: &TextureCache, tag: TagHash) -> Option<Mater
 
 fn draw_dye_palette(draw: &ModelDraw) -> Option<[[f32; 4]; 3]> {
     draw.gear_dye.map(|dye| [dye.color; 3])
-}
-
-static DEBUG_PLACEHOLDER_TEXTURES: LazyLock<Mutex<HashMap<TagHash, bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn is_debug_placeholder_texture(texture_cache: &TextureCache, tag: TagHash) -> bool {
-    if let Some(value) = DEBUG_PLACEHOLDER_TEXTURES
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&tag).copied())
-    {
-        return value;
-    }
-    let value = texture_cache
-        .get_or_load_material(tag)
-        .and_then(|(texture, _id)| texture.to_image(&texture_cache.render_state, 0).ok())
-        .map(|image| debug_placeholder_pixels(&image.thumbnail(64, 64).to_rgba8()))
-        .unwrap_or(false);
-    if let Ok(mut cache) = DEBUG_PLACEHOLDER_TEXTURES.lock() {
-        if cache.len() >= MAX_MATERIAL_ANALYSIS_CACHE_ENTRIES && !cache.contains_key(&tag) {
-            cache.clear();
-        }
-        cache.insert(tag, value);
-    }
-    value
-}
-
-fn debug_placeholder_pixels(image: &image::RgbaImage) -> bool {
-    let mut neon = 0usize;
-    let mut neutral_dark = 0usize;
-    let mut visible = 0usize;
-    for pixel in image.pixels() {
-        let [r, g, b, a] = pixel.0;
-        if a < 16 {
-            continue;
-        }
-        visible += 1;
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
-        if max < 140 && max.saturating_sub(min) < 24 {
-            neutral_dark += 1;
-        }
-        if b > 170 && g < 115 && (r > 120 || r < 80) {
-            neon += 1;
-        }
-    }
-    visible > 0 && neon * 100 >= visible && neutral_dark * 2 >= visible
 }
 
 fn model_view_depth(position: [f32; 3], center: [f32; 3], yaw: f32, pitch: f32) -> f32 {
@@ -3348,6 +3885,21 @@ struct ModelPipelineResources {
     _fallback_color: wgpu::Texture,
     fallback_color_view: wgpu::TextureView,
     model_shader: wgpu::ShaderModule,
+    _authored_program_modules: crate::render::authored_program::AuthoredProgramModules,
+    authored_surface_vertex_layout: wgpu::BindGroupLayout,
+    authored_rigid_vertex_layout: wgpu::BindGroupLayout,
+    authored_auxiliary_vertex_layout: wgpu::BindGroupLayout,
+    authored_displacement_vertex_layout: wgpu::BindGroupLayout,
+    authored_color_vertex_layout: wgpu::BindGroupLayout,
+    authored_surface_pipelines: Vec<((crate::render::authored_program::DescriptorAbi, crate::render::authored_program::DescriptorAbi, u8, wgpu::IndexFormat), crate::render::body_draw::BodyDrawPipeline)>,
+    authored_source_color: crate::render::surface_targets::SourceColorProjection,
+    authored_viewer_material: crate::render::surface_targets::ViewerMaterialProjection,
+    viewer_receiver_import: crate::render::surface_targets::ViewerReceiverImport,
+    viewer_receiver_coverage: crate::render::surface_targets::ViewerReceiverCoverage,
+    authored_compute_pipelines: Vec<(crate::render::authored_program::DescriptorAbi, crate::render::body_mesh::BodyMeshProducer)>,
+    authored_c827_pipelines: Vec<(wgpu::IndexFormat,crate::render::c827_draw::C827DrawPipeline)>,
+    authored_decal_pipelines: Vec<((crate::render::authored_program::DescriptorAbi, crate::render::authored_program::DescriptorAbi, wgpu::IndexFormat),crate::render::decal_draw::DecalDrawPipeline)>,
+    authored_material_c827_pipelines: Vec<(wgpu::IndexFormat,crate::render::c827_draw::C827DrawPipeline)>,
     shadow_shader: wgpu::ShaderModule,
     authored_depth_shader: wgpu::ShaderModule,
     model_pipeline_layout: wgpu::PipelineLayout,
@@ -3373,14 +3925,34 @@ struct ModelPipelineResources {
     cubemap_sampler: wgpu::Sampler,
 }
 
+
+
+#[cfg(test)]
+struct AuthoredHeadPipeline {
+    _pixel_layout: wgpu::BindGroupLayout,
+    _vertex_layout: wgpu::BindGroupLayout,
+    _pipeline: wgpu::RenderPipeline,
+}
+
+#[cfg(test)]
+struct AuthoredHeadPipelines {
+    _entries: Vec<AuthoredHeadPipeline>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ModelTargetFeatures {
+    native_surface: bool,
+    native_decals: bool,
+    mixed_receivers: bool,
     deferred_normal_copy: bool,
     distortion: bool,
     bloom: bool,
 }
 
 struct ModelTargetResources {
+    native_surface: Option<crate::render::surface_targets::SurfaceTargets>,
+    native_normal_snapshot: Option<(wgpu::Texture, wgpu::TextureView)>,
+    mixed_receivers: Option<crate::render::surface_targets::ReceiverTargets>,
     size: [u32; 2],
     features: ModelTargetFeatures,
     _color: wgpu::Texture,
@@ -3434,11 +4006,44 @@ struct ModelFrameResources {
     lighting_bind_group: wgpu::BindGroup,
     distortion_resolve_bind_group: wgpu::BindGroup,
     opaque_bundles: Vec<wgpu::RenderBundle>,
-    decal_bundles: Vec<wgpu::RenderBundle>,
+    decal_runs: Vec<ModelDecalRun>,
+    native_view_buffer: Option<wgpu::Buffer>,
+    native_pixel_view_buffer: Option<wgpu::Buffer>,
+    native_surfaces: Vec<(usize, crate::render::authored_program::DescriptorAbi, crate::render::body_draw::BodyDrawBindings)>,
+    native_source_color: Option<wgpu::BindGroup>,
+    native_viewer_material: Option<wgpu::BindGroup>,
+    viewer_receiver_import: Option<wgpu::BindGroup>,
+    viewer_receiver_coverage: Option<wgpu::BindGroup>,
+    native_skinning_buffers: Vec<(usize, wgpu::Buffer)>,
+    native_surface_constants: Vec<(usize, wgpu::Buffer)>,
+    native_compute: Vec<((usize, usize), wgpu::BindGroup)>,
+    native_c827: Vec<(usize, crate::render::c827_draw::C827DrawBindings)>,
+    native_decals: Vec<(usize, NativeDecalBindings)>,
     additive_bundles: Vec<wgpu::RenderBundle>,
     transparent_bundles: Vec<wgpu::RenderBundle>,
     coating_bundles: Vec<wgpu::RenderBundle>,
     distortion_bundles: Vec<wgpu::RenderBundle>,
+}
+
+enum ModelDecalRun {
+    Compatibility(Vec<wgpu::RenderBundle>),
+    C827(usize),
+    Authored(usize),
+}
+
+struct NativeDecalBindings {
+    vertex_program: crate::render::authored_program::DescriptorAbi,
+    program: crate::render::authored_program::DescriptorAbi,
+    pixel: wgpu::BindGroup,
+    #[cfg(test)]
+    pixel_zero_mask: wgpu::BindGroup,
+    #[cfg(test)]
+    globals: wgpu::Buffer,
+    vertex: wgpu::BindGroup,
+    source: wgpu::Buffer,
+    uv: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    range: Range<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3463,7 +4068,7 @@ fn create_model_render_bundles(
     draws
         .par_iter()
         .filter(|draw| {
-            draw.passes
+            !draw.native_c827 && !draw.native_surface && !draw.native_decal && draw.passes
                 .iter()
                 .any(|pass| accepted_passes.contains(pass))
         })
@@ -3511,6 +4116,11 @@ fn create_model_render_bundles(
             bundle.set_vertex_buffer(0, preview.vertex_buffer.slice(..));
             bundle.set_index_buffer(preview.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             bundle.draw_indexed(draw.indices.clone(), 0, 0..1);
+            #[cfg(test)]
+            model_binding_audit::record_draw(
+                draw,
+                [scene_bind_group, material, coating_deferred_bind_group],
+            );
             Some(bundle.finish(&wgpu::RenderBundleDescriptor {
                 label: Some("quicktag_model_parallel_draw"),
             }))
@@ -3521,6 +4131,11 @@ fn create_model_render_bundles(
 impl ModelPaintCallback {
     fn target_features(&self) -> ModelTargetFeatures {
         ModelTargetFeatures {
+            native_surface: self.draws.iter().any(|draw| draw.native_surface || draw.native_decal),
+            native_decals: self.draws.iter().any(|draw| draw.native_decal),
+            mixed_receivers: self.draws.iter().any(|draw| draw.native_decal || draw.native_c827)
+                && self.draws.iter().any(|draw| draw.native_surface || draw.native_decal)
+                && self.draws.iter().any(is_generic_opaque_receiver),
             deferred_normal_copy: self.draws.iter().any(|draw| {
                 draw.passes.iter().any(|pass| {
                     matches!(
@@ -3548,6 +4163,9 @@ impl CallbackTrait for ModelPaintCallback {
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        // Never change an admitted shader into a generic material while its
+        // resources load. The next UI callback retries the same source contract.
+        if self.native_resources_pending { return Vec::new(); }
         let needs_pipeline = callback_resources
             .get::<ModelPipelineResources>()
             .is_none_or(|resources| resources.target_format != self.target_format);
@@ -3638,9 +4256,74 @@ impl CallbackTrait for ModelPaintCallback {
             .collect_vec();
 
         if let Some(resources) = callback_resources.get_mut::<ModelPipelineResources>() {
+            for mesh in self
+                .preview
+                .authored_inputs
+                .iter()
+                .flatten()
+                .flat_map(|source| source.static_meshes.iter())
+            {
+                if !resources
+                    .authored_compute_pipelines
+                    .iter()
+                    .any(|(abi, _)| *abi == mesh.producer)
+                {
+                    let shader = resources
+                        ._authored_program_modules
+                        .module(mesh.producer)
+                        .expect("admitted compute source");
+                    resources.authored_compute_pipelines.push((
+                        mesh.producer,
+                        crate::render::body_mesh::BodyMeshProducer::new_for_abi(
+                            device,
+                            shader,
+                            mesh.producer,
+                        ),
+                    ));
+                }
+            }
+            for format in self.draws.iter().filter(|d|d.native_c827).map(|d|self.preview.authored_index_format(d.stable_index)).unique() {
+                if !resources.authored_c827_pipelines.iter().any(|(f,_)|*f==format) {
+                    resources.authored_c827_pipelines.push((format,create_authored_c827_pipeline(device,&resources._authored_program_modules,format)));
+                }
+                if !self.target_features().native_surface || resources.authored_material_c827_pipelines.iter().any(|(f,_)|*f==format) {continue;}
+                use crate::render::authored_program::DescriptorAbi as D;
+                resources.authored_material_c827_pipelines.push((format,crate::render::c827_draw::C827DrawPipeline::new_material(
+                    device,resources._authored_program_modules.module(D::SharedLayout7VertexScalarStorage).unwrap(),
+                    resources._authored_program_modules.module(D::C827Pixel).unwrap(),[wgpu::TextureFormat::Rgba32Float;4],
+                    depth_stencil_state(15,1),rasterizer_cull_mode(2),format)));
+            }
+            for loaded in &self.native_decals {
+                let spec=self.preview.draws[loaded.stable_index].native_decal.as_ref().unwrap();
+                let format=self.preview.authored_index_format(loaded.stable_index);
+                if resources.authored_decal_pipelines.iter().any(|(abi,_)|*abi==(spec.vertex_program,spec.program,format)) {continue;}
+                use crate::render::authored_program::DescriptorAbi as D;
+                let pipeline=crate::render::decal_draw::DecalDrawPipeline::new(
+                    device, resources._authored_program_modules.module(spec.vertex_program).unwrap(),
+                    resources._authored_program_modules.module(spec.program).unwrap(),
+                    &resources.authored_surface_vertex_layout,model_decals::contract(spec.program).unwrap(),[wgpu::TextureFormat::Rgba32Float;4],
+                    wgpu::FrontFace::Ccw,rasterizer_cull_mode(2),depth_stencil_state(15,1),format);
+                resources.authored_decal_pipelines.push(((spec.vertex_program,spec.program,format),pipeline));
+            }
+            let missing_surface_keys = self.native_surfaces.iter().filter_map(|loaded| {
+                let draw = &self.preview.draws[loaded.stable_index];
+                let spec = draw.native_surface.as_ref()?;
+                let key = (spec.vertex_program, spec.program, draw.pipeline.rasterizer,self.preview.authored_index_format(loaded.stable_index));
+                (!resources.authored_surface_pipelines.iter().any(|(existing, _)| *existing == key)).then_some(key)
+            }).unique().collect_vec();
+            if !missing_surface_keys.is_empty() {
+                let pipelines = create_authored_surface_pipelines(device, &resources._authored_program_modules,
+                    &resources.authored_surface_vertex_layout, &resources.authored_rigid_vertex_layout,
+                    &resources.authored_auxiliary_vertex_layout, &resources.authored_color_vertex_layout,
+                    &resources.authored_displacement_vertex_layout,
+                    &missing_surface_keys);
+                assert_eq!(pipelines.len(), missing_surface_keys.len(), "every admitted material needs its exact cached pipeline");
+                resources.authored_surface_pipelines.extend(pipelines);
+            }
             let keys = self
                 .draws
                 .iter()
+                .filter(|draw| !draw.native_c827 && !draw.native_surface && !draw.native_decal)
                 .flat_map(|draw| {
                     [
                         Some(draw.pipeline),
@@ -3775,13 +4458,233 @@ impl CallbackTrait for ModelPaintCallback {
         if reuse_frame {
             if let Some(frame) = callback_resources.get::<ModelFrameResources>() {
                 _queue.write_buffer(&frame.scene_buffer, 0, bytemuck::bytes_of(&self.scene));
+                if let Some(view)=&frame.native_view_buffer { _queue.write_buffer(view, 0, bytemuck::cast_slice(&native_view_image(&self.scene))); }
+                if let Some(view)=&frame.native_pixel_view_buffer { _queue.write_buffer(view, 0, bytemuck::cast_slice(&model_surfaces::pixel_view_image(&self.scene))); }
+                for (index,buffer) in &frame.native_skinning_buffers {
+                    let source_index=self.preview.draws[*index].authored_source.expect("retained native draw source");
+                    let source=self.preview.authored_inputs[source_index].as_ref().expect("retained native source");
+                    let object=if let Some(surface)=&self.preview.draws[*index].native_surface {
+                        native_surface_object_image(surface.vertex_program,source,&self.scene)
+                    } else {c827_static_skinning(source,&self.scene)};
+                    _queue.write_buffer(buffer,0,bytemuck::cast_slice(&object));
+                }
             }
         } else {
+            let native_view_buffer=self.draws.iter().any(|d| d.native_c827 || d.native_surface || d.native_decal).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("viewer native VS View"), contents: bytemuck::cast_slice(&native_view_image(&self.scene)),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            }));
+            let mut native_c827=Vec::new();
+            let mut native_compute=Vec::new();
+            let mut native_skinning_buffers=Vec::new();
+            let mut native_surface_constants=Vec::new();
+            let native_pixel_view_buffer=self.draws.iter().any(|d| d.native_surface).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label:Some("viewer authored PS View"),contents:bytemuck::cast_slice(&model_surfaces::pixel_view_image(&self.scene)),
+                usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST,
+            }));
+            let mut native_surfaces=Vec::new();
+            let native_pipelines=callback_resources.get::<ModelPipelineResources>().expect("native pipeline cache");
+            let native_source_color=callback_resources.get::<ModelTargetResources>().and_then(|target|
+                target.native_surface.as_ref().map(|native|native_pipelines.authored_source_color.bind(device,native,
+                    target.mixed_receivers.as_ref().map(|r|&r.coverage_view))));
+            for loaded in &self.native_surfaces {
+                let draw=&self.preview.draws[loaded.stable_index];
+                let spec=draw.native_surface.as_ref().expect("audited surface source");
+                let source_index=draw.authored_source.expect("native surface source");
+                let source=self.preview.authored_inputs[source_index].as_ref().expect("retained raw source");
+                let direct_ia=spec.vertex_program == crate::render::authored_program::DescriptorAbi::RigidVertexDirectIa;
+                let mesh=if direct_ia { None } else {
+                    let (mesh_index, mesh)=source.static_mesh(draw.authored_stage.expect("authored producer range")).expect("retained exact producer");
+                    if !native_compute.iter().any(|(i,_)|*i==(source_index, mesh_index)) {
+                        native_compute.push(((source_index, mesh_index),mesh.bind(device,&native_pipelines.authored_compute_pipelines.iter().find(|(abi,_)|*abi==mesh.producer).expect("exact compute pipeline").1)));
+                    }
+                    Some(mesh)
+                };
+                let skin=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label:Some("viewer surface object scope"),contents:bytemuck::cast_slice(&native_surface_object_image(spec.vertex_program,source,&self.scene)),
+                    usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST
+                        | if spec.vertex_program == crate::render::authored_program::DescriptorAbi::VertexColorStorage {
+                            wgpu::BufferUsages::COPY_SRC
+                        } else { wgpu::BufferUsages::empty() },
+                });
+                let constants=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label:Some("authored surface cb0 zero-gate preview"),contents:bytemuck::cast_slice(&spec.constants),usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST,
+                });
+                let views=loaded.textures.iter().map(|t|create_model_texture_view(&t.handle,&Default::default())).collect_vec();
+                let samplers=spec.samplers.iter().map(|desc|create_native_authored_sampler(device,desc)).collect_vec();
+                let vertex=if spec.vertex_program == crate::render::authored_program::DescriptorAbi::DisplacementEC03VertexStorage {
+                    let mesh = mesh.expect("exact EC03 static producer");
+                    assert_eq!(mesh.producer, spec.vertex_program.static_vertex_producer().unwrap());
+                    let cb0 = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("authored EC03 displacement image"),
+                        contents: bytemuck::cast_slice(spec.vertex_constants.as_ref().expect("resolved EC03 CB0")),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    crate::render::displacement_vertex::bind(device, &native_pipelines.authored_displacement_vertex_layout,
+                        crate::render::body_vertex::BodyVertexInputs {
+                            skinning: &skin, view: native_view_buffer.as_ref().unwrap(),
+                            positions: &mesh.positions, frames: &mesh.frames, previous_positions: &mesh.positions,
+                        }, &cb0)
+                } else if let Some((_,_,producer)) = spec.vertex_program.auxiliary_vertex_contract() {
+                    let mesh = mesh.expect("exact static auxiliary-vertex producer");
+                    assert_eq!(mesh.producer, producer);
+                    let vertex_constants = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("authored auxiliary vertex cb0"),
+                        contents: bytemuck::cast_slice(spec.vertex_constants.as_ref().expect("audited auxiliary vertex image")),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    crate::render::auxiliary_vertex::bind(device, &native_pipelines.authored_auxiliary_vertex_layout,
+                        [mesh.inert_vertex_auxiliary(), &mesh.positions, &mesh.frames, &mesh.positions,
+                         &vertex_constants, native_view_buffer.as_ref().unwrap(), &skin])
+                } else if spec.vertex_program == crate::render::authored_program::DescriptorAbi::VertexColorStorage {
+                    let mesh = mesh.expect("source-paired vertex-color producer");
+                    let colors = source.vertex_colors.as_ref().expect("actual authored colors");
+                    crate::render::color_vertex::bind(device, &native_pipelines.authored_color_vertex_layout,
+                        [&colors.buffer, &mesh.positions, &mesh.frames, &mesh.positions,
+                         native_view_buffer.as_ref().unwrap(), &skin])
+                } else if let Some(mesh)=mesh {
+                    crate::render::body_vertex::bind(device,&native_pipelines.authored_surface_vertex_layout,
+                        crate::render::body_vertex::BodyVertexInputs { skinning:&skin,view:native_view_buffer.as_ref().unwrap(),
+                            positions:&mesh.positions,frames:&mesh.frames,previous_positions:&mesh.positions })
+                } else {
+                    crate::render::rigid_vertex::bind(device,&native_pipelines.authored_rigid_vertex_layout,
+                        &skin,native_view_buffer.as_ref().unwrap())
+                };
+                let pipeline=&native_pipelines.authored_surface_pipelines.iter().find(|(key,_)|*key==(spec.vertex_program,spec.program,draw.pipeline.rasterizer,self.preview.authored_index_format(loaded.stable_index))).expect("exact surface pipeline").1;
+                let stream=|index|&source.vertex_streams.iter().find(|s|s.stream_index==index).expect("raw surface IA").buffer;
+                let authored=draw.authored_stage.unwrap();
+                let index=source.index_buffer.as_ref().unwrap();
+                let range=authored.source_index_start..authored.source_index_start.checked_add(authored.source_index_count).expect("surface strip overflow");
+                assert!(range.end<=index.index_count);
+                let bindings=pipeline.bind_dense(device,[&constants,&skin,native_pixel_view_buffer.as_ref().unwrap()],
+                    &views.iter().collect_vec(),samplers.iter().collect_vec(),&vertex,stream(0),stream(1),&index.buffer,range);
+                #[cfg(test)] model_binding_audit::record_surface_bindings(loaded.stable_index,spec,&bindings,&views,&samplers);
+                native_skinning_buffers.push((loaded.stable_index,skin));
+                native_surface_constants.push((loaded.stable_index,constants));
+                native_surfaces.push((loaded.stable_index,spec.program,bindings));
+            }
+            for draw in self.draws.iter().filter(|d| d.native_c827) {
+                let source_index=draw.authored_source.expect("native draw source");
+                let source=self.preview.authored_inputs[source_index].as_ref().expect("native raw source");
+                let (mesh_index, mesh)=source.static_mesh(draw.authored_stage.expect("authored producer range")).expect("retained exact producer");
+                if !native_compute.iter().any(|(i,_)| *i==(source_index, mesh_index)) {
+                    native_compute.push(((source_index, mesh_index),mesh.bind(device,&native_pipelines.authored_compute_pipelines.iter().find(|(abi,_)|*abi==mesh.producer).expect("exact compute pipeline").1)));
+                }
+                let skin=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("viewer native Skinning prefix"), contents: bytemuck::cast_slice(&c827_static_skinning(source,&self.scene)),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+                let pixel=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("C827 authored external pixel constants"),
+                    contents: bytemuck::cast_slice(self.preview.draws[draw.stable_index].native_c827.as_ref().expect("native pixel constants")),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let pipeline=&native_pipelines.authored_c827_pipelines.iter().find(|(f,_)|*f==self.preview.authored_index_format(draw.stable_index)).expect("exact C827 index format").1;
+                let pixel_group=device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label:Some("C827 retained pixel inputs"), layout:&pipeline.pixel_layout,
+                    entries:&[wgpu::BindGroupEntry { binding:0,resource:pixel.as_entire_binding() }],
+                });
+                let vertex_group=crate::render::body_vertex::bind(device,&pipeline.vertex_layout,crate::render::body_vertex::BodyVertexInputs {
+                    skinning:&skin,view:native_view_buffer.as_ref().expect("native camera buffer"),positions:&mesh.positions,frames:&mesh.frames,previous_positions:&mesh.positions,
+                });
+                native_skinning_buffers.push((draw.stable_index,skin));
+                let stream=|index| source.vertex_streams.iter().find(|s| s.stream_index==index).expect("native IA stream").buffer.clone();
+                let authored=draw.authored_stage.expect("native original range");
+                let index=source.index_buffer.as_ref().expect("native strip indices");
+                let end=authored.source_index_start.checked_add(authored.source_index_count).expect("C827 source range overflow");
+                assert!(end<=index.index_count);
+                native_c827.push((draw.stable_index,crate::render::c827_draw::C827DrawBindings {
+                    pixel:pixel_group, vertex:vertex_group, source:stream(0), uv:stream(1),indices:index.buffer.clone(),
+                    range:authored.source_index_start..end,
+                }));
+            }
             let scene_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("quicktag_model_scene_uniform"),
                 contents: bytemuck::bytes_of(&self.scene),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
+            let native_viewer_material=callback_resources.get::<ModelTargetResources>().and_then(|target|
+                target.native_surface.as_ref().map(|native|native_pipelines.authored_viewer_material.bind(device,native,&scene_buffer,
+                    target.mixed_receivers.as_ref().map(|r|&r.coverage_view))));
+            let viewer_receiver_import=callback_resources.get::<ModelTargetResources>().and_then(|target|
+                target.mixed_receivers.as_ref().map(|receiver|native_pipelines.viewer_receiver_import.bind(device,
+                    &target.surface_normal_view,&target.surface_properties_view,&target.surface_albedo_view,&target.depth_view,
+                    &receiver.original_native_normal_view,&scene_buffer)));
+            let viewer_receiver_coverage=callback_resources.get::<ModelTargetResources>().and_then(|target|
+                target.mixed_receivers.as_ref().map(|receiver|native_pipelines.viewer_receiver_coverage.bind_targets(device,
+                    target.native_surface.as_ref().expect("mixed receivers require authored targets"),receiver)));
+            let mut native_decals=Vec::new();
+            if !self.native_decals.is_empty() {
+                let normal=&callback_resources.get::<ModelTargetResources>().unwrap().native_normal_snapshot.as_ref().unwrap().1;
+                let view=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label:Some("viewer Decal viewport image"),contents:bytemuck::cast_slice(&model_decals::view(self.target_size)),
+                    usage:wgpu::BufferUsages::UNIFORM,
+                });
+                for loaded in &self.native_decals {
+                    let draw=&self.preview.draws[loaded.stable_index];
+                    let source_index=draw.authored_source.unwrap();
+                    let source=self.preview.authored_inputs[source_index].as_ref().unwrap();
+                    let (mesh_index, mesh)=source.static_mesh(draw.authored_stage.expect("authored producer range")).expect("retained exact producer");
+                    if !native_compute.iter().any(|(i,_)|*i==(source_index, mesh_index)) {
+                        native_compute.push(((source_index, mesh_index),mesh.bind(device,&native_pipelines.authored_compute_pipelines.iter().find(|(abi,_)|*abi==mesh.producer).expect("exact compute pipeline").1)));
+                    }
+                    let spec=draw.native_decal.as_ref().unwrap();
+                    let pipeline=&native_pipelines.authored_decal_pipelines.iter().find(|(abi,_)|*abi==(spec.vertex_program,spec.program,self.preview.authored_index_format(loaded.stable_index))).unwrap().1;
+                    let globals=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label:Some("authored Decal constants and viewer texel transform"),contents:bytemuck::cast_slice(&spec.globals(self.target_size)),
+                        usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST,
+                    });
+                    let skin=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label:Some("viewer native Decal Skinning image"),contents:bytemuck::cast_slice(&c827_static_skinning(source,&self.scene)),
+                        usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST,
+                    });
+                    let vertex=crate::render::body_vertex::bind(device,&native_pipelines.authored_surface_vertex_layout,
+                        crate::render::body_vertex::BodyVertexInputs {skinning:&skin,view:native_view_buffer.as_ref().unwrap(),
+                            positions:&mesh.positions,frames:&mesh.frames,previous_positions:&mesh.positions});
+                    let views=loaded.textures.iter().map(|t|create_model_texture_view(&t.handle,
+                        &wgpu::TextureViewDescriptor {format:Some(t.desc.format),dimension:Some(wgpu::TextureViewDimension::D2),..Default::default()})).collect_vec();
+                    let samplers=spec.samplers.iter().map(|desc|create_native_authored_sampler(device,desc)).collect_vec();
+                    let pixel=pipeline.bind(device,crate::render::decal_draw::DecalPixelInputs {
+                        globals:&globals,view:&view,scene_normal:normal,textures:&views.iter().collect_vec(),samplers:&samplers.iter().collect_vec(),
+                    });
+                    #[cfg(test)]
+                    let pixel_zero_mask={
+                        let texture=device.create_texture_with_data(_queue,&wgpu::TextureDescriptor {
+                            label:Some("decal discarded-mask negative control"),
+                            size:wgpu::Extent3d {width:1,height:1,depth_or_array_layers:1},
+                            mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,
+                            format:wgpu::TextureFormat::Rgba8Unorm,
+                            usage:wgpu::TextureUsages::TEXTURE_BINDING,view_formats:&[],
+                        },wgpu::util::TextureDataOrder::LayerMajor,&[0;4]);
+                        let zero=texture.create_view(&Default::default());
+                        if spec.program==crate::render::authored_program::DescriptorAbi::D0F2PixelDense {
+                            pipeline.bind(device,crate::render::decal_draw::DecalPixelInputs {
+                                globals:&globals,view:&view,scene_normal:normal,textures:&[&views[0],&zero],samplers:&samplers.iter().collect_vec(),
+                            })
+                        }else{
+                            let mut constants=spec.globals(self.target_size);
+                            constants.last_mut().unwrap()[1]=0.0;
+                            let disabled=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label:Some("authored decal zero output-gate control"),contents:bytemuck::cast_slice(&constants),usage:wgpu::BufferUsages::UNIFORM,
+                            });
+                            pipeline.bind(device,crate::render::decal_draw::DecalPixelInputs {
+                                globals:&disabled,view:&view,scene_normal:normal,textures:&views.iter().collect_vec(),samplers:&samplers.iter().collect_vec(),
+                            })
+                        }
+                    };
+                    let stream=|index|source.vertex_streams.iter().find(|s|s.stream_index==index).unwrap().buffer.clone();
+                    let authored=draw.authored_stage.unwrap();
+                    let index=source.index_buffer.as_ref().unwrap();
+                    let range=authored.source_index_start..authored.source_index_start.checked_add(authored.source_index_count).unwrap();
+                    assert!(range.end<=index.index_count);
+                    native_skinning_buffers.push((loaded.stable_index,skin));
+                    native_decals.push((loaded.stable_index,NativeDecalBindings {vertex_program:spec.vertex_program,program:spec.program,pixel,vertex,source:stream(0),uv:stream(1),
+                        indices:index.buffer.clone(),range,
+                        #[cfg(test)] pixel_zero_mask,
+                        #[cfg(test)] globals,
+                    }));
+                }
+            }
             let Some(shadow_depth_view) = callback_resources
                 .get::<ModelTargetResources>()
                 .map(|target| target.shadow_depth_view.clone())
@@ -3793,49 +4696,58 @@ impl CallbackTrait for ModelPaintCallback {
                 .as_ref()
                 .and_then(|texture| {
                     texture.full_cubemap_texture.as_ref().map(|handle| {
-                        handle.create_view(&wgpu::TextureViewDescriptor {
-                            format: Some(srgb_texture_format(texture.desc.format)),
-                            dimension: Some(wgpu::TextureViewDimension::Cube),
-                            array_layer_count: Some(6),
-                            ..Default::default()
-                        })
+                        create_model_texture_view(
+                            &handle,
+                            &wgpu::TextureViewDescriptor {
+                                format: Some(srgb_texture_format(texture.desc.format)),
+                                dimension: Some(wgpu::TextureViewDimension::Cube),
+                                array_layer_count: Some(6),
+                                ..Default::default()
+                            },
+                        )
                     })
                 })
                 .unwrap_or_else(|| fallback_cubemap_view.clone());
-            let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("quicktag_model_scene_bind_group"),
-                layout: &scene_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
+            let scene_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_scene_bind_group"),
+                    layout: &scene_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: scene_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&cubemap_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&cubemap_sampler),
+                        },
+                    ],
+                },
+            );
+            let shadow_scene_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_shadow_scene_bind_group"),
+                    layout: &shadow_scene_layout,
+                    entries: &[wgpu::BindGroupEntry {
                         binding: 0,
                         resource: scene_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&cubemap_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::Sampler(&cubemap_sampler),
-                    },
-                ],
-            });
-            let shadow_scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("quicktag_model_shadow_scene_bind_group"),
-                layout: &shadow_scene_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: scene_buffer.as_entire_binding(),
-                }],
-            });
+                    }],
+                },
+            );
             let mut authored_shadow_uniform_buffers =
                 Vec::with_capacity(self.preview.authored_inputs.len());
             let mut authored_shadow_bind_groups =
@@ -3855,16 +4767,19 @@ impl CallbackTrait for ModelPaintCallback {
                     contents: bytemuck::bytes_of(&uniform),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!(
-                        "quicktag_authored_shadow_bind_group_{source_index}"
-                    )),
-                    layout: &strict_shadow_transform_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
-                });
+                let bind_group = create_model_bind_group(
+                    device,
+                    &wgpu::BindGroupDescriptor {
+                        label: Some(&format!(
+                            "quicktag_authored_shadow_bind_group_{source_index}"
+                        )),
+                        layout: &strict_shadow_transform_layout,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buffer.as_entire_binding(),
+                        }],
+                    },
+                );
                 authored_shadow_uniform_buffers.push(Some(buffer));
                 authored_shadow_bind_groups.push(Some(bind_group));
             }
@@ -4436,12 +5351,15 @@ impl CallbackTrait for ModelPaintCallback {
                     .as_ref()
                     .and_then(|texture| {
                         texture.full_cubemap_texture.as_ref().map(|handle| {
-                            handle.create_view(&wgpu::TextureViewDescriptor {
-                                format: Some(srgb_texture_format(texture.desc.format)),
-                                dimension: Some(wgpu::TextureViewDimension::Cube),
-                                array_layer_count: Some(6),
-                                ..Default::default()
-                            })
+                            create_model_texture_view(
+                                &handle,
+                                &wgpu::TextureViewDescriptor {
+                                    format: Some(srgb_texture_format(texture.desc.format)),
+                                    dimension: Some(wgpu::TextureViewDimension::Cube),
+                                    array_layer_count: Some(6),
+                                    ..Default::default()
+                                },
+                            )
                         })
                     })
                     .unwrap_or_else(|| fallback_cubemap_view.clone());
@@ -4455,104 +5373,113 @@ impl CallbackTrait for ModelPaintCallback {
                 let coating_environment_sampler = authored_coating_environment_sampler
                     .as_ref()
                     .unwrap_or(&material_sampler);
-                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("quicktag_model_material_bind_group"),
-                    layout: &material_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&color_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&normal_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&emissive_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&control_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: wgpu::BindingResource::TextureView(&wear_scratches_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: wgpu::BindingResource::TextureView(&wear_grime_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 8,
-                            resource: wgpu::BindingResource::TextureView(&wear_damage_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 9,
-                            resource: wgpu::BindingResource::TextureView(&pattern_field_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 10,
-                            resource: wgpu::BindingResource::TextureView(&character_surface_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 11,
-                            resource: wgpu::BindingResource::TextureView(
-                                &character_detail_color_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 12,
-                            resource: wgpu::BindingResource::TextureView(
-                                &character_procedural_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 13,
-                            resource: wgpu::BindingResource::TextureView(&runner_surface_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 14,
-                            resource: wgpu::BindingResource::TextureView(
-                                &runner_detail_normal_a_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 15,
-                            resource: wgpu::BindingResource::TextureView(
-                                &runner_detail_normal_b_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 16,
-                            resource: wgpu::BindingResource::TextureView(
-                                &runner_detail_normal_c_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 17,
-                            resource: wgpu::BindingResource::TextureView(
-                                &runner_detail_normal_d_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 18,
-                            resource: wgpu::BindingResource::TextureView(&coating_environment_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 19,
-                            resource: wgpu::BindingResource::Sampler(coating_environment_sampler),
-                        },
-                    ],
-                });
+                let bind_group = create_model_bind_group(
+                    device,
+                    &wgpu::BindGroupDescriptor {
+                        label: Some("quicktag_model_material_bind_group"),
+                        layout: &material_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&color_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&normal_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&emissive_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(&control_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::Sampler(sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(&wear_scratches_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::TextureView(&wear_grime_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 8,
+                                resource: wgpu::BindingResource::TextureView(&wear_damage_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 9,
+                                resource: wgpu::BindingResource::TextureView(&pattern_field_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 10,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &character_surface_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 11,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &character_detail_color_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 12,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &character_procedural_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 13,
+                                resource: wgpu::BindingResource::TextureView(&runner_surface_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 14,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &runner_detail_normal_a_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 15,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &runner_detail_normal_b_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 16,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &runner_detail_normal_c_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 17,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &runner_detail_normal_d_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 18,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &coating_environment_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 19,
+                                resource: wgpu::BindingResource::Sampler(
+                                    coating_environment_sampler,
+                                ),
+                            },
+                        ],
+                    },
+                );
                 material_buffers.push(buffer);
                 material_bind_groups.push(bind_group);
             }
@@ -4602,36 +5529,43 @@ impl CallbackTrait for ModelPaintCallback {
                 .as_ref()
                 .map(|texture| material_texture_view(texture, true))
                 .unwrap_or_else(|| fallback_color_view.clone());
-            let bloom_half_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("quicktag_model_bloom_half_source"),
-                layout: &bloom_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&lit_color_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&present_sampler),
-                    },
-                ],
-            });
-            let bloom_quarter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("quicktag_model_bloom_quarter_source"),
-                layout: &bloom_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&bloom_half_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&present_sampler),
-                    },
-                ],
-            });
-            let bloom_blur_horizontal_bind_group =
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bloom_half_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_bloom_half_source"),
+                    layout: &bloom_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&lit_color_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&present_sampler),
+                        },
+                    ],
+                },
+            );
+            let bloom_quarter_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_bloom_quarter_source"),
+                    layout: &bloom_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&bloom_half_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&present_sampler),
+                        },
+                    ],
+                },
+            );
+            let bloom_blur_horizontal_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
                     label: Some("quicktag_model_bloom_blur_horizontal_source"),
                     layout: &bloom_layout,
                     entries: &[
@@ -4644,9 +5578,11 @@ impl CallbackTrait for ModelPaintCallback {
                             resource: wgpu::BindingResource::Sampler(&present_sampler),
                         },
                     ],
-                });
-            let bloom_blur_vertical_bind_group =
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                },
+            );
+            let bloom_blur_vertical_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
                     label: Some("quicktag_model_bloom_blur_vertical_source"),
                     layout: &bloom_layout,
                     entries: &[
@@ -4659,93 +5595,108 @@ impl CallbackTrait for ModelPaintCallback {
                             resource: wgpu::BindingResource::Sampler(&present_sampler),
                         },
                     ],
-                });
-            let present_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("quicktag_model_present_bind_group"),
-                layout: &present_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&lit_color_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&present_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: scene_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&decal_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&depth_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::TextureView(&bloom_half_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: wgpu::BindingResource::TextureView(&bloom_quarter_view),
-                    },
-                ],
-            });
-            let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("quicktag_model_lighting_bind_group"),
-                layout: &lighting_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&surface_normal_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&surface_properties_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&surface_emissive_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::Sampler(&present_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: scene_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: wgpu::BindingResource::TextureView(&surface_flags_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: wgpu::BindingResource::TextureView(&surface_albedo_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: wgpu::BindingResource::TextureView(&depth_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 9,
-                        resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 10,
-                        resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                    },
-                ],
-            });
-            let distortion_resolve_bind_group =
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                },
+            );
+            let present_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_present_bind_group"),
+                    layout: &present_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&lit_color_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&present_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: scene_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&decal_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&bloom_half_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&bloom_quarter_view),
+                        },
+                    ],
+                },
+            );
+            let lighting_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("quicktag_model_lighting_bind_group"),
+                    layout: &lighting_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&color_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&surface_normal_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&surface_properties_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&surface_emissive_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&present_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: scene_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&surface_flags_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&surface_albedo_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(&depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 11,
+                            resource: wgpu::BindingResource::TextureView(&callback_resources.get::<ModelTargetResources>()
+                                .and_then(|target|target.mixed_receivers.as_ref().map(|receiver|receiver.coverage_view.clone())
+                                    .or_else(||target.native_surface.as_ref().map(|native|native.views[1].clone())))
+                                .unwrap_or_else(||fallback_color_view.clone())),
+                        },
+                    ],
+                },
+            );
+            let distortion_resolve_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
                     label: Some("quicktag_model_distortion_resolve_bind_group"),
                     layout: &distortion_resolve_layout,
                     entries: &[
@@ -4762,9 +5713,11 @@ impl CallbackTrait for ModelPaintCallback {
                             resource: wgpu::BindingResource::Sampler(&present_sampler),
                         },
                     ],
-                });
-            let coating_deferred_bind_group =
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                },
+            );
+            let coating_deferred_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
                     label: Some("quicktag_model_coating_deferred_bind_group"),
                     layout: &callback_resources
                         .get::<ModelPipelineResources>()
@@ -4780,9 +5733,11 @@ impl CallbackTrait for ModelPaintCallback {
                             resource: wgpu::BindingResource::TextureView(&scene_normal_copy_view),
                         },
                     ],
-                });
-            let coating_fallback_bind_group =
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                },
+            );
+            let coating_fallback_bind_group = create_model_bind_group(
+                device,
+                &wgpu::BindGroupDescriptor {
                     label: Some("quicktag_model_coating_deferred_fallback_bind_group"),
                     layout: &callback_resources
                         .get::<ModelPipelineResources>()
@@ -4798,7 +5753,8 @@ impl CallbackTrait for ModelPaintCallback {
                             resource: wgpu::BindingResource::TextureView(&scene_normal_copy_view),
                         },
                     ],
-                });
+                },
+            );
             let make_bundles = |passes: &[RenderPassKind], coating_deferred| {
                 callback_resources
                     .get::<ModelPipelineResources>()
@@ -4831,6 +5787,22 @@ impl CallbackTrait for ModelPaintCallback {
                 ],
                 &coating_fallback_bind_group,
             );
+            let mut generic=decal_bundles.into_iter();
+            let mut decal_runs=Vec::new();
+            for draw in self.draws.iter().filter(|d| d.passes.iter().any(|p| matches!(p,RenderPassKind::DecalCompatibility|RenderPassKind::InvestmentDecalCompatibility))) {
+                if draw.native_c827 {
+                    let index=native_c827.iter().position(|(i,_)| *i==draw.stable_index).expect("native decal retained binding");
+                    decal_runs.push(ModelDecalRun::C827(index));
+                } else if draw.native_decal {
+                    let index=native_decals.iter().position(|(i,_)|*i==draw.stable_index).unwrap();
+                    decal_runs.push(ModelDecalRun::Authored(index));
+                } else {
+                    let bundle = generic.next().expect("every compatibility decal must retain its own ordered bundle");
+                    if let Some(ModelDecalRun::Compatibility(bundles))=decal_runs.last_mut() { bundles.push(bundle); }
+                    else { decal_runs.push(ModelDecalRun::Compatibility(vec![bundle])); }
+                }
+            }
+            assert!(generic.next().is_none());
             let additive_bundles = make_bundles(
                 &[RenderPassKind::ForwardAdditive],
                 &coating_fallback_bind_group,
@@ -4864,7 +5836,19 @@ impl CallbackTrait for ModelPaintCallback {
                 lighting_bind_group,
                 distortion_resolve_bind_group,
                 opaque_bundles,
-                decal_bundles,
+                decal_runs,
+                native_view_buffer,
+                native_pixel_view_buffer,
+                native_surfaces,
+                native_source_color,
+                native_viewer_material,
+                viewer_receiver_import,
+                viewer_receiver_coverage,
+                native_skinning_buffers,
+                native_surface_constants,
+                native_compute,
+                native_c827,
+                native_decals,
                 additive_bundles,
                 transparent_bundles,
                 coating_bundles,
@@ -4881,6 +5865,12 @@ impl CallbackTrait for ModelPaintCallback {
         let Some(frame) = callback_resources.get::<ModelFrameResources>() else {
             return Vec::new();
         };
+
+        for ((index, mesh_index),bindings) in &frame.native_compute {
+            let mesh=&self.preview.authored_inputs[*index].as_ref().expect("native geometry").static_meshes[*mesh_index];
+            let producer=&pipelines.authored_compute_pipelines.iter().find(|(abi,_)|*abi==mesh.producer).expect("exact compute source").1;
+            mesh.encode_once(egui_encoder,producer,bindings);
+        }
 
         {
             let mut shadow_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4964,6 +5954,12 @@ impl CallbackTrait for ModelPaintCallback {
                     shadow_pass.set_bind_group(2, transform_bind_group, &[]);
                     shadow_pass.draw_indexed(authored.source_index_start..end, 0, 0..1);
                     #[cfg(test)]
+                    model_binding_audit::record_shadow(draw, authored.source_index_start..end, &[
+                        (0, &frame.shadow_scene_bind_group),
+                        (1, &frame.material_bind_groups[draw.material_index]),
+                        (2, transform_bind_group),
+                    ], true);
+                    #[cfg(test)]
                     eprintln!(
                         "STRICT_SHADOW_NATIVE source={} geometry={} layout={} primitive={} indices={}..{}",
                         source_index,
@@ -4993,6 +5989,16 @@ impl CallbackTrait for ModelPaintCallback {
                         wgpu::IndexFormat::Uint32,
                     );
                     shadow_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
+                    #[cfg(test)]
+                    model_binding_audit::record_shadow(
+                        draw,
+                        draw.indices.clone(),
+                        &[
+                            (0, &frame.shadow_scene_bind_group),
+                            (1, &frame.material_bind_groups[draw.material_index]),
+                        ],
+                        false,
+                    );
                 }
             }
         }
@@ -5119,7 +6125,7 @@ impl CallbackTrait for ModelPaintCallback {
             }
         }
 
-        let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+    let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("quicktag_model_offscreen_pass"),
             color_attachments: &[
                 Some(wgpu::RenderPassColorAttachment {
@@ -5158,6 +6164,103 @@ impl CallbackTrait for ModelPaintCallback {
         pass.execute_bundles(frame.opaque_bundles.iter());
         drop(pass);
 
+        if let Some(native)=&target.native_surface {
+            let mut pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label:Some("live authored opaque surface MRTs"),
+                color_attachments:&std::array::from_fn::<_,4,_>(|i|Some(clear_surface_attachment(&native.views[i]))),
+                depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {
+                    view:&target.depth_view,depth_ops:Some(wgpu::Operations { load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store }),stencil_ops:None,
+                }),timestamp_writes:None,occlusion_query_set:None,
+            });
+            for (stable_index,abi,bindings) in &frame.native_surfaces {
+                let rasterizer=self.preview.draws[*stable_index].pipeline.rasterizer;
+                let vertex=self.preview.draws[*stable_index].native_surface.as_ref().unwrap().vertex_program;
+                pipelines.authored_surface_pipelines.iter().find(|(key,_)|*key==(vertex,*abi,rasterizer,self.preview.authored_index_format(*stable_index))).unwrap().1.encode(&mut pass,bindings);
+                #[cfg(test)] model_binding_audit::record_surface(*stable_index,*abi,vertex,bindings,self.preview.authored_index_format(*stable_index));
+                #[cfg(test)] eprintln!("LIVE_AUTHORED_SURFACE stable_index={stable_index} program={abi:?} raw_ia=true vertex_inputs={} native_mrts=4 consumer={}",
+                    if vertex == crate::render::authored_program::DescriptorAbi::RigidVertexDirectIa {"direct_ia_no_compute"}else{"source_compute"},
+                    if self.scene.fidelity[0]==1.0 {"ViewerLighting"}else{"BaseColor"});
+            }
+            drop(pass);
+            // Decals need valid destinations on generic opaque parts too.
+            // Retain native-only coverage and unchanged generic pixels.
+            if let Some(receiver)=&target.mixed_receivers {
+                receiver.copy_original_native_normal(egui_encoder,&native.textures[1]);
+                let mut pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("generic opaque receivers into authored decal attachments"),
+                    color_attachments:&std::array::from_fn::<_,4,_>(|i|Some(load_surface_attachment(&native.views[i]))),
+                    depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,
+                });
+                pipelines.viewer_receiver_import.encode(&mut pass,frame.viewer_receiver_import.as_ref().unwrap());
+                drop(pass);
+                receiver.copy_opaque(egui_encoder,native);
+            }
+            if let Some((snapshot,_))=&target.native_normal_snapshot {
+                egui_encoder.copy_texture_to_texture(native.textures[1].as_image_copy(),snapshot.as_image_copy(),
+                    wgpu::Extent3d {width:target.size[0],height:target.size[1],depth_or_array_layers:1});
+            }
+            if frame.decal_runs.iter().any(|run|matches!(run,ModelDecalRun::Authored(_)|ModelDecalRun::C827(_))) {
+                let mut pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("authored ordered stage2 material composition"),
+                    color_attachments:&std::array::from_fn::<_,4,_>(|i|Some(load_surface_attachment(&native.views[i]))),
+                    depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {
+                        view:&target.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None,
+                    }),timestamp_writes:None,occlusion_query_set:None,
+                });
+                for run in &frame.decal_runs {
+                    match run {
+                        ModelDecalRun::Authored(index) => {
+                            let (stable_index,b)=&frame.native_decals[*index];
+                            pipelines.authored_decal_pipelines.iter().find(|(abi,_)|*abi==(b.vertex_program,b.program,self.preview.authored_index_format(*stable_index))).unwrap().1.encode(&mut pass,&b.pixel,&b.vertex,
+                                &b.source,&b.uv,&b.indices,b.range.clone());
+                            #[cfg(test)] model_binding_audit::record_decal(*stable_index,b,self.preview.authored_index_format(*stable_index));
+                            #[cfg(test)] eprintln!("LIVE_AUTHORED_DECAL stable_index={stable_index} original_strip={:?} normal_snapshot=true before_viewer_lighting=true",b.range);
+                        },
+                        ModelDecalRun::C827(index) => {
+                            let (stable_index,b)=&frame.native_c827[*index];
+                            pipelines.authored_material_c827_pipelines.iter().find(|(f,_)|*f==self.preview.authored_index_format(*stable_index)).unwrap().1.encode(&mut pass,b,false);
+                            #[cfg(test)] model_binding_audit::record_c827_material(*stable_index,b,self.preview.authored_index_format(*stable_index));
+                        },
+                        ModelDecalRun::Compatibility(_) => {},
+                    }
+                }
+            }
+            if let Some(receiver)=&target.mixed_receivers {
+                let mut pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("native and decal-modified receiver coverage"),
+                    color_attachments:&[Some(clear_surface_attachment(&receiver.coverage_view))],
+                    depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,
+                });
+                pipelines.viewer_receiver_coverage.encode(&mut pass,frame.viewer_receiver_coverage.as_ref().unwrap());
+            }
+            if self.scene.postprocess2[0] == 0.0 && self.scene.fidelity[0] == 1.0 {
+                let mut pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("live authored materials to viewer lighting"),
+                    color_attachments:&[
+                        Some(load_surface_attachment(&target.surface_normal_view)),
+                        Some(load_surface_attachment(&target.surface_properties_view)),
+                        Some(load_surface_attachment(&target.surface_albedo_view)),
+                    ], depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,
+                });
+                pipelines.authored_viewer_material.encode(&mut pass,frame.native_viewer_material.as_ref().unwrap());
+            }
+            let mut pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label:Some("live authored RT0 Base Color consumer"),
+                color_attachments:&[Some(load_surface_attachment(&target.surface_albedo_view))],
+                depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,
+            });
+            pipelines.authored_source_color.encode(&mut pass,frame.native_source_color.as_ref().unwrap(),false);
+            drop(pass);
+            if self.scene.postprocess2[0] == 1.0 {
+                let mut pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("live authored RT0 Base Color diagnostic consumer"),
+                    color_attachments:&[Some(load_surface_attachment(&target.color_view))],
+                    depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,
+                });
+                pipelines.authored_source_color.encode(&mut pass,frame.native_source_color.as_ref().unwrap(),true);
+            }
+        }
+
         // Stage-2 investment decals read the normal already written by the
         // opaque surface pass through an external screen-space texture. Keep
         // the source and destination separate: the normal attachment is still
@@ -5174,15 +6277,10 @@ impl CallbackTrait for ModelPaintCallback {
             );
         }
 
-        for (label, bundles) in [(
-            "quicktag_model_investment_decal_pass",
-            frame.decal_bundles.as_slice(),
-        )] {
-            if bundles.is_empty() {
-                continue;
-            }
+        for run in &frame.decal_runs {
+            if matches!(run,ModelDecalRun::Authored(_)) || (target.native_surface.is_some() && matches!(run,ModelDecalRun::C827(_))) { continue; }
             let mut special_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
+                label: Some("quicktag_model_ordered_decal_pass"),
                 color_attachments: &[
                     Some(load_surface_attachment(&target.color_view)),
                     Some(load_surface_attachment(&target.surface_normal_view)),
@@ -5200,7 +6298,33 @@ impl CallbackTrait for ModelPaintCallback {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            special_pass.execute_bundles(bundles.iter());
+            match run {
+                ModelDecalRun::Compatibility(bundles) => special_pass.execute_bundles(bundles.iter()),
+                ModelDecalRun::Authored(_) => unreachable!("authored decals execute in the material pass"),
+                ModelDecalRun::C827(index) => {
+                    let (stable_index,b)=&frame.native_c827[*index];
+                    pipelines.authored_c827_pipelines.iter().find(|(f,_)|*f==self.preview.authored_index_format(*stable_index)).unwrap().1.encode(&mut special_pass,b,false);
+                    #[cfg(test)] model_binding_audit::record_c827(*stable_index,b,false,self.preview.authored_index_format(*stable_index));
+                },
+            }
+            drop(special_pass);
+            if let ModelDecalRun::C827(index)=run {
+                // Exact RT0 multiplier also consumes the viewer's separate
+                // albedo color. This is a color projection, not an assertion
+                // that native RT3 (motion) contains albedo.
+                let mut albedo_pass=egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("C827 receiver albedo projection"),
+                    color_attachments:&[Some(load_surface_attachment(&target.surface_albedo_view)),None,None,None],
+                    depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {
+                        view:&target.depth_view, depth_ops:Some(wgpu::Operations { load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store }),stencil_ops:None,
+                    }),timestamp_writes:None,occlusion_query_set:None,
+                });
+                let (stable_index,b)=&frame.native_c827[*index];
+                pipelines.authored_c827_pipelines.iter().find(|(f,_)|*f==self.preview.authored_index_format(*stable_index)).unwrap().1.encode(&mut albedo_pass,b,true);
+                #[cfg(test)] model_binding_audit::record_c827(*stable_index,b,true,self.preview.authored_index_format(*stable_index));
+                #[cfg(test)]
+                eprintln!("LIVE_C827 stable_index={} original_strip={:?} exact_paired_vs_ps=true viewer_bind_pose=true receiver_color_projections=2",frame.native_c827[*index].0,frame.native_c827[*index].1.range);
+            }
         }
 
         {
@@ -5228,7 +6352,7 @@ impl CallbackTrait for ModelPaintCallback {
             for draw in self
                 .draws
                 .iter()
-                .filter(|draw| !draw.passes.iter().copied().any(is_forward_pass))
+                .filter(|draw| !draw.native_c827 && !draw.native_surface && !draw.native_decal && !draw.passes.iter().copied().any(is_forward_pass))
             {
                 let emissive_key = draw.pipeline.material_emissive();
                 let Some((_, pipeline)) = pipelines
@@ -5273,7 +6397,7 @@ impl CallbackTrait for ModelPaintCallback {
             for draw in self
                 .draws
                 .iter()
-                .filter(|draw| !draw.passes.iter().copied().any(is_forward_pass))
+                .filter(|draw| !draw.native_c827 && !draw.native_surface && !draw.native_decal && !draw.passes.iter().copied().any(is_forward_pass))
             {
                 let flag_key = draw.pipeline.material_flags();
                 let Some((_, pipeline)) = pipelines
@@ -5458,6 +6582,7 @@ impl CallbackTrait for ModelPaintCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &CallbackResources,
     ) {
+        if self.native_resources_pending { return; }
         let Some(pipelines) = callback_resources.get::<ModelPipelineResources>() else {
             return;
         };
@@ -5479,14 +6604,58 @@ fn alpha_mode(format: wgpu::TextureFormat) -> f32 {
 }
 
 fn material_texture_view(texture: &Texture, srgb: bool) -> wgpu::TextureView {
-    texture.handle.create_view(&wgpu::TextureViewDescriptor {
-        format: Some(if srgb {
-            srgb_texture_format(texture.desc.format)
-        } else {
-            linear_texture_format(texture.desc.format)
-        }),
-        ..Default::default()
+    create_model_texture_view(
+        &texture.handle,
+        &wgpu::TextureViewDescriptor {
+            format: Some(if srgb {
+                srgb_texture_format(texture.desc.format)
+            } else {
+                linear_texture_format(texture.desc.format)
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+fn create_native_authored_sampler(device: &wgpu::Device, desc: &ModelSamplerDesc) -> wgpu::Sampler {
+    // D3D11_FILTER_MIN_MAG_MIP_POINT = 0; 0x15/0x55 use linear filters.
+    // Adapters apply each authored mip bias in the original sample instruction.
+    let filter = match desc.filter {
+        0 => wgpu::FilterMode::Nearest,
+        0x15 | 0x55 => wgpu::FilterMode::Linear,
+        value => panic!("unsupported native authored filter: {value}"),
+    };
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("exact native authored sampler; shader embeds mip bias"),
+        address_mode_u: authored_sampler_address_mode(desc.address_u),
+        address_mode_v: authored_sampler_address_mode(desc.address_v),
+        address_mode_w: authored_sampler_address_mode(desc.address_w),
+        mag_filter: filter, min_filter: filter, mipmap_filter: filter,
+        lod_min_clamp: desc.min_lod, lod_max_clamp: desc.max_lod,
+        border_color: authored_sampler_border_color(desc).expect("admitted sampler border contract"),
+        anisotropy_clamp: desc.max_anisotropy as u16, ..Default::default()
     })
+}
+
+// D3D11_TEXTURE_ADDRESS_MODE: explicit mapping for audited source samplers.
+fn authored_sampler_address_mode(mode: u32) -> wgpu::AddressMode {
+    match mode {
+        1 => wgpu::AddressMode::Repeat,
+        2 => wgpu::AddressMode::MirrorRepeat,
+        3 => wgpu::AddressMode::ClampToEdge,
+        4 => wgpu::AddressMode::ClampToBorder,
+        _ => panic!("unsupported authored sampler address mode: {mode}"),
+    }
+}
+
+fn authored_sampler_border_color(desc: &ModelSamplerDesc) -> Result<Option<wgpu::SamplerBorderColor>, &'static str> {
+    if ![desc.address_u, desc.address_v, desc.address_w].contains(&4) { return Ok(None); }
+    Ok(Some(match desc.border_color {
+        [0.0, 0.0, 0.0, 0.0] => wgpu::SamplerBorderColor::TransparentBlack,
+        [0.0, 0.0, 0.0, 1.0] => wgpu::SamplerBorderColor::OpaqueBlack,
+        [1.0, 1.0, 1.0, 1.0] => wgpu::SamplerBorderColor::OpaqueWhite,
+        _ => return Err("unsupported authored sampler border color"),
+    }))
 }
 
 fn load_model_sampler_desc(tag: TagHash) -> Option<ModelSamplerDesc> {
@@ -5512,6 +6681,7 @@ fn decode_model_sampler_desc(data: &[u8]) -> Option<ModelSamplerDesc> {
         address_w: read_u32(12)?,
         mip_lod_bias: read_f32(16)?,
         max_anisotropy: read_u32(20)?.clamp(1, 16),
+        border_color: [read_f32(28)?, read_f32(32)?, read_f32(36)?, read_f32(40)?],
         min_lod: read_f32(44)?,
         max_lod: read_f32(48)?,
     })
@@ -5521,7 +6691,8 @@ fn create_model_sampler(device: &wgpu::Device, desc: ModelSamplerDesc) -> wgpu::
     let address_mode = |mode| match mode {
         1 => wgpu::AddressMode::Repeat,
         2 => wgpu::AddressMode::MirrorRepeat,
-        // D3D mirror-once and border modes have no portable WebGPU equivalent.
+        4 => wgpu::AddressMode::ClampToBorder,
+        // Mirror-once remains outside the native material admission contract.
         _ => wgpu::AddressMode::ClampToEdge,
     };
     let anisotropic = desc.filter & 0x40 != 0;
@@ -5558,7 +6729,7 @@ fn create_model_sampler(device: &wgpu::Device, desc: ModelSamplerDesc) -> wgpu::
         } else {
             1
         },
-        border_color: None,
+        border_color: authored_sampler_border_color(&desc).expect("authored sampler border contract"),
     })
 }
 
@@ -5567,6 +6738,29 @@ fn create_pipeline_resources(
     queue: &wgpu::Queue,
     target_format: wgpu::TextureFormat,
 ) -> ModelPipelineResources {
+    assert!(
+        device
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS),
+        "model renderer requires authored SPIR-V passthrough support"
+    );
+    let authored_program_modules =
+        crate::render::authored_program::AuthoredProgramModules::new(device);
+    let authored_surface_vertex_layout = crate::render::body_vertex::create_layout(device);
+    let authored_rigid_vertex_layout = crate::render::rigid_vertex::create_layout(device);
+    let authored_auxiliary_vertex_layout = crate::render::auxiliary_vertex::create_layout(device);
+    let authored_displacement_vertex_layout = crate::render::displacement_vertex::create_layout(device);
+    let authored_color_vertex_layout = crate::render::color_vertex::create_layout(device);
+    // Material pipelines are created once when a fully resident admitted draw
+    // first needs them. Opening another model never compiles unrelated shaders.
+    let authored_surface_pipelines = Vec::new();
+    let authored_source_color = crate::render::surface_targets::SourceColorProjection::new(device, [SURFACE_FORMAT,OFFSCREEN_FORMAT]);
+    let authored_viewer_material = crate::render::surface_targets::ViewerMaterialProjection::new(device,
+        [SURFACE_FORMAT,SURFACE_PROPERTIES_FORMAT,SURFACE_FORMAT]);
+    let viewer_receiver_import = crate::render::surface_targets::ViewerReceiverImport::new(device);
+    let viewer_receiver_coverage = crate::render::surface_targets::ViewerReceiverCoverage::new(device);
+    let authored_body_compute_pipeline =
+        create_authored_body_compute_pipeline(device, &authored_program_modules);
     let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("quicktag_model_scene_layout"),
         entries: &[
@@ -5840,6 +7034,13 @@ fn create_pipeline_resources(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 11, visibility: wgpu::ShaderStages::FRAGMENT, count: None,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                },
+            },
         ],
     });
     let distortion_resolve_layout =
@@ -5892,7 +7093,7 @@ fn create_pipeline_resources(
         wgpu::util::TextureDataOrder::default(),
         &[255, 255, 255, 255],
     );
-    let fallback_color_view = fallback_color.create_view(&Default::default());
+    let fallback_color_view = create_model_texture_view(&fallback_color, &Default::default());
     let fallback_cubemap = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
@@ -5915,11 +7116,14 @@ fn create_pipeline_resources(
             255, 255, 55, 110, 255, 255,
         ],
     );
-    let fallback_cubemap_view = fallback_cubemap.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::Cube),
-        array_layer_count: Some(6),
-        ..Default::default()
-    });
+    let fallback_cubemap_view = create_model_texture_view(
+        &fallback_cubemap,
+        &wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            array_layer_count: Some(6),
+            ..Default::default()
+        },
+    );
     let cubemap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("quicktag_environment_cubemap_sampler"),
         mag_filter: wgpu::FilterMode::Linear,
@@ -6190,6 +7394,21 @@ fn create_pipeline_resources(
         _fallback_color: fallback_color,
         fallback_color_view,
         model_shader,
+        _authored_program_modules: authored_program_modules,
+        authored_surface_vertex_layout,
+        authored_rigid_vertex_layout,
+        authored_auxiliary_vertex_layout,
+        authored_displacement_vertex_layout,
+        authored_color_vertex_layout,
+        authored_surface_pipelines,
+        authored_source_color,
+        authored_viewer_material,
+        viewer_receiver_import,
+        viewer_receiver_coverage,
+        authored_compute_pipelines: vec![(crate::render::authored_program::DescriptorAbi::BodyMeshComputeStorage, authored_body_compute_pipeline)],
+        authored_c827_pipelines: Vec::new(),
+        authored_decal_pipelines: Vec::new(),
+        authored_material_c827_pipelines: Vec::new(),
         shadow_shader,
         authored_depth_shader,
         model_pipeline_layout,
@@ -6498,6 +7717,334 @@ fn create_bloom_pipeline(
     })
 }
 
+fn create_authored_body_compute_pipeline(
+    device: &wgpu::Device,
+    modules: &crate::render::authored_program::AuthoredProgramModules,
+) -> crate::render::body_mesh::BodyMeshProducer {
+    use crate::render::authored_program::DescriptorAbi;
+
+    crate::render::body_mesh::BodyMeshProducer::new(
+        device,
+        modules
+            .module(DescriptorAbi::BodyMeshComputeStorage)
+            .expect("embedded body mesh compute program"),
+    )
+}
+
+fn create_authored_surface_pipelines(
+    device: &wgpu::Device,
+    modules: &crate::render::authored_program::AuthoredProgramModules,
+    vertex_layout: &wgpu::BindGroupLayout,
+    rigid_vertex_layout: &wgpu::BindGroupLayout,
+    auxiliary_vertex_layout: &wgpu::BindGroupLayout,
+    color_vertex_layout: &wgpu::BindGroupLayout,
+    displacement_vertex_layout: &wgpu::BindGroupLayout,
+    requested: &[(crate::render::authored_program::DescriptorAbi, crate::render::authored_program::DescriptorAbi, u8, wgpu::IndexFormat)],
+) -> Vec<((crate::render::authored_program::DescriptorAbi, crate::render::authored_program::DescriptorAbi, u8, wgpu::IndexFormat), crate::render::body_draw::BodyDrawPipeline)> {
+    use crate::render::{authored_program::DescriptorAbi as D, dense_pixel::SurfacePixelAbi as S};
+    let contracts=[(D::BodyPixelDense,S::Body),(D::ChestPixelDense,S::Layered),(D::SleevesPixelDense,S::Layered),
+        (D::HandsPixelDense,S::Hands),(D::HardwarePixelDense,S::Hardware),
+        (D::FacePixelDense,S::Audited {rows:127,textures:7,volume:Some(5),samplers:3}),
+        (D::EyeDetailPixelDense,S::Audited {rows:71,textures:2,volume:Some(1),samplers:2})].into_iter().map(|(ps,abi)|(D::BodyVertexScalarStorage,ps,abi)).chain(
+            crate::render::runner_surface_programs::SURFACES.iter().flat_map(|s|s.vertex_programs.iter().map(move |&vertex|(vertex,s.program.descriptor_abi,
+                S::Audited { rows:s.rows as u64,textures:s.texture_count,volume:s.volume_slot,samplers:s.sampler_count })))).chain(
+            [(D::HairVertexStorage, D::HairPixelDense,
+              S::Audited { rows:167, textures:5, volume:Some(4), samplers:2 }),
+             (D::HairVertexStorage, D::HairSolidPixelDense,
+              S::Audited { rows:170, textures:6, volume:Some(5), samplers:2 })]);
+    contracts.flat_map(|(vertex,program,abi)|[1u8,2].into_iter().flat_map(move |rasterizer|[wgpu::IndexFormat::Uint16,wgpu::IndexFormat::Uint32].map(|format|(vertex,program,abi,rasterizer,format))))
+        .filter(|(vertex,program,_,rasterizer,format)|requested.contains(&(*vertex,*program,*rasterizer,*format)))
+        .map(|(vertex,program,abi,rasterizer,format)| {
+    let build=if matches!(vertex,D::RigidVertexDirectIa|D::FloatVertexScalarStorage) {crate::render::body_draw::BodyDrawPipeline::new_direct_ia}
+        else {crate::render::body_draw::BodyDrawPipeline::new_dense};
+    ((vertex,program,rasterizer,format), build(
+        device,
+        modules.module(vertex).expect("embedded audited layout7 vertex program"),
+        modules.module(program).expect("embedded audited surface pixel program"),
+        match vertex {
+            D::RigidVertexDirectIa => rigid_vertex_layout,
+            D::VertexColorStorage => color_vertex_layout,
+            D::DisplacementEC03VertexStorage => displacement_vertex_layout,
+            D::HairVertexStorage | D::Hair14580VertexStorage | D::Hair120RowVertexStorage | D::HairBA67VertexStorage
+                | D::BodyProceduralVertexStorage | D::BodyC9C5VertexStorage | D::ClothVertexStorage | D::ClothB152VertexStorage => auxiliary_vertex_layout,
+            _ => vertex_layout,
+        }, abi,
+        std::array::from_fn(|_|Some(surface_target(wgpu::TextureFormat::Rgba32Float))),
+        wgpu::FrontFace::Ccw, (rasterizer==2).then_some(wgpu::Face::Back), depth_stencil_state(2, 0),format,
+    )) }).collect()
+}
+fn create_authored_scalar_vertex_layout(
+    device: &wgpu::Device,
+    label: &str,
+) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_authored_c827_pipeline(
+    device: &wgpu::Device,
+    modules: &crate::render::authored_program::AuthoredProgramModules,
+    index_format: wgpu::IndexFormat,
+) -> crate::render::c827_draw::C827DrawPipeline {
+    use crate::render::authored_program::DescriptorAbi;
+    crate::render::c827_draw::C827DrawPipeline::new(
+        device,
+        modules.module(DescriptorAbi::SharedLayout7VertexScalarStorage).expect("embedded C827 VS"),
+        modules.module(DescriptorAbi::C827Pixel).expect("embedded C827 PS"),
+        [OFFSCREEN_FORMAT, SURFACE_FORMAT, SURFACE_PROPERTIES_FORMAT, SURFACE_FORMAT],
+        depth_stencil_state(15,1), rasterizer_cull_mode(2),index_format,
+    )
+}
+
+#[cfg(test)]
+fn create_authored_d0f2_pipeline(
+    device: &wgpu::Device,
+    modules: &crate::render::authored_program::AuthoredProgramModules,
+) -> crate::render::decal_draw::DecalDrawPipeline {
+    use crate::render::authored_program::DescriptorAbi;
+    let vertex_layout = crate::render::body_vertex::create_layout(device);
+    crate::render::decal_draw::DecalDrawPipeline::new(
+        device,
+        modules.module(DescriptorAbi::SharedLayout7VertexScalarStorage).expect("embedded D0F2 vertex program"),
+        modules.module(DescriptorAbi::D0F2PixelDense).expect("embedded D0F2 pixel program"),
+        &vertex_layout,
+        crate::render::decal_draw::DecalPixelContract::D0F2,
+        [OFFSCREEN_FORMAT, SURFACE_FORMAT, SURFACE_PROPERTIES_FORMAT, SURFACE_FORMAT],
+        wgpu::FrontFace::Ccw,
+        rasterizer_cull_mode(2),
+        depth_stencil_state(15, 1),
+        wgpu::IndexFormat::Uint16,
+    )
+}
+
+#[cfg(test)]
+fn create_authored_head_pipelines(
+    device: &wgpu::Device,
+    modules: &crate::render::authored_program::AuthoredProgramModules,
+) -> AuthoredHeadPipelines {
+    use crate::render::authored_program::DescriptorAbi;
+
+    let pixel_abi = |source_sha| {
+        let source_sha = crate::render::authored_program::decode_sha256(source_sha);
+        crate::render::authored_program::programs()
+            .find(|program| program.stage == ShaderStage::Pixel && program.source_sha256 == source_sha)
+            .expect("canonical audited head pixel contract").descriptor_abi
+    };
+    let entries = vec![
+        create_authored_head_pipeline(
+            device,
+            modules,
+            "authored mouth 80A9A2C7 + 80A9AA27",
+            DescriptorAbi::EyesVertexStorage,
+            pixel_abi("bd135d1b7ca9ce2f18f65c0204839ce5b08f2d3f30cf7d97ba4474bb1cf4f621"),
+            49,
+            &[
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D2,
+            ],
+            1,
+            None,
+        ),
+        create_authored_head_pipeline(
+            device,
+            modules,
+            "authored eyes 80A9A2C7 + 80A9D1D1",
+            DescriptorAbi::EyesVertexStorage,
+            pixel_abi("fba1a1fcf152f2fbc14cfe82743a2ab01a8ca99bc681ce3ac8f4ba3ef8ba3245"),
+            74,
+            &[
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D2,
+            ],
+            1,
+            None,
+        ),
+        create_authored_head_pipeline(
+            device,
+            modules,
+            "authored eye-detail 80A60DAD + 80A9BE2C rasterizer 1",
+            DescriptorAbi::BodyVertexScalarStorage,
+            DescriptorAbi::EyeDetailPixelDense,
+            71,
+            &[
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D3,
+            ],
+            2,
+            rasterizer_cull_mode(1),
+        ),
+        create_authored_head_pipeline(
+            device,
+            modules,
+            "authored face 80A60DAD + 80A9D0DF",
+            DescriptorAbi::BodyVertexScalarStorage,
+            DescriptorAbi::FacePixelDense,
+            127,
+            &[
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D2,
+                wgpu::TextureViewDimension::D3,
+                wgpu::TextureViewDimension::D2,
+            ],
+            3,
+            None,
+        ),
+    ];
+    AuthoredHeadPipelines { _entries: entries }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn create_authored_head_pipeline(
+    device: &wgpu::Device,
+    modules: &crate::render::authored_program::AuthoredProgramModules,
+    label: &str,
+    vertex_abi: crate::render::authored_program::DescriptorAbi,
+    pixel_abi: crate::render::authored_program::DescriptorAbi,
+    globals_rows: u64,
+    texture_dimensions: &[wgpu::TextureViewDimension],
+    sampler_count: u32,
+    cull_mode: Option<wgpu::Face>,
+) -> AuthoredHeadPipeline {
+    let mut pixel_entries =
+        Vec::with_capacity(3 + texture_dimensions.len() + sampler_count as usize);
+    for (binding, rows) in [(0, globals_rows), (1, 31), (2, 29)] {
+        pixel_entries.push(wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(rows * 16),
+            },
+            count: None,
+        });
+    }
+    for (index, &view_dimension) in texture_dimensions.iter().enumerate() {
+        pixel_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 3 + index as u32,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension,
+                multisampled: false,
+            },
+            count: None,
+        });
+    }
+    for index in 0..sampler_count {
+        pixel_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 3 + texture_dimensions.len() as u32 + index,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        });
+    }
+    let pixel_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &pixel_entries,
+    });
+    let vertex_layout = create_authored_scalar_vertex_layout(device, label);
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[&pixel_layout, &vertex_layout],
+        push_constant_ranges: &[],
+    });
+    let vertex = modules
+        .module(vertex_abi)
+        .expect("embedded head vertex program");
+    let pixel = modules
+        .module(pixel_abi)
+        .expect("embedded head pixel program");
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: authored_layout7_vertex_state(vertex),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode,
+            ..Default::default()
+        },
+        // Blend/depth are inherited in these target techniques and remain unresolved.
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: pixel,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(surface_target(OFFSCREEN_FORMAT)),
+                Some(surface_target(SURFACE_FORMAT)),
+                Some(surface_target(SURFACE_PROPERTIES_FORMAT)),
+                Some(surface_target(SURFACE_FORMAT)),
+            ],
+        }),
+        multiview: None,
+        cache: None,
+    });
+    AuthoredHeadPipeline {
+        _pixel_layout: pixel_layout,
+        _vertex_layout: vertex_layout,
+        _pipeline: pipeline,
+    }
+}
+
 fn create_model_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -6796,11 +8343,21 @@ fn create_target_resources(
         estimated_model_target_bytes(size, features) <= MAX_MODEL_TARGET_BYTES,
         "model target allocation exceeded the renderer memory budget"
     );
+    let native_surface=features.native_surface.then(||crate::render::surface_targets::SurfaceTargets::new(device,size));
+    let mixed_receivers=features.mixed_receivers.then(||crate::render::surface_targets::ReceiverTargets::new(device,size));
     let extent = wgpu::Extent3d {
         width: size[0],
         height: size[1],
         depth_or_array_layers: 1,
     };
+    let native_normal_snapshot=features.native_decals.then(|| {
+        let texture=device.create_texture(&wgpu::TextureDescriptor {
+            label:Some("authored opaque normal snapshot before stage2"),size:extent,mip_level_count:1,sample_count:1,
+            dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba32Float,
+            usage:wgpu::TextureUsages::COPY_DST|wgpu::TextureUsages::COPY_SRC|wgpu::TextureUsages::TEXTURE_BINDING,view_formats:&[],
+        });
+        let view=texture.create_view(&Default::default()); (texture,view)
+    });
     let optional_extent = |enabled: bool| {
         if enabled {
             extent
@@ -6824,7 +8381,7 @@ fn create_target_resources(
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let color_view = color.create_view(&Default::default());
+    let color_view = create_model_texture_view(&color, &Default::default());
     let lit_color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_lit_color_target"),
         size: extent,
@@ -6837,7 +8394,7 @@ fn create_target_resources(
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let lit_color_view = lit_color.create_view(&Default::default());
+    let lit_color_view = create_model_texture_view(&lit_color, &Default::default());
     let scene_color_copy = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_scene_color_copy"),
         size: optional_extent(features.distortion),
@@ -6848,7 +8405,7 @@ fn create_target_resources(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let scene_color_copy_view = scene_color_copy.create_view(&Default::default());
+    let scene_color_copy_view = create_model_texture_view(&scene_color_copy, &Default::default());
     let scene_normal_copy = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_scene_normal_copy"),
         size: optional_extent(features.deferred_normal_copy),
@@ -6859,7 +8416,7 @@ fn create_target_resources(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let scene_normal_copy_view = scene_normal_copy.create_view(&Default::default());
+    let scene_normal_copy_view = create_model_texture_view(&scene_normal_copy, &Default::default());
     let distortion = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_distortion_payload"),
         size: optional_extent(features.distortion),
@@ -6870,7 +8427,7 @@ fn create_target_resources(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let distortion_view = distortion.create_view(&Default::default());
+    let distortion_view = create_model_texture_view(&distortion, &Default::default());
     let surface_texture = |label, format| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -6886,18 +8443,19 @@ fn create_target_resources(
         })
     };
     let surface_normal = surface_texture("quicktag_surface_normal_roughness", SURFACE_FORMAT);
-    let surface_normal_view = surface_normal.create_view(&Default::default());
+    let surface_normal_view = create_model_texture_view(&surface_normal, &Default::default());
     let surface_properties = surface_texture(
         "quicktag_surface_material_properties",
         SURFACE_PROPERTIES_FORMAT,
     );
-    let surface_properties_view = surface_properties.create_view(&Default::default());
+    let surface_properties_view =
+        create_model_texture_view(&surface_properties, &Default::default());
     let surface_emissive = surface_texture("quicktag_surface_emissive", SURFACE_EMISSIVE_FORMAT);
-    let surface_emissive_view = surface_emissive.create_view(&Default::default());
+    let surface_emissive_view = create_model_texture_view(&surface_emissive, &Default::default());
     let surface_albedo = surface_texture("quicktag_surface_albedo_opacity", SURFACE_FORMAT);
-    let surface_albedo_view = surface_albedo.create_view(&Default::default());
+    let surface_albedo_view = create_model_texture_view(&surface_albedo, &Default::default());
     let surface_flags = surface_texture("quicktag_surface_flags", SURFACE_FLAGS_FORMAT);
-    let surface_flags_view = surface_flags.create_view(&Default::default());
+    let surface_flags_view = create_model_texture_view(&surface_flags, &Default::default());
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_depth_target"),
         size: extent,
@@ -6908,7 +8466,7 @@ fn create_target_resources(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let depth_view = depth.create_view(&Default::default());
+    let depth_view = create_model_texture_view(&depth, &Default::default());
     let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("quicktag_model_sun_shadow"),
         size: wgpu::Extent3d {
@@ -6923,7 +8481,7 @@ fn create_target_resources(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let shadow_depth_view = shadow_depth.create_view(&Default::default());
+    let shadow_depth_view = create_model_texture_view(&shadow_depth, &Default::default());
     let bloom_texture = |label, width, height| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -6955,20 +8513,23 @@ fn create_target_resources(
         bloom_half_size[0],
         bloom_half_size[1],
     );
-    let bloom_half_view = bloom_half.create_view(&Default::default());
+    let bloom_half_view = create_model_texture_view(&bloom_half, &Default::default());
     let bloom_quarter = bloom_texture(
         "quicktag_model_bloom_quarter",
         bloom_quarter_size[0],
         bloom_quarter_size[1],
     );
-    let bloom_quarter_view = bloom_quarter.create_view(&Default::default());
+    let bloom_quarter_view = create_model_texture_view(&bloom_quarter, &Default::default());
     let bloom_blur = bloom_texture(
         "quicktag_model_bloom_blur_ping_pong",
         bloom_quarter_size[0],
         bloom_quarter_size[1],
     );
-    let bloom_blur_view = bloom_blur.create_view(&Default::default());
+    let bloom_blur_view = create_model_texture_view(&bloom_blur, &Default::default());
     ModelTargetResources {
+        native_surface,
+        native_normal_snapshot,
+        mixed_receivers,
         size,
         features,
         _color: color,
@@ -7040,6 +8601,7 @@ const LIGHTING_SHADER: &str = r#"
 @group(0) @binding(8) var scene_depth: texture_depth_2d;
 @group(0) @binding(9) var sun_shadow: texture_depth_2d;
 @group(0) @binding(10) var sun_shadow_sampler: sampler_comparison;
+@group(0) @binding(11) var authored_coverage: texture_2d<f32>;
 
 struct SceneUniform {
     center: vec4<f32>, params0: vec4<f32>, params1: vec4<f32>, uv_transform: vec4<f32>,
@@ -7396,8 +8958,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if u32(scene.postprocess2.x + 0.5) != 0u {
         return compatibility;
     }
+    var authored = false;
+    if scene.fidelity.x > 0.5 {
+        authored = textureLoad(authored_coverage,scene_pixel,0).a != 0.0;
+    }
     let model = u32(scene.fidelity.y + 0.5);
-    if model == 1u {
+    // Authored opaque surfaces have no old forward material submission. Both
+    // GGX viewer modes consume the decoded material ABI here; unrelated
+    // Compatibility surfaces retain their existing forward result.
+    if model == 1u || (model == 0u && authored) {
         if surface.a <= 0.0 {
             return compatibility;
         }
@@ -7447,7 +9016,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let light = normalize(scene.light_position.xyz - view_position);
         let lambert = max(dot(normal, light), 0.0) * spotlight_factor_world(position);
         let ao = properties.g;
-        return vec4<f32>(surface.rgb * (0.18 * ao + 0.82 * lambert) + emissive, compatibility.a);
+        return vec4<f32>(surface.rgb * (0.18 * ao + 0.82 * lambert) + emissive, select(compatibility.a,surface.a,authored));
     }
     if model == 3u {
         return vec4<f32>(normal * 0.5 + vec3<f32>(0.5), compatibility.a);
@@ -10008,8 +11577,9 @@ fn material_surface(input: VertexOutput, albedo: vec3<f32>) -> vec2<f32> {
         return material.solid_surface.xy;
     }
     if material.character_params.x > 0.5 {
-        // Exact MRT contract shared by audited Goliath character permutations:
-        // RT1.a = 0.67 roughness; RT2.r = 0 metalness.
+        // Compatibility preview approximation. Audited body RT1.a is literal
+        // .67, while RGB vector length carries a separate response. This fixed
+        // viewer roughness does not decode the authored MRT material contract.
         return vec2<f32>(0.67, 0.0);
     }
     if (material.runner_layered_params.y > 15.5
@@ -11863,6 +13433,66 @@ mod lighting_tests;
 
 #[cfg(test)]
 mod tests {
+    fn read_receiver_images(device: &wgpu::Device, queue: &wgpu::Queue, target: &super::ModelTargetResources) -> Vec<Vec<u8>> {
+        let textures=[&target._color,&target._surface_normal,&target._surface_properties,&target._surface_albedo];
+        read_texture_images(device,queue,&textures)
+    }
+
+    fn read_authored_images(device:&wgpu::Device,queue:&wgpu::Queue,target:&super::ModelTargetResources)->Vec<Vec<u8>> {
+        let textures=&target.native_surface.as_ref().expect("live authored targets").textures;
+        read_texture_images(device,queue,&textures.iter().collect::<Vec<_>>())
+    }
+
+    pub(super) fn read_texture_images(device:&wgpu::Device,queue:&wgpu::Queue,textures:&[&wgpu::Texture])->Vec<Vec<u8>> {
+        let mut encoder=device.create_command_encoder(&Default::default());
+        let buffers:Vec<_>=textures.iter().map(|texture| {
+            let row=texture.width()*texture.format().block_copy_size(None).unwrap();
+            let padded=row.div_ceil(256)*256;
+            let buffer=device.create_buffer(&wgpu::BufferDescriptor { label:Some("native receiver bit readback"),
+                size:u64::from(padded)*u64::from(texture.height()), usage:wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::MAP_READ,mapped_at_creation:false });
+            encoder.copy_texture_to_buffer(texture.as_image_copy(),wgpu::TexelCopyBufferInfo { buffer:&buffer,
+                layout:wgpu::TexelCopyBufferLayout { offset:0,bytes_per_row:Some(padded),rows_per_image:Some(texture.height()) } },texture.size());
+            (buffer,row,padded,texture.height())
+        }).collect();
+        queue.submit([encoder.finish()]);
+        let (tx,rx)=std::sync::mpsc::channel();
+        for (buffer,_,_,_) in &buffers { let tx=tx.clone(); buffer.slice(..).map_async(wgpu::MapMode::Read,move |r|tx.send(r).unwrap()); }
+        device.poll(wgpu::PollType::Wait { submission_index:None,timeout:Some(std::time::Duration::from_secs(30)) }).unwrap();
+        for _ in &buffers { rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap().unwrap(); }
+        buffers.iter().map(|(buffer,row,padded,height)| {
+            let mapped=buffer.slice(..).get_mapped_range();
+            let mut bytes=Vec::with_capacity((row*height) as usize);
+            for line in mapped.chunks_exact(*padded as usize) { bytes.extend_from_slice(&line[..*row as usize]); }
+            drop(mapped);buffer.unmap();bytes
+        }).collect()
+    }
+
+    #[test]
+    fn native_camera_matches_viewer_projection_and_keeps_relative_offsets_separate() {
+        let mut scene=<super::SceneUniform as bytemuck::Zeroable>::zeroed();
+        scene.center=[-0.14,0.52,0.9,0.0];scene.params0=[1.9,0.65,-0.24,2.2];scene.params1=[0.625,0.13,-0.09,0.0];
+        let matrix=super::native_view_image(&scene);
+        for p in [[-0.5,0.2,1.1],[0.4,-0.3,0.7],[0.2,0.8,1.3]] {
+            let reference=project_hiz_vertex(p,[scene.center[0],scene.center[1],scene.center[2]],1.9,0.625,0.65,-0.24,[0.13,-0.09],2.2);
+            let clip:[f32;3]=std::array::from_fn(|a| (0..3).map(|i|p[i]*matrix[i][a]).sum::<f32>()+matrix[19][a]);
+            let projected=[clip[0]*0.5+0.5,0.5-clip[1]*0.5,clip[2]];
+            for a in 0..3 { assert!((projected[a]-reference[a]).abs()<4e-7); }
+        }
+        assert_eq!(&matrix[20..23],&[[0.0;4];3]);
+    }
+
+    #[test]
+    fn c827_skinning_rows_preserve_authored_position_and_uv_field_ownership() {
+        let mut scene=<super::SceneUniform as bytemuck::Zeroable>::zeroed();
+        scene.uv_transform=[0.8,1.1,0.2,-0.1];
+        let source=super::GpuAuthoredGeometryInput { geometry:TagHash(0),vertex_streams:vec![],index_buffer:None,stage_layouts:vec![],vertex_colors:None,
+            position_transform:Some(crate::geometry::GeometryPositionTransform { scale:[0.25;3],offset:[1.2,-0.4,2.3],procedural_scale:0.25 }),
+            uv_transform:Some(crate::geometry::UvTransformPreview { scale:[0.5,0.75],offset:[0.3,-0.2] }),attachment_pose:None,static_meshes:Vec::new(),static_mesh_parts:std::collections::HashMap::new() };
+        let image=super::c827_static_skinning(&source,&scene);
+        assert_eq!(image[12],[1.2,-0.4,2.3,0.25]);assert_eq!(image[13],image[12]);
+        for (v,expected) in image[6].iter().zip([0.4,0.825,0.44,-0.32]) { assert!((*v-expected).abs()<1e-7); }
+        assert_eq!(image[14][0].to_bits(),2);assert_eq!(image[14][1].to_bits(),2);
+    }
     use super::{
         AUTHORED_DEPTH_SHADER, BLOOM_SHADER, GpuModelPreview, LIGHTING_SHADER, LightingModel,
         MAX_MODEL_TARGET_BYTES, MAX_MODEL_TARGET_PIXELS, MODEL_SHADER, MaterialLuminance,
@@ -11888,7 +13518,7 @@ mod tests {
             GeometryPreviewKind, GeometryTagPreview, RunnerShellAssembly,
             WeaponModPreviewAttachment, WeaponModRarity, WireframeAuthoredDrawMetadata,
             WireframeAuthoredStageRange, WireframeMaterialRange, WireframeMaterialTextures,
-            WireframePreview,
+            WireframePreview, pattern_object_channel_evidence,
         },
         render::pass_plan::RenderPassKind,
         texture::{Texture, cache::TextureCache},
@@ -12561,6 +14191,9 @@ mod tests {
             authored_source: None,
             authored_stage: None,
             authored_native_vertex_supported: false,
+            native_c827: false,
+            native_surface: false,
+            native_decal: false,
         };
         let visible = vec![prepared(
             0..3,
@@ -12661,14 +14294,22 @@ mod tests {
     #[test]
     #[ignore = "requires GPU"]
     fn validates_authored_depth_pipeline_wgpu() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .expect("GPU adapter");
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_sampled_textures_per_shader_stage = 18;
+        required_limits.max_storage_buffers_per_shader_stage = 12;
+        required_limits.max_color_attachment_bytes_per_sample = 64;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS,
             required_limits,
+            // SAFETY: renderer embeds validated, hash-pinned SPIR-V only.
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             ..Default::default()
         }))
         .expect("GPU device");
@@ -13091,7 +14732,7 @@ mod tests {
     #[test]
     fn creates_model_preview_pipelines() {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
         let adapter =
@@ -13099,18 +14740,29 @@ mod tests {
                 .expect("GPU adapter required for model pipeline smoke test");
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_sampled_textures_per_shader_stage = 18;
+        required_limits.max_storage_buffers_per_shader_stage = 12;
+        required_limits.max_color_attachment_bytes_per_sample = 64;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS,
             required_limits,
+            // SAFETY: renderer embeds validated, hash-pinned SPIR-V only.
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             ..Default::default()
         }))
         .expect("GPU device required for model pipeline smoke test");
 
         let resources =
             create_pipeline_resources(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert!(resources.authored_surface_pipelines.is_empty(), "opening a model must not compile unrelated authored material pipelines");
+        let _decal = super::create_authored_d0f2_pipeline(&device, &resources._authored_program_modules);
+        let _head = super::create_authored_head_pipelines(&device, &resources._authored_program_modules);
         let target = create_target_resources(
             &device,
             [640, 360],
             ModelTargetFeatures {
+                native_surface: false,
+                native_decals: false,
+                mixed_receivers: false,
                 deferred_normal_copy: true,
                 distortion: true,
                 bloom: true,
@@ -13134,6 +14786,7 @@ mod tests {
                 address_w: 3,
                 mip_lod_bias: -0.5,
                 max_anisotropy: 8,
+                border_color: [0.0; 4],
                 min_lod: 0.0,
                 max_lod: 12.0,
             },
@@ -13288,6 +14941,9 @@ mod tests {
             estimated_model_target_bytes(
                 four_k,
                 ModelTargetFeatures {
+                    native_surface: false,
+                    native_decals: false,
+                    mixed_receivers: false,
                     deferred_normal_copy: true,
                     distortion: true,
                     bloom: true,
@@ -13776,13 +15432,25 @@ mod tests {
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .expect("GPU adapter");
         let adapter_info = adapter.get_info();
-        let required_features = adapter.features()
-            & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let required_features = wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+            | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+            | wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS
+            | (adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        assert!(
+            adapter.features().contains(required_features),
+            "target capture adapter lacks BC sliced-3D support"
+        );
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_sampled_textures_per_shader_stage = 18;
+        required_limits.max_storage_buffers_per_shader_stage = 12;
+        required_limits.max_color_attachment_bytes_per_sample = 64;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features,
             required_limits,
+            // SAFETY: renderer embeds validated, hash-pinned SPIR-V only.
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             ..Default::default()
         }))
         .expect("GPU device");
@@ -13810,12 +15478,16 @@ mod tests {
         let mut renders = Vec::new();
         let mut visual_failures = Vec::new();
         let requested_case = std::env::var("QUICKTAG_MODEL_PROBE_CASE").ok();
+        let simple_probe = std::env::var_os("QUICKTAG_PROBE_SIMPLE").is_some();
+        let receiver_control = std::env::var_os("QUICKTAG_PROBE_RECEIVER_CONTROL").is_some();
         let isolated_draw = std::env::var("QUICKTAG_PROBE_DRAW_RANGE").ok();
         let diagnostic_name = std::env::var("QUICKTAG_PROBE_PASS")
             .unwrap_or_else(|_| "final".into())
             .to_ascii_lowercase();
         let (diagnostic_pass, probe_lighting_model) = match diagnostic_name.as_str() {
             "final" => (0, LightingModel::TigerGgxApproximation),
+            "compatibility" => (0, LightingModel::TigerGgxCompatibility),
+            "lambert" => (0, LightingModel::DebugLambert),
             "base-color" | "base_colour" | "base-colour" => {
                 (1, LightingModel::TigerGgxCompatibility)
             }
@@ -14487,6 +16159,37 @@ mod tests {
                 -106.5_f32.to_radians(),
             ),
             (
+                "runner-thief-cryo-shift-combined",
+                TagHash(0x80A9D134),
+                TagHash(0x80A9D134),
+                vec![],
+                vec![],
+                -58.1_f32.to_radians(),
+            ),
+            ("runner-assassin-digital-prowl-combined",TagHash(0x80A9DC79),TagHash(0x80A9DC79),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-thief-weaverunner-combined",TagHash(0x80A9C2C4),TagHash(0x80A9C2C4),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-thief-kasha-yokai-combined",TagHash(0x80B15334),TagHash(0x80B15334),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-thief-midnight-decay-combined",TagHash(0x80A9E079),TagHash(0x80A9E079),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-thief-refresh-resist-combined",TagHash(0x80A9E438),TagHash(0x80A9E438),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-vandal-vox-nocturna-combined",TagHash(0x80A9CA45),TagHash(0x80A9CA45),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-triage-astrophage-combined",TagHash(0x80A9ECCC),TagHash(0x80A9ECCC),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-thief-acid-abyss-combined",TagHash(0x80B1454D),TagHash(0x80B1454D),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-destroyer-ikari-yokai-combined",TagHash(0x80A9F6BD),TagHash(0x80A9F6BD),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-assassin-weaverunner-combined",TagHash(0x80B14C4B),TagHash(0x80B14C4B),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-triage-weaverunner-combined",TagHash(0x80A9F1D9),TagHash(0x80A9F1D9),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-thief-the-severed-combined",TagHash(0x80B14758),TagHash(0x80B14758),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-rook-aftermarket-scratch-combined",TagHash(0x80A9EAB2),TagHash(0x80A9EAB2),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-assassin-cryo-shift-combined",TagHash(0x80A9DD33),TagHash(0x80A9DD33),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-vandal-weaverunner-combined",TagHash(0x80A9DAD3),TagHash(0x80A9DAD3),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-vandal-shadow-index-combined",TagHash(0x80A9BB5D),TagHash(0x80A9BB5D),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-vandal-achromatic-rush-combined",TagHash(0x80A9E83E),TagHash(0x80A9E83E),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-vandal-fineline-xs-combined",TagHash(0x80A9BC5C),TagHash(0x80A9BC5C),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-sentinel-syntax-disrupt-combined",TagHash(0x80A9F8E5),TagHash(0x80A9F8E5),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-recon-white-rabbit-combined",TagHash(0x80B15870),TagHash(0x80B15870),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-thief-white-rabbit-combined",TagHash(0x80A9CD09),TagHash(0x80A9CD09),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-triage-overdrive-combined",TagHash(0x80A9C6BE),TagHash(0x80A9C6BE),vec![],vec![],-58.1_f32.to_radians()),
+            ("runner-destroyer-cyber-red-combined",TagHash(0x80A9D869),TagHash(0x80A9D869),vec![],vec![],-58.1_f32.to_radians()),
+            (
                 "runner-vandal-cryo-shift-combined",
                 TagHash(0x80A9E76B),
                 TagHash(0x80A9E76B),
@@ -14501,6 +16204,47 @@ mod tests {
             {
                 continue;
             }
+            let visual_failure_start = visual_failures.len();
+            let output_suffix = std::env::var("QUICKTAG_PROBE_OUTPUT_SUFFIX")
+                .ok()
+                .filter(|value| !value.is_empty());
+            let isolated_suffix = isolated_draw
+                .as_deref()
+                .map(|value| format!("draw-{value}"));
+            let manifest_suffix = match (output_suffix, isolated_suffix) {
+                (Some(output), Some(draw)) => format!("-{output}-{draw}"),
+                (Some(output), None) => format!("-{output}"),
+                (None, Some(draw)) => format!("-{draw}"),
+                (None, None) => String::new(),
+            };
+            let manifest_stem = if diagnostic_name == "final" {
+                name.to_string()
+            } else {
+                format!("{name}-{diagnostic_name}")
+            };
+            let mut capture_journal = if name == "runner-thief-cryo-shift-combined" {
+                let case_manifest = serde_json::json!({
+                    "schema": 1,
+                    "kind": "quicktag_capture_case",
+                    "case": {
+                        "name": name,
+                        "weapon": weapon.to_string(),
+                        "diagnostic": &diagnostic_name,
+                        "isolated_draw": isolated_draw.as_deref(),
+                    },
+                });
+                Some(
+                    super::model_manifest::CaptureJournal::begin(
+                        output.join(format!(
+                            "{manifest_stem}{manifest_suffix}.capture.journal.json"
+                        )),
+                        &case_manifest,
+                    )
+                    .expect("start capture journal"),
+                )
+            } else {
+                None
+            };
             let lighting_reference_case = name == "vox-nocturna-misriah-ingame-lighting";
             let flat_panel_reference_case = name.starts_with("vox-nocturna-v85-flat-panel");
             let coating_reference_case = name == "vox-nocturna-copperhead-forward-coating";
@@ -14578,6 +16322,21 @@ mod tests {
                 })
                 .collect_vec();
             let combined_runner = match name {
+                "runner-assassin-digital-prowl-combined" | "runner-assassin-cryo-shift-combined"
+                | "runner-thief-weaverunner-combined" | "runner-assassin-weaverunner-combined"
+                | "runner-thief-kasha-yokai-combined"
+                | "runner-thief-midnight-decay-combined"
+                | "runner-thief-refresh-resist-combined" | "runner-thief-acid-abyss-combined"
+                | "runner-destroyer-ikari-yokai-combined" | "runner-triage-astrophage-combined" | "runner-vandal-vox-nocturna-combined"
+                | "runner-triage-weaverunner-combined" | "runner-thief-the-severed-combined"
+                | "runner-rook-aftermarket-scratch-combined"
+                | "runner-triage-overdrive-combined" | "runner-vandal-fineline-xs-combined" | "runner-sentinel-syntax-disrupt-combined" | "runner-recon-white-rabbit-combined" | "runner-thief-white-rabbit-combined"
+                | "runner-vandal-weaverunner-combined" | "runner-destroyer-cyber-red-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache,weapon).expect("cross-skin Pattern")),
+                "runner-thief-cryo-shift-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, weapon)
+                        .expect("Thief Cryo Shift authored shell Pattern"),
+                ),
                 "runner-destroyer-emerald-impact-combined" => Some(
                     RunnerShellAssembly::resolve(&cache, TagHash(0x80A9F543))
                         .expect("authored shell Pattern"),
@@ -14706,8 +16465,22 @@ mod tests {
                     RunnerShellAssembly::resolve(&cache, TagHash(0x80A9E6F9))
                         .expect("authored shell Pattern"),
                 ),
+                "runner-vandal-shadow-index-combined" | "runner-vandal-achromatic-rush-combined" => Some(
+                    RunnerShellAssembly::resolve(&cache, weapon).expect("authored shell Pattern"),
+                ),
                 _ => None,
             };
+            let cross_skin_case=matches!(name,"runner-assassin-digital-prowl-combined"|"runner-assassin-cryo-shift-combined"
+                |"runner-thief-kasha-yokai-combined"
+                |"runner-thief-midnight-decay-combined"
+                |"runner-thief-refresh-resist-combined"|"runner-thief-acid-abyss-combined"
+                |"runner-destroyer-ikari-yokai-combined"|"runner-triage-astrophage-combined"|"runner-vandal-vox-nocturna-combined"
+                |"runner-thief-weaverunner-combined"|"runner-assassin-weaverunner-combined"
+                |"runner-triage-weaverunner-combined"|"runner-thief-the-severed-combined"
+                |"runner-rook-aftermarket-scratch-combined"
+                |"runner-triage-overdrive-combined"|"runner-vandal-fineline-xs-combined"|"runner-sentinel-syntax-disrupt-combined"|"runner-recon-white-rabbit-combined"|"runner-thief-white-rabbit-combined"
+                |"runner-vandal-weaverunner-combined"|"runner-vandal-shadow-index-combined"
+                |"runner-vandal-achromatic-rush-combined"|"runner-destroyer-cyber-red-combined");
             let runner_selection = combined_runner.clone();
             let preview_started = Instant::now();
             let preview = if let Some(combination) = combined_runner {
@@ -14906,6 +16679,13 @@ mod tests {
                         && let Some(entry) = package_manager().get_entry(technique)
                         && let Ok(data) = package_manager().read_tag(technique)
                     {
+                        if name == "runner-thief-cryo-shift-combined" {
+                            std::fs::write(
+                                output.join(format!("{name}-{technique}.technique.bin")),
+                                &data,
+                            )
+                            .expect("save authored technique payload");
+                        }
                         writeln!(
                             report,
                             "  render state={:?}",
@@ -15045,7 +16825,7 @@ mod tests {
                 }
                 let id = render_state.renderer.write().register_native_texture(
                     &render_state.device,
-                    &texture.view,
+                    &texture.raw_view(),
                     wgpu::FilterMode::Linear,
                 );
                 texture_cache
@@ -15058,9 +16838,26 @@ mod tests {
                 .iter()
                 .find_map(|range| range.textures.color.or(range.texture));
             let gpu = Arc::new(
-                GpuModelPreview::create(&render_state.device, wireframe, fallback)
+                GpuModelPreview::create(&render_state.device, wireframe, fallback,
+                    &crate::render::tfx::TfxRuntimeInputs::for_model_preview(&cache,
+                        runner_selection.as_ref().map_or(weapon, |selection| selection.pattern)))
                     .expect("GPU model"),
             );
+            // Source shaders can use textures omitted by generic material
+            // selection. Preload the admitted resource graph, so this one-frame
+            // probe reaches the same ready state as the live UI's later frame.
+            for tag in gpu.draws.iter().flat_map(|draw| {
+                draw.native_surface.as_ref().map(|s| s.textures.as_slice())
+                    .into_iter().chain(draw.native_decal.as_ref().map(|s| s.textures.as_slice()))
+                    .flatten().copied()
+            }).unique() {
+                if texture_cache.cache.read().contains_key(&(tag, false)) { continue; }
+                let texture = Texture::load(&render_state, tag, false)
+                    .unwrap_or_else(|error| panic!("authored texture {tag}: {error}"));
+                let id = render_state.renderer.write().register_native_texture(
+                    &render_state.device, &texture.raw_view(), wgpu::FilterMode::Linear);
+                texture_cache.cache.write().insert((tag, false), Left(Some((Arc::new(texture), id))));
+            }
             if name.starts_with("vox-nocturna-v85-flat-panel")
                 || name == "vox-nocturna-copperhead-forward-coating"
             {
@@ -15398,7 +17195,7 @@ mod tests {
                 },
                 probe_f32(
                     "QUICKTAG_PROBE_ZOOM",
-                    if yokais_lash_reference_case { 6.2 } else { 3.1 },
+                    if yokais_lash_reference_case { 6.2 } else if name == "runner-thief-cryo-shift-combined" || cross_skin_case { 2.0 } else { 3.1 },
                 ),
                 egui::vec2(
                     probe_f32("QUICKTAG_PROBE_PAN_X", 0.0),
@@ -15416,6 +17213,142 @@ mod tests {
                 1.0,
                 verification_environment,
             );
+            if name == "runner-thief-cryo-shift-combined" {
+                let object_channel_evidence = pattern_object_channel_evidence(&cache, weapon);
+                let mut runtime_inputs = crate::render::tfx::TfxRuntimeInputs::default();
+                let global_channels = runtime_inputs
+                    .apply_marathon_global_defaults()
+                    .expect("Marathon render-global channel defaults");
+                let required_channel = object_channel_evidence
+                    .iter()
+                    .find(|contract| contract.owner == TagHash(0x80A9E636))
+                    .expect("Thief root object-channel component");
+                // Tiger initializes every declared object channel to one. The
+                // Pattern's local-scope AF85 bindings then replace matching
+                // declarations with their authored vectors.
+                for channel in &required_channel.channels {
+                    runtime_inputs
+                        .object_channels
+                        .insert(channel.hash, crate::render::tfx::TfxValue::Vector([1.0; 4]));
+                }
+                for binding in required_channel
+                    .bindings
+                    .iter()
+                    .filter(|binding| binding.scope == 0x811C9DC5)
+                {
+                    if let Some(value) = binding.value {
+                        runtime_inputs.object_channels.insert(
+                            binding.parameter,
+                            crate::render::tfx::TfxValue::Vector(value),
+                        );
+                    }
+                }
+                // Inventory/model previews are not owned by the local player.
+                // This is scene policy, separate from the Pattern's serialized
+                // zero-valued binding evidence.
+                runtime_inputs
+                    .object_channels
+                    .insert(0x8A4DE2D7, crate::render::tfx::TfxValue::Vector([0.0; 4]));
+                let mut manifest = super::model_manifest::build_draw_manifest(
+                    &callback,
+                    wireframe,
+                    &runtime_inputs,
+                );
+                manifest["package"] =
+                    super::model_manifest::package_identity_for_manifest(&callback, wireframe);
+                manifest
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("package_build_hashes");
+                manifest["root"] = serde_json::json!(weapon.to_string());
+                manifest["runtime_input_policy"] = serde_json::json!({
+                    "is_local_player": 0.0,
+                    "reason": "catalog/model preview has no local-player ownership",
+                    "object_channel_defaults": "declared channels initialize to vec4(1); authored local-scope AF85 vectors override them",
+                    "gpu_consumed": !callback.native_surfaces.is_empty(),
+                    "gpu_scope": "eligible authored source-color draws only; other material paths remain compatibility",
+                });
+                manifest["global_channel_defaults"] = serde_json::to_value(&global_channels)
+                    .expect("serialize Marathon global-channel defaults");
+                for index in [7usize, 114, 202] {
+                    assert_eq!(
+                        runtime_inputs.global_channels.get(&(index as u32)),
+                        Some(&crate::render::tfx::TfxValue::Vector(
+                            global_channels.default_values[index]
+                        ))
+                    );
+                }
+                manifest["pattern_object_channels"] =
+                    serde_json::to_value(&object_channel_evidence)
+                        .expect("serialize Pattern object-channel evidence");
+                assert!(required_channel.channels.iter().any(|channel| {
+                    channel.hash == 0x8A4DE2D7
+                        && channel.bytecode.is_empty()
+                        && channel.constants.is_empty()
+                }));
+                assert!(required_channel.bindings.iter().any(|binding| {
+                    binding.scope == 0x811C9DC5
+                        && binding.parameter == 0x8A4DE2D7
+                        && binding.vector_index == 3
+                        && binding.value == Some([0.0; 4])
+                }));
+                manifest["shell_assembly"] = serde_json::json!(runner_selection.as_ref().map(|assembly| {
+                    serde_json::json!({
+                        "pattern": assembly.pattern.to_string(),
+                        "nested_patterns": assembly.nested_patterns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        "parts": assembly.parts.iter().map(|part| serde_json::json!({
+                            "component": part.component.to_string(), "geometry": part.geometry.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        })).collect::<Vec<_>>(),
+                    })
+                }));
+                capture_journal
+                    .as_mut()
+                    .expect("target capture journal")
+                    .attach_manifest(&manifest)
+                    .expect("attach draw manifest to capture journal");
+                std::fs::write(
+                    output.join(format!(
+                        "{manifest_stem}{manifest_suffix}.draw-manifest.json"
+                    )),
+                    serde_json::to_vec_pretty(&manifest).expect("serialize draw manifest"),
+                )
+                .expect("write draw manifest");
+                assert_eq!(manifest["schema"], 1);
+                assert_eq!(manifest["gpu"]["shader_consumed"], "unknown");
+                assert!(
+                    !manifest["renderer"]["groups"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                if isolated_draw.is_none() {
+                    assert!(
+                        manifest["draws"]
+                            .as_array()
+                            .is_some_and(|draws| !draws.is_empty()),
+                        "Thief Cryo Shift draw manifest must retain visible draws"
+                    );
+                    let decal = manifest["draws"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|draw| draw["authored"]["technique"] == "80A9C827")
+                        .expect("target procedural decal draw");
+                    let stage = decal["resolved"]["technique"]["stages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|stage| stage["stage"] == "PS")
+                        .expect("procedural decal PS");
+                    assert_eq!(stage["constant_buffer"], "80A9D945");
+                    assert_eq!(stage["external_constants"].as_array().unwrap().len(), 9);
+                    assert_eq!(stage["runtime_evaluation"]["constant_registers"][8][1], 1.0);
+                    assert_eq!(
+                        stage["shader"]["sha256"],
+                        "35f80c341dff4287fff1efb94e5458596c4ce7f76483bfdeb6d5ce53d1e84a00"
+                    );
+                }
+            }
             if cryo_shift_reference_case && isolated_draw.is_none() {
                 let selection = runner_selection
                     .as_ref()
@@ -15484,7 +17417,7 @@ mod tests {
                                             })
                                             .collect::<Vec<_>>();
                                         let samplers = stage
-                                            .samplers
+                                            .indexed_resources
                                             .iter()
                                             .map(|sampler| {
                                                 serde_json::json!({
@@ -15603,7 +17536,7 @@ mod tests {
                             };
                         add_texture(
                             "color",
-                            draw.material.map(|material| material.color),
+                            draw.material.and_then(|material| material.color),
                             loaded.and_then(|material| material.color.as_ref()),
                         );
                         add_texture(
@@ -15769,7 +17702,7 @@ mod tests {
                             "warnings": draw.packet.pass_plan.warnings.iter().map(|warning| format!("{warning:?}")).collect::<Vec<_>>(),
                             "wireframe_range": range_textures,
                             "material": {
-                                "color": draw.material.map(|material| material.color.to_string()),
+                                "color": draw.material.and_then(|material| material.color).map(|tag| tag.to_string()),
                                 "normal": tag_string(draw.material.and_then(|material| material.normal)),
                                 "emissive": tag_string(draw.material.and_then(|material| material.emissive)),
                                 "control": tag_string(draw.control),
@@ -15929,7 +17862,10 @@ mod tests {
                 )
                 .expect("write Cryo Shift metadata");
             }
-            if revamp_baseline_case || yokais_lash_reference_case {
+            if revamp_baseline_case
+                || yokais_lash_reference_case
+                || name == "runner-thief-cryo-shift-combined"
+            {
                 let draws = callback
                     .preview
                     .draws
@@ -15996,16 +17932,8 @@ mod tests {
                     schema: 2,
                     adapter_version: crate::render::adapter::GoliathAdapter::ADAPTER_VERSION,
                     renderer_schema_version: 2,
-                    asset: if yokais_lash_reference_case {
-                        "80B7BF4D".into()
-                    } else {
-                        "80A9FF17".into()
-                    },
-                    owner: if yokais_lash_reference_case {
-                        "80A7AD4A".into()
-                    } else {
-                        "80A7AA89".into()
-                    },
+                    asset: weapon.to_string(),
+                    owner: weapon_owner.to_string(),
                     attachments: mods.iter().map(ToString::to_string).collect(),
                     gpu_name: adapter_info.name.clone(),
                     gpu_backend: format!("{:?}", adapter_info.backend),
@@ -16264,7 +18192,12 @@ mod tests {
                         }),
                         "decoded alpha runner lost independent t1 coverage or t2 AO"
                     );
-                } else if name != "runner-destroyer-base-combined" {
+                } else if !matches!(
+                    name,
+                    "runner-destroyer-base-combined" | "runner-thief-cryo-shift-combined"
+                ) && !cross_skin_case {
+                    // Thief Cryo Shift is an unresolved-family diagnostic, not
+                    // a claim that the common character-surface ABI applies.
                     assert!(
                         !runner_surfaces.is_empty(),
                         "decoded combined runner lost authored character-surface resources"
@@ -16280,10 +18213,11 @@ mod tests {
                         "decoded runner character surfaces require all ABI resources"
                     );
                 }
-                if wireframe
-                    .material_ranges
-                    .iter()
-                    .any(|range| range.render_stage == Some(2))
+                if isolated_draw.is_none()
+                    && wireframe
+                        .material_ranges
+                        .iter()
+                        .any(|range| range.render_stage == Some(2))
                 {
                     assert!(
                         callback
@@ -16355,6 +18289,7 @@ mod tests {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("weapon_mod_probe"),
                     });
+            super::model_binding_audit::reset();
             callback.prepare(
                 &render_state.device,
                 &render_state.queue,
@@ -16363,6 +18298,195 @@ mod tests {
                 &mut resources,
             );
             render_state.queue.submit(Some(encoder.finish()));
+            if std::env::var_os("QUICKTAG_PROBE_CHANNELS").is_some() {
+                let report = super::channel_probe::verify_live_channels(&callback, &cache,
+                    runner_selection.as_ref().map_or(weapon, |selection| selection.pattern),
+                    wireframe, &texture_cache, &render_state, verification_environment,
+                    &descriptor, &mut resources);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.channels.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_PROCEDURAL_BODY").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_procedural_body(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.procedural-body.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_VERTEX_COLOR").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_vertex_colors(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.vertex-color.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_CLOTH").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_cloth(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.cloth.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_ZERO_CLASS").is_some() {
+                let report=super::decal_tests::verify_zero_class_coverage(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.zero-class.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_HAIR_VARIANT").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_hair_variant(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.hair-variant.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_C9C5").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_c9c5(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline,
+                    &crate::render::tfx::TfxRuntimeInputs::for_model_preview(&cache,
+                        runner_selection.as_ref().map_or(weapon,|selection|selection.pattern)));
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.c9c5.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_B152BE").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_b152be(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.b152be.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_EC03").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_ec03(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.ec03.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_CLOTH_VARIANT").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_cloth_variant(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.cloth-variant.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            if std::env::var_os("QUICKTAG_PROBE_HAIR_CONTROL").is_some() {
+                let baseline=read_authored_images(&render_state.device,&render_state.queue,
+                    resources.get::<super::ModelTargetResources>().unwrap());
+                let report=super::decal_tests::verify_live_hair_control(&callback,
+                    &render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline);
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.hair-control.json")),
+                    serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            }
+            let first_native_receivers=(!simple_probe && name == "runner-thief-cryo-shift-combined").then(||read_receiver_images(
+                &render_state.device,&render_state.queue,resources.get::<super::ModelTargetResources>().expect("normal renderer targets")));
+            let first_authored_images=(!simple_probe && (name=="runner-thief-cryo-shift-combined" || cross_skin_case)
+                && !resources.get::<ModelFrameResources>().unwrap().native_surfaces.is_empty()).then(|| {
+                let frame=resources.get::<ModelFrameResources>().unwrap();
+                let indices=frame.native_surfaces.iter().map(|(index,_,_)|*index).collect_vec();
+                let required_pipelines=indices.iter().map(|index| {
+                    let draw=&callback.preview.draws[*index];
+                    let spec=draw.native_surface.as_ref().unwrap();
+                    (spec.vertex_program,spec.program,draw.pipeline.rasterizer,callback.preview.authored_index_format(*index))
+                }).unique().collect_vec();
+                let cache=&resources.get::<ModelPipelineResources>().unwrap().authored_surface_pipelines;
+                assert_eq!(cache.len(),required_pipelines.len(),"only this model's required material pipelines may be compiled");
+                assert!(required_pipelines.iter().all(|key|cache.iter().any(|(existing,_)|existing==key)));
+                if !cross_skin_case { assert_eq!(indices,[0,1,3,4,5,7,8,9,11,12,13],"all audited Thief body and head material ranges must be live"); }
+                else {
+                    let expected=callback.preview.draws.iter().enumerate().filter(|(_,d)|d.native_surface.is_some()).map(|(i,_)|i).collect_vec();
+                    assert_eq!(indices,expected,"every admitted material must have a real encoded draw");
+                    if name=="runner-thief-weaverunner-combined" {
+                        assert_eq!(indices,[0,1,3,4,5,6,7,8,10,11,12,13],"audited body, eyes and mouth materials must replace their generic submissions");
+                    } else if name=="runner-triage-weaverunner-combined" {
+                        assert_eq!(indices,[7,8,12,14],"Triage's currently audited receiver parts must be live; remaining body contracts stay incomplete");
+                    } else if name=="runner-rook-aftermarket-scratch-combined" {
+                        assert_eq!(indices,[0,1,2,3,4,5,6,8],"all authored Rook opaque receiver parts must be encoded");
+                    } else if name=="runner-triage-overdrive-combined" {
+                        assert_eq!(indices,[0,1,2,4,5,6,7,8,9,10,11,13,14,18],
+                            "all four render-clock material contracts must replace their generic submissions");
+                    } else if name=="runner-recon-white-rabbit-combined" {
+                        assert_eq!(indices.len(),2,"remaining procedural-mask opaque contracts are separately incomplete");
+                        let encoded=super::model_binding_audit::snapshot();
+                        assert!(encoded.as_array().unwrap().iter().any(|record|record["kind"]=="encoded_native_decal_draw"&&record["stable_index"]==14),
+                            "final source atlas decal must reach normal renderer encoding");
+                        let decal=callback.preview.draws[14].native_decal.as_ref().unwrap();
+                        assert_eq!(decal.constants[4],[f32::from_bits(0x3eaaaaab),f32::from_bits(0x3ea957fb),0.0,0.0]);
+                        assert_eq!(decal.textures,[TagHash(0x80B15810)]);
+                    } else if name=="runner-sentinel-syntax-disrupt-combined" {
+                        assert!(indices.contains(&11),"source point-sampled material must reach the live renderer");
+                        assert!(indices.iter().all(|&index|callback.preview.authored_index_format(index)==wgpu::IndexFormat::Uint32),
+                            "Sentinel's original 32-bit strips must reach every native pipeline");
+                        let spec=callback.preview.draws[11].native_surface.as_ref().unwrap();
+                        assert_eq!(spec.samplers.iter().map(|s|s.filter).collect_vec(),[0x15,0x15,0,0]);
+                        assert_eq!(spec.samplers[2].address_u,3);
+                        assert_eq!(spec.samplers[3].address_u,2);
+                        assert!(spec.samplers.iter().all(|s|s.mip_lod_bias == -0.5));
+                    } else if name=="runner-vandal-fineline-xs-combined" {
+                        let cutouts=indices.iter().filter(|&&index| {
+                            let spec=callback.preview.draws[index].native_surface.as_ref().unwrap();
+                            let crate::render::authored_program::DescriptorAbi::RunnerSurface(program)=spec.program else {return false};
+                            crate::render::runner_surface_programs::SURFACES[program as usize].program.shader_tag==TagHash(0x80A9BE22)
+                        }).copied().collect_vec();
+                        assert_eq!(cutouts,[9,10,23],"all three source cutout parts must reach the normal renderer");
+                        for index in cutouts {
+                            assert_eq!(callback.preview.draws[index].native_surface.as_ref().unwrap().constants[2],[0.0;4],
+                                "explicit static-viewer analytic coverage input must reach source cb0[2]");
+                        }
+                    } else if name=="runner-vandal-weaverunner-combined" {
+                        let direct=indices.iter().filter(|&&index|callback.preview.draws[index].native_surface.as_ref().unwrap().vertex_program
+                            == crate::render::authored_program::DescriptorAbi::RigidVertexDirectIa).copied().collect_vec();
+                        assert_eq!(direct.len(),2,"both original direct-IA B857 receiver parts must be live");
+                        let encoded=super::model_binding_audit::snapshot();
+                        for index in direct {
+                            assert!(encoded.as_array().unwrap().iter().any(|record|record["kind"]=="encoded_native_surface_draw"
+                                && record["stable_index"]==index && record["primitive"]=="TriangleList"),
+                                "direct-IA source topology must reach the normal renderer");
+                            let source_index=callback.preview.draws[index].authored_source.unwrap();
+                            let part=callback.preview.draws[index].authored_stage.unwrap().part_index;
+                            let input=callback.preview.authored_inputs[source_index].as_ref().unwrap();
+                            assert!(!input.static_mesh_parts.contains_key(&part),
+                                "direct-IA part must not own a substitute compute producer");
+                        }
+                        let floats=indices.iter().filter(|&&index|callback.preview.draws[index].native_surface.as_ref().unwrap().vertex_program
+                            == crate::render::authored_program::DescriptorAbi::FloatVertexScalarStorage).copied().collect_vec();
+                        assert_eq!(floats,[10,11],"both source-paired B7FC generated Float48 parts must be live");
+                        for index in floats {
+                            let draw=&callback.preview.draws[index];
+                            let source=draw.authored_source.unwrap();
+                            let input=callback.preview.authored_inputs[source].as_ref().unwrap();
+                            let mesh=input.static_mesh_parts[&draw.authored_stage.unwrap().part_index];
+                            assert_eq!(input.static_meshes[mesh].producer,crate::render::authored_program::DescriptorAbi::BodyMesh15RowComputeStorage);
+                            assert!(frame.native_compute.iter().any(|((s,m),_)|*s==source && *m==mesh),
+                                "Float48 part must dispatch its exact LOD-owned B7C5 producer");
+                        }
+                    } else {
+                        assert!(indices.len()>=5,"cross-skin correction must consume several authored parts");
+                    }
+                }
+                let audit=super::model_binding_audit::snapshot();
+                let old_surface_draws=audit.as_array().unwrap().iter().filter(|r|r["kind"]=="encoded_indexed_draw")
+                    .filter(|r|indices.iter().any(|&index|r["technique"]==callback.preview.draws[index].packet.technique_hash.map(|t|t.to_string()).unwrap())).count();
+                assert_eq!(old_surface_draws,0,"native Base Color surfaces cannot retain old opaque submissions");
+                let images=read_authored_images(&render_state.device,&render_state.queue,resources.get::<super::ModelTargetResources>().unwrap());
+                // Retain unvalidated native outputs before any finite/contract
+                // assertion; a failing case must expose its actual bad channels.
+                for (target,bytes) in images.iter().enumerate() {
+                    std::fs::write(output.join(format!("{name}.unvalidated-native-rt{target}.rgba32f")),bytes).unwrap();
+                }
+                images
+            });
+            let first_authored_decal_images=(!resources.get::<ModelFrameResources>().unwrap().native_decals.is_empty()).then(||
+                read_authored_images(&render_state.device,&render_state.queue,resources.get::<super::ModelTargetResources>().unwrap())
+            );
             for _ in 0..2 {
                 let mut reuse_encoder =
                     render_state
@@ -16379,6 +18503,314 @@ mod tests {
                 );
                 render_state.queue.submit(Some(reuse_encoder.finish()));
             }
+            let native_receivers=first_native_receivers.map(|first| {
+                let repeated=read_receiver_images(&render_state.device,&render_state.queue,resources.get::<super::ModelTargetResources>().unwrap());
+                assert_eq!(first,repeated,"native receiver MRTs must repeat bit-exactly across retained frame reuse");
+                first
+            });
+            // Run D0F2's focused native MRT controls before unrelated C827
+            // receiver influence assertions so this proof remains actionable
+            // when a separate receiver fixture is still under investigation.
+            let imported_receiver_control=receiver_control.then(|| {
+                let baseline=first_authored_decal_images.as_ref().expect("receiver control requires native decals");
+                super::decal_tests::verify_live_imported_generic_stage2(
+                    &callback,&render_state.device,&render_state.queue,&descriptor,&mut resources,baseline)
+            });
+            if let Some(control)=&imported_receiver_control {
+                std::fs::write(output.join(format!("{manifest_stem}{manifest_suffix}.receiver-composition.json")),
+                    serde_json::to_vec_pretty(control).unwrap()).unwrap();
+            }
+            let native_decal_control=first_authored_decal_images.as_ref().filter(|_|!simple_probe).map(|baseline| {
+                super::decal_tests::verify_live_d0f2(
+                    &callback,&render_state.device,&render_state.queue,&descriptor,&mut resources,baseline)
+            });
+            let mut native_uv_control=None;
+            if let Some(baseline)=&native_receivers
+                && !resources.get::<ModelFrameResources>().unwrap().native_c827.is_empty() {
+                let has_native_decals=!resources.get::<ModelFrameResources>().unwrap().native_decals.is_empty();
+                let native_mrt_baseline=has_native_decals.then(||
+                    read_authored_images(&render_state.device,&render_state.queue,
+                        resources.get::<super::ModelTargetResources>().unwrap()));
+                let native_albedo_baseline=has_native_decals.then(|| {
+                    let target=resources.get::<super::ModelTargetResources>().unwrap();
+                    read_texture_images(&render_state.device,&render_state.queue,&[&target._surface_albedo])
+                });
+                let native_lit_baseline=has_native_decals.then(|| {
+                    let target=resources.get::<super::ModelTargetResources>().unwrap();
+                    read_texture_images(&render_state.device,&render_state.queue,&[&target.lit_color])
+                });
+                let mut control_encoder=render_state.device.create_command_encoder(&Default::default());
+                callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut control_encoder,&mut resources);
+                let control_frame=resources.get::<ModelFrameResources>().unwrap();
+                for (draw_index,buffer) in &control_frame.native_skinning_buffers {
+                    if !control_frame.native_c827.iter().any(|(index,_)|index==draw_index) { continue; }
+                    let source_index=callback.preview.draws[*draw_index].authored_source.unwrap();
+                    let source=callback.preview.authored_inputs[source_index].as_ref().unwrap();
+                    let mut skin=super::c827_static_skinning(source,&callback.scene);
+                    skin[6][3]+=0.125;
+                    render_state.queue.write_buffer(buffer,0,bytemuck::cast_slice(&skin));
+                }
+                render_state.queue.submit([control_encoder.finish()]);
+                let changed=read_receiver_images(&render_state.device,&render_state.queue,resources.get::<super::ModelTargetResources>().unwrap());
+                assert!(changed[1]==baseline[1],"C827 UV control must preserve every receiver normal byte");
+                assert!(changed[2]==baseline[2],"C827 UV control must preserve every material-property byte");
+                let count=|target:usize,bytes:usize| {
+                    changed[target].chunks_exact(bytes).zip(baseline[target].chunks_exact(bytes)).map(|(a,b)| {
+                        assert_eq!(&a[bytes*3/4..],&b[bytes*3/4..],"C827 must preserve receiver alpha bits");
+                        usize::from(a!=b)
+                    }).sum::<usize>()
+                };
+                let color_changes=[count(0,8),count(3,4)];
+                let mut native_changes=None;
+                let mut native_albedo_changes=None;
+                let mut native_lit_changes=None;
+                if let (Some(native_baseline),Some(albedo_baseline),Some(lit_baseline))=
+                    (&native_mrt_baseline,&native_albedo_baseline,&native_lit_baseline) {
+                    let target=resources.get::<super::ModelTargetResources>().unwrap();
+                    let changed_native=read_authored_images(&render_state.device,&render_state.queue,target);
+                    let changed_albedo=read_texture_images(&render_state.device,&render_state.queue,&[&target._surface_albedo]);
+                    let changed_lit=read_texture_images(&render_state.device,&render_state.queue,&[&target.lit_color]);
+                    let changed_count=|actual:&[u8],expected:&[u8],stride:usize| {
+                        actual.chunks_exact(stride).zip(expected.chunks_exact(stride)).filter(|(a,b)|a!=b).count()
+                    };
+                    let rt0_changes=changed_count(&changed_native[0],&native_baseline[0],16);
+                    assert!(rt0_changes>0,"C827 UV offset must influence native RT0 RGB");
+                    assert!(changed_native[0].chunks_exact(16).zip(native_baseline[0].chunks_exact(16)).all(|(a,b)|a[12..16]==b[12..16]),
+                        "C827 UV offset must preserve native RT0 alpha");
+                    for target in 1..4 {
+                        assert!(changed_native[target]==native_baseline[target],"C827 UV offset must preserve native RT{target}");
+                    }
+                    let albedo_changes=changed_count(&changed_albedo[0],&albedo_baseline[0],4);
+                    let lit_changes=changed_count(&changed_lit[0],&lit_baseline[0],8);
+                    assert!(albedo_changes>0,"C827 native RT0 UV offset must reach viewer albedo projection");
+                    assert!(lit_changes>0,"C827 native RT0 UV offset must reach viewer lit color");
+                    native_changes=Some(rt0_changes);
+                    native_albedo_changes=Some(albedo_changes);
+                    native_lit_changes=Some(lit_changes);
+                } else {
+                    assert!(color_changes.iter().all(|&v|v>0),"authored UV offset must influence both live color receivers: {color_changes:?}");
+                }
+                let mut restore=render_state.device.create_command_encoder(&Default::default());
+                callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut restore,&mut resources);
+                render_state.queue.submit([restore.finish()]);
+                let target=resources.get::<super::ModelTargetResources>().unwrap();
+                let restored_receivers=read_receiver_images(&render_state.device,&render_state.queue,target);
+                assert!(restored_receivers==*baseline,
+                    "restoring live UV uniforms must restore all receiver MRT bits without rebuilding bind groups");
+                if let Some(native_baseline)=&native_mrt_baseline {
+                    let restored_native=read_authored_images(&render_state.device,&render_state.queue,target);
+                    assert!(restored_native==*native_baseline,"restoring C827 UV must restore all native MRT bits");
+                    let restored_albedo=read_texture_images(&render_state.device,&render_state.queue,&[&target._surface_albedo]);
+                    let restored_lit=read_texture_images(&render_state.device,&render_state.queue,&[&target.lit_color]);
+                    assert!(restored_albedo==*native_albedo_baseline.as_ref().unwrap(),"restoring C827 UV must restore viewer albedo bits");
+                    assert!(restored_lit==*native_lit_baseline.as_ref().unwrap(),"restoring C827 UV must restore viewer lit bits");
+                }
+                native_uv_control=Some(serde_json::json!({"cb1_row6_w_delta":0.125,"changed_color_pixels":color_changes,
+                    "native_rt0_changed_pixels":native_changes,"native_albedo_changed_pixels":native_albedo_changes,
+                    "native_lit_changed_pixels":native_lit_changes,"all_normal_properties_and_alpha_bits_preserved":true,
+                    "restore_all_mrt_bits_exact":true}));
+            }
+            let authored_surface_control=first_authored_images.map(|baseline| {
+                let target=resources.get::<super::ModelTargetResources>().unwrap();
+                assert_eq!(baseline,read_authored_images(&render_state.device,&render_state.queue,target),"live authored MRTs repeat exactly on retained frame reuse");
+                let source_nan=super::color_domain_tests::verify(&render_state.device,&render_state.queue,&resources,&callback.preview,&baseline);
+                let mut covered=0;
+                for i in 0..(size[0]*size[1]) as usize {
+                    let component=|target:usize,axis:usize|f32::from_le_bytes(baseline[target][i*16+axis*4..i*16+axis*4+4].try_into().unwrap());
+                    if component(1,3)==0.0 {continue;}
+                    covered+=1;
+                    assert_eq!(component(1,3),0.67,"audited opaque material class literal");
+                    for target in 0..4 {for axis in 0..4 {
+                        if target==0 && axis==0 && source_nan[i] {
+                            assert!(component(target,axis).is_nan(),"source-predicted NaN must be preserved");
+                        } else {
+                            assert!(component(target,axis).is_finite(),"unproved nonfinite authored output: {name} pixel={i} rt={target} channel={axis}");
+                        }
+                    }}
+                    assert_eq!(component(0,3),0.0);
+                    // D0F2's authored state writes RT2 R/B. Keep the old
+                    // opaque-surface literals for bodies without live decals;
+                    // the native decal helper owns writable-channel checks.
+                    if !cross_skin_case && native_decal_control.is_none() {
+                        assert_eq!(component(2,0),0.0);
+                        assert_eq!(component(2,2),0.0);
+                    }
+                    // These literals belong to the isolated Thief fixture.
+                    // Other exact PS programs store authored payloads in
+                    // RT3.z/w. Their finite outputs, source controls and full
+                    // RT3 repeat/UV/restoration checks remain required below.
+                    if !cross_skin_case {
+                        assert_eq!(component(3,2),0.0);assert_eq!(component(3,3),0.0);
+                    }
+                }
+                // White Rabbit currently admits only eyes/mouth. This fixture
+                // verifies its final atlas decal, not complete body receivers.
+                let partial_receiver_fixture=name=="runner-recon-white-rabbit-combined";
+                if partial_receiver_fixture && covered==0 {
+                    let metadata_control=super::decal_tests::verify_atlas_metadata(
+                        &callback,&render_state.device,&render_state.queue,&descriptor,&mut resources,&baseline,14);
+                    return (baseline,serde_json::json!({"covered_pixels":0,"partial_receiver_fixture":true,
+                        "surface_controls_exercised":false,"complete_native_receivers":false,
+                        "atlas_metadata_control":metadata_control,
+                        "limits":"No opaque native receiver pixels in this fixture; encoded head draws and decal controls do not prove body coverage."}));
+                }
+                assert!(covered>if partial_receiver_fixture {0} else {1000},
+                    "source materials must cover the fixture's admitted visible surfaces: {covered}");
+                let cutoff_fixture=match name {
+                    "runner-vandal-fineline-xs-combined" => Some((vec![9usize,10,23],2usize,1usize)),
+                    _ => None,
+                };
+                let analytic_cutoff_control=if let Some((cutouts,frame_row,cutoff_row))=cutoff_fixture {
+                    let frame=resources.get::<ModelFrameResources>().unwrap();
+                    for &index in &cutouts {
+                        let spec=callback.preview.draws[index].native_surface.as_ref().unwrap();
+                        assert_eq!(spec.constants[frame_row],[0.0;4]);
+                        let mut constants=spec.constants.clone();
+                        constants[cutoff_row][0]=2.0;
+                        let buffer=&frame.native_surface_constants.iter().find(|(i,_)|*i==index).unwrap().1;
+                        render_state.queue.write_buffer(buffer,0,bytemuck::cast_slice(&constants));
+                    }
+                    let mut encoder=render_state.device.create_command_encoder(&Default::default());
+                    // The normal frame cache retains material constants. Run
+                    // the full renderer, including depth and displayed consumers.
+                    callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut encoder,&mut resources);
+                    render_state.queue.submit([encoder.finish()]);
+                    let changed=read_authored_images(&render_state.device,&render_state.queue,
+                        resources.get::<super::ModelTargetResources>().unwrap());
+                    let count=changed[0].chunks_exact(16).zip(baseline[0].chunks_exact(16)).filter(|(a,b)|a!=b).count();
+                    assert!(count>0,"source analytic cutoff must remove visible cutout pixels");
+                    for &index in &cutouts {
+                        let spec=callback.preview.draws[index].native_surface.as_ref().unwrap();
+                        let buffer=&resources.get::<ModelFrameResources>().unwrap().native_surface_constants.iter().find(|(i,_)|*i==index).unwrap().1;
+                        render_state.queue.write_buffer(buffer,0,bytemuck::cast_slice(&spec.constants));
+                    }
+                    let mut restore=render_state.device.create_command_encoder(&Default::default());
+                    callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut restore,&mut resources);
+                    render_state.queue.submit([restore.finish()]);
+                    assert!(baseline==read_authored_images(&render_state.device,&render_state.queue,
+                        resources.get::<super::ModelTargetResources>().unwrap()),"restoring cutoff must restore every native MRT bit");
+                    Some(serde_json::json!({"draws":cutouts,"frame_0x1e0":[0,0,0,0],"control_cutoff":2.0,
+                        "native_rt0_changed_pixels":count,"restore_all_mrt_bits_exact":true}))
+                } else {None};
+                // Every admitted payload must independently retain its source
+                // zero-gate behavior on the actual geometry/texture graph.
+                let constant_buffers=resources.get::<ModelFrameResources>().unwrap().native_surface_constants.clone();
+                for value in [0.25f32,1.0] {
+                    for (index,buffer) in &constant_buffers {
+                        let spec=callback.preview.draws[*index].native_surface.as_ref().unwrap();
+                        let mut constants=spec.constants.clone();
+                        for &(metadata_row, zero_gate) in &spec.metadata_rows {
+                            constants[metadata_row]=[value;4];
+                            if let Some(gate)=zero_gate { assert_eq!(constants[gate][0],0.0); }
+                        }
+                        render_state.queue.write_buffer(buffer,0,bytemuck::cast_slice(&constants));
+                    }
+                    let mut encoder=render_state.device.create_command_encoder(&Default::default());
+                    callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut encoder,&mut resources);
+                    render_state.queue.submit([encoder.finish()]);
+                    assert_eq!(baseline,read_authored_images(&render_state.device,&render_state.queue,resources.get::<super::ModelTargetResources>().unwrap()),
+                        "finite unresolved-row controls must preserve all native outputs behind source-proven gates");
+                }
+                for (index,buffer) in &resources.get::<ModelFrameResources>().unwrap().native_surface_constants {
+                    let spec=callback.preview.draws[*index].native_surface.as_ref().unwrap();
+                    render_state.queue.write_buffer(buffer,0,bytemuck::cast_slice(&spec.constants));
+                }
+                let mut restore=render_state.device.create_command_encoder(&Default::default());
+                callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut restore,&mut resources);
+                render_state.queue.submit([restore.finish()]);
+                assert_eq!(baseline,read_authored_images(&render_state.device,&render_state.queue,resources.get::<super::ModelTargetResources>().unwrap()));
+                let target=resources.get::<super::ModelTargetResources>().unwrap();
+                let receiver_baseline=read_receiver_images(&render_state.device,&render_state.queue,target);
+                let lit_baseline=(callback.scene.fidelity[0]==1.0).then(||read_texture_images(
+                    &render_state.device,&render_state.queue,&[&target.lit_color]));
+                if let Some(lit)=&lit_baseline {
+                    assert!(lit[0].chunks_exact(2).all(|b|u16::from_le_bytes(b.try_into().unwrap())&0x7c00!=0x7c00),
+                        "viewer lit HDR must contain no NaN or infinity");
+                }
+                let projection_error=lit_baseline.as_ref().map(|_|super::lighting_tests::verify_authored_viewer_projection(
+                    &render_state.device,&render_state.queue,&resources,&callback.scene,&baseline));
+                let mut light_changed_pixels=0;
+                if let Some(lit)=&lit_baseline {
+                    let mut encoder=render_state.device.create_command_encoder(&Default::default());
+                    callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut encoder,&mut resources);
+                    let mut moved_light=callback.scene;
+                    // Historical Thief baseline turns the key light off. Give
+                    // this separate influence control a finite broad key light.
+                    let radius=moved_light.params0[0];
+                    moved_light.light_position[..3].copy_from_slice(&[2.0*radius,3.0*radius,4.0*radius]);
+                    moved_light.light_parameters[1]=100.0*radius;
+                    moved_light.light_parameters[2]=-1.0;
+                    moved_light.light_parameters[3]=-0.999;
+                    moved_light.postprocess0[3]=1.0;
+                    render_state.queue.write_buffer(&resources.get::<ModelFrameResources>().unwrap().scene_buffer,
+                        0,bytemuck::bytes_of(&moved_light));
+                    render_state.queue.submit([encoder.finish()]);
+                    let target=resources.get::<super::ModelTargetResources>().unwrap();
+                    assert_eq!(baseline,read_authored_images(&render_state.device,&render_state.queue,target),
+                        "viewer light edits must preserve every authored material MRT bit");
+                    let changed=read_texture_images(&render_state.device,&render_state.queue,&[&target.lit_color]);
+                    for (i,(a,b)) in changed[0].chunks_exact(8).zip(lit[0].chunks_exact(8)).enumerate() {
+                        let class=f32::from_le_bytes(baseline[1][i*16+12..i*16+16].try_into().unwrap());
+                        if class!=0.0 && a!=b {light_changed_pixels+=1;}
+                    }
+                    assert!(light_changed_pixels>if partial_receiver_fixture {0} else {100},
+                        "existing viewer light must affect admitted lit surfaces: {light_changed_pixels}");
+                    let mut restore=render_state.device.create_command_encoder(&Default::default());
+                    callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut restore,&mut resources);
+                    render_state.queue.submit([restore.finish()]);
+                    let target=resources.get::<super::ModelTargetResources>().unwrap();
+                    assert_eq!(*lit,read_texture_images(&render_state.device,&render_state.queue,&[&target.lit_color]),
+                        "restoring viewer light must restore all lit HDR bits");
+                }
+                let mut encoder=render_state.device.create_command_encoder(&Default::default());
+                callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut encoder,&mut resources);
+                let frame=resources.get::<ModelFrameResources>().unwrap();
+                for (draw_index,buffer) in &frame.native_skinning_buffers {
+                    if !frame.native_surfaces.iter().any(|(index,_,_)|index==draw_index) {continue;}
+                    // Keep cutout visibility fixed for the motion-only UV
+                    // control. Their discard has its own source cutoff control.
+                    let spec=callback.preview.draws[*draw_index].native_surface.as_ref().unwrap();
+                    if let crate::render::authored_program::DescriptorAbi::RunnerSurface(program)=spec.program {
+                        let tag=crate::render::runner_surface_programs::SURFACES[program as usize].program.shader_tag.0;
+                        if matches!(tag,0x80A9BE22|0x80A9C951|0x80A9F94D|0x80B14EF0|0x80B7A11F|0x80B7A2A6) {continue;}
+                    }
+                    let source_index=callback.preview.draws[*draw_index].authored_source.unwrap();
+                    let source=callback.preview.authored_inputs[source_index].as_ref().unwrap();
+                    let vertex=callback.preview.draws[*draw_index].native_surface.as_ref().unwrap().vertex_program;
+                    let mut skin=super::native_surface_object_image(vertex,source,&callback.scene);
+                    skin[6][3]+=0.125;
+                    render_state.queue.write_buffer(buffer,0,bytemuck::cast_slice(&skin));
+                }
+                render_state.queue.submit([encoder.finish()]);
+                let target=resources.get::<super::ModelTargetResources>().unwrap();
+                let changed=read_authored_images(&render_state.device,&render_state.queue,target);
+                assert!(changed[3].chunks_exact(16).zip(baseline[3].chunks_exact(16)).all(|(a,b)|a[..8]==b[..8]),
+                    "UV-only edits with fixed coverage cannot change signed motion XY");
+                let changed_receivers=read_receiver_images(&render_state.device,&render_state.queue,target);
+                let changed_count=|a:&[u8],b:&[u8],stride:usize|a.chunks_exact(stride).zip(b.chunks_exact(stride)).filter(|(a,b)|a!=b).count();
+                let native_changes=changed_count(&changed[0],&baseline[0],16);
+                let albedo_changes=changed_count(&changed_receivers[3],&receiver_baseline[3],4);
+                let lit_uv_changes=lit_baseline.as_ref().map(|lit| {
+                    let changed=read_texture_images(&render_state.device,&render_state.queue,&[&target.lit_color]);
+                    let count=changed_count(&changed[0],&lit[0],8);
+                    assert!(count>0,"authored UV/color must affect lit output in every viewer lighting mode"); count
+                });
+                assert!(native_changes>0 && albedo_changes>0,"authored UV must reach native RT0 and its displayed consumer");
+                if diagnostic_pass==1 {assert!(changed_count(&changed_receivers[0],&receiver_baseline[0],8)>0,"Base Color diagnostic must consume native color");}
+                let mut restore=render_state.device.create_command_encoder(&Default::default());
+                callback.prepare(&render_state.device,&render_state.queue,&descriptor,&mut restore,&mut resources);
+                render_state.queue.submit([restore.finish()]);
+                let target=resources.get::<super::ModelTargetResources>().unwrap();
+                assert_eq!(baseline,read_authored_images(&render_state.device,&render_state.queue,target),"restoring UV must restore all four native MRTs exactly");
+                assert_eq!(receiver_baseline,read_receiver_images(&render_state.device,&render_state.queue,target),"restoring UV must restore displayed receiver bits exactly");
+                if let Some(lit)=&lit_baseline { assert_eq!(*lit,read_texture_images(&render_state.device,&render_state.queue,&[&target.lit_color]),
+                    "restoring authored UV must restore all lit HDR bits"); }
+                (baseline,serde_json::json!({"covered_pixels":covered,"partial_receiver_fixture":partial_receiver_fixture,
+                    "uv_delta":0.125,"native_source_color_changed_pixels":native_changes,
+                    "displayed_albedo_changed_pixels":albedo_changes,"lit_uv_changed_pixels":lit_uv_changes,
+                    "lit_light_changed_pixels":light_changed_pixels,"viewer_projection_max_byte_error":projection_error,
+                    "motion_xy_preserved_exact":true,"analytic_cutoff_control":analytic_cutoff_control,"restore_native_and_receiver_bits_exact":true}))
+            });
             let pipelines = resources
                 .get::<ModelPipelineResources>()
                 .expect("model pipelines");
@@ -16399,7 +18831,7 @@ mod tests {
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
-            let presented_view = presented.create_view(&Default::default());
+            let presented_view = super::create_model_texture_view(&presented, &Default::default());
             let unpadded_bytes_per_row = size[0] * 4;
             let bytes_per_row = unpadded_bytes_per_row.div_ceil(256) * 256;
             let buffer = render_state.device.create_buffer(&wgpu::BufferDescriptor {
@@ -16459,6 +18891,11 @@ mod tests {
                 })
                 .expect("GPU wait");
             let slice = buffer.slice(..);
+            if let Some(journal) = capture_journal.as_mut() {
+                journal
+                    .mark_phase("readback_started")
+                    .expect("record readback phase");
+            }
             slice.map_async(wgpu::MapMode::Read, |_| {});
             render_state
                 .device
@@ -16484,8 +18921,71 @@ mod tests {
                     pixel.swap(0, 2);
                 }
             }
+            if name == "runner-thief-cryo-shift-combined" {
+                let suffix = std::env::var("QUICKTAG_PROBE_OUTPUT_SUFFIX")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("-{value}"))
+                    .unwrap_or_default();
+                std::fs::write(
+                    output.join(format!(
+                        "{name}-{diagnostic_name}{suffix}.gpu-descriptors.json"
+                    )),
+                    serde_json::to_vec_pretty(&super::model_binding_audit::snapshot()).unwrap(),
+                )
+                .expect("write actual GPU descriptors");
+            }
             let image =
                 image::RgbaImage::from_raw(size[0], size[1], pixels).expect("readback image");
+            // Retain failing diagnostics too; assertions must not leave a stale
+            // image from an earlier camera/pass beside fresh capture metadata.
+            let suffix = std::env::var("QUICKTAG_PROBE_OUTPUT_SUFFIX")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("-{value}"))
+                .unwrap_or_default();
+            let output_stem = if diagnostic_name != "final" {
+                format!("{name}-{diagnostic_name}")
+            } else {
+                name.to_string()
+            };
+            let output_path = output.join(format!("{output_stem}{suffix}.png"));
+            image.save(&output_path).expect("save render");
+            if let Some(receivers)=&native_receivers {
+                use sha2::{Digest,Sha256};
+                let names=["hdr.rgba16f","normal.rgba8","properties.rgba8","albedo.rgba8"];
+                let records:Vec<_>=names.iter().zip(receivers).map(|(name,bytes)| {
+                    let artifact=format!("{output_stem}{suffix}.{name}");std::fs::write(output.join(&artifact),bytes).unwrap();
+                    serde_json::json!({"artifact":artifact,"bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(bytes))})
+                }).collect();
+                std::fs::write(output.join(format!("{output_stem}{suffix}.native-receivers.json")),serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema":"quicktag-native-receiver-images-v2","width":size[0],"height":size[1],"repeat_bit_exact":true,
+                    "camera":{"yaw_radians":callback.scene.params0[1],"pitch_radians":callback.scene.params0[2],
+                        "zoom":callback.scene.params0[3],"pan": [callback.scene.params1[1],callback.scene.params1[2]]},
+                    "native_c827_draws":frame.native_c827.len(),"images":records,"native_uv_control":native_uv_control,
+                    "limits":"normal UI targets under viewer camera/bind pose; consumer projection is viewer color only; native state activation/lighting not claimed"
+                })).unwrap()).unwrap();
+            }
+            if let Some((native,control))=&authored_surface_control {
+                use sha2::{Digest,Sha256};
+                let records=native.iter().enumerate().map(|(index,bytes)| {
+                    let artifact=format!("{output_stem}{suffix}.native-rt{index}.rgba32f");
+                    std::fs::write(output.join(&artifact),bytes).unwrap();
+                    serde_json::json!({"target":index,"artifact":artifact,"bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(bytes))})
+                }).collect_vec();
+                let draws=frame.native_surfaces.iter().map(|(index,abi,bindings)|serde_json::json!({
+                    "stable_index":index,"program":format!("{abi:?}"),"original_strip":[bindings.range.start,bindings.range.end],
+                    "reconstructed_opaque_submission_removed":callback.draws.iter().find(|d|d.stable_index==*index).unwrap().native_surface,
+                })).collect_vec();
+                std::fs::write(output.join(format!("{output_stem}{suffix}.authored-surfaces.json")),serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema":if callback.scene.fidelity[0]==1.0 {"quicktag-live-authored-viewer-material-v2"}else{"quicktag-live-authored-source-color-v1"},
+                    "width":size[0],"height":size[1],"draws":draws,
+                    "images":records,"repeat_bit_exact":true,"control":control,"native_d0f2_control":native_decal_control,
+                    "consumer":if callback.scene.fidelity[0]==1.0 {"normal renderer authored materials with existing viewer lighting"}else{"normal renderer Base Color inspection; RT0 RGB only"},
+                    "viewer_lighting_model":format!("{probe_lighting_model:?}"),
+                    "limits":"explicit viewer static pose/camera/frequency, zero-gated unresolved metadata, storage format views and FP32 intermediates; native inherited state, BC7 view intent and lit graph not claimed",
+                })).unwrap()).unwrap();
+            }
             let background = image.get_pixel(0, 0).0[..3].to_vec();
             let visible = image
                 .pixels()
@@ -16995,18 +19495,6 @@ mod tests {
                     "runner decals must preserve authored marks without returning solid white atlas quads"
                 );
             }
-            let suffix = std::env::var("QUICKTAG_PROBE_OUTPUT_SUFFIX")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(|value| format!("-{value}"))
-                .unwrap_or_default();
-            let output_stem = if diagnostic_name != "final" {
-                format!("{name}-{diagnostic_name}")
-            } else {
-                name.to_string()
-            };
-            let output_path = output.join(format!("{output_stem}{suffix}.png"));
-            image.save(&output_path).expect("save render");
             if name == "conquest-lmg-belt-endpoints" {
                 let crop = image::imageops::crop_imm(&image, 470, 100, 280, 300).to_image();
                 image::imageops::resize(&crop, 840, 900, image::imageops::FilterType::Nearest)
@@ -17016,6 +19504,21 @@ mod tests {
             if let Some(baseline_path) = std::env::var_os("QUICKTAG_PROBE_BASELINE") {
                 let report_path = output.join(format!("{output_stem}{suffix}.metrics.json"));
                 verify_visual_baseline(&image, Path::new(&baseline_path), &report_path);
+            }
+            let case_visual_failures = visual_failures[visual_failure_start..].join("\n");
+            if let Some(journal) = capture_journal.as_mut() {
+                journal
+                    .mark_phase("readback_complete")
+                    .expect("record completed readback");
+                if case_visual_failures.is_empty() {
+                    journal
+                        .succeed(serde_json::json!({"image": output_path}))
+                        .expect("record capture success");
+                } else {
+                    journal
+                        .fail("visual_validation", &case_visual_failures)
+                        .expect("record capture visual failure");
+                }
             }
             renders.push((name, image));
         }

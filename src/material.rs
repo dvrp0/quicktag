@@ -64,7 +64,7 @@ pub struct TechniqueStagePreview {
     pub shader: Option<TagHash>,
     pub textures: Vec<TextureSlotBindingPreview>,
     pub constants: Vec<[f32; 4]>,
-    pub samplers: Vec<WideHashPreview>,
+    pub indexed_resources: Vec<WideHashPreview>,
     pub inline_constants: Vec<[f32; 4]>,
     pub bytecode_len: usize,
     pub constant_buffer_slot: Option<i32>,
@@ -79,7 +79,7 @@ pub struct ConstantBufferPreview {
     pub data_tag: TagHash,
     pub header_len: usize,
     pub data_len: usize,
-    pub first_values: Vec<[f32; 4]>,
+    pub values: Vec<[f32; 4]>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,8 +312,8 @@ pub fn primary_sampler_for_technique(entry: &UEntryHeader, data: &[u8]) -> Optio
                 .parse::<usize>()
                 .ok()
         })
-        .or_else(|| (!stage.samplers.is_empty()).then_some(0))?;
-    let sampler = stage.samplers.get(sampler_index)?;
+        .or_else(|| (!stage.indexed_resources.is_empty()).then_some(0))?;
+    let sampler = stage.indexed_resources.get(sampler_index)?;
     sampler
         .resolved
         .and_then(sampler_header_tag)
@@ -347,7 +347,7 @@ pub fn sampler_for_technique_slot(
         .strip_suffix(']')?
         .parse::<usize>()
         .ok()?;
-    let sampler = stage.samplers.get(sampler_index)?;
+    let sampler = stage.indexed_resources.get(sampler_index)?;
     sampler
         .resolved
         .and_then(sampler_header_tag)
@@ -416,7 +416,7 @@ pub fn scope_stages(entry: &UEntryHeader, data: &[u8]) -> Vec<TechniqueStagePrev
             stage.shader.is_some()
                 || !stage.textures.is_empty()
                 || !stage.constants.is_empty()
-                || !stage.samplers.is_empty()
+                || !stage.indexed_resources.is_empty()
                 || !stage.inline_constants.is_empty()
                 || stage.bytecode_len != 0
                 || stage.constant_buffer.is_some()
@@ -605,7 +605,7 @@ fn parse_technique_stage(
     let constants = read_array(data, constants_offset + 0x10, 0x10, endian)
         .map(|constants| parse_vec4_array(constants, endian))
         .unwrap_or_default();
-    let samplers = read_array(data, constants_offset + 0x20, 0x10, endian)
+    let indexed_resources = read_array(data, constants_offset + 0x20, 0x10, endian)
         .map(|samplers| {
             samplers
                 .chunks_exact(0x10)
@@ -616,14 +616,8 @@ fn parse_technique_stage(
     let inline_constants = read_array(data, constants_offset + 0x30, 0x10, endian)
         .map(|constants| parse_vec4_array(constants, endian))
         .unwrap_or_default();
-    let constant_buffer_slot = data
-        .get(constants_offset + 0x50..constants_offset + 0x54)
-        .map(|bytes| read_i32(bytes, endian))
-        .filter(|slot| *slot >= 0);
-    let constant_buffer = data
-        .get(constants_offset + 0x54..constants_offset + 0x58)
-        .map(|bytes| read_tag(bytes, endian))
-        .filter(|tag| tag.is_some());
+    let (constant_buffer_slot, constant_buffer) =
+        constant_buffer_binding(data, offset, endian, marathon_tfx);
     let constant_buffer_preview = constant_buffer.and_then(load_constant_buffer_preview);
     let bytecode = read_array(data, constants_offset, 1, endian)
         .map(|bytecode| {
@@ -634,7 +628,7 @@ fn parse_technique_stage(
 
     if shader.is_none()
         && textures.is_empty()
-        && samplers.is_empty()
+        && indexed_resources.is_empty()
         && constants.is_empty()
         && inline_constants.is_empty()
         && bytecode_len == 0
@@ -648,7 +642,7 @@ fn parse_technique_stage(
         shader: shader.is_some().then_some(shader),
         textures,
         constants,
-        samplers,
+        indexed_resources,
         inline_constants,
         bytecode_len,
         constant_buffer_slot,
@@ -656,6 +650,26 @@ fn parse_technique_stage(
         constant_buffer_preview,
         bytecode,
     })
+}
+
+fn constant_buffer_binding(
+    data: &[u8],
+    stage_offset: usize,
+    endian: Endian,
+    marathon: bool,
+) -> (Option<i32>, Option<TagHash>) {
+    // Marathon's stage has an eight-byte reserved block after inline data;
+    // Destiny has sixteen. The C827 payload proves slot/tag at +0x68/+0x6c.
+    let binding_offset = stage_offset + if marathon { 0x68 } else { 0x70 };
+    let slot = data
+        .get(binding_offset..binding_offset + 4)
+        .map(|bytes| read_i32(bytes, endian))
+        .filter(|slot| *slot >= 0);
+    let buffer = data
+        .get(binding_offset + 4..binding_offset + 8)
+        .map(|bytes| read_tag(bytes, endian))
+        .filter(|tag| tag.is_some());
+    (slot, buffer)
 }
 
 fn load_constant_buffer_preview(tag: TagHash) -> Option<ConstantBufferPreview> {
@@ -673,15 +687,36 @@ fn load_constant_buffer_preview(tag: TagHash) -> Option<ConstantBufferPreview> {
         package_manager().read_tag(data_tag).ok()?
     };
     let endian = package_manager().version.endian();
-    let first_values = parse_vec4_array(&data[..data.len().min(0x80)], endian);
+    let values = parse_constant_buffer_values(&data, endian)?;
 
     Some(ConstantBufferPreview {
         header_tag: tag,
         data_tag,
         header_len: header.len(),
         data_len: data.len(),
-        first_values,
+        values,
     })
+}
+
+fn parse_constant_buffer_values(data: &[u8], endian: Endian) -> Option<Vec<[f32; 4]>> {
+    if !data.len().is_multiple_of(4) {
+        return None;
+    }
+    // DXIL buffers may end partway through a vec4 (e.g. 136 bytes).
+    // Preserve the final scalars; only absent components receive zero padding.
+    Some(
+        data.chunks(16)
+            .map(|chunk| {
+                std::array::from_fn(|component| {
+                    let offset = component * 4;
+                    chunk
+                        .get(offset..offset + 4)
+                        .map(|bytes| read_f32(bytes, endian))
+                        .unwrap_or(0.0)
+                })
+            })
+            .collect(),
+    )
 }
 
 fn parse_vec4_array(data: &[u8], endian: Endian) -> Vec<[f32; 4]> {
@@ -830,6 +865,8 @@ fn parse_marathon_tfx_bytecode_op(
                 format!("{} slot={}", tfx_shader_stage_name(value), value & 0x1f),
             ))
         }
+        // Historical diagnostic label only: the one-byte runtime selector is
+        // proven, but its producer/metadata field remains unidentified.
         0x64 => Some((
             "push_marathon_texture_metadata",
             format!("index={}", read_u8(cursor)?),
@@ -891,9 +928,9 @@ fn marathon_tfx_legacy_opcode(opcode: u8) -> Option<u8> {
         0x50 => Some(0x42),
         0x52 => Some(0x43),
         0x53 => Some(0x44),
-        0x54 => Some(0x45),
-        0x55 => Some(0x46),
-        0x56 => Some(0x47),
+        // Packaged Marathon View/RigidModel scopes store four matrix rows
+        // with 0x55. 0x54/0x56 have no verified meaning; do not reuse legacy mappings.
+        0x55 => Some(0x45),
         0x59 => Some(0x48),
         0x5d => Some(0x4a),
         0x5e => Some(0x4b),
@@ -1016,6 +1053,7 @@ pub(crate) fn interpret_tfx_stack_with_object_channels(
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
+        &std::collections::BTreeMap::new(),
     )
 }
 
@@ -1026,6 +1064,7 @@ pub(crate) fn interpret_tfx_stack_with_runtime_values(
     extern_values: &std::collections::HashMap<(String, u32), [f32; 4]>,
     global_channels: &std::collections::HashMap<u32, [f32; 4]>,
     context_values: &std::collections::HashMap<u32, [f32; 4]>,
+    texture_metadata: &std::collections::BTreeMap<u8, crate::texture::TextureExpressionMetadata>,
 ) -> (Vec<TfxBindingPreview>, Vec<TfxExpressionPreview>) {
     let mut stack = Vec::<TfxStackValue>::new();
     let mut temps = std::collections::BTreeMap::<u8, TfxStackValue>::new();
@@ -1039,15 +1078,12 @@ pub(crate) fn interpret_tfx_stack_with_runtime_values(
             | "push_sampler"
             | "push_extern_float"
             | "push_extern_vec4"
-            | "push_extern_mat4"
             | "push_extern_texture"
             | "push_extern_u32"
             | "push_extern_uav"
             | "push_object_channel"
             | "push_global_channel"
             | "push_tex_dimensions"
-            | "push_tex_tiling_params"
-            | "push_tex_tile_layer_count"
             | "push_marathon_texture_metadata"
             | "push_marathon_indexed_value"
             | "marathon_context_value" => stack.push(format_tfx_runtime_value(
@@ -1058,6 +1094,32 @@ pub(crate) fn interpret_tfx_stack_with_runtime_values(
                 global_channels,
                 context_values,
             )),
+            "push_tex_tiling_params" | "push_tex_tile_layer_count" => {
+                let value = op.detail.split_once(" fields=0x").and_then(|(index, fields)| {
+                    let index = index.strip_prefix("index=")?.parse::<u8>().ok()?;
+                    let fields = u8::from_str_radix(fields,16).ok()?;
+                    texture_metadata.get(&index)?.evaluate(op.name,fields)
+                });
+                let mut source = format_tfx_value(op,constants);
+                source.value = value;
+                stack.push(source);
+            }
+            "push_extern_mat4" => {
+                let source = op.detail.split_once("+0x").and_then(|(scope, offset)| {
+                    Some((scope, u32::from_str_radix(offset, 16).ok()?))
+                });
+                // Tiger matrices push four column vectors in source order.
+                for row in 0..4 {
+                    stack.push(TfxStackValue {
+                        expression: format!("extern_mat4({})[{row}]", op.detail),
+                        value: source.and_then(|(scope, offset)| {
+                            extern_values
+                                .get(&(scope.to_string(), offset + row * 16))
+                                .copied()
+                        }),
+                    });
+                }
+            }
             "push_from_output" => {
                 let element = op
                     .detail
@@ -1117,28 +1179,29 @@ pub(crate) fn interpret_tfx_stack_with_runtime_values(
                 }
             }
             "pop_output" | "pop_output_mat4" => {
-                let target = op
+                let first = op
                     .detail
                     .strip_prefix("element=")
-                    .map(|element| format!("output[{element}]"))
-                    .unwrap_or_else(|| "output[?]".to_string());
-                let value = stack.pop().unwrap_or_else(|| TfxStackValue {
-                    expression: "<empty stack>".to_string(),
-                    value: None,
-                });
-                if let Some(element) = op
-                    .detail
-                    .strip_prefix("element=")
-                    .and_then(|element| element.parse::<u8>().ok())
-                {
-                    outputs.insert(element, value.clone());
+                    .and_then(|element| element.parse::<u8>().ok());
+                let count = if op.name == "pop_output_mat4" { 4 } else { 1 };
+                for row in (0..count).rev() {
+                    let value = stack.pop().unwrap_or_else(|| TfxStackValue {
+                        expression: "<empty stack>".to_string(),
+                        value: None,
+                    });
+                    let element = first.and_then(|first| first.checked_add(row));
+                    if let Some(element) = element {
+                        outputs.insert(element, value.clone());
+                    }
+                    expressions.push(TfxExpressionPreview {
+                        op_offset: op.offset,
+                        target: element
+                            .map(|element| format!("output[{element}]"))
+                            .unwrap_or_else(|| "output[?]".to_string()),
+                        expression: value.expression,
+                        value: value.value,
+                    });
                 }
-                expressions.push(TfxExpressionPreview {
-                    op_offset: op.offset,
-                    target,
-                    expression: value.expression,
-                    value: value.value,
-                });
             }
             "pop_temp" => {
                 let value = stack.pop().unwrap_or_else(|| TfxStackValue {
@@ -1346,6 +1409,7 @@ fn collapse_constant_range_op(
             eval_spline8_chain(input, recursion.as_ref()?.value?, values)
         }
         ("gradient4_const", Some(values)) => eval_gradient4(input, values),
+        ("unk3b", Some(values)) => eval_piecewise_vector8(input, values),
         _ => None,
     });
     stack.push(TfxStackValue {
@@ -1363,6 +1427,45 @@ fn collapse_constant_range_op(
         ),
         value,
     });
+}
+
+/// Exact scalar form of Alkahest's bytecode_op_unk3b_const SSE helper.
+/// Marathon encodes this operation as 0x49. Two groups of four clamped ramps
+/// add authored vectors to a base value; preserve the reference reduction order.
+fn eval_piecewise_vector8(input: [f32; 4], constants: &[[f32; 4]]) -> Option<[f32; 4]> {
+    let constants: &[[f32; 4]; 11] = constants.try_into().ok()?;
+    let ramps = |thresholds: [f32; 4], last: f32| {
+        std::array::from_fn::<_, 4, _>(|lane| {
+            let next = if lane < 3 { thresholds[lane + 1] } else { last };
+            let width = next - thresholds[lane];
+            let offset = input[lane] - thresholds[lane];
+            let value = if width.abs() > 0.0001 {
+                offset / width
+            } else {
+                if offset >= 0.0 { 1.0 } else { 0.0 }
+            };
+            // SSE max/min select their second operand on a tie or unordered
+            // comparison, including NaN and signed zero.
+            let value = if value > 0.0 { value } else { 0.0 };
+            if value < 1.0 { value } else { 1.0 }
+        })
+    };
+    let first = ramps(constants[9], constants[10][0]);
+    let second = ramps(constants[10], 1.0);
+    let mut result = constants[0];
+    for component in 0..4 {
+        let weighted = std::array::from_fn::<_, 4, _>(|lane| {
+            constants[component + 1][lane] * first[lane]
+                + constants[component + 5][lane] * second[lane]
+        });
+        let pairs = [weighted[2] + weighted[0], weighted[3] + weighted[1],
+                     weighted[0] + weighted[2], weighted[1] + weighted[3]];
+        let sum = pairs[(component + 3) % 4] + pairs[component];
+        for lane in 0..4 {
+            result[lane] = (if lane == component { sum } else { 0.0 }) + result[lane];
+        }
+    }
+    Some(result)
 }
 
 fn spline_channel_mask(x: [f32; 4], thresholds: [f32; 4]) -> [f32; 4] {
@@ -1676,6 +1779,13 @@ fn parse_stage_slot(detail: &str) -> Option<(&'static str, u8)> {
     Some((stage, slot))
 }
 
+fn tfx_extern_label(value: u8, name: fn(u8) -> &'static str) -> String {
+    match name(value) {
+        "Extern" => format!("Extern[{value}]"),
+        known => known.to_owned(),
+    }
+}
+
 fn parse_tfx_bytecode_op(
     data: &[u8],
     cursor: &mut usize,
@@ -1749,7 +1859,11 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_float",
-                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 4),
+                format!(
+                    "{}+0x{:X}",
+                    tfx_extern_label(extern_, extern_name),
+                    offset as usize * 4
+                ),
             )
         }
         0x3d => {
@@ -1757,7 +1871,11 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_vec4",
-                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 16),
+                format!(
+                    "{}+0x{:X}",
+                    tfx_extern_label(extern_, extern_name),
+                    offset as usize * 16
+                ),
             )
         }
         0x3e => {
@@ -1765,7 +1883,11 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_mat4",
-                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 16),
+                format!(
+                    "{}+0x{:X}",
+                    tfx_extern_label(extern_, extern_name),
+                    offset as usize * 16
+                ),
             )
         }
         0x3f => {
@@ -1773,7 +1895,11 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_texture",
-                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 8),
+                format!(
+                    "{}+0x{:X}",
+                    tfx_extern_label(extern_, extern_name),
+                    offset as usize * 8
+                ),
             )
         }
         0x40 => {
@@ -1781,7 +1907,11 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_u32",
-                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 4),
+                format!(
+                    "{}+0x{:X}",
+                    tfx_extern_label(extern_, extern_name),
+                    offset as usize * 4
+                ),
             )
         }
         0x41 => {
@@ -1789,7 +1919,11 @@ fn parse_tfx_bytecode_op(
             let offset = read_u8()?;
             (
                 "push_extern_uav",
-                format!("{}+0x{:X}", extern_name(extern_), offset as usize * 8),
+                format!(
+                    "{}+0x{:X}",
+                    tfx_extern_label(extern_, extern_name),
+                    offset as usize * 8
+                ),
             )
         }
         0x42 => ("unk42", String::new()),
@@ -1994,6 +2128,7 @@ fn tfx_extern_name(value: u8) -> &'static str {
 /// above unchanged; its bytecode uses the legacy numbering.
 fn tfx_marathon_extern_name(value: u8) -> &'static str {
     match value {
+        0..=23 => tfx_extern_name(value),
         24 => "CuiDrawingShader",
         25..=97 => tfx_extern_name(value - 1),
         98 => "ParticleMeshEmissionCompute",
@@ -2136,9 +2271,46 @@ fn read_i64(data: &[u8], endian: Endian) -> i64 {
     read_u64(data, endian) as i64
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "material_piecewise_reference_tests.rs"]
+mod piecewise_reference_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marathon_constant_buffer_binding_uses_its_authored_stage_layout() {
+        let mut data = [0u8; 0x80];
+        data[0x68..0x6c].copy_from_slice(&3i32.to_le_bytes());
+        data[0x6c..0x70].copy_from_slice(&0x80A9D945u32.to_le_bytes());
+        data[0x70..0x74].copy_from_slice(&7i32.to_le_bytes());
+        data[0x74..0x78].copy_from_slice(&0x80A9D0E9u32.to_le_bytes());
+        assert_eq!(
+            constant_buffer_binding(&data, 0, Endian::Little, true),
+            (Some(3), Some(TagHash(0x80A9D945)))
+        );
+        assert_eq!(
+            constant_buffer_binding(&data, 0, Endian::Little, false),
+            (Some(7), Some(TagHash(0x80A9D0E9)))
+        );
+    }
+
+    #[test]
+    fn constant_buffer_retains_partial_final_register_in_both_endians() {
+        for endian in [Endian::Little, Endian::Big] {
+            let data = (0..34)
+                .flat_map(|i| match endian {
+                    Endian::Little => (i as f32).to_le_bytes(),
+                    Endian::Big => (i as f32).to_be_bytes(),
+                })
+                .collect::<Vec<_>>();
+            let values = parse_constant_buffer_values(&data, endian).unwrap();
+            assert_eq!(values.len(), 9);
+            assert_eq!(values[8], [32.0, 33.0, 0.0, 0.0]);
+        }
+        assert!(parse_constant_buffer_values(&[0; 3], Endian::Little).is_none());
+    }
 
     fn stack_value(value: [f32; 4]) -> TfxStackValue {
         TfxStackValue {
@@ -2385,6 +2557,135 @@ mod tests {
     }
 
     #[test]
+    fn unknown_extern_scopes_retain_identity_and_resolve_independently() {
+        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
+        let decoded = parse_tfx_bytecode_with_constants_dialect(
+            &[0x4b, 108, 7, 0x53, 0, 0x4b, 109, 7, 0x53, 1],
+            &[],
+            true,
+        );
+        assert_eq!(decoded.externs[0].scope, "Extern[108]");
+        assert_eq!(decoded.externs[1].scope, "Extern[109]");
+        let mut inputs = TfxRuntimeInputs::default();
+        inputs
+            .scoped_externs
+            .insert((108, 0x70), TfxValue::Vector([1.0; 4]));
+        inputs
+            .scoped_externs
+            .insert((109, 0x70), TfxValue::Vector([2.0; 4]));
+        let result = execute_preview(&decoded, &[], &inputs, &Default::default());
+        assert_eq!(result.outputs["output[0]"], TfxValue::Vector([1.0; 4]));
+        assert_eq!(result.outputs["output[1]"], TfxValue::Vector([2.0; 4]));
+        assert!(
+            result
+                .dependencies
+                .iter()
+                .all(|dependency| dependency.resolved)
+        );
+        inputs
+            .scoped_externs
+            .insert((109, 0x70), TfxValue::Vector([3.0; 4]));
+        let changed = execute_preview(&decoded, &[], &inputs, &Default::default());
+        assert_eq!(changed.outputs["output[0]"], result.outputs["output[0]"]);
+        assert_eq!(changed.outputs["output[1]"], TfxValue::Vector([3.0; 4]));
+        inputs.scoped_externs.insert(
+            (108, 0x70),
+            TfxValue::Unknown("missing skinning input".into()),
+        );
+        let missing = execute_preview(&decoded, &[], &inputs, &Default::default());
+        assert!(!missing.dependencies[0].resolved);
+        assert!(matches!(missing.outputs["output[0]"], TfxValue::Unknown(_)));
+    }
+
+    #[test]
+    fn marathon_matrix_store_preserves_order_stack_and_missing_row_status() {
+        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
+        let program = parse_tfx_bytecode_with_constants_dialect(
+            &[
+                0x42, 0x00, // scalar/vector beneath matrix stays on stack
+                0x4c, 0x02, 0x1a, // actual View scope matrix source +0x1A0
+                0x55, 0x04, // actual Marathon four-row output store
+                0x53, 0x03,
+            ],
+            &[[91.0; 4]],
+            true,
+        );
+        assert_eq!(program.status, TfxDecodeStatus::Complete);
+        assert_eq!(program.ops[2].name, "pop_output_mat4");
+        let columns = [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+            [13.0, 14.0, 15.0, 16.0],
+        ];
+        let mut inputs = TfxRuntimeInputs::default();
+        for (row, column) in columns.into_iter().enumerate() {
+            inputs
+                .view
+                .insert(0x1a0 + row as u32 * 16, TfxValue::Vector(column));
+        }
+        let result = execute_preview(&program, &[[91.0; 4]], &inputs, &Default::default());
+        assert_eq!(result.outputs.len(), 5);
+        assert_eq!(result.outputs["output[3]"], TfxValue::Vector([91.0; 4]));
+        for (row, column) in columns.into_iter().enumerate() {
+            assert_eq!(
+                result.outputs[&format!("output[{}]", row + 4)],
+                TfxValue::Vector(column)
+            );
+        }
+        assert!(result.dependencies[0].resolved);
+        // A scoped unknown must override a named row and invalidate the whole
+        // matrix dependency, without silently replacing it with another row.
+        inputs
+            .scoped_externs
+            .insert((2, 0x1c0), TfxValue::Unknown("missing column".into()));
+        let missing = execute_preview(&program, &[[91.0; 4]], &inputs, &Default::default());
+        assert!(!missing.dependencies[0].resolved);
+        assert!(matches!(missing.outputs["output[6]"], TfxValue::Unknown(_)));
+        assert_eq!(missing.outputs["output[4]"], result.outputs["output[4]"]);
+        inputs
+            .scoped_externs
+            .insert((2, 0x1c0), TfxValue::Vector([37.0; 4]));
+        let changed = execute_preview(&program, &[[91.0; 4]], &inputs, &Default::default());
+        assert!(changed.dependencies[0].resolved);
+        assert_eq!(changed.outputs["output[6]"], TfxValue::Vector([37.0; 4]));
+    }
+
+    #[test]
+    fn external_matrix_transform_consumes_four_columns() {
+        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
+        let program = parse_tfx_bytecode_with_constants_dialect(
+            &[0x4c, 0x02, 0x1a, 0x42, 0x00, 0x35, 0x53, 0x00],
+            &[[2.0, 3.0, 5.0, 7.0]],
+            true,
+        );
+        let mut inputs = TfxRuntimeInputs::default();
+        for row in 0..4 {
+            inputs.scoped_externs.insert(
+                (2, 0x1a0 + row * 16),
+                TfxValue::Vector(std::array::from_fn(|lane| {
+                    (row * 4 + lane as u32 + 1) as f32
+                })),
+            );
+        }
+        let result = execute_preview(&program, &[[2.0, 3.0, 5.0, 7.0]], &inputs, &Default::default());
+        assert_eq!(
+            result.outputs["output[0]"],
+            TfxValue::Vector([153.0, 170.0, 187.0, 204.0])
+        );
+        assert!(result.dependencies[0].resolved);
+    }
+
+    #[test]
+    fn marathon_unverified_matrix_opcode_remains_explicit() {
+        for opcode in [0x54, 0x56] {
+            let program = parse_tfx_bytecode_with_constants_dialect(&[opcode, 0x00], &[], true);
+            assert_eq!(program.status, TfxDecodeStatus::StoppedAtUnknown);
+            assert_eq!(program.undecoded_bytes, [opcode, 0x00]);
+        }
+    }
+
+    #[test]
     fn decodes_extern_refs() {
         let decoded = parse_tfx_bytecode(&[
             0x3d, 0x02, 0x03, // push_extern_vec4 View+0x30
@@ -2403,6 +2704,98 @@ mod tests {
             decoded.externs[1].hint,
             "material texture-set runtime binding"
         );
+    }
+
+    #[test]
+    fn marathon_frame_and_view_inputs_resolve_with_matching_dependency_status() {
+        use crate::render::tfx::{TfxRuntimeInputs, TfxValue, execute_preview};
+        let program = parse_tfx_bytecode_with_constants_dialect(
+            &[
+                0x4a, 1, 0, 0x53, 0, // authored Frame float at0 -> output0
+                0x4b, 2, 3, 0x53, 1, // authored View vec4 at0x30 -> output1
+                0x4a, 1, 1, 0x53, 2, // authored Frame render time at4 -> output2
+            ],
+            &[],
+            true,
+        );
+        assert_eq!(program.externs[0].scope, "Frame");
+        assert_eq!(program.externs[1].scope, "View");
+        let mut inputs = TfxRuntimeInputs {
+            time_seconds: 2.5,
+            ..Default::default()
+        };
+        let missing_view = execute_preview(&program, &[], &inputs, &Default::default());
+        assert!(missing_view.dependencies[0].resolved);
+        assert!(!missing_view.dependencies[1].resolved);
+        assert!(missing_view.dependencies[2].resolved);
+        assert_eq!(missing_view.outputs["output[2]"], TfxValue::Vector([2.5; 4]));
+        assert_eq!(
+            missing_view.outputs["output[0]"],
+            TfxValue::Vector([2.5; 4])
+        );
+        inputs
+            .view
+            .insert(0x30, TfxValue::Vector([1.0, 2.0, 3.0, 4.0]));
+        inputs.time_seconds = 3.5;
+        let live = execute_preview(&program, &[], &inputs, &Default::default());
+        assert!(live.dependencies.iter().all(|d| d.resolved));
+        assert_eq!(live.outputs["output[0]"], TfxValue::Vector([3.5; 4]));
+        assert_eq!(live.outputs["output[2]"], TfxValue::Vector([3.5; 4]));
+        inputs.frame.insert(4, TfxValue::Scalar(19.0));
+        let separate_clock = execute_preview(&program, &[], &inputs, &Default::default());
+        assert_eq!(separate_clock.outputs["output[0]"], TfxValue::Vector([3.5; 4]));
+        assert_eq!(separate_clock.outputs["output[2]"], TfxValue::Vector([19.0; 4]));
+        inputs.scoped_externs.insert((1, 4), TfxValue::Unknown("missing render time".into()));
+        let missing_render_time = execute_preview(&program, &[], &inputs, &Default::default());
+        assert!(!missing_render_time.dependencies[2].resolved);
+        assert!(matches!(missing_render_time.outputs["output[2]"], TfxValue::Unknown(_)));
+        inputs.scoped_externs.remove(&(1, 4));
+        assert_eq!(
+            live.outputs["output[1]"],
+            TfxValue::Vector([1.0, 2.0, 3.0, 4.0])
+        );
+        inputs
+            .frame
+            .insert(0, TfxValue::Unknown("explicit missing frame".into()));
+        let missing_frame = execute_preview(&program, &[], &inputs, &Default::default());
+        assert!(!missing_frame.dependencies[0].resolved);
+        assert!(matches!(
+            missing_frame.outputs["output[0]"],
+            TfxValue::Unknown(_)
+        ));
+        inputs.frame.insert(0, TfxValue::Scalar(7.0));
+        let explicit_frame = execute_preview(&program, &[], &inputs, &Default::default());
+        assert!(explicit_frame.dependencies[0].resolved);
+        assert_eq!(
+            explicit_frame.outputs["output[0]"],
+            TfxValue::Vector([7.0; 4])
+        );
+        inputs.scoped_externs.insert(
+            (1, 0),
+            TfxValue::Unknown("numeric ID explicitly missing".into()),
+        );
+        let scoped_missing = execute_preview(&program, &[], &inputs, &Default::default());
+        assert!(!scoped_missing.dependencies[0].resolved);
+        assert!(matches!(
+            scoped_missing.outputs["output[0]"],
+            TfxValue::Unknown(_)
+        ));
+        let coverage=parse_tfx_bytecode_with_constants_dialect(&[0x4b,1,0x1e,0x53,2],&[],true);
+        let mut inputs=TfxRuntimeInputs::default();
+        assert!(!execute_preview(&coverage,&[],&inputs, &Default::default()).dependencies[0].resolved);
+        inputs.apply_static_preview_coverage();
+        let analytic=execute_preview(&coverage,&[],&inputs, &Default::default());
+        assert!(analytic.dependencies[0].resolved);
+        assert_eq!(analytic.outputs["output[2]"],TfxValue::Vector([0.0;4]));
+        inputs.frame.insert(0x1e0,TfxValue::Vector([1.0;4]));
+        inputs.apply_static_preview_coverage();
+        assert_eq!(execute_preview(&coverage,&[],&inputs, &Default::default()).outputs["output[2]"],TfxValue::Vector([1.0;4]));
+        inputs.scoped_externs.insert((1,0x1e0),TfxValue::Unknown("explicit missing coverage".into()));
+        assert!(!execute_preview(&coverage,&[],&inputs, &Default::default()).dependencies[0].resolved);
+        inputs.scoped_externs.clear();
+        inputs.frame.insert(0x1e0,TfxValue::Unknown("explicit missing frame coverage".into()));
+        inputs.apply_static_preview_coverage();
+        assert!(!execute_preview(&coverage,&[],&inputs, &Default::default()).dependencies[0].resolved);
     }
 
     #[test]

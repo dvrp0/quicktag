@@ -3242,6 +3242,7 @@ name = "quicktag"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "ash",
  "base64",
  "bincode 2.0.1",
  "binrw",
@@ -3280,6 +3281,7 @@ dependencies = [
  "rustc-hash 2.1.0",
  "serde",
  "serde_json",
+ "sha2",
  "tiger-pkg",
  "tokio",
  "wgpu",

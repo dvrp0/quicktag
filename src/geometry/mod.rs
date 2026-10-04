@@ -1082,6 +1082,31 @@ const CLASS_PATTERN_VECTOR_BINDINGS: u32 = 0x8080AF85;
 const CLASS_PATTERN_OBJECT_CHANNELS: u32 = 0x8080AF86;
 const PATTERN_LOCAL_SCOPE_HASH: u32 = 0x811C9DC5;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PatternObjectChannelEvidence {
+    pub owner: TagHash,
+    pub depth: usize,
+    pub vectors: Vec<[f32; 4]>,
+    pub channels: Vec<PatternObjectChannelDeclaration>,
+    pub bindings: Vec<PatternVectorBindingEvidence>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PatternObjectChannelDeclaration {
+    pub hash: u32,
+    pub bytecode: Vec<u8>,
+    pub constants: Vec<[f32; 4]>,
+    pub interpolation: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PatternVectorBindingEvidence {
+    pub scope: u32,
+    pub parameter: u32,
+    pub vector_index: u32,
+    pub value: Option<[f32; 4]>,
+}
+
 // The pattern compiler hashes the six material parameters independently from
 // their serialized vector positions. Those positions are intentionally
 // shuffled between patterns, so the binding table is the source of truth.
@@ -2277,6 +2302,82 @@ fn descendant_pattern_nodes_with_depth(
         }
     }
     result
+}
+
+/// Captures authored Pattern object-channel declarations and their serialized
+/// vector bindings without assigning runtime semantics to either structure.
+/// A declaration's expression and a binding-table value are distinct evidence;
+/// callers must not treat one as the other's default implicitly.
+pub(crate) fn pattern_object_channel_evidence(
+    cache: &TagCache,
+    root: TagHash,
+) -> Vec<PatternObjectChannelEvidence> {
+    let endian = package_manager().version.endian();
+    descendant_pattern_nodes_with_depth(cache, root, 8)
+        .into_iter()
+        .filter_map(|(owner, depth)| {
+            let data = package_manager().read_tag(owner).ok()?;
+            let arrays = scan_arrays(&data, endian);
+            let channels = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_PATTERN_OBJECT_CHANNELS)
+                .flat_map(|array| {
+                    array_records(&data, array, 0x70)
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| {
+                            let record_offset = array.data_offset + index * 0x70;
+                            Some(PatternObjectChannelDeclaration {
+                                hash: read_u32_at(record, 0, endian)?,
+                                bytecode: read_array(&data, record_offset + 0x08, 1, endian)?
+                                    .to_vec(),
+                                constants: read_array(&data, record_offset + 0x18, 0x10, endian)?
+                                    .chunks_exact(0x10)
+                                    .filter_map(|value| read_vec4_f32(value, 0, endian))
+                                    .collect(),
+                                interpolation: read_u64_at(record, 0x60, endian)?,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            if channels.is_empty() {
+                return None;
+            }
+            let vectors = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_VECTOR4)
+                .flat_map(|array| array_records(&data, array, 0x10))
+                .filter_map(|value| read_vec4_f32(value, 0, endian))
+                .collect::<Vec<_>>();
+            let bindings = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+                .flat_map(|array| array_records(&data, array, 0x0c))
+                .filter_map(|record| {
+                    let scope = read_u32_at(record, 0, endian)?;
+                    let parameter = read_u32_at(record, 4, endian)?;
+                    let vector_index = read_u32_at(record, 8, endian)?;
+                    Some(PatternVectorBindingEvidence {
+                        scope,
+                        parameter,
+                        vector_index,
+                        value: vectors.get(vector_index as usize).copied(),
+                    })
+                })
+                .collect();
+            Some(PatternObjectChannelEvidence {
+                owner,
+                depth,
+                vectors,
+                channels,
+                bindings,
+            })
+        })
+        .collect()
 }
 
 fn weapon_attachment_poses(tag: TagHash) -> Vec<WeaponModAttachmentPose> {
@@ -8876,6 +8977,36 @@ impl GeometryRenderStageAbi {
     }
 }
 
+/// Authored compute part membership, independent of visible surface selection.
+pub(crate) fn geometry_compute_technique(geometry: TagHash, visible_part: usize,
+    range: std::ops::Range<u32>) -> Option<TagHash> {
+    let data = package_manager().read_tag(geometry).ok()?;
+    let endian = package_manager().version.endian();
+    let abi = geometry_render_stage_abi(&data, endian)?;
+    let parts = scan_arrays(&data, endian).into_iter().find(|a| a.class == CLASS_GEOMETRY_PART)?;
+    if visible_part >= parts.count { return None; }
+    let visible=parts.data_offset+visible_part*0x28;
+    if read_u32_at(&data,visible+8,endian)? != range.start
+        || read_u32_at(&data,visible+12,endian)?.checked_add(range.start)? != range.end {
+        return None;
+    }
+    let lod=*data.get(visible+0x1c)?;
+    let lod_run=*data.get(visible+0x1f)?;
+    let mut found=None;
+    for part in abi.part_range(24)? {
+        let offset=parts.data_offset+part*0x28;
+        let start=read_u32_at(&data,offset+8,endian)?;
+        let count=read_u32_at(&data,offset+12,endian)?;
+        if start==range.start && start.checked_add(count)?==range.end
+            && data.get(offset+0x1c)==Some(&lod) && data.get(offset+0x1f)==Some(&lod_run) {
+            let technique=read_tag_at(&data,offset,endian)?;
+            if found.is_some_and(|existing| existing!=technique) { return None; }
+            found=Some(technique);
+        }
+    }
+    found
+}
+
 fn geometry_render_stage_abi(data: &[u8], endian: Endian) -> Option<GeometryRenderStageAbi> {
     let arrays = scan_arrays(data, endian);
     let part_count = arrays
@@ -9047,7 +9178,7 @@ fn goliath_stage_technique_signature(technique: TagHash, cache: &TagCache) -> se
                 "shader": stage.shader.map(|shader| shader.to_string()),
                 "shader_strings": shader_strings,
                 "texture_count": stage.textures.len(),
-                "sampler_count": stage.samplers.len(),
+                "indexed_resource_count": stage.indexed_resources.len(),
                 "constant_count": stage.constants.len(),
                 "inline_constant_count": stage.inline_constants.len(),
                 "bytecode_len": stage.bytecode_len,
@@ -10786,6 +10917,128 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires installed Marathon packages; captures authored Thief compute producers"]
+    fn probes_thief_compute_producer_contract() {
+        use crate::render::technique::{ShaderStage, TechniqueDescriptor};
+        use crate::render::tfx::TfxRuntimeInputs;
+        init_goliath_test_package_manager();
+        let mut reports = Vec::new();
+        for (tag, expected_shader) in [(0x80A9D0EC, 0x80A9BE34), (0x80A9D0F5, 0x80A9A2E2)] {
+            let descriptor =
+                TechniqueDescriptor::load(TagHash(tag)).expect("shell-linked compute technique");
+            let stage = descriptor
+                .stages
+                .iter()
+                .find(|stage| stage.stage == ShaderStage::Compute)
+                .expect("compute stage");
+            assert_eq!(stage.shader, Some(TagHash(expected_shader)));
+            let runtime = stage.runtime_state(&TfxRuntimeInputs::default());
+            reports.push(serde_json::json!({
+                "technique":TagHash(tag).to_string(),"shader":stage.shader.unwrap().to_string(),
+                "constant_buffer_slot":stage.constant_buffer_slot,"external_constant_buffer":stage.constant_buffer.map(|tag|tag.to_string()),
+                "external_registers":stage.external_constants,"inline_registers":stage.inline_constants,
+                "runtime_registers":runtime.constant_registers,"runtime_status":format!("{:?}",runtime.status),
+                "unresolved_dependencies":runtime.unresolved_dependencies,
+                "bindings":runtime.bindings.iter().map(|binding|serde_json::json!({"kind":binding.kind,"slot":binding.slot,"source":binding.source,"resolved":binding.resolved.map(|tag|tag.to_string())})).collect::<Vec<_>>(),
+                "externs":stage.tfx.externs.iter().map(|value|serde_json::json!({"scope_id":value.scope_id,"scope":value.scope,"offset":value.byte_offset,"type":value.value_type})).collect::<Vec<_>>(),
+                "expressions":stage.tfx.expressions.iter().map(|value|serde_json::json!({"target":value.target,"expression":value.expression,"value":value.value})).collect::<Vec<_>>(),
+                "proof":"normal production technique parser; default runtime values are not actual skinning context",
+            }));
+        }
+        let output = std::path::Path::new("target/cryo-runtime-audit");
+        std::fs::create_dir_all(output).unwrap();
+        std::fs::write(
+            output.join("thief-compute-techniques.json"),
+            serde_json::to_vec_pretty(&reports).unwrap(),
+        )
+        .unwrap();
+        eprintln!("captured {} shell-linked compute techniques", reports.len());
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; captures exact compute-stage part membership"]
+    fn probes_runner_compute_part_membership() {
+        use crate::render::technique::{ShaderStage, TechniqueDescriptor};
+        use sha2::Digest;
+        init_goliath_test_package_manager();
+        let endian = package_manager().version.endian();
+        let mut geometries = Vec::new();
+        for tag in [0x80A9D130, 0x80A9E634, 0x80A9D18F,
+            0x80A9CA42, 0x80A9DACF, 0x80A9B52B] {
+            let data = package_manager()
+                .read_tag(TagHash(tag))
+                .expect("actual geometry");
+            let abi = geometry_render_stage_abi(&data, endian).expect("geometry stage ABI");
+            let array = scan_arrays(&data, endian)
+                .into_iter()
+                .find(|a| a.class == CLASS_GEOMETRY_PART)
+                .expect("geometry parts");
+            if matches!(tag, 0x80A9CA42 | 0x80A9DACF | 0x80A9B52B) {
+                let mesh_array=scan_arrays(&data,endian).into_iter()
+                    .find(|a|a.class==CLASS_GEOMETRY_BUFFER_SET).expect("authored buffer set");
+                let mesh=array_records(&data,mesh_array,0x80).into_iter().next().expect("first authored buffer set");
+                let source=authored_geometry_input(TagHash(tag),mesh,&data,endian,
+                    read_geometry_position_transform(&data,endian),read_geometry_uv_transform(&data,endian));
+                let mut streams=Vec::new();
+                for stream in &source.vertex_streams {
+                    let raw=package_manager().read_tag(stream.data_tag).unwrap();
+                    assert_eq!(raw.len(),stream.data_size as usize);
+                    let path=format!("target/runner-float-ia-audit/{:08X}-stream{}.bin",tag,stream.stream_index);
+                    std::fs::create_dir_all("target/runner-float-ia-audit").unwrap();
+                    std::fs::write(&path,&raw).unwrap();
+                    streams.push(serde_json::json!({"slot":stream.stream_index,"header":stream.header_tag.to_string(),
+                        "data":stream.data_tag.to_string(),"stride":stream.stride,"count":stream.element_count,
+                        "sha256":format!("{:x}",sha2::Sha256::digest(&raw)),"path":path}));
+                }
+                let transform=source.position_transform.unwrap();
+                std::fs::write(format!("target/runner-float-ia-audit/{tag:08X}-inputs.json"),
+                    serde_json::to_vec_pretty(&serde_json::json!({"geometry":TagHash(tag).to_string(),
+                        "streams":streams,"palette_present":source.skinning_buffer.is_some(),
+                        "position_scale":transform.scale,"position_offset":transform.offset,
+                        "procedural_scale":transform.procedural_scale})).unwrap()).unwrap();
+                for part in abi.part_range(0).expect("opaque stage") {
+                    let offset=array.data_offset+part*0x28;
+                    let start=read_u32_at(&data,offset+8,endian).unwrap();
+                    let count=read_u32_at(&data,offset+12,endian).unwrap();
+                    let selected=geometry_compute_technique(TagHash(tag),part,start..start+count)
+                        .expect("LOD-owned compute technique");
+                    let descriptor=TechniqueDescriptor::load(selected).unwrap();
+                    let shader=descriptor.stages.iter().find(|s|s.stage==ShaderStage::Compute).unwrap().shader.unwrap();
+                    let expected=if data[offset+0x1c]==3 { 0x80A9B7E4 }
+                        else if tag==0x80A9CA42 { 0x80A9CA3E } else { 0x80A9B7C5 };
+                    assert_eq!(shader,TagHash(expected),"compute producer must retain the visible part's authored LOD category");
+                }
+            }
+            let mut parts = Vec::new();
+            for part in abi.part_range(24).expect("compute skinning stage") {
+                let offset = array.data_offset + part * 0x28;
+                let record = &data[offset..offset + 0x28];
+                let technique = read_tag_at(record, 0, endian).expect("part technique");
+                let descriptor = TechniqueDescriptor::load(technique).expect("compute technique");
+                let compute = descriptor
+                    .stages
+                    .iter()
+                    .find(|s| s.stage == ShaderStage::Compute)
+                    .expect("authored compute stage");
+                assert!(compute.shader.is_some());
+                parts.push(serde_json::json!({"part_index":part,"record_offset":offset,
+                    "technique":technique.to_string(),"compute_shader":compute.shader.unwrap().to_string(),
+                    "raw_u32":(0..10).map(|i|read_u32_at(record,i*4,endian).unwrap()).collect::<Vec<_>>(),
+                    "lod_category":record[0x1c],"change_color_index":record[0x1d],"lod_run":record[0x1f]}));
+            }
+            geometries.push(serde_json::json!({"geometry":TagHash(tag).to_string(),"stage":24,
+                "stage_layout":abi.input_layouts[24],"part_boundaries":abi.boundaries,"parts":parts}));
+        }
+        let output = std::path::Path::new("target/cryo-runtime-audit");
+        std::fs::create_dir_all(output).unwrap();
+        std::fs::write(
+            output.join("runner-compute-parts.json"),
+            serde_json::to_vec_pretty(&geometries).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn decodes_authored_stage8_transmission_color_by_relative_surface_abi() {
         let mut constants = vec![[0.0; 4]; 40];
         constants[18] = [0.048289_683, 0.075825_13, 0.982852_64, 0.0];
@@ -11034,7 +11287,7 @@ mod tests {
                             stage
                                 .constant_buffer_preview
                                 .as_ref()
-                                .map(|buffer| &buffer.first_values),
+                                .map(|buffer| &buffer.values),
                         );
                     }
                 }
@@ -12158,6 +12411,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
+    fn probes_goliath_preview_runtime_scopes() {
+        use sha2::{Digest, Sha256};
+
+        init_goliath_test_package_manager();
+        let cache = quicktag_scanner::load_tag_cache();
+        let output = std::path::Path::new("target/cryo-runtime-audit/scopes");
+        std::fs::create_dir_all(output).expect("scope export directory");
+        let mut inventory = Vec::new();
+        let mut selected = Vec::new();
+        let mut scopes = package_manager().get_all_by_reference(0x808031DC);
+        scopes.sort_by_key(|(tag, _)| tag.0);
+        for (tag, entry) in scopes {
+            let names = cache.hashes.get(&tag).map(|scan| &scan.raw_strings);
+            inventory.push(serde_json::json!({"tag": tag.to_string(), "strings": names}));
+            if !names.is_some_and(|names| names.iter().any(|name| {
+                ["view", "rigid_model", "skinning", "frame"]
+                    .iter()
+                    .any(|needle| name.to_ascii_lowercase().contains(needle))
+            })) {
+                continue;
+            }
+            let bytes = package_manager().read_tag(tag).expect("selected scope bytes");
+            std::fs::write(output.join(format!("{tag}.bin")), &bytes).expect("scope bytes export");
+            let stages = crate::material::scope_stages(&entry, &bytes).into_iter().map(|stage| {
+                serde_json::json!({
+                    "stage": stage.stage,
+                    "constant_buffer_slot": stage.constant_buffer_slot,
+                    "constant_buffer": stage.constant_buffer.map(|tag| tag.to_string()),
+                    "external_constants": stage.constant_buffer_preview.as_ref().map(|buffer| serde_json::json!({
+                        "header": buffer.header_tag.to_string(), "payload": buffer.data_tag.to_string(),
+                        "bytes": buffer.data_len, "values": buffer.values,
+                    })),
+                    "inline_constants": stage.inline_constants,
+                    "constants": stage.constants,
+                    "indexed_resources": stage.indexed_resources.iter().enumerate().map(|(ordinal, sampler)| {
+                        serde_json::json!({
+                            "ordinal": ordinal,
+                            "raw32": sampler.raw32.to_string(),
+                            "raw64": format!("{:016X}", sampler.raw64.0),
+                            "resolved": sampler.resolved.map(|tag| tag.to_string()),
+                        })
+                    }).collect_vec(),
+                    "tfx": {
+                        "status": format!("{:?}", stage.bytecode.status),
+                        "bytes": stage.bytecode.total_bytes,
+                        "ops": stage.bytecode.ops.iter().map(|op| serde_json::json!({
+                            "offset": op.offset, "opcode": op.opcode, "name": op.name,
+                            "detail": op.detail, "extern_scope_id": op.extern_scope_id,
+                        })).collect_vec(),
+                        "bindings": stage.bytecode.bindings.iter().map(|binding| serde_json::json!({
+                            "kind": binding.kind, "stage": binding.stage, "slot": binding.slot,
+                            "source": binding.source,
+                        })).collect_vec(),
+                        "expressions": format!("{:?}", stage.bytecode.expressions),
+                        "externs": format!("{:?}", stage.bytecode.externs),
+                    },
+                })
+            }).collect_vec();
+            selected.push(serde_json::json!({
+                "tag": tag.to_string(), "strings": names,
+                "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                "bytes": bytes.len(), "stages": stages,
+            }));
+        }
+        assert!(!selected.is_empty(), "named runtime scope candidates must be present");
+        std::fs::write("target/cryo-runtime-audit/preview-runtime-scopes.json",
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": 1, "inventory": inventory, "selected": selected,
+                "proof": "fresh packaged s_scope bytes and production parser; string selection is a candidate filter, not live binding ownership",
+            })).unwrap()).expect("runtime scope report");
+        eprintln!("runtime scope candidates={} total={}", selected.len(), inventory.len());
     }
 
     #[test]
@@ -13752,7 +14080,7 @@ mod tests {
                     stage
                         .constant_buffer_preview
                         .as_ref()
-                        .map(|preview| &preview.first_values)
+                        .map(|preview| &preview.values)
                 );
                 eprintln!("  expressions={:?}", stage.bytecode.expressions);
                 eprintln!("  externs={:?}", stage.bytecode.externs);
@@ -14999,7 +15327,7 @@ mod tests {
                         .iter()
                         .find(|stage| stage.stage == "PS")
                         .and_then(|stage| stage.constant_buffer_preview.as_ref())
-                        .and_then(|buffer| buffer.first_values.get(7)),
+                        .and_then(|buffer| buffer.values.get(7)),
                     preview
                         .stages
                         .iter()

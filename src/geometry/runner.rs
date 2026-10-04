@@ -12,6 +12,8 @@ pub struct RunnerShellAssembly {
 #[derive(Clone, Debug)]
 pub struct RunnerShellPart {
     pub component: TagHash,
+    /// Authored ancestry, from selected shell to the nearest owning Pattern.
+    pub pattern_path: Vec<TagHash>,
     pub geometry: Vec<TagHash>,
 }
 
@@ -30,13 +32,13 @@ impl RunnerShellAssembly {
             return None;
         }
         let pattern = model;
-        let mut queue = VecDeque::from([pattern]);
+        let mut queue = VecDeque::from([(pattern, vec![pattern])]);
         let mut seen = rustc_hash::FxHashSet::default();
         let mut seen_geometry = rustc_hash::FxHashSet::default();
-        let mut parts = vec![];
+        let mut parts = Vec::<RunnerShellPart>::new();
         let mut nested_patterns = vec![];
-        while let Some(parent) = queue.pop_front() {
-            if !seen.insert(parent) {
+        while let Some((parent, path)) = queue.pop_front() {
+            if !seen.insert((parent, path.clone())) {
                 continue;
             }
             if parent != pattern
@@ -44,7 +46,7 @@ impl RunnerShellAssembly {
                     .get_entry(parent)
                     .is_some_and(|entry| entry.reference == CLASS_PATTERN)
             {
-                nested_patterns.push(parent);
+                if !nested_patterns.contains(&parent) { nested_patterns.push(parent); }
             }
             let mut geometry = vec![];
             for child in pattern_graph_children(cache, parent) {
@@ -52,9 +54,24 @@ impl RunnerShellAssembly {
                     .get_entry(child)
                     .map(|entry| entry.reference)
                 {
-                    Some(CLASS_PATTERN | CLASS_PATTERN_COMPONENT) => queue.push_back(child),
-                    Some(CLASS_GEOMETRY_RESOURCE) if seen_geometry.insert(child) => {
-                        geometry.push(child)
+                    Some(CLASS_PATTERN) if !path.contains(&child) => {
+                        let mut child_path=path.clone(); child_path.push(child);
+                        queue.push_back((child,child_path));
+                    }
+                    Some(CLASS_PATTERN_COMPONENT) => queue.push_back((child,path.clone())),
+                    Some(CLASS_GEOMETRY_RESOURCE) => {
+                        if seen_geometry.insert(child) {
+                            geometry.push(child);
+                        } else {
+                            // Shared geometry with different object owners has no
+                            // unique local scope. Keep geometry once; reject scope
+                            // assignment rather than picking traversal order.
+                            for part in &mut parts {
+                                if part.geometry.contains(&child) && part.pattern_path != path {
+                                    part.pattern_path.clear();
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -63,6 +80,7 @@ impl RunnerShellAssembly {
                 geometry.sort_unstable();
                 parts.push(RunnerShellPart {
                     component: parent,
+                    pattern_path: path,
                     geometry,
                 });
             }
