@@ -383,6 +383,9 @@ impl ModelsView {
         time_seconds: f32,
         lighting: [f32; 9],
         view: &str,
+        clip: Option<(TagHash, f32)>,
+        list_clips: bool,
+        list_codename: Option<&str>,
         output: &std::path::Path,
     ) -> anyhow::Result<()> {
         let cache = Arc::new(quicktag_scanner::load_tag_cache());
@@ -390,16 +393,29 @@ impl ModelsView {
         let entry = package_manager()
             .get_entry(tag)
             .ok_or_else(|| anyhow::anyhow!("model {tag} is unavailable"))?;
-        let preview = if let Some(shell) = RunnerShellAssembly::resolve(&cache, tag) {
+        let preview = if let Some(mut shell) = RunnerShellAssembly::resolve(&cache, tag) {
+            shell.runner = super::gear::GearView::runner_for_skin(&cache, tag);
             shell.load(cache.clone())
         } else {
+            // A weapon skin is assembled as the Models panel does it: on its
+            // weapon's owner record, with the default mods in the empty slots.
+            let weapon = super::gear::GearView::weapon_for_skin(&cache, tag);
+            let owner = weapon.as_ref().map_or(tag, |weapon| weapon.owner_tag);
+            let socket_owner = weapon.as_ref().and_then(|weapon| weapon.socket_owner).unwrap_or(owner);
+            let attachments = weapon.map_or_else(Vec::new, |_| {
+                weapon_unoccupied_default_mod_patterns(&cache, owner, socket_owner, &[])
+                    .into_iter()
+                    .unique()
+                    .map(|model_tag| WeaponModPreviewAttachment { model_tag, rarity: None, unique_id: 0.5 })
+                    .collect()
+            });
             GeometryTagPreview::load_model_with_weapon_mod_attachments(
                 cache.clone(),
                 tag,
                 &entry,
-                tag,
-                tag,
-                &[],
+                owner,
+                socket_owner,
+                &attachments,
             )
         }
         .ok_or_else(|| anyhow::anyhow!("failed to assemble {tag}"))?;
@@ -418,8 +434,66 @@ impl ModelsView {
             GpuModelPreview::create(&render_state.device, wireframe, fallback_color, &runtime_inputs)
                 .ok_or_else(|| anyhow::anyhow!("failed to create GPU preview for {tag}"))?,
         );
+        if list_clips {
+            match gpu.main_skeleton() {
+                Some(skeleton) => {
+                    println!("SKELETON {} nodes={} runner={}", skeleton.tag, skeleton.names.len(), skeleton.is_runner());
+                    let offered = crate::animation::rig_index().clips_for_model(skeleton, list_codename);
+                    for clip in &offered {
+                        println!(
+                            "OFFERED\t{}\t{}\t{}\t{:08X}\t{:08X}",
+                            clip.tag, clip.frames, clip.slots, clip.rig, clip.name_hash
+                        );
+                    }
+                    let clips = crate::animation::rig_index().model_clips(skeleton);
+                    for (kind, list) in [("own", &clips.own), ("rig", &clips.same_rig)] {
+                        for clip in list {
+                            println!(
+                                "MODELCLIP\t{kind}\t{}\t{}\t{}\t{:08X}\t{:08X}",
+                                clip.tag, clip.frames, clip.slots, clip.rig, clip.name_hash
+                            );
+                        }
+                    }
+                }
+                None => println!("SKELETON none matched"),
+            }
+        }
+        // A negative frame poses the skeleton in its own bind pose, which must
+        // render exactly like the unposed model.
+        let pose = clip
+            .map(|(clip_tag, frame)| -> anyhow::Result<_> {
+                let clip = crate::animation::Clip::load(clip_tag)
+                    .ok_or_else(|| anyhow::anyhow!("{clip_tag} is not an animation clip"))?;
+                let pose = gpu
+                    .clip_pose(&clip, frame)
+                    .ok_or_else(|| anyhow::anyhow!("no runner skeleton matches {tag}"))?;
+                println!(
+                    "ANIMATION clip={clip_tag} slots={} frames={} posed_sources={}/{}",
+                    clip.slots,
+                    clip.frames,
+                    pose.sources.iter().flatten().count(),
+                    pose.sources.len()
+                );
+                Ok(Arc::new(pose))
+            })
+            .transpose()?;
         for line in gpu.inspection_lines() {
             println!("{line}");
+        }
+        // Object channels the Pattern graph declares and the vectors it binds.
+        for scope in crate::geometry::pattern_object_channel_evidence(&cache, tag) {
+            println!(
+                "CHANNELS owner={} depth={} declared=[{}]",
+                scope.owner,
+                scope.depth,
+                scope.channels.iter().map(|channel| format!("{:08X}", channel.hash)).join(" ")
+            );
+            for binding in &scope.bindings {
+                println!(
+                    "BINDING owner={} scope={:08X} parameter={:08X} value={:?}",
+                    scope.owner, binding.scope, binding.parameter, binding.value
+                );
+            }
         }
         // What the package authors, independent of what the preview selects.
         let mut techniques = std::collections::BTreeMap::<TagHash, (TagHash, std::collections::BTreeSet<u8>)>::new();
@@ -428,11 +502,12 @@ impl ModelsView {
                 format!("{}:stride{}:type{}:count{}", stream.data_tag, stream.stride, stream.vertex_type, stream.element_count)
             };
             println!(
-                "INPUT geometry={} streams=[{}] color={} skinning={}",
+                "INPUT geometry={} streams=[{}] color={} skinning={} uv={:?}",
                 input.geometry,
                 input.vertex_streams.iter().map(|stream| format!("{}={}", stream.stream_index, buffer(stream))).join(", "),
                 input.color_buffer.as_ref().map_or("none".to_string(), buffer),
                 input.skinning_buffer.as_ref().map_or("none".to_string(), buffer),
+                input.uv_transform.map(|uv| (uv.scale, uv.offset)),
             );
             for part in crate::geometry::geometry_stage_parts(input.geometry) {
                 println!(
@@ -467,9 +542,12 @@ impl ModelsView {
                     .map(|op| format!("0x{:02X}", op.opcode)).unique().join(",");
                 let clock = stage.tfx.externs.iter()
                     .any(|external| external.scope == "Frame" && matches!(external.byte_offset, 0 | 4));
+                // The eight runtime-only View rows behind the reflection highlight lookup.
+                let planes = stage.tfx.externs.iter()
+                    .any(|external| external.scope == "View" && (0x470..=0x4e0).contains(&external.byte_offset));
                 let state = stage.runtime_state(&inputs);
                 println!(
-                    "TECHNIQUE {technique_tag} render_stages={stages:?} shader_stage={:?} shader={} program={} tfx={:?} clock={clock} unknown_ops=[{unknown_ops}] unresolved={:?}",
+                    "TECHNIQUE {technique_tag} render_stages={stages:?} shader_stage={:?} shader={} program={} tfx={:?} clock={clock} planes={planes} unknown_ops=[{unknown_ops}] unresolved={:?}",
                     stage.stage,
                     stage.shader.map_or("none".to_string(), |shader| shader.to_string()),
                     registered.unwrap_or_else(|| "none".to_string()),
@@ -503,20 +581,24 @@ impl ModelsView {
                         "normals" => LightingModel::SurfaceNormals,
                         "properties" => LightingModel::SurfaceProperties,
                         "emissive" => LightingModel::SurfaceEmissive,
+                        "fallback" => LightingModel::TigerGgxCompatibility,
                         _ => LightingModel::TigerGgxApproximation,
                     },
+                    // Channel views are measurements: no filmic curve on them.
+                    tone_mapping: view == "final",
                     light_color: [lighting[0], lighting[1], lighting[2]],
                     ambient_sky_color: [lighting[3], lighting[4], lighting[5]],
                     ambient_ground_color: [lighting[6], lighting[7], lighting[8]],
                     ..Default::default()
                 },
             );
-            if callback.resources_ready() {
+            // Fallback materials draw a placeholder until the cache has theirs.
+            if callback.resources_ready() && !texture_cache.is_loading_textures() {
                 break callback;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        callback.with_export_focus(zoom, focus).export_image(
+        callback.with_pose(pose).with_export_focus(zoom, focus).export_image(
             render_state,
             output,
             [SIZE, SIZE],
@@ -1130,7 +1212,8 @@ fn runner_model_index(
         .runner_skins
         .iter()
         .filter_map(|skin| {
-            let assembly = RunnerShellAssembly::resolve(cache, skin.model_tag)?;
+            let mut assembly = RunnerShellAssembly::resolve(cache, skin.model_tag)?;
+            assembly.runner = skin.runner;
             Some((assembly.pattern, assembly))
         })
         .collect()
@@ -1153,6 +1236,24 @@ fn runner_model_root(
 impl View for ModelsView {
     fn view(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui) -> Option<ViewAction> {
         let mut action = None;
+
+        // Tell the animation panel which runner is on screen and how runners are named.
+        let mut animation = ModelAnimationState::load(ui.ctx());
+        animation.model_shell = self
+            .selected_model
+            .and_then(|model| runner_skin_for_model(&self.weapon_catalog, model))
+            .map(|skin| skin.shell_name.clone());
+        if animation.runners.is_empty() {
+            animation.runners = Arc::new(
+                self.weapon_catalog
+                    .runner_skins
+                    .iter()
+                    .filter_map(|skin| Some((skin.archetype.clone()?, skin.shell_name.clone())))
+                    .unique()
+                    .collect(),
+            );
+        }
+        animation.store(ui.ctx());
 
         egui::SidePanel::left("models_left_panel")
             .resizable(true)
@@ -2088,6 +2189,251 @@ fn lighting_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
         });
 }
 
+/// Clip playback chosen in the model viewport. Kept in egui memory so every
+/// viewport shares it and switching skins keeps the clip playing.
+#[derive(Clone)]
+struct ModelAnimationState {
+    clip: Option<Arc<crate::animation::Clip>>,
+    playing: bool,
+    frame: f32,
+    speed: f32,
+    filter: String,
+    group: ClipGroupChoice,
+    /// Runner codenames with the shell name each one is shown as.
+    runners: Arc<Vec<(String, String)>>,
+    /// The viewed model's clips, kept per skeleton and runner codename.
+    offered: Option<(TagHash, Option<String>, Arc<Vec<crate::animation::ClipInfo>>)>,
+    /// The selected clip cannot drive the viewed model.
+    unposable: bool,
+    /// Shell name of the runner whose skin the Models view has selected.
+    model_shell: Option<String>,
+}
+
+/// Which clips the animation panel lists.
+#[derive(Clone, PartialEq)]
+enum ClipGroupChoice {
+    /// The clips the packages tie to whichever model the viewport shows.
+    ViewedRunner,
+    Runner(String),
+    /// A rig the packages do not name, identified by its first clip.
+    Rig(TagHash),
+    All,
+}
+
+impl Default for ModelAnimationState {
+    fn default() -> Self {
+        Self {
+            clip: None,
+            playing: true,
+            frame: 0.0,
+            speed: 1.0,
+            filter: String::new(),
+            group: ClipGroupChoice::ViewedRunner,
+            runners: Default::default(),
+            model_shell: None,
+            offered: None,
+            unposable: false,
+        }
+    }
+}
+
+impl ModelAnimationState {
+    fn id() -> egui::Id {
+        egui::Id::new("model_animation_state")
+    }
+
+    fn load(ctx: &egui::Context) -> Self {
+        ctx.data(|data| data.get_temp(Self::id())).unwrap_or_default()
+    }
+
+    fn store(self, ctx: &egui::Context) {
+        ctx.data_mut(|data| data.insert_temp(Self::id(), self));
+    }
+
+    /// Advance playback and pose `preview` at the current frame. Models that
+    /// the clip was not authored for stay unposed.
+    fn pose(&mut self, ui: &egui::Ui, preview: &GpuModelPreview) -> Option<Arc<crate::animation::ModelPose>> {
+        let clip = self.clip.clone()?;
+        let pose = preview.clip_pose(&clip, self.frame);
+        self.unposable = pose.is_none();
+        let pose = pose?;
+        if self.playing && clip.frames > 1 {
+            let step = ui.input(|input| input.stable_dt) * crate::animation::CLIP_FRAMES_PER_SECOND * self.speed;
+            self.frame = (self.frame + step).rem_euclid((clip.frames - 1) as f32);
+            ui.ctx().request_repaint();
+        }
+        Some(Arc::new(pose))
+    }
+}
+
+/// A clip's recovered name, or its name hash when the wordlist has no match.
+fn clip_label(name_hash: u32) -> String {
+    crate::animation::runner_clip_names_if_ready()
+        .and_then(|names| names.get(&name_hash))
+        .cloned()
+        .unwrap_or_else(|| format!("{name_hash:08X}"))
+}
+
+fn model_animation_panel(ui: &mut egui::Ui, preview: Option<&GpuModelPreview>) {
+    // A fixed width keeps the popup still while clip names resolve.
+    ui.set_width(420.0);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    let mut state = ModelAnimationState::load(ui.ctx());
+    ui.strong("Animation");
+    match state.clip.clone() {
+        Some(clip) => {
+            ui.horizontal(|ui| {
+                ui.monospace(format!("{}  {}", clip.tag, clip_label(clip.name_hash)));
+                if ui.button("Clear").clicked() {
+                    state.clip = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button(if state.playing { "Pause" } else { "Play" }).clicked() {
+                    state.playing = !state.playing;
+                }
+                if ui.button("Restart").clicked() {
+                    state.frame = 0.0;
+                }
+                ui.label(format!("{:.1} s", clip.duration_seconds()));
+            });
+            let last_frame = (clip.frames - 1) as f32;
+            if ui.add(egui::Slider::new(&mut state.frame, 0.0..=last_frame.max(1.0)).text("Frame")).changed() {
+                state.playing = false;
+            }
+            ui.add(egui::Slider::new(&mut state.speed, 0.0..=2.0).text("Speed"));
+            if state.unposable {
+                ui.colored_label(ui.visuals().warn_fg_color, "This clip was not authored for the rig of the viewed model.");
+            }
+        }
+        None => {
+            ui.label("Pick a clip to pose the model shown in the viewport.");
+        }
+    }
+    ui.separator();
+
+    let groups = crate::animation::runner_clip_groups();
+    let runners = state.runners.clone();
+    let model_shell = state.model_shell.clone();
+    let runner_label = |codename: &str| {
+        runners
+            .iter()
+            .find(|(candidate, _)| candidate == codename)
+            .map_or_else(|| codename.to_owned(), |(_, shell)| format!("{shell} ({codename})"))
+    };
+    // The viewed model's clips: a named runner's by codename, anything else
+    // through the entity definitions built on its skeleton.
+    let viewed_codename = model_shell
+        .as_ref()
+        .and_then(|shell| runners.iter().find(|(_, candidate)| candidate == shell))
+        .map(|(codename, _)| codename.as_str());
+    let viewed_skeleton = preview.and_then(GpuModelPreview::main_skeleton);
+    // Entity definitions tie the model's skeleton to its clips; indexing them
+    // happens once, off the UI thread.
+    let index = crate::animation::rig_index_if_ready();
+    if index.is_none() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Indexing animations…");
+        });
+        ui.ctx().request_repaint();
+    }
+    // Resolving a model's clips reads clip data, so keep the answer per model.
+    let viewed_clips = match (index, viewed_skeleton) {
+        (Some(index), Some(skeleton)) => {
+            let key = (skeleton.tag, viewed_codename.map(str::to_owned));
+            if state.offered.as_ref().is_none_or(|(tag, codename, _)| (*tag, codename) != (key.0, &key.1)) {
+                let clips = index.clips_for_model(skeleton, viewed_codename);
+                state.offered = Some((key.0, key.1, Arc::new(clips)));
+            }
+            state.offered.as_ref().map(|(_, _, clips)| clips.clone())
+        }
+        _ => None,
+    };
+    // Only runners can fall back to the clips every runner shares.
+    let viewed_is_runner = viewed_skeleton.is_none_or(|skeleton| skeleton.is_runner());
+    let choice_label = |choice: &ClipGroupChoice| match choice {
+        ClipGroupChoice::ViewedRunner => match &model_shell {
+            Some(shell) => format!("This model: {shell}"),
+            None => "This model".to_owned(),
+        },
+        ClipGroupChoice::Runner(codename) => runner_label(codename),
+        ClipGroupChoice::Rig(first_clip) => groups
+            .iter()
+            .find(|group| group.clips[0].tag == *first_clip)
+            .map_or_else(String::new, |group| {
+                let sizes = group.slot_counts.iter().join("/");
+                format!("Unnamed rig, {sizes} nodes ({} clips)", group.clips.len())
+            }),
+        ClipGroupChoice::All => "All shared clips".to_owned(),
+    };
+    egui::ComboBox::from_label("Clips")
+        .width(300.0)
+        .selected_text(choice_label(&state.group))
+        .show_ui(ui, |ui| {
+            let options = [ClipGroupChoice::ViewedRunner]
+                .into_iter()
+                .chain(groups.iter().map(|group| match &group.codename {
+                    Some(codename) => ClipGroupChoice::Runner(codename.clone()),
+                    None => ClipGroupChoice::Rig(group.clips[0].tag),
+                }))
+                .chain([ClipGroupChoice::All]);
+            for option in options {
+                let label = choice_label(&option);
+                ui.selectable_value(&mut state.group, option, label);
+            }
+        });
+    // A runner the packages give no clips of its own falls back to the shared list.
+    let listed = match &state.group {
+        ClipGroupChoice::ViewedRunner => viewed_clips
+            .filter(|clips| !clips.is_empty() || !viewed_is_runner)
+            .map(|clips| clips.to_vec()),
+        ClipGroupChoice::Runner(codename) => groups
+            .iter()
+            .find(|group| group.codename.as_deref() == Some(codename.as_str()))
+            .map(|group| group.clips.clone()),
+        ClipGroupChoice::Rig(first_clip) => {
+            groups.iter().find(|group| group.clips[0].tag == *first_clip).map(|group| group.clips.clone())
+        }
+        ClipGroupChoice::All => None,
+    }
+    .unwrap_or_else(|| crate::animation::runner_clips().to_vec());
+
+    ui.horizontal(|ui| {
+        ui.label("Filter");
+        ui.add(egui::TextEdit::singleline(&mut state.filter).desired_width(f32::INFINITY));
+    });
+    let filter = state.filter.trim().to_lowercase();
+    let clips = listed
+        .iter()
+        .filter(|clip| {
+            filter.is_empty()
+                || clip.tag.to_string().to_lowercase().contains(&filter)
+                || clip_label(clip.name_hash).to_lowercase().contains(&filter)
+        })
+        .collect_vec();
+    ui.label(format!("{} clips", clips.len()));
+    let row_height = ui.spacing().interact_size.y;
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, clips.len(), |ui, rows| {
+            // Every row spans the list so rows never resize with their text.
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                for clip in &clips[rows] {
+                    let selected = state.clip.as_ref().is_some_and(|current| current.tag == clip.tag);
+                    let label = format!("{}  {:>4}f  {}", clip.tag, clip.frames, clip_label(clip.name_hash));
+                    if ui.selectable_label(selected, egui::RichText::new(label).monospace()).clicked() {
+                        state.clip = crate::animation::Clip::load(clip.tag).map(Arc::new);
+                        state.frame = 0.0;
+                        state.playing = true;
+                    }
+                }
+            });
+        });
+    state.store(ui.ctx());
+}
+
 fn image_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
     ui.set_min_width(360.0);
 
@@ -2166,6 +2512,36 @@ fn image_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
     );
 }
 
+/// A panel toggled by a toolbar button. Unlike egui's memory-tracked popups it
+/// stays open while a dropdown inside it is open or was just used: a combo box
+/// is a popup of its own, and clicking one of its items is a click outside the panel.
+fn toolbar_popup(button: &egui::Response, content: impl FnOnce(&mut egui::Ui)) {
+    let ctx = button.ctx.clone();
+    let open_slot = egui::Id::new("model_toolbar_open_panel");
+    let nested_slot = egui::Id::new("model_toolbar_nested_popup");
+    let id = egui::Popup::default_response_id(button);
+    let mut open_panel = ctx.data(|data| data.get_temp::<Option<egui::Id>>(open_slot)).flatten();
+    if button.clicked() {
+        open_panel = (open_panel != Some(id)).then_some(id);
+    }
+    let mut open = open_panel == Some(id);
+    if open {
+        let nested_before = ctx.data(|data| data.get_temp::<bool>(nested_slot)).unwrap_or(false);
+        let response = egui::Popup::from_response(button)
+            .open_bool(&mut open)
+            .align(egui::RectAlign::BOTTOM_END)
+            .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+            .show(content);
+        let nested_now = egui::Popup::is_any_open(&ctx);
+        let clicked_outside = response.is_some_and(|response| response.response.clicked_elsewhere());
+        if !open || (clicked_outside && !button.clicked() && !nested_before && !nested_now) {
+            open_panel = None;
+        }
+        ctx.data_mut(|data| data.insert_temp(nested_slot, nested_now));
+    }
+    ctx.data_mut(|data| data.insert_temp(open_slot, open_panel));
+}
+
 fn model_viewport_toolbar(
     ctx: &egui::Context,
     rect: egui::Rect,
@@ -2185,33 +2561,25 @@ fn model_viewport_toolbar(
             model_overlay_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let lighting = ui.button("Lighting");
-                    egui::Popup::from_toggle_button_response(&lighting)
-                        .align(egui::RectAlign::BOTTOM_END)
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| lighting_panel(ui, environment));
+                    toolbar_popup(&lighting, |ui| lighting_panel(ui, environment));
 
                     let channel = ui.add_enabled(channels.is_some(), egui::Button::new("Channel"));
-                    egui::Popup::from_toggle_button_response(&channel)
-                        .align(egui::RectAlign::BOTTOM_END)
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| {
+                    toolbar_popup(&channel, |ui| {
                             if let Some(channels) = channels {
                                 model_channel_panel(ui, channels);
                             }
                         });
 
                     let image = ui.button("Image");
-                    egui::Popup::from_toggle_button_response(&image)
-                        .align(egui::RectAlign::BOTTOM_END)
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| image_panel(ui, environment));
+                    toolbar_popup(&image, |ui| image_panel(ui, environment));
+
+                    let animation =
+                        ui.add_enabled(gpu_preview.is_some(), egui::Button::new("Animation"));
+                    toolbar_popup(&animation, |ui| model_animation_panel(ui, gpu_preview.map(Arc::as_ref)));
 
                     if show_textures {
                         let textures_button = ui.button("Textures");
-                        egui::Popup::from_toggle_button_response(&textures_button)
-                            .align(egui::RectAlign::BOTTOM_END)
-                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                            .show(|ui| {
+                        toolbar_popup(&textures_button, |ui| {
                                 ui.set_min_width(500.0);
                                 egui::ScrollArea::vertical()
                                     .max_height(560.0)
@@ -2227,10 +2595,7 @@ fn model_viewport_toolbar(
 
                     let evidence =
                         ui.add_enabled(gpu_preview.is_some(), egui::Button::new("Render evidence"));
-                    egui::Popup::from_toggle_button_response(&evidence)
-                        .align(egui::RectAlign::BOTTOM_END)
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| {
+                    toolbar_popup(&evidence, |ui| {
                             if let Some(gpu_preview) = gpu_preview {
                                 render_evidence_panel(ui, gpu_preview);
                             }
@@ -2660,6 +3025,9 @@ pub(super) fn model_wireframe_ui(
             ui.ctx().pixels_per_point(),
             *environment,
         );
+        let mut animation = ModelAnimationState::load(ui.ctx());
+        let callback = callback.with_pose(animation.pose(ui, gpu_preview));
+        animation.store(ui.ctx());
         callback.show_loading_status(ui, rect);
         ui.painter()
             .add(Callback::new_paint_callback(rect, callback));

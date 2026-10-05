@@ -90,7 +90,17 @@ pub(crate) struct StaticMesh {
     pub frames: wgpu::Buffer,
     count: u32,
     generated: std::sync::atomic::AtomicBool,
+    posed: std::sync::atomic::AtomicBool,
+    /// Constant row holding the skinning mode; `None` for float sources,
+    /// whose POSITION.w does not carry bone data.
+    pose_mode_row: Option<u64>,
 }
+
+/// Bone capacity of the palette image: palette records index bones with one byte.
+const MAX_BONES: usize = 256;
+
+/// Factor by which a posed mesh widens its packed position range.
+pub(crate) const POSED_POSITION_RANGE: f32 = 4.0;
 
 impl StaticMesh {
     pub fn new(
@@ -271,21 +281,36 @@ impl StaticMesh {
             constants: buffer(
                 "viewer rigid mesh constants",
                 bytemuck::cast_slice(&constants),
-                wgpu::BufferUsages::UNIFORM | if cfg!(test) {
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | if cfg!(test) {
                     wgpu::BufferUsages::COPY_SRC
                 } else { wgpu::BufferUsages::empty() },
             ),
             source: source.clone(),
             palette: palette_buffer,
+            // Two float4 rows (real, dual quaternion) per bone. Identity until
+            // `set_pose` uploads an animated palette and selects mode 1.
             bones: buffer(
-                "viewer rigid branch unused bones",
-                bytemuck::cast_slice(&[0u32; 12]),
-                storage,
+                "viewer bone dual quaternions",
+                bytemuck::cast_slice(
+                    &(0..MAX_BONES)
+                        .flat_map(|_| [[0.0f32, 0.0, 0.0, 1.0], [0.0; 4]])
+                        .collect::<Vec<_>>(),
+                ),
+                storage | wgpu::BufferUsages::COPY_DST,
             ),
+            // The row after the remap/vertex-count prefix selects the producer's
+            // skinning mode: 0 passes positions through, 1 blends dual quaternions.
+            pose_mode_row: (source_stride == 24).then_some(if procedural {
+                15
+            } else if shifted_head {
+                9
+            } else {
+                8
+            }),
             batch: buffer(
                 "viewer rigid mesh batch",
                 bytemuck::cast_slice(&[2u32, 0, 1.0f32.to_bits(), 0, 0, 0]),
-                storage,
+                storage | wgpu::BufferUsages::COPY_DST,
             ),
             unused: buffer(
                 "viewer rigid branch unused inputs",
@@ -309,6 +334,7 @@ impl StaticMesh {
             ),
             count,
             generated: std::sync::atomic::AtomicBool::new(false),
+            posed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -390,6 +416,31 @@ impl StaticMesh {
             | super::authored_program::DescriptorAbi::BodyProceduralComputeStorage
             | super::authored_program::DescriptorAbi::Cloth46RowComputeStorage));
         &self.bones
+    }
+
+    /// Upload a posed bone palette (two rows per bone) and regenerate the
+    /// packed positions, or return to the unposed pass-through with `None`.
+    pub fn set_pose(&self, queue: &wgpu::Queue, bones: Option<&[[f32; 4]]>) {
+        let Some(row) = self.pose_mode_row else { return };
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        // An unposed mesh stays generated once; only leaving a pose regenerates it.
+        if !self.posed.swap(bones.is_some(), relaxed) && bones.is_none() { return; }
+        if let Some(bones) = bones {
+            let bones = &bones[..bones.len().min(MAX_BONES * 2)];
+            queue.write_buffer(&self.bones, 0, bytemuck::cast_slice(bones));
+        }
+        // Batch word 2 scales positions before packing: a posed mesh may leave its
+        // bind bounds, so pack it over a wider range its consumers undo.
+        let pack_scale = if bones.is_some() { 1.0 / POSED_POSITION_RANGE } else { 1.0f32 };
+        queue.write_buffer(&self.batch, 8, bytemuck::bytes_of(&pack_scale));
+        let mode = [if bones.is_some() { 1.0f32 } else { 0.0 }, 0.0, 0.0, 0.0];
+        queue.write_buffer(&self.constants, row * 16, bytemuck::cast_slice(&mode));
+        self.generated.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `set_pose` can drive this mesh.
+    pub fn poseable(&self) -> bool {
+        self.pose_mode_row.is_some()
     }
 
     pub fn dispatch(&self) -> [u32; 3] {

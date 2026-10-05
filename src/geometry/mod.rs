@@ -595,6 +595,10 @@ pub struct TransmissionMaterial {
     /// `(opacity, scene gain)` of a refractive-glass program. Its colours are
     /// the near and far absorption tints applied to the scene behind it.
     pub absorption: Option<[f32; 2]>,
+    /// Rows of a halftone-glow program: scroll rates, noise remap, dot grid
+    /// and dot/alpha remap. Its colours are the two glow tints (gain in the
+    /// first alpha) and its surfaces the two noise transforms at time zero.
+    pub halftone: Option<[[f32; 4]; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5923,7 +5927,84 @@ fn transmission_material_for_technique(technique: TagHash) -> Option<Transmissio
     let MaterialPreviewKind::Technique(preview) = preview.kind;
     let stage = preview.stages.iter().find(|stage| stage.stage == "PS")?;
     refractive_glass_material(stage)
+        .or_else(|| halftone_glow_material(technique, stage))
         .or_else(|| transmission_material_from_constants(&stage.inline_constants))
+}
+
+/// Constant rows a halftone-glow pixel program reads, taken from its source:
+/// two scrolling samples of one noise texture are multiplied and remapped,
+/// a dot grid `frac(uv * grid) - centre` is subtracted, and what remains
+/// lights the surface additively in a colour between the two tints.
+struct HalftoneGlowRows {
+    source_sha256: [u8; 32],
+    tints: [usize; 2],
+    noise_transforms: [usize; 2],
+    noise_remap: usize,
+    noise_gain: usize,
+    tint_exponent: usize,
+    grid: usize,
+    centre: usize,
+    dot_remap: usize,
+    alpha_remap: usize,
+    gains: [usize; 2],
+}
+
+const HALFTONE_GLOW_PROGRAMS: &[HalftoneGlowRows] = &[HalftoneGlowRows {
+    // PS 80AA01D0 (Outland Dusk Eliminator side panels).
+    source_sha256: crate::render::authored_program::decode_sha256(
+        "d8e022b69d8f8b1aaed8696dceefebf6ae81286ec5308f3a92e35306982f7c4a",
+    ),
+    tints: [17, 18],
+    noise_transforms: [19, 20],
+    noise_remap: 21,
+    noise_gain: 22,
+    tint_exponent: 23,
+    grid: 24,
+    centre: 25,
+    dot_remap: 27,
+    alpha_remap: 29,
+    gains: [31, 32],
+}];
+
+fn halftone_glow_material(
+    technique: TagHash,
+    stage: &crate::material::TechniqueStagePreview,
+) -> Option<TransmissionMaterial> {
+    use sha2::{Digest, Sha256};
+    let entry = package_manager().get_entry(stage.shader?)?;
+    let payload = package_manager().read_tag(TagHash(entry.reference)).ok()?;
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+    let rows = HALFTONE_GLOW_PROGRAMS.iter().find(|rows| rows.source_sha256 == digest)?;
+    // The noise transforms scroll with the clock: evaluate them a second
+    // apart and hand the shader the rate.
+    let descriptor = crate::render::technique::TechniqueDescriptor::load(technique)?;
+    let pixel = descriptor.stages.iter().find(|stage| stage.stage == crate::render::technique::ShaderStage::Pixel)?;
+    let at = |seconds: f32| {
+        let mut inputs = crate::render::tfx::TfxRuntimeInputs::default();
+        inputs.apply_marathon_global_defaults();
+        inputs.time_seconds = seconds;
+        pixel.runtime_state(&inputs).constant_registers
+    };
+    let (start, later) = (at(0.0), at(1.0));
+    let row = |index: usize| start.get(index).copied();
+    let rate = |index: usize| Some([later.get(index)?[2] - row(index)?[2], later.get(index)?[3] - row(index)?[3]]);
+    let gain = row(rows.gains[0])?[0] * row(rows.gains[1])?[0];
+    let (rate_a, rate_b) = (rate(rows.noise_transforms[0])?, rate(rows.noise_transforms[1])?);
+    Some(TransmissionMaterial {
+        colors: [
+            [row(rows.tints[0])?[0], row(rows.tints[0])?[1], row(rows.tints[0])?[2], gain],
+            [row(rows.tints[1])?[0], row(rows.tints[1])?[1], row(rows.tints[1])?[2], 1.0],
+        ],
+        surfaces: [row(rows.noise_transforms[0])?, row(rows.noise_transforms[1])?],
+        color_count: 2,
+        absorption: None,
+        halftone: Some([
+            [rate_a[0], rate_a[1], rate_b[0], rate_b[1]],
+            [row(rows.noise_remap)?[0], row(rows.noise_remap)?[1], row(rows.noise_gain)?[0], row(rows.tint_exponent)?[0]],
+            [row(rows.grid)?[0], row(rows.grid)?[1], row(rows.centre)?[0], row(rows.centre)?[1]],
+            [row(rows.dot_remap)?[0], row(rows.dot_remap)?[1], row(rows.alpha_remap)?[0], row(rows.alpha_remap)?[1]],
+        ]),
+    })
 }
 
 /// Constant rows a refractive-glass pixel program reads, taken from its source:
@@ -5963,6 +6044,7 @@ fn refractive_glass_material(
         surfaces: [[0.0; 4]; 2],
         color_count: 2,
         absorption: Some([row(rows.opacity)?[0], row(rows.gain)?[0]]),
+        halftone: None,
     })
 }
 
@@ -6037,6 +6119,7 @@ fn transmission_material_from_constants(constants: &[[f32; 4]]) -> Option<Transm
         surfaces: [surfaces[0], surfaces[1]],
         color_count,
         absorption: None,
+        halftone: None,
     })
 }
 
@@ -6128,6 +6211,7 @@ fn stage8_alpha_color_material(constants: &[[f32; 4]]) -> Option<TransmissionMat
         surfaces: [surfaces[0], surfaces[1]],
         color_count,
         absorption: None,
+        halftone: None,
     })
 }
 

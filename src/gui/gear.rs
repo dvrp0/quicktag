@@ -337,6 +337,10 @@ pub(super) struct ModelMeleeSkinEntry {
 pub(super) struct ModelRunnerSkinEntry {
     pub(super) name: String,
     pub(super) shell_name: String,
+    /// Internal runner codename from the skin's `heroes.<codename>.` path.
+    pub(super) archetype: Option<String>,
+    /// The runner's own entity definition, which carries its default gear.
+    pub(super) runner: Option<TagHash>,
     pub(super) model_tag: TagHash,
     pub(super) color: Color32,
 }
@@ -481,6 +485,57 @@ impl GearView {
         Ok(exported)
     }
 
+    /// The model catalogue as the Models panel receives it.
+    fn load_model_catalog(cache: &quicktag_scanner::TagCache) -> Result<ModelWeaponCatalog, String> {
+        let strings = Arc::new(
+            quicktag_strings::localized::create_stringmap_for_language(LocalizedLanguage::English)
+                .map_err(|error| format!("Failed to load English localized strings: {error:#}"))?,
+        );
+        let mut view = Self::new(strings);
+        if let Some(error) = view.load_error() {
+            return Err(error.to_owned());
+        }
+        view.reconcile_weapon_skin_models(cache);
+        Ok(view.model_weapon_catalog())
+    }
+
+    /// The weapon a skin's model belongs to.
+    pub(super) fn weapon_for_skin(cache: &quicktag_scanner::TagCache, model_tag: TagHash) -> Option<ModelWeaponEntry> {
+        Self::load_model_catalog(cache).ok()?.weapons.into_iter()
+            .find(|weapon| weapon.skins.iter().any(|skin| skin.model_tag == model_tag))
+    }
+
+    /// Print every runner and weapon skin of the model catalogue with its root tag.
+    /// The entity definition of the runner a skin model belongs to.
+    pub(crate) fn runner_for_skin(cache: &quicktag_scanner::TagCache, skin: TagHash) -> Option<TagHash> {
+        Self::load_model_catalog(cache)
+            .ok()?
+            .runner_skins
+            .iter()
+            .find(|entry| entry.model_tag == skin)?
+            .runner
+    }
+
+    pub(crate) fn print_skin_catalog() -> Result<(), String> {
+        let catalog = Self::load_model_catalog(&quicktag_scanner::load_tag_cache())?;
+        for skin in &catalog.runner_skins {
+            println!(
+                "SKIN\trunner\t{}\t{}\t{}\t{}\t{}",
+                skin.shell_name,
+                skin.name,
+                skin.model_tag,
+                skin.archetype.as_deref().unwrap_or("-"),
+                skin.runner.map_or("-".to_string(), |runner| runner.to_string())
+            );
+        }
+        for weapon in &catalog.weapons {
+            for skin in &weapon.skins {
+                println!("SKIN\tweapon\t{}\t{}\t{}", weapon.name, skin.name, skin.model_tag);
+            }
+        }
+        Ok(())
+    }
+
     /// A compact, render-ready projection of Gear's authored weapon/mod data.
     /// Keeping this derived from the same records prevents the Models and Gear
     /// panels from developing separate compatibility rules.
@@ -610,6 +665,13 @@ impl GearView {
                 Some(ModelRunnerSkinEntry {
                     name: item.name.clone(),
                     shell_name: item.applies_to.clone()?,
+                    runner: None,
+                    archetype: item
+                        .internal_name
+                        .as_deref()
+                        .and_then(|name| name.strip_prefix("heroes."))
+                        .and_then(|path| path.split('.').next())
+                        .map(str::to_owned),
                     model_tag: item.model_tag?,
                     color: item.rarity.map(GearRarity::color).unwrap_or(Color32::GRAY),
                 })
@@ -621,6 +683,28 @@ impl GearView {
                 && left.name == right.name
                 && left.shell_name == right.shell_name
         });
+
+        // Tie each skin to its runner's own entity. The investment data names
+        // that entity `runners.<codename>`; a shell's codename is the one its
+        // skins' internal paths carry, or the shell's own name where none of
+        // them resolved, kept only when such a pattern row exists.
+        let resolver = InvestmentPatternResolver::load();
+        let mut shell_runners = FxHashMap::<String, Option<TagHash>>::default();
+        for skin in &runner_skins {
+            if shell_runners.contains_key(&skin.shell_name) {
+                continue;
+            }
+            let runner = runner_skins
+                .iter()
+                .filter(|other| other.shell_name == skin.shell_name)
+                .filter_map(|other| other.archetype.clone())
+                .chain([skin.shell_name.to_lowercase().replace(' ', "_")])
+                .find_map(|codename| resolver.runner_definition(&codename));
+            shell_runners.insert(skin.shell_name.clone(), runner);
+        }
+        for skin in &mut runner_skins {
+            skin.runner = shell_runners.get(&skin.shell_name).copied().flatten();
+        }
 
         let mut melee_skins = self
             .items
@@ -5287,6 +5371,14 @@ impl InvestmentPatternResolver {
             cosmetics,
             cosmetics_by_api_hash,
         }
+    }
+
+    /// The entity definition the investment data assigns to a runner: the
+    /// pattern row named `runners.<codename>`.
+    fn runner_definition(&self, codename: &str) -> Option<TagHash> {
+        let name = quicktag_core::util::fnv1(format!("runners.{codename}").as_bytes());
+        let row = self.pattern_internal_hashes.iter().position(|hash| *hash == name)?;
+        self.assignments.get(self.pattern_globals.get(row)?).copied()
     }
 
     fn resolve_definition(&self, internal_hash: Option<u32>, definition: &[u8]) -> Option<TagHash> {

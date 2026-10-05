@@ -80,13 +80,23 @@ impl TfxRuntimeInputs {
     }
 
     /// Viewer policy: View+0x470..0x4E0 hold eight planes that the engine
-    /// writes at runtime; no package carries them. Materials test the scaled
-    /// reflection vector against them to gate an additive highlight lookup.
-    /// Zero planes fail every test, so the highlight is absent while the rest
-    /// of the material stays exact. This is not a captured Marathon View value.
+    /// writes at runtime; no package carries them. Materials cut the scaled
+    /// reflection vector with them and colour each cell from the hue ramp
+    /// `80A60089`, which is what makes a surface iridescent. Zero planes put
+    /// every pixel in the one cell those materials mask out.
+    ///
+    /// Each material tests four axis permutations of the reflection vector
+    /// against the same planes, so one plane crossing the reflection range
+    /// draws a strip whose hue steps where the four copies cross it. The first
+    /// plane does that; the other seven never change sign. Its tilt and offset
+    /// are fitted to an in-game capture of Destroyer KILO BASIC (one stepped
+    /// blue-to-purple strip on the visor); they are not captured View values.
     pub(crate) fn apply_static_preview_highlight_planes(&mut self) {
-        for offset in (0x470..=0x4e0).step_by(16) {
-            self.view.entry(offset).or_insert(TfxValue::Vector([0.0;4]));
+        const SLICE: [f32;4] = [1.0,0.6,0.3,-0.4];
+        const CLEAR: [f32;4] = [0.0,0.0,0.0,1.0];
+        for (index,offset) in (0x470..=0x4e0).step_by(16).enumerate() {
+            let plane=if index == 0 { SLICE } else { CLEAR };
+            self.view.entry(offset).or_insert(TfxValue::Vector(plane));
         }
     }
 
@@ -106,8 +116,16 @@ impl TfxRuntimeInputs {
         let nearest=evidence.iter().map(|scope|scope.depth).min();
         let owners=evidence.iter().filter(|scope|Some(scope.depth)==nearest).collect::<Vec<_>>();
         if let [scope]=owners.as_slice() {
+            // A declared channel no Pattern binds holds whatever the game last
+            // wrote. Five surface-state channels are declared by every runner
+            // and bound by none (each is max()ed with a sibling bound to
+            // zero): at one the surface is dry and clean, which is the idle
+            // look. Any other unbound channel is a skin's own state switch
+            // and rests at zero.
+            const SURFACE_STATE: [u32;5]=[0x961AD1AF,0xD6FA8024,0xA590EEC6,0x8C5EA344,0xD4FB5E33];
             for channel in &scope.channels {
-                inputs.object_channels.insert(channel.hash,TfxValue::Vector([1.0;4]));
+                let rest=if SURFACE_STATE.contains(&channel.hash) { 1.0 } else { 0.0 };
+                inputs.object_channels.insert(channel.hash,TfxValue::Vector([rest;4]));
             }
             for binding in scope.bindings.iter().filter(|b|b.scope==0x811C9DC5) {
                 if let Some(value)=binding.value {
@@ -118,6 +136,9 @@ impl TfxRuntimeInputs {
         // Catalog models have no local-player ownership. This is viewer policy,
         // independent of the serialized Pattern vector bindings.
         inputs.object_channels.insert(0x8A4DE2D7,TfxValue::Vector([0.0;4]));
+        // `is_alive`: the game raises it on a living character; Patterns bind
+        // zero as the default. Materials scale their idle animation by it.
+        inputs.object_channels.insert(0x7A3B2DB7,TfxValue::Vector([1.0;4]));
         inputs
     }
 

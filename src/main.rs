@@ -1,3 +1,4 @@
+mod animation;
 mod asset_cache;
 mod geometry;
 mod gui;
@@ -38,6 +39,14 @@ struct Args {
     #[arg(long, default_value = "./implant_icons")]
     implant_icons_output: std::path::PathBuf,
 
+    /// Print every runner and weapon skin with its model root tag and exit
+    #[arg(long)]
+    list_skins: bool,
+
+    /// Print every full-body runner animation clip with its frame count and name and exit
+    #[arg(long)]
+    list_clips: bool,
+
     /// Decode one texture tag (hex) to a PNG at --render-output and exit
     #[arg(long, value_name = "TAG", value_parser = parse_tag)]
     export_texture: Option<tiger_pkg::TagHash>,
@@ -76,9 +85,25 @@ struct Args {
     render_lighting: Vec<f32>,
 
     /// Output of --render-model: final, albedo, normals, properties (metal,
-    /// AO, roughness) or emissive
+    /// AO, roughness), emissive, or fallback (no original shaders)
     #[arg(long, default_value = "final")]
     render_view: String,
+
+    /// With --render-model: print the clips the packages tie to the model's skeleton
+    #[arg(long)]
+    list_model_clips: bool,
+
+    /// Runner codename (thief, stealth, ...) for --list-model-clips, as the Models view derives it
+    #[arg(long)]
+    runner_codename: Option<String>,
+
+    /// Pose --render-model with one animation clip tag (runner skins)
+    #[arg(long, value_name = "TAG", value_parser = parse_tag)]
+    render_clip: Option<tiger_pkg::TagHash>,
+
+    /// Clip frame for --render-clip; negative renders the skeleton's bind pose
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    render_frame: f32,
 
     /// Magnification of the fitted frame for --render-model
     #[arg(long, default_value_t = 1.0)]
@@ -134,6 +159,25 @@ fn main() -> eframe::Result<()> {
     tiger_pkg::initialize_package_manager(&Arc::new(pm));
 
     quicktag_core::classes::initialize_reference_names();
+
+    if args.list_skins {
+        return crate::gui::GearView::print_skin_catalog()
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))));
+    }
+
+    if args.list_clips {
+        let names = animation::runner_clip_names();
+        for group in animation::runner_clip_groups() {
+            for clip in &group.clips {
+                println!("RUNNERCLIP	{}	{}	{}	{:08X}	{}	{:08X}", group.codename.as_deref().unwrap_or("-"), clip.tag, clip.frames, clip.name_hash, clip.slots, clip.rig);
+            }
+        }
+        for clip in animation::runner_clips() {
+            let name = names.get(&clip.name_hash).cloned().unwrap_or_else(|| format!("{:08X}", clip.name_hash));
+            println!("CLIP	{}	{}	{name}", clip.tag, clip.frames);
+        }
+        return Ok(());
+    }
 
     if args.export_implant_icons {
         let render_state = create_headless_render_state()
@@ -210,7 +254,8 @@ fn main() -> eframe::Result<()> {
         image
             .save(&args.render_output)
             .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
-        println!("Exported {tag} ({}x{}) to {}", image.width(), image.height(), args.render_output.display());
+        let format = crate::texture::Texture::load_desc(tag).map(|desc| desc.format).ok();
+        println!("Exported {tag} ({}x{}, {format:?}) to {}", image.width(), image.height(), args.render_output.display());
         return Ok(());
     }
 
@@ -227,6 +272,9 @@ fn main() -> eframe::Result<()> {
             args.render_time,
             std::array::from_fn(|index| args.render_lighting.get(index).copied().unwrap_or(1.0)),
             &args.render_view,
+            args.render_clip.map(|clip| (clip, args.render_frame)),
+            args.list_model_clips,
+            args.runner_codename.as_deref(),
             &args.render_output,
         )
         .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;

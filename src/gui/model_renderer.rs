@@ -328,6 +328,7 @@ struct GpuAuthoredGeometryInput {
     static_meshes: Vec<crate::render::static_mesh::StaticMesh>,
     static_mesh_parts: HashMap<usize, usize>,
     vertex_colors: Option<GpuAuthoredVertexColors>,
+    bone_samples: Vec<crate::animation::BoneSample>,
 }
 
 struct GpuAuthoredVertexColors {
@@ -737,7 +738,53 @@ fn create_gpu_authored_geometry_input(
         static_meshes,
         static_mesh_parts,
         vertex_colors,
+        bone_samples: crate::animation::bone_samples(source),
     })
+}
+
+/// Up to four (bone, weight) influences; unused entries have zero weight.
+type VertexSkin = [(u16, f32); 4];
+/// A preview vertex's geometry source and its influences there.
+type SourcedVertexSkin = (u32, VertexSkin);
+
+/// Bone influences for the reconstructed preview vertices, recovered by
+/// matching each one to the packed layout-7 source vertex at its position.
+fn model_vertex_skin(vertices: &[ModelVertex], sources: &[AuthoredGeometryInput]) -> Vec<SourcedVertexSkin> {
+    let key = |position: [f32; 3]| position.map(|value| (value * 20_000.0).round() as i32);
+    let mut by_position = HashMap::<[i32; 3], SourcedVertexSkin>::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        let (Some(stream), Some(palette), Some(transform)) = (
+            source.vertex_streams.iter().find(|s| s.stream_index == 0 && s.stride == 24),
+            source.skinning_buffer.as_ref(),
+            source.position_transform,
+        ) else { continue; };
+        let (Ok(data), Ok(palette)) = (
+            package_manager().read_tag(stream.data_tag),
+            package_manager().read_tag(palette.data_tag),
+        ) else { continue; };
+        for (index, vertex) in data.chunks_exact(24).enumerate() {
+            let component = |lane: usize| i16::from_le_bytes([vertex[lane * 2], vertex[lane * 2 + 1]]);
+            let w = i32::from(component(3));
+            let mut skin: VertexSkin = [(0, 0.0); 4];
+            if w.abs() <= 2047 {
+                let Ok(bone) = u16::try_from(w) else { continue; };
+                skin[0] = (bone, 1.0);
+            } else {
+                // Positive w addresses one two-influence record, negative w two.
+                let first = (((w.abs() - 2048) * 8) as usize) | ((index << usize::from(w < 0)) & 7);
+                for record in 0..1 + usize::from(w < 0) {
+                    let Some(bytes) = palette.get((first + record) * 4..(first + record) * 4 + 4) else { continue; };
+                    skin[record * 2] = (u16::from(bytes[0]), f32::from(bytes[2]) / 255.0);
+                    skin[record * 2 + 1] = (u16::from(bytes[1]), f32::from(bytes[3]) / 255.0);
+                }
+            }
+            let position = std::array::from_fn(|lane| {
+                f32::from(component(lane)) / 32767.0 * transform.scale[lane] + transform.offset[lane]
+            });
+            by_position.insert(key(position), (source_index as u32, skin));
+        }
+    }
+    vertices.iter().map(|vertex| by_position.get(&key(vertex.position)).copied().unwrap_or((0, [(0, 0.0); 4]))).collect()
 }
 
 pub(crate) struct GpuModelPreview {
@@ -747,12 +794,81 @@ pub(crate) struct GpuModelPreview {
     draws: Vec<ModelDraw>,
     authored_shadow_draws: Vec<ModelDraw>,
     vertices: Vec<ModelVertex>,
+    vertex_skin: Vec<SourcedVertexSkin>,
+    /// Skeleton each geometry source indexes, matched on first use.
+    source_skeletons: std::sync::OnceLock<Vec<Option<&'static crate::animation::Skeleton>>>,
+    /// Whether the shared CPU vertex buffer currently holds a posed copy.
+    cpu_posed: std::sync::atomic::AtomicBool,
     indices: Vec<u32>,
     vertex_abi: VertexAbiDescriptor,
     provenance: ProvenanceStore,
 }
 
 impl GpuModelPreview {
+    /// The reconstructed preview vertices under a bone pose, blended like the
+    /// skinning producer: antipodality-corrected dual quaternions.
+    fn posed_vertices(&self, pose: &crate::animation::ModelPose) -> Vec<ModelVertex> {
+        let bones = pose.sources.iter().map(|source| source.as_ref()
+            .map(|source| crate::animation::packed_space_dual_quaternions(source, 1.0, [0.0; 3]))).collect_vec();
+        self.vertices.iter().zip(&self.vertex_skin).map(|(vertex, (source, skin))| {
+            let Some(bones) = bones.get(*source as usize).and_then(Option::as_ref) else { return *vertex; };
+            let (mut real, mut dual) = ([0.0f32; 4], [0.0f32; 4]);
+            let mut pivot: Option<[f32; 4]> = None;
+            for (bone, weight) in skin.iter().filter(|(_, weight)| *weight > 0.0) {
+                let Some(rows) = bones.get(usize::from(*bone) * 2..usize::from(*bone) * 2 + 2) else { continue; };
+                let pivot = *pivot.get_or_insert(rows[0]);
+                let sign = if (0..4).map(|c| pivot[c] * rows[0][c]).sum::<f32>() < 0.0 { -weight } else { *weight };
+                for c in 0..4 { real[c] += rows[0][c] * sign; dual[c] += rows[1][c] * sign; }
+            }
+            let length = real.iter().map(|c| c * c).sum::<f32>().sqrt();
+            if length < 1e-6 { return *vertex; }
+            let (real, dual) = (real.map(|c| c / length), dual.map(|c| c / length));
+            let translation = crate::animation::quat_mul(dual, [-real[0], -real[1], -real[2], real[3]]);
+            let rotate = |v: [f32; 3]| crate::animation::quat_rotate(real, v);
+            let position = rotate(vertex.position);
+            let tangent = rotate([vertex.tangent[0], vertex.tangent[1], vertex.tangent[2]]);
+            ModelVertex {
+                position: std::array::from_fn(|c| position[c] + 2.0 * translation[c]),
+                normal: rotate(vertex.normal),
+                tangent: [tangent[0], tangent[1], tangent[2], vertex.tangent[3]],
+                ..*vertex
+            }
+        }).collect()
+    }
+
+    /// The skeleton this model's animation runs on: the runner body when it has
+    /// one, else the largest skeleton any of its sources is skinned to.
+    pub(crate) fn main_skeleton(&self) -> Option<&'static crate::animation::Skeleton> {
+        let skeletons = self.source_skeletons().iter().flatten().copied().collect_vec();
+        skeletons.iter().filter(|skeleton| skeleton.is_runner()).max_by_key(|skeleton| skeleton.names.len())
+            .or_else(|| skeletons.iter().max_by_key(|skeleton| skeleton.names.len())).copied()
+    }
+
+    fn source_skeletons(&self) -> &[Option<&'static crate::animation::Skeleton>] {
+        self.source_skeletons.get_or_init(|| {
+            fn samples(input: &Option<GpuAuthoredGeometryInput>) -> Option<&[crate::animation::BoneSample]> {
+                input.as_ref().map(|input| input.bone_samples.as_slice())
+            }
+            let matched = self.authored_inputs.iter()
+                .map(|input| crate::animation::match_skeleton(samples(input)?)).collect_vec();
+            // A part skinned to a single bone fits many skeletons by position
+            // alone. Runner parts are therefore held to the player rigs: the
+            // bodies and the head rigs that share their node names.
+            if matched.iter().flatten().any(|skeleton| skeleton.is_runner()) {
+                return self.authored_inputs.iter().map(|input| {
+                    crate::animation::match_skeleton_where(samples(input)?, crate::animation::Skeleton::is_player_rig)
+                }).collect();
+            }
+            matched
+        })
+    }
+
+    /// One clip frame as a pose for this model, or `None` when no source is
+    /// skinned to a runner body. A negative frame yields the bind pose.
+    pub(crate) fn clip_pose(&self, clip: &crate::animation::Clip, frame: f32) -> Option<crate::animation::ModelPose> {
+        crate::animation::ModelPose::from_clip(self.source_skeletons(), clip, frame)
+    }
+
     fn authored_index_format(&self, stable_index: usize) -> wgpu::IndexFormat {
         let source = self.draws[stable_index].authored_source.expect("native source");
         self.authored_inputs[source].as_ref().expect("resident native source")
@@ -1020,7 +1136,7 @@ impl GpuModelPreview {
         let vertex_buffer = retained.map(|preview| preview.vertex_buffer.clone()).unwrap_or_else(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quicktag_model_preview_vertices"),
             contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         }));
         let mut gpu_indices = wireframe.indices.clone();
         gpu_indices.extend_from_slice(&authored_shadow_indices);
@@ -1116,6 +1232,10 @@ impl GpuModelPreview {
             authored_inputs,
             draws,
             authored_shadow_draws,
+            vertex_skin: retained.map(|preview| preview.vertex_skin.clone())
+                .unwrap_or_else(|| model_vertex_skin(&vertices, &wireframe.authored_inputs)),
+            cpu_posed: std::sync::atomic::AtomicBool::new(false),
+            source_skeletons: Default::default(),
             vertices,
             indices: wireframe.indices.clone(),
             vertex_abi: VertexAbiDescriptor::from_wireframe(wireframe),
@@ -1225,9 +1345,10 @@ fn model_draw_from_source(
         &pass_plan,
         source.technique,
     );
-    let glass = material_inputs.transmission.filter(|transmission| transmission.absorption.is_some()
-        && source.render_stage == Some(crate::render::adapter::GoliathAdapter::TRANSPARENT_STAGE));
-    if glass.is_some() {
+    let transparent = source.render_stage == Some(crate::render::adapter::GoliathAdapter::TRANSPARENT_STAGE);
+    let glass = material_inputs.transmission.filter(|transmission| transparent
+        && (transmission.absorption.is_some() || transmission.halftone.is_some()));
+    if glass.is_some_and(|glass| glass.absorption.is_some()) {
         pipeline.blend = ABSORPTION_BLEND;
     }
     let authored_native_vertex_supported =
@@ -1691,13 +1812,14 @@ fn native_view_image(scene: &SceneUniform) -> [[f32;4];27] {
     view
 }
 
-fn c827_static_skinning(source: &GpuAuthoredGeometryInput, scene: &SceneUniform) -> [[f32;4];31] {
+fn c827_static_skinning(source: &GpuAuthoredGeometryInput) -> [[f32;4];31] {
     let p=source.position_transform.expect("native static position transform");
     let uv=source.uv_transform.expect("native static UV transform");
     let mut skin=[[0.0;4];31];
     for start in [0,8] { for axis in 0..4 { skin[start+axis][axis]=1.0; } }
-    skin[6]=[uv.scale[0]*scene.uv_transform[0], uv.scale[1]*scene.uv_transform[1],
-        uv.offset[0]*scene.uv_transform[0]+scene.uv_transform[2], uv.offset[1]*scene.uv_transform[1]+scene.uv_transform[3]];
+    // The geometry's own transform is the whole transform: the game VS reads
+    // raw texcoords. The scene's preview transform belongs to the fallback VS.
+    skin[6]=[uv.scale[0], uv.scale[1], uv.offset[0], uv.offset[1]];
     // Exact paired C827 VS reads offset.xyz and scale.w. Geometry metadata's
     // separate scale/offset fields must be packed in that shader order.
     skin[12]=[p.offset[0],p.offset[1],p.offset[2],p.procedural_scale];
@@ -1711,9 +1833,9 @@ fn c827_static_skinning(source: &GpuAuthoredGeometryInput, scene: &SceneUniform)
 
 fn native_surface_object_image(
     vertex: crate::render::authored_program::DescriptorAbi,
-    source: &GpuAuthoredGeometryInput, scene: &SceneUniform,
+    source: &GpuAuthoredGeometryInput,
 ) -> [[f32;4];31] {
-    let mut object=c827_static_skinning(source,scene);
+    let mut object=c827_static_skinning(source);
     if vertex == crate::render::authored_program::DescriptorAbi::VertexColorStorage {
         // Explicit static preview policy: C107's UMin selects actual authored
         // records and clamps to this buffer's final record, including sentinel.
@@ -1988,6 +2110,7 @@ struct MaterialUniform {
     transmission_colors: [[f32; 4]; 2],
     transmission_surfaces: [[f32; 4]; 2],
     transmission_params: [f32; 4],
+    transmission_halftone: [[f32; 4]; 4],
     coating_colors: [[f32; 4]; 2],
     coating_projection: [f32; 4],
     coating_params0: [f32; 4],
@@ -2129,6 +2252,7 @@ pub(crate) struct ModelPaintCallback {
     shadow_draws: Vec<PreparedDraw>,
     cubemap: Option<Arc<Texture>>,
     decal: Option<Arc<Texture>>,
+    pose: Option<Arc<crate::animation::ModelPose>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2786,7 +2910,15 @@ impl ModelPaintCallback {
             shadow_draws,
             cubemap,
             decal,
+            pose: None,
         }
+    }
+
+    /// Pose the model with per-bone skinning transforms (bind object space to
+    /// posed object space). `None` keeps the unposed model.
+    pub(crate) fn with_pose(mut self, pose: Option<Arc<crate::animation::ModelPose>>) -> Self {
+        self.pose = pose;
+        self
     }
 
     /// Export current assembled model with deterministic framing. Interactive
@@ -4424,8 +4556,8 @@ impl CallbackTrait for ModelPaintCallback {
                     let source_index=self.preview.draws[*index].authored_source.expect("retained native draw source");
                     let source=self.preview.authored_inputs[source_index].as_ref().expect("retained native source");
                     let object=if let Some(surface)=&self.preview.draws[*index].native_surface {
-                        native_surface_object_image(surface.vertex_program,source,&self.scene)
-                    } else {c827_static_skinning(source,&self.scene)};
+                        native_surface_object_image(surface.vertex_program,source)
+                    } else {c827_static_skinning(source)};
                     _queue.write_buffer(buffer,0,bytemuck::cast_slice(&object));
                 }
                 // Re-run every time-dependent TFX program at the viewer clock.
@@ -4475,7 +4607,7 @@ impl CallbackTrait for ModelPaintCallback {
                     Some(mesh)
                 };
                 let skin=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label:Some("viewer surface object scope"),contents:bytemuck::cast_slice(&native_surface_object_image(spec.vertex_program,source,&self.scene)),
+                    label:Some("viewer surface object scope"),contents:bytemuck::cast_slice(&native_surface_object_image(spec.vertex_program,source)),
                     usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST
                         | if spec.vertex_program == crate::render::authored_program::DescriptorAbi::VertexColorStorage {
                             wgpu::BufferUsages::COPY_SRC
@@ -4549,7 +4681,7 @@ impl CallbackTrait for ModelPaintCallback {
                     native_compute.push(((source_index, mesh_index),mesh.bind(device,&native_pipelines.authored_compute_pipelines.iter().find(|(abi,_)|*abi==mesh.producer).expect("exact compute pipeline").1)));
                 }
                 let skin=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("viewer native Skinning prefix"), contents: bytemuck::cast_slice(&c827_static_skinning(source,&self.scene)),
+                    label: Some("viewer native Skinning prefix"), contents: bytemuck::cast_slice(&c827_static_skinning(source)),
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 });
                 let pixel=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -4613,7 +4745,7 @@ impl CallbackTrait for ModelPaintCallback {
                         usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST,
                     });
                     let skin=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label:Some("viewer native Decal Skinning image"),contents:bytemuck::cast_slice(&c827_static_skinning(source,&self.scene)),
+                        label:Some("viewer native Decal Skinning image"),contents:bytemuck::cast_slice(&c827_static_skinning(source)),
                         usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST,
                     });
                     let vertex=crate::render::body_vertex::bind(device,&native_pipelines.authored_surface_vertex_layout,
@@ -5053,8 +5185,13 @@ impl CallbackTrait for ModelPaintCallback {
                             .map_or(0.0, |absorption| absorption[0]),
                         material.transmission.and_then(|transmission| transmission.absorption)
                             .map_or(0.0, |absorption| absorption[1]),
-                        0.0,
+                        material.transmission.and_then(|transmission| transmission.halftone)
+                            .map_or(0.0, |_| 1.0),
                     ],
+                    transmission_halftone: material
+                        .transmission
+                        .and_then(|transmission| transmission.halftone)
+                        .unwrap_or_default(),
                     coating_colors: material
                         .forward_coating
                         .map(|coating| coating.colors)
@@ -5821,9 +5958,40 @@ impl CallbackTrait for ModelPaintCallback {
             return Vec::new();
         };
 
+        // Posed sources pack positions over a wider range; the draws reading
+        // them decode with the matching scale.
+        if let Some(pose)=&self.pose {
+            for (index,buffer) in &frame.native_skinning_buffers {
+                let draw=&self.preview.draws[*index];
+                let Some(source_index)=draw.authored_source else { continue; };
+                let Some(source)=self.preview.authored_inputs[source_index].as_ref() else { continue; };
+                let direct_ia=draw.native_surface.as_ref().is_some_and(|surface|
+                    surface.vertex_program==crate::render::authored_program::DescriptorAbi::RigidVertexDirectIa);
+                let posed=!direct_ia
+                    && pose.sources.get(source_index).is_some_and(Option::is_some)
+                    && draw.authored_stage.and_then(|stage|source.static_mesh(stage)).is_some_and(|(_,mesh)|mesh.poseable());
+                if !posed { continue; }
+                let mut object=if let Some(surface)=&draw.native_surface {
+                    native_surface_object_image(surface.vertex_program,source)
+                } else { c827_static_skinning(source) };
+                for row in [12,13] { object[row][3]*=crate::render::static_mesh::POSED_POSITION_RANGE; }
+                _queue.write_buffer(buffer,0,bytemuck::cast_slice(&object));
+            }
+        }
+        // Viewer-owned passes draw the reconstructed mesh; keep it in the same pose.
+        if let Some(pose)=&self.pose {
+            _queue.write_buffer(&self.preview.vertex_buffer,0,bytemuck::cast_slice(&self.preview.posed_vertices(pose)));
+            self.preview.cpu_posed.store(true,std::sync::atomic::Ordering::Relaxed);
+        } else if self.preview.cpu_posed.swap(false,std::sync::atomic::Ordering::Relaxed) {
+            _queue.write_buffer(&self.preview.vertex_buffer,0,bytemuck::cast_slice(&self.preview.vertices));
+        }
         for ((index, mesh_index),bindings) in &frame.native_compute {
             let mesh=&self.preview.authored_inputs[*index].as_ref().expect("native geometry").static_meshes[*mesh_index];
             let producer=&pipelines.authored_compute_pipelines.iter().find(|(abi,_)|*abi==mesh.producer).expect("exact compute source").1;
+            // Posed bones live in each source's packed coordinate space.
+            let source=self.preview.authored_inputs[*index].as_ref().expect("native geometry");
+            let bones=self.pose.as_ref().and_then(|pose|pose.sources.get(*index)?.as_ref()).zip(source.position_transform).map(|(pose,p)|crate::animation::packed_space_dual_quaternions(pose,p.procedural_scale,p.offset));
+            mesh.set_pose(_queue,bones.as_deref());
             mesh.encode_once(egui_encoder,producer,bindings);
         }
 
@@ -5851,7 +6019,7 @@ impl CallbackTrait for ModelPaintCallback {
                 );
 
                 let rendered_authored = (|| {
-                    if !draw.authored_native_vertex_supported {
+                    if !draw.authored_native_vertex_supported || self.pose.is_some() {
                         return None;
                     }
                     let source_index = draw.authored_source?;
@@ -5953,7 +6121,7 @@ impl CallbackTrait for ModelPaintCallback {
                 .filter(|draw| draw.passes.contains(&RenderPassKind::DepthOnly))
             {
                 let rendered_authored = (|| {
-                    if !draw.authored_native_vertex_supported {
+                    if !draw.authored_native_vertex_supported || self.pose.is_some() {
                         return None;
                     }
                     let source_index = draw.authored_source?;
@@ -8634,9 +8802,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             return compatibility;
         }
         let albedo = surface.rgb;
-        let roughness = clamp(packed_normal.a, 0.045, 1.0);
+        let roughness = clamp(packed_normal.a, 0.0, 1.0);
+        // Tiger's deferred light lobe (packaged deferred_uber_light): its
+        // roughness is 3.7 - 3.6 * packed radius, which is 1 - 0.9 * response.
+        // The light-size control widens it; that part is the viewer's.
         let key_roughness = clamp(
-            roughness + (scene.light_parameters.x - 5.0) * 0.025,
+            0.1 + 0.9 * roughness + (scene.light_parameters.x - 5.0) * 0.025,
             0.02,
             1.0,
         );
@@ -8647,21 +8818,27 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let spotlight = spotlight_factor_world(position);
         let view = vec3<f32>(0.0, 0.0, 1.0);
         let halfway = normalize(light + view);
-        let n_dot_l = max(dot(normal, light), 0.0);
-        let n_dot_v = max(dot(normal, view), 0.001);
-        let n_dot_h = max(dot(normal, halfway), 0.0);
-        let v_dot_h = max(dot(view, halfway), 0.0);
-        let alpha = key_roughness * key_roughness;
-        let alpha2 = alpha * alpha;
-        let denominator = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0;
-        let distribution = alpha2 / max(3.14159265 * denominator * denominator, 0.0001);
-        let k = (key_roughness + 1.0) * (key_roughness + 1.0) * 0.125;
-        let visibility_l = n_dot_l / max(n_dot_l * (1.0 - k) + k, 0.0001);
-        let visibility_v = n_dot_v / max(n_dot_v * (1.0 - k) + k, 0.0001);
+        let n_dot_l = clamp(dot(normal, light), 0.0, 1.0);
+        let n_dot_v = abs(dot(normal, view)) + 0.00001;
+        let n_dot_h = dot(normal, halfway);
+        let l_dot_h = clamp(dot(light, halfway), 0.0, 1.0);
+        let alpha2 = key_roughness * key_roughness * key_roughness * key_roughness;
+        let denominator = (alpha2 * n_dot_h - n_dot_h) * n_dot_h + 1.0;
+        let distribution = alpha2 / (denominator * denominator);
+        let visibility = clamp(
+            0.5 / (n_dot_l * sqrt((n_dot_v - alpha2 * n_dot_v) * n_dot_v + alpha2)
+                + n_dot_v * sqrt((n_dot_l - alpha2 * n_dot_l) * n_dot_l + alpha2)),
+            0.0,
+            1.0,
+        );
         let f0 = mix(vec3<f32>(0.04), albedo, metalness);
-        let fresnel = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - v_dot_h, 5.0);
-        let specular = distribution * visibility_l * visibility_v * fresnel * 0.25;
-        let diffuse = (vec3<f32>(1.0) - fresnel) * (1.0 - metalness) * albedo / 3.14159265;
+        let grazing = pow(max(1.0 - l_dot_h, 0.000001), 5.0);
+        let fresnel = f0 * ((1.0 - grazing) + grazing / (0.84 * metalness + 0.04));
+        let specular = distribution * visibility * fresnel / 3.14159265;
+        let retro = l_dot_h * l_dot_h * 2.0 * key_roughness - 0.5;
+        let burley = (1.0 + retro * pow(max(1.0 - n_dot_l, 0.000001), 5.0))
+            * (1.0 + retro * pow(max(1.0 - n_dot_v, 0.000001), 5.0));
+        let diffuse = burley * (1.0 - metalness) * albedo / 3.14159265;
         let shadow = mix(1.0, deferred_shadow(input.uv, normal), scene.light_direction.w);
         let direct = (diffuse + specular)
             * scene.light_color.rgb
@@ -8675,8 +8852,23 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let ground = clamp(0.5 - 0.5 * up, 0.0, 1.0);
         let ambient = sky * sky * scene.ambient_sky.rgb + ground * ground * scene.ambient_ground.rgb;
         let ibl_diffuse = albedo * (1.0 - metalness) * scene.postprocess4.z * ao * ambient;
-        let ibl_specular = f0 * mix(0.08, 1.0, 1.0 - roughness)
-            * scene.postprocess4.w * ao;
+        // Tiger's cubemap_apply response, looking up the viewer's sky/ground
+        // environment: the lookup leans from the normal to the reflection as
+        // the response rises and blurs with sqrt(1 - response).
+        let response = 1.0 - roughness;
+        let reflection = 2.0 * dot(normal, view) * normal - view;
+        let lookup = normal + clamp(1.5 * response, 0.0, 1.0) * (reflection - normal);
+        let blur = sqrt(max(1.0 - response, 0.000001));
+        let horizon = view_direction_to_world(normalize(lookup)).z;
+        let environment = mix(
+            scene.ambient_ground.rgb,
+            scene.ambient_sky.rgb,
+            clamp(0.5 + 0.5 * horizon / max(blur, 0.02), 0.0, 1.0),
+        );
+        let visible = ao * ao;
+        let cone = clamp(visible - 1.0 + pow(visible + n_dot_v, response), 0.0, 1.0);
+        let ibl_specular = f0 * environment * mix(visible, cone, response)
+            * scene.postprocess4.w;
         let color = (direct + ibl_diffuse + ibl_specular + emissive) * scene.postprocess0.x;
         return vec4<f32>(color, surface.a);
     }
@@ -8893,6 +9085,7 @@ struct MaterialUniform {
     transmission_colors: array<vec4<f32>, 2>,
     transmission_surfaces: array<vec4<f32>, 2>,
     transmission_params: vec4<f32>,
+    transmission_halftone: array<vec4<f32>, 4>,
     coating_colors: array<vec4<f32>, 2>,
     coating_projection: vec4<f32>,
     coating_params0: vec4<f32>,
@@ -9225,6 +9418,7 @@ struct MaterialUniform {
     transmission_colors: array<vec4<f32>, 2>,
     transmission_surfaces: array<vec4<f32>, 2>,
     transmission_params: vec4<f32>,
+    transmission_halftone: array<vec4<f32>, 4>,
     coating_colors: array<vec4<f32>, 2>,
     coating_projection: vec4<f32>,
     coating_params0: vec4<f32>,
@@ -12505,6 +12699,33 @@ fn fs_forward_transparent(input: VertexOutput) -> @location(0) vec4<f32> {
         let opacity = material.transmission_params.y;
         let tinted = material.transmission_colors[0].rgb * material.transmission_params.z;
         return vec4<f32>(vec3<f32>(1.0 - opacity) + opacity * tinted, 1.0);
+    }
+    if material.transmission_params.w > 0.5 {
+        // Halftone glow. Two scrolling samples of one noise texture are
+        // multiplied and remapped, a dot grid is subtracted, and the rest is
+        // added in a colour between the two tints. The source's atmosphere
+        // and exposure clamp are not reproduced.
+        let rows = material.transmission_halftone;
+        let time = scene.fidelity.z;
+        let transform_a = material.transmission_surfaces[0];
+        let transform_b = material.transmission_surfaces[1];
+        // The source scrolls by frac(time * rate) through a wrapping sampler;
+        // this draw's sampler may clamp, so wrap the coordinates here.
+        let noise_a = textureSampleLevel(color_texture, material_sampler,
+            fract(input.uv * transform_a.xy + transform_a.zw + fract(rows[0].xy * time)), 0.0).r;
+        let noise_b = textureSampleLevel(color_texture, material_sampler,
+            fract(input.uv * transform_b.xy + transform_b.zw + fract(rows[0].zw * time)), 0.0).r;
+        let wave = rows[1].z * clamp(noise_a * noise_b * rows[1].x + rows[1].y, 0.0, 1.0);
+        let tint = mix(material.transmission_colors[0].rgb, material.transmission_colors[1].rgb,
+            pow(max(1.0 - wave, 0.0), rows[1].w));
+        let cell = fract(input.uv * rows[2].xy) - rows[2].zw;
+        let dot_edge = clamp(rows[3].x * length(cell) + rows[3].y, 0.0, 1.0);
+        let glow = clamp((wave - dot_edge) * rows[3].z + rows[3].w, 0.0, 1.0);
+        let color = material.transmission_colors[0].a * tint * glow;
+        if all(color < vec3<f32>(0.001)) {
+            discard;
+        }
+        return vec4<f32>(color, 0.0);
     }
     return shade_model(input, false).compatibility_hdr;
 }

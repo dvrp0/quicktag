@@ -2,11 +2,19 @@
 use super::*;
 use std::collections::VecDeque;
 
+/// Package holding the entities the game spawns, runners included.
+const RUNNER_ENTITY_PACKAGE: &str = "sr_sandbox";
+/// Array of the slots an entity plugs child entities into (a runner: head, body).
+const CLASS_ENTITY_SLOT_TABLE: u32 = 0x808032BA;
+
 #[derive(Clone, Debug)]
 pub struct RunnerShellAssembly {
     pub pattern: TagHash,
     pub nested_patterns: Vec<TagHash>,
     pub parts: Vec<RunnerShellPart>,
+    /// The runner's own entity definition, when the caller knows which runner
+    /// this shell belongs to. Its default gear is rendered with the shell.
+    pub runner: Option<TagHash>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +88,7 @@ impl RunnerShellAssembly {
             pattern,
             nested_patterns,
             parts,
+            runner: None,
         })
     }
 
@@ -87,6 +96,111 @@ impl RunnerShellAssembly {
         self.parts
             .iter()
             .flat_map(|part| part.geometry.iter().copied())
+            .collect()
+    }
+
+    /// Geometry the runner wears by default: the gear its own entity definition
+    /// carries, which no skin repeats (the Destroyer's forearm shield, the
+    /// drones at Triage's thighs).
+    ///
+    /// The skin is skinned to its runner's body skeleton, and the entity
+    /// definitions built on that skeleton in the game-entity package are the
+    /// runner itself. Several are; the one with the least geometry is the bare
+    /// runner, without the weapons and effects the fuller ones gather. Only
+    /// geometry from that package is gear: the rest is shared placeholder
+    /// content. Runners sharing one skeleton cannot be told apart this way, so
+    /// when the bare definitions disagree nothing is added.
+    fn default_gear(&self, cache: &TagCache, sources: &[AuthoredGeometryInput]) -> Vec<TagHash> {
+        let Some(skeleton) = crate::animation::runner_body_skeleton(sources) else {
+            return vec![];
+        };
+        let package = |tag: TagHash| package_manager().package_paths.get(&tag.pkg_id()).map(|path| path.name.clone());
+        let worn = self.geometry();
+        let candidates = crate::animation::definitions_of_skeleton(skeleton)
+            .into_iter()
+            .filter(|definition| package(*definition).as_deref() == Some(RUNNER_ENTITY_PACKAGE))
+            .filter_map(|definition| {
+                let mut gear = Self::resolve(cache, definition)?
+                    .geometry()
+                    .into_iter()
+                    .filter(|geometry| package(*geometry) == package(definition) && !worn.contains(geometry))
+                    .collect::<Vec<_>>();
+                gear.sort_by_key(|tag| tag.0);
+                log::debug!("runner definition {definition}: gear geometry {gear:?}");
+                (!gear.is_empty()).then_some(gear)
+            })
+            .collect::<Vec<_>>();
+        let Some(least) = candidates.iter().map(Vec::len).min() else {
+            return vec![];
+        };
+        let mut bare = candidates.into_iter().filter(|gear| gear.len() == least).collect::<Vec<_>>();
+        bare.dedup();
+        match bare.as_slice() {
+            [gear] => gear.clone(),
+            _ => vec![],
+        }
+    }
+
+    /// Gear of the runner whose entity definition is `runner`.
+    ///
+    /// A runner exists as several definitions sharing one slot-table component
+    /// (the table its head and body are plugged into): the full one the
+    /// investment data names, holding every skill model, and a bare one. The
+    /// bare one is the definition with the least geometry of its own package,
+    /// and that geometry is the gear, once anything another runner's bare
+    /// definition also lists is set aside as shared content.
+    fn runner_gear(cache: &TagCache, runner: TagHash) -> Vec<TagHash> {
+        let package = |tag: TagHash| package_manager().package_paths.get(&tag.pkg_id()).map(|path| path.name.clone());
+        let is_class = |tag: TagHash, class: u32| {
+            package_manager().get_entry(tag).is_some_and(|entry| entry.reference == class)
+        };
+        // Bare gear list per slot table, over every runner in the package.
+        let mut bare_by_slots = rustc_hash::FxHashMap::<TagHash, Vec<TagHash>>::default();
+        let mut slots_of_runner = None;
+        for (component, _) in package_manager().get_all_by_reference(CLASS_PATTERN_COMPONENT) {
+            if package(component).as_deref() != Some(RUNNER_ENTITY_PACKAGE) {
+                continue;
+            }
+            let Ok(data) = package_manager().read_tag(component) else { continue };
+            let endian = package_manager().version.endian();
+            if !scan_arrays(&data, endian).iter().any(|array| array.class == CLASS_ENTITY_SLOT_TABLE) {
+                continue;
+            }
+            let definitions = cache
+                .hashes
+                .get(&component)
+                .map(|scan| scan.references.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tag| is_class(*tag, CLASS_PATTERN))
+                .unique()
+                .collect::<Vec<_>>();
+            if definitions.contains(&runner) {
+                slots_of_runner = Some(component);
+            }
+            let bare = definitions
+                .into_iter()
+                .filter_map(|definition| {
+                    let mut gear = Self::resolve(cache, definition)?
+                        .geometry()
+                        .into_iter()
+                        .filter(|geometry| package(*geometry) == package(definition))
+                        .collect::<Vec<_>>();
+                    gear.sort_by_key(|tag| tag.0);
+                    (!gear.is_empty()).then_some(gear)
+                })
+                .min_by_key(Vec::len);
+            if let Some(bare) = bare {
+                bare_by_slots.insert(component, bare);
+            }
+        }
+        let Some(slots) = slots_of_runner else { return vec![] };
+        let Some(bare) = bare_by_slots.get(&slots) else { return vec![] };
+        bare.iter()
+            .copied()
+            .filter(|geometry| {
+                bare_by_slots.iter().all(|(other, listed)| *other == slots || !listed.contains(geometry))
+            })
             .collect()
     }
 
@@ -100,6 +214,17 @@ impl RunnerShellAssembly {
             self.geometry(),
             &[],
         );
+        let gear = model
+            .wireframe
+            .as_ref()
+            .map_or_else(Vec::new, |wireframe| match self.runner {
+                Some(runner) => Self::runner_gear(&cache, runner).into_iter().filter(|gear| !self.geometry().contains(gear)).collect(),
+                None => self.default_gear(&cache, &wireframe.authored_inputs),
+            });
+        if !gear.is_empty() {
+            let geometry = self.geometry().into_iter().chain(gear).collect();
+            model = load_model_preview_from_tags(cache.clone(), self.pattern, &entry, "Runner shell", geometry, &[]);
+        }
         // Cosmetic channels belong to this shell's immediate components. Never
         // search reverse/shared graph edges, which can reach another skin.
         let palette = pattern_graph_children(&cache, self.pattern)
