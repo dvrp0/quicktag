@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use binrw::Endian;
 use serde::Serialize;
@@ -25,6 +25,10 @@ pub struct TfxRuntimeInputs {
     /// Branch-owned catalog values for merged shell geometry. Shared ambiguous
     /// owners get an empty map; no sibling object's channels are imported.
     pub geometry_object_channels: BTreeMap<TagHash, BTreeMap<u32, TfxValue>>,
+    /// Object channels something writes: a Pattern binding, the runner's dye
+    /// row, a playing clip, the idle state the game holds, or an edit. Every
+    /// other channel is state only gameplay raises and sits at rest.
+    pub driven_channels: BTreeSet<u32>,
     pub global_channels: BTreeMap<u32, TfxValue>,
     pub gear_channels: BTreeMap<u32, TfxValue>,
     /// Numeric runtime externs keyed by their authored scope ID and byte offset.
@@ -61,8 +65,9 @@ impl TfxRuntimeInputs {
                 let channels=if part.pattern_path.is_empty() { BTreeMap::new() } else {
                     let mut channels=BTreeMap::new();
                     for owner in &part.pattern_path {
-                        let scope=scopes.entry(*owner).or_insert_with(||Self::for_pattern_preview(cache,*owner).object_channels);
-                        channels.extend(scope.clone());
+                        let scope=scopes.entry(*owner).or_insert_with(||Self::for_pattern_preview(cache,*owner));
+                        channels.extend(scope.object_channels.clone());
+                        inputs.driven_channels.extend(scope.driven_channels.iter().copied());
                     }
                     channels
                 };
@@ -70,6 +75,41 @@ impl TfxRuntimeInputs {
             }
         }
         inputs
+    }
+
+    /// Object channels a playing clip animates. The game writes them onto the
+    /// entity, so every material of the model reads them.
+    pub(crate) fn apply_clip_channels(&mut self, channels: &[(u32, f32)]) {
+        for scope in self.geometry_object_channels.values_mut().chain(std::iter::once(&mut self.object_channels)) {
+            for (channel, value) in channels {
+                scope.insert(*channel, TfxValue::Vector([*value; 4]));
+            }
+        }
+        self.driven_channels.extend(channels.iter().map(|(channel, _)| *channel));
+    }
+
+    /// The row a skin selects in its runner's dye table. The game writes it
+    /// onto the runner, so it reaches every material of the shell and of the
+    /// gear the runner's own entity carries; gear shares the body's scope.
+    pub(crate) fn apply_runner_dye(&mut self, channels: &[(u32, [f32; 4])], gear: &[TagHash]) {
+        if channels.is_empty() {
+            return;
+        }
+        let body = self
+            .geometry_object_channels
+            .values()
+            .min_by_key(|scope| scope.len())
+            .cloned()
+            .unwrap_or_else(|| self.object_channels.clone());
+        for geometry in gear {
+            self.geometry_object_channels.entry(*geometry).or_insert_with(|| body.clone());
+        }
+        self.driven_channels.extend(channels.iter().map(|(channel, _)| *channel));
+        for scope in self.geometry_object_channels.values_mut().chain(std::iter::once(&mut self.object_channels)) {
+            for (channel, value) in channels {
+                scope.insert(*channel, TfxValue::Vector(*value));
+            }
+        }
     }
 
     /// Viewer policy: select source shaders' analytic alpha cutoff instead of
@@ -126,10 +166,12 @@ impl TfxRuntimeInputs {
             for channel in &scope.channels {
                 let rest=if SURFACE_STATE.contains(&channel.hash) { 1.0 } else { 0.0 };
                 inputs.object_channels.insert(channel.hash,TfxValue::Vector([rest;4]));
+                if rest != 0.0 { inputs.driven_channels.insert(channel.hash); }
             }
             for binding in scope.bindings.iter().filter(|b|b.scope==0x811C9DC5) {
                 if let Some(value)=binding.value {
                     inputs.object_channels.insert(binding.parameter,TfxValue::Vector(value));
+                    inputs.driven_channels.insert(binding.parameter);
                 }
             }
         }
@@ -139,6 +181,7 @@ impl TfxRuntimeInputs {
         // `is_alive`: the game raises it on a living character; Patterns bind
         // zero as the default. Materials scale their idle animation by it.
         inputs.object_channels.insert(0x7A3B2DB7,TfxValue::Vector([1.0;4]));
+        inputs.driven_channels.extend([0x8A4DE2D7,0x7A3B2DB7]);
         inputs
     }
 

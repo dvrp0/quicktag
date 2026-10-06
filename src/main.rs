@@ -43,6 +43,34 @@ struct Args {
     #[arg(long)]
     list_skins: bool,
 
+    /// Print decoded stat inputs of weapons/mods whose name contains one of these (comma separated) and exit
+    #[arg(long, value_delimiter = ',')]
+    dump_weapon_stats: Vec<String>,
+
+    /// Weapon mod definition tags (hex, comma separated) applied by --dump-weapon-stats
+    #[arg(long, value_delimiter = ',', value_parser = parse_tag)]
+    dump_weapon_mods: Vec<tiger_pkg::TagHash>,
+
+    /// Match --dump-weapon-stats names in Korean instead of English; also the language of --export-gear-json
+    #[arg(long)]
+    dump_korean: bool,
+
+    /// Write every Gear record with its weapon, mod and implant stats to this JSON file and exit
+    #[arg(long, value_name = "FILE")]
+    export_gear_json: Option<std::path::PathBuf>,
+
+    /// Write the raw bytes of these tags (hex, comma separated) as <TAG>.bin into the --render-output directory and exit
+    #[arg(long, value_delimiter = ',', value_parser = parse_tag)]
+    dump_tags: Vec<tiger_pkg::TagHash>,
+
+    /// Print every authoring path embedded in a tag, with how many tags hold it, and exit
+    #[arg(long)]
+    dump_paths: bool,
+
+    /// Print every tag that references this tag (hex) and exit
+    #[arg(long, value_name = "TAG", value_parser = parse_tag)]
+    dump_referrers: Option<tiger_pkg::TagHash>,
+
     /// Print every full-body runner animation clip with its frame count and name and exit
     #[arg(long)]
     list_clips: bool,
@@ -163,6 +191,95 @@ fn main() -> eframe::Result<()> {
     if args.list_skins {
         return crate::gui::GearView::print_skin_catalog()
             .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))));
+    }
+
+    if let Some(target) = args.dump_referrers {
+        let cache = quicktag_scanner::load_tag_cache();
+        for (tag, scan) in cache.hashes.iter() {
+            if scan.file_hashes.iter().any(|item| item.hash == target) {
+                let reference = package_manager().get_entry(*tag).map(|entry| entry.reference);
+                println!("REFERRER {tag} reference={reference:08X?}");
+            }
+        }
+        return Ok(());
+    }
+
+    if args.dump_paths {
+        // Authoring paths embedded in tags, as the scanner's raw strings hold them.
+        let cache = quicktag_scanner::load_tag_cache();
+        let mut paths = std::collections::BTreeMap::<String, Vec<tiger_pkg::TagHash>>::new();
+        for (tag, scan) in cache.hashes.iter() {
+            for text in &scan.raw_strings {
+                if text.starts_with("content") && text.contains(['\\', '/']) {
+                    paths.entry(text.replace('/', "\\")).or_default().push(*tag);
+                }
+            }
+        }
+        for (path, tags) in &paths {
+            println!("{path}\t{}\t{}", tags.len(), tags[0]);
+        }
+        return Ok(());
+    }
+
+    if !args.dump_tags.is_empty() {
+        // A value that is not a tag is taken as a reference class: every tag of it is written.
+        let tags = args
+            .dump_tags
+            .iter()
+            .flat_map(|tag| match package_manager().get_entry(*tag) {
+                Some(_) => vec![*tag],
+                None => package_manager()
+                    .get_all_by_reference(tag.0)
+                    .into_iter()
+                    .map(|(tag, _)| tag)
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        for tag in &tags {
+            let result = package_manager()
+                .read_tag(*tag)
+                .map_err(std::io::Error::other)
+                .and_then(|data| std::fs::write(args.render_output.join(format!("{tag}.bin")), data));
+            let reference = package_manager().get_entry(*tag).map(|entry| entry.reference);
+            println!("TAG {tag} reference={reference:08X?} {result:?}");
+            // Wide (Tag64) references, which the 32-bit hash scan cannot see.
+            let data = package_manager().read_tag(*tag).unwrap_or_default();
+            for offset in (0..data.len().saturating_sub(7)).step_by(4) {
+                let wide = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                if let Some(entry) = package_manager().lookup.tag64_entries.get(&wide) {
+                    let target = entry.hash32;
+                    let class = package_manager().get_entry(target).map(|entry| entry.reference);
+                    println!("  TAG64 {offset:#x} -> {target} reference={class:08X?}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if !args.dump_weapon_stats.is_empty() {
+        let language = if args.dump_korean {
+            quicktag_strings::localized::LocalizedLanguage::Korean
+        } else {
+            quicktag_strings::localized::LocalizedLanguage::English
+        };
+        return crate::gui::GearView::dump_weapon_stats(
+            &args.dump_weapon_stats,
+            &args.dump_weapon_mods,
+            language,
+        )
+        .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))));
+    }
+
+    if let Some(output) = &args.export_gear_json {
+        let language = if args.dump_korean {
+            quicktag_strings::localized::LocalizedLanguage::Korean
+        } else {
+            quicktag_strings::localized::LocalizedLanguage::English
+        };
+        let exported = crate::gui::GearView::export_json(output, language)
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+        println!("Exported {exported} gear records to {}", output.display());
+        return Ok(());
     }
 
     if args.list_clips {

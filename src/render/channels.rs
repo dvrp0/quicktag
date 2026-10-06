@@ -108,6 +108,9 @@ impl ModelChannels {
         for row in &self.rows {
             match row.domain {
                 ChannelDomain::Object => {
+                    if !self.original_inputs.driven_channels.contains(&row.id) {
+                        inputs.driven_channels.remove(&row.id);
+                    }
                     restore_value(
                         &mut inputs.object_channels,
                         &self.original_inputs.object_channels,
@@ -156,6 +159,7 @@ impl ModelChannels {
     pub(crate) fn apply_overrides(&self, inputs: &mut TfxRuntimeInputs) {
         for (&id, value) in &self.object_overrides {
             let value = TfxValue::Vector(*value);
+            inputs.driven_channels.insert(id);
             inputs.object_channels.insert(id, value.clone());
             for channels in inputs.geometry_object_channels.values_mut() {
                 channels.insert(id, value.clone());
@@ -450,7 +454,7 @@ fn update_override(
     }
 }
 
-fn parse_hex_id(detail: &str) -> Option<u32> {
+pub(crate) fn parse_hex_id(detail: &str) -> Option<u32> {
     let start = detail
         .find("0x")
         .map(|start| start + 2)

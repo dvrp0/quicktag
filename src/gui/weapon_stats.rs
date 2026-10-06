@@ -5,7 +5,10 @@ use tiger_pkg::{TagHash, package_manager};
 mod weapon_mod_stats;
 #[path = "weapon_stat_expressions.rs"]
 mod weapon_stat_expressions;
-pub(super) use weapon_mod_stats::{WeaponModDetails, WeaponModStatChange, WeaponModWeaponStats};
+pub(super) use weapon_mod_stats::{
+    WeaponBaseRating, WeaponModDetails, WeaponModRawStat, WeaponModStatChange,
+    WeaponModWeaponStats,
+};
 use weapon_stat_expressions::PropertyProgram;
 #[path = "weapon_stat_display.rs"]
 mod weapon_stat_display;
@@ -16,6 +19,7 @@ const STAT_RATING_ARRAY: u32 = 0x8080_924b;
 const CURVE_DESCRIPTOR_ARRAY: u32 = 0x8080_bc4d;
 const CURVE_VALUE_ARRAY: u32 = 0x8080_000f;
 const CURVE_SEMANTIC_ARRAY: u32 = 0x8080_3f8e;
+const SOCKET_ARRAY: u32 = 0x8080_6919;
 const GAMEPLAY_COMPONENT_REFERENCE: u32 = 0x8080_badb;
 const PATTERN_REFERENCE: u32 = 0x8080_baad;
 const PATTERN_ASSIGNMENT_TABLE_REFERENCE: u32 = 0x8080_b61c;
@@ -56,6 +60,7 @@ pub(super) struct WeaponStats {
     pub(super) equip_seconds: Option<f32>,
     pub(super) aim_seconds: Option<f32>,
     pub(super) reload_seconds: Option<f32>,
+    pub(super) charge_seconds: Option<f32>,
     pub(super) weight: Option<f32>,
     pub(super) hip_fire_spread_degrees: Option<f32>,
     pub(super) ads_spread_degrees: Option<f32>,
@@ -142,21 +147,105 @@ impl<'a> WeaponStatResolver<'a> {
         }
     }
 
-    pub(super) fn extract(&self, definition_tag: TagHash) -> Option<WeaponStats> {
-        let mut stats = self
-            .mod_weapon_context(definition_tag)
-            .ok()?
-            .baseline(definition_tag, self.rating_metadata.as_deref()?)
-            .ok()?;
-        // WeaponStats stores a fraction; the authored UI program returns percent.
-        stats.movement_accuracy_loss = stats.movement_accuracy_loss.and_then(|value| {
-            self.display_programs
-                .as_ref()?
-                .single_property((2, 0x14), value)
-                .map(|percent| percent / 100.0)
-        });
-        Some(stats)
+    pub(super) fn debug_dump(&self, weapon: TagHash, mods: &[TagHash]) -> String {
+        let mut out = String::new();
+        let mut ratings = vec![];
+        for modification in mods {
+            match self.mod_raw_stats(*modification) {
+                Ok(rows) => {
+                    out += &format!("  MOD {modification} {rows:?}\n");
+                    ratings.extend(rows);
+                }
+                Err(error) => out += &format!("  MOD {modification} failed: {error:#}\n"),
+            }
+        }
+        if let Ok(definition) = package_manager().read_tag(weapon) {
+            out += &format!("  DEFINITION {weapon} {} bytes\n", definition.len());
+            for array in arrays(&definition) {
+                out += &format!(
+                    "  ARRAY class={:08X} count={} start={:#x}\n",
+                    array.class, array.count, array.start
+                );
+                if array.class == STAT_RATING_ARRAY {
+                    for index in 0..array.count {
+                        let start = array.start + index * 0x28;
+                        out += &format!(
+                            "    {:?}\n",
+                            (0..10).filter_map(|word| read_u32(&definition, start + word * 4)).collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+            for offset in (0..definition.len().saturating_sub(3)).step_by(4) {
+                let Some(value) = read_u32(&definition, offset) else { continue };
+                if value >> 16 == 0x8080 && value != ARRAY_MARKER {
+                    out += &format!("  CLASS {offset:#06x} {value:08X}\n");
+                } else if let Some(entry) = package_manager().get_entry(TagHash(value)) {
+                    out += &format!("  TAGREF {offset:#06x} {} ref={:08X}\n", TagHash(value), entry.reference);
+                }
+            }
+        }
+        let Some(metadata) = self.rating_metadata.as_deref() else {
+            return out + "  no rating metadata\n";
+        };
+        match self.mod_weapon_context(weapon) {
+            Ok(context) => out += &context.debug_dump(&ratings, metadata),
+            Err(error) => out += &format!("  context failed: {error:#}\n"),
+        }
+        out += &self.debug_components(weapon);
+        out += &format!("  STATS {:?}\n", self.extract(weapon, mods));
+        out
     }
+
+    pub(super) fn debug_display_programs(&self) -> String {
+        self.display_programs
+            .as_ref()
+            .map_or_else(|| "  no display programs\n".to_owned(), StatDisplayPrograms::debug_dump)
+    }
+
+    /// Stats as the game shows them: the frame's ratings plus those of the
+    /// plugs preset in its sockets (`preset_plugs`), which unique weapons carry.
+    pub(super) fn extract(&self, definition_tag: TagHash, presets: &[TagHash]) -> Option<WeaponStats> {
+        self.extract_with_ratings(definition_tag, presets)
+            .map(|(stats, _)| stats)
+    }
+
+    /// `extract`, with the frame's base ratings the stats were sampled from.
+    pub(super) fn extract_with_ratings(
+        &self,
+        definition_tag: TagHash,
+        presets: &[TagHash],
+    ) -> Option<(WeaponStats, Vec<WeaponBaseRating>)> {
+        let context = self.mod_weapon_context(definition_tag).ok()?;
+        let mut ratings = vec![];
+        for plug in presets {
+            match self.mod_raw_stats(*plug) {
+                Ok(rows) => ratings.extend(rows),
+                Err(error) => {
+                    log::warn!("Preset plug {plug} of weapon {definition_tag} has no ratings: {error:#}")
+                }
+            }
+        }
+        let stats = context.stats(
+            definition_tag,
+            &weapon_mod_stats::rating_deltas(&ratings),
+            self.rating_metadata.as_deref()?,
+            self.display_programs.as_ref(),
+        );
+        Some((stats, context.base_ratings()))
+    }
+}
+
+/// Definitions of the plugs preset in a weapon definition's sockets. Each
+/// socket row names its plug by position in the hash-to-definition table
+/// (`definitions`); an empty socket holds 0xFFFF.
+pub(super) fn preset_plugs(definition: &[u8], definitions: &[TagHash]) -> Vec<TagHash> {
+    arrays(definition)
+        .into_iter()
+        .filter(|array| array.class == SOCKET_ARRAY)
+        .flat_map(|array| (0..array.count).map(move |row| array.start + row * 0x50 + 0x28))
+        .filter_map(|offset| definitions.get(read_u32(definition, offset)? as usize).copied())
+        .collect()
 }
 
 impl CurveSet {

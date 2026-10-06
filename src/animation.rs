@@ -15,6 +15,8 @@ use quicktag_core::util::fnv1;
 use tiger_pkg::{TagHash, package_manager};
 
 const CLASS_ANIMATION_CLIP: u32 = 0x8080AE01;
+/// Ranged per-frame samples of the object channels a clip animates.
+const CLASS_CHANNEL_SAMPLES: u32 = 0x8080B14A;
 const CLASS_PATTERN: u32 = 0x8080BADB;
 const CLASS_ARRAY: u32 = 0x8080BFCD;
 const CLASS_SKELETON_NODE_HIERARCHY: u32 = 0x8080AF42;
@@ -111,6 +113,8 @@ fn nlerp(a: Quat, b: Quat, t: f32) -> Quat {
 pub struct Transform {
     pub rotation: Quat,
     pub translation: [f32; 3],
+    /// Uniform scale, applied before the rotation.
+    pub scale: f32,
 }
 
 /// Skeleton carried by an entity pattern, in the node order vertices index.
@@ -149,6 +153,7 @@ impl Skeleton {
                         bind.push(Transform {
                             rotation: [value(0)?, value(1)?, value(2)?, value(3)?],
                             translation: [value(4)?, value(5)?, value(6)?],
+                            scale: 1.0,
                         });
                     }
                 }
@@ -198,27 +203,26 @@ impl Skeleton {
                 inverse,
                 std::array::from_fn(|c| bind.translation[c] - parent.translation[c]),
             ),
+            scale: 1.0,
         }
     }
 
-    /// Object-space node transforms taking every node another rig posed (by
-    /// name) and carrying the rest along under their posed parents.
-    pub fn retarget(&self, named: &rustc_hash::FxHashMap<u32, Transform>) -> Vec<Transform> {
+    /// Object-space node transforms following another rig: every node that
+    /// rig also has (by name) moves as that rig's node does, and the rest are
+    /// carried along under their posed parents.
+    ///
+    /// `moved` holds the other rig's skinning transforms, not its poses: two
+    /// rigs may rest the same node differently (a head rig's jaw and eyes
+    /// against the body rig's), and it is the movement that is shared.
+    pub fn retarget(&self, moved: &rustc_hash::FxHashMap<u32, Transform>) -> Vec<Transform> {
         let mut pose: Vec<Transform> = Vec::with_capacity(self.names.len());
         for node in 0..self.names.len() {
             let parent = usize::try_from(self.parents[node])
                 .ok()
                 .and_then(|p| pose.get(p).copied());
-            pose.push(match (named.get(&self.names[node]), parent) {
-                (Some(posed), _) => *posed,
-                (None, Some(parent)) => {
-                    let local = self.bind_local(node);
-                    let rotated = quat_rotate(parent.rotation, local.translation);
-                    Transform {
-                        rotation: normalize(quat_mul(parent.rotation, local.rotation)),
-                        translation: std::array::from_fn(|c| parent.translation[c] + rotated[c]),
-                    }
-                }
+            pose.push(match (moved.get(&self.names[node]), parent) {
+                (Some(moved), _) => compose(*moved, self.bind[node]),
+                (None, Some(parent)) => compose(parent, self.bind_local(node)),
                 (None, None) => self.bind[node],
             });
         }
@@ -236,18 +240,13 @@ impl Skeleton {
             let local = Transform {
                 rotation: sample.rotation.unwrap_or(bind.rotation),
                 translation: sample.translation.unwrap_or(bind.translation),
+                scale: sample.scale.unwrap_or(bind.scale),
             };
             let parent = usize::try_from(self.parents[node])
                 .ok()
                 .and_then(|p| pose.get(p).copied());
             pose.push(match parent {
-                Some(parent) => {
-                    let rotated = quat_rotate(parent.rotation, local.translation);
-                    Transform {
-                        rotation: normalize(quat_mul(parent.rotation, local.rotation)),
-                        translation: std::array::from_fn(|c| parent.translation[c] + rotated[c]),
-                    }
-                }
+                Some(parent) => compose(parent, local),
                 None => local,
             });
         }
@@ -261,10 +260,12 @@ impl Skeleton {
             .zip(pose)
             .map(|(bind, posed)| {
                 let rotation = normalize(quat_mul(posed.rotation, quat_conjugate(bind.rotation)));
+                let scale = posed.scale / bind.scale;
                 let rotated = quat_rotate(rotation, bind.translation);
                 Transform {
                     rotation,
-                    translation: std::array::from_fn(|c| posed.translation[c] - rotated[c]),
+                    translation: std::array::from_fn(|c| posed.translation[c] - rotated[c] * scale),
+                    scale,
                 }
             })
             .collect()
@@ -350,6 +351,7 @@ pub fn match_skeleton_where(
 pub struct SlotSample {
     pub rotation: Option<Quat>,
     pub translation: Option<[f32; 3]>,
+    pub scale: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +390,37 @@ impl Clip {
         })
     }
 
+    /// Object channels the clip animates, as (channel, value) at `frame`.
+    ///
+    /// Besides bone tracks a clip carries tracks for object channels, the
+    /// values materials read: the array at 0x90 names them, and a chunk of
+    /// ranged per-frame samples holds one track for each name after those the
+    /// keyframed chunk covers. The game writes them onto the entity while the
+    /// clip plays (Sentinel's mask shows another icon mid-fidget this way).
+    pub fn channel_values(&self, frame: f32) -> Vec<(u32, f32)> {
+        let data = &self.data;
+        let sampled = || {
+            let (count, names) = array_at(data, 0x90)?;
+            let pointer = u64::from_le_bytes(data.get(0x20..0x28)?.try_into().ok()?) as usize;
+            let chunk = 0x20 + Some(pointer).filter(|pointer| *pointer != 0)?;
+            (u32_at(data, chunk.checked_sub(4)?)? == CLASS_CHANNEL_SAMPLES).then_some(())?;
+            let tracks = usize::from(u16_at(data, chunk + 2)?);
+            let frames = (u32_at(data, chunk + 0xc)? as usize).max(1);
+            let samples = u16_array(data, chunk + 0x20)?;
+            let ranges = f32_array(data, chunk + 0x40)?;
+            let minimums = f32_array(data, chunk + 0x50)?;
+            let frame = (frame.max(0.0).round() as usize).min(frames - 1);
+            (0..tracks)
+                .map(|track| {
+                    let name = u32_at(data, names + (count.checked_sub(tracks)? + track) * 4)?;
+                    let sample = f32::from(*samples.get(track * frames + frame)?) / 65535.0;
+                    Some((name, minimums.get(track)? + sample * ranges.get(track)?))
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        sampled().unwrap_or_default()
+    }
+
     pub fn info(&self) -> ClipInfo {
         ClipInfo {
             tag: self.tag,
@@ -416,6 +449,9 @@ impl Clip {
                 if let (Some(a), Some(b)) = (sample.translation, next.translation) {
                     sample.translation = Some(std::array::from_fn(|c| a[c] * (1.0 - t) + b[c] * t));
                 }
+                if let (Some(a), Some(b)) = (sample.scale, next.scale) {
+                    sample.scale = Some(a * (1.0 - t) + b * t);
+                }
             }
         }
         samples
@@ -438,9 +474,13 @@ impl Clip {
             (relative != 0).then_some(offset + relative)
         };
         decode_raw(data, pointer(0x10)?, 0, &maps[1], &maps[2], out)?;
+        decode_raw_scales(data, pointer(0x10)?, 0, &maps[0], out)?;
         if let Some(chunk) = pointer(0x18) {
             match u32_at(data, chunk - 4)? {
-                CODEC_RAW => decode_raw(data, chunk, frame, &maps[4], &maps[5], out)?,
+                CODEC_RAW => {
+                    decode_raw(data, chunk, frame, &maps[4], &maps[5], out)?;
+                    decode_raw_scales(data, chunk, frame, &maps[3], out)?
+                }
                 CODEC_RANGED => decode_ranged(data, chunk, frame, &maps[4], &maps[5], out)?,
                 CODEC_CURVE => decode_curve(data, chunk, frame, &maps[4], &maps[5], out)?,
                 _ => {}
@@ -486,6 +526,31 @@ impl Clip {
 
 fn slot<'a>(out: &'a mut [SlotSample], map: &[u16], track: usize) -> Option<&'a mut SlotSample> {
     out.get_mut(usize::from(*map.get(track)?))
+}
+
+/// `B13B` uniform scales: one value per track and frame over a shared range.
+fn decode_raw_scales(
+    data: &[u8],
+    chunk: usize,
+    frame: usize,
+    scales: &[u16],
+    out: &mut [SlotSample],
+) -> Option<()> {
+    let count = usize::from(u16_at(data, chunk + 2)?);
+    if count == 0 {
+        return Some(());
+    }
+    let frames = (u32_at(data, chunk + 0x10)? as usize).max(1);
+    let frame = frame.min(frames - 1);
+    let (range, minimum) = (f32_at(data, chunk + 0x14)?, f32_at(data, chunk + 0x18)?);
+    let values = u16_array(data, chunk + 0x38)?;
+    for track in 0..count {
+        let raw = *values.get(track * frames + frame)?;
+        if let Some(sample) = slot(out, scales, track) {
+            sample.scale = Some(f32::from(raw) / 65535.0 * range + minimum);
+        }
+    }
+    Some(())
 }
 
 /// `B13B`: every frame stored; rotations as offset-binary xyzw, one translation range per axis.
@@ -712,12 +777,20 @@ enum SlotSpace {
     Delta,
     /// The node's parent-local rotation and translation, as stored.
     Local,
+    /// An object-space rotation and a position relative to this node (the
+    /// clavicle of the same side): how the rig's grip targets are authored.
+    Target(usize),
 }
 
 /// Name hash of the unnamed aim node every runner rig keeps in slot 1.
 const RUNNER_AIM_NODE: u32 = 0xA91077F2;
 /// Control-rig slots this viewer does not pose: they keep the bind pose.
-const RUNNER_UNPOSED_SLOTS: [&str; 4] = ["b_pedestal", "b_utility", "b_l_grip", "b_r_grip"];
+const RUNNER_UNPOSED_SLOTS: [&str; 2] = ["b_pedestal", "b_utility"];
+/// Grip slots: what a hand holds rides these rather than the hands.
+/// Each is authored against the clavicle of its side, so a holstered item
+/// stays put on the body whatever the arms do.
+const RUNNER_TARGET_SLOTS: [(usize, &str, &str); 2] =
+    [(23, "b_r_grip", "b_r_clav"), (24, "b_l_grip", "b_l_clav")];
 /// The control rig, the four finger roots and the thirty finger joints.
 const RUNNER_NAMED_SLOTS: usize = 60;
 
@@ -737,6 +810,17 @@ pub struct RunnerRig {
 }
 
 impl RunnerRig {
+    /// `new`, built once per skeleton and clip size: a playing clip asks for
+    /// its mapping every frame.
+    pub fn cached(skeleton: &'static Skeleton, clip_slots: usize) -> std::sync::Arc<Self> {
+        type Rigs = rustc_hash::FxHashMap<(TagHash, usize), std::sync::Arc<RunnerRig>>;
+        static RIGS: OnceLock<std::sync::Mutex<Rigs>> = OnceLock::new();
+        let mut rigs = RIGS.get_or_init(Default::default).lock().unwrap();
+        rigs.entry((skeleton.tag, clip_slots))
+            .or_insert_with(|| std::sync::Arc::new(Self::new(skeleton, clip_slots)))
+            .clone()
+    }
+
     /// The mapping for clips of `clip_slots` slots played on `skeleton`.
     pub fn new(skeleton: &'static Skeleton, clip_slots: usize) -> Self {
         let mut slots = vec![None; skeleton.names.len()];
@@ -751,6 +835,12 @@ impl RunnerRig {
         for (slot, name) in RUNNER_LOCAL_SLOTS {
             if let Some(node) = skeleton.node(name) {
                 slots[node] = Some((slot, SlotSpace::Delta));
+                named[node] = true;
+            }
+        }
+        for (slot, name, origin) in RUNNER_TARGET_SLOTS {
+            if let Some((node, origin)) = skeleton.node(name).zip(skeleton.node(origin)) {
+                slots[node] = Some((slot, SlotSpace::Target(origin)));
                 named[node] = true;
             }
         }
@@ -843,7 +933,7 @@ impl RunnerRig {
             let mut local = skeleton.bind_local(node);
             let sample = self.slots[node].and_then(|(slot, space)| Some((samples.get(slot)?, space)));
             let rotation = match sample.and_then(|(sample, space)| Some((sample.rotation?, space))) {
-                Some((rotation, SlotSpace::Object)) => rotation,
+                Some((rotation, SlotSpace::Object | SlotSpace::Target(_))) => rotation,
                 Some((delta, SlotSpace::Delta)) => {
                     normalize(quat_mul(parent.rotation, quat_mul(local.rotation, delta)))
                 }
@@ -856,6 +946,11 @@ impl RunnerRig {
             let rotated = quat_rotate(parent.rotation, local.translation);
             let mut translation: [f32; 3] =
                 std::array::from_fn(|c| parent.translation[c] + rotated[c]);
+            if let Some((sample, SlotSpace::Target(origin))) = sample {
+                if let (Some(offset), Some(origin)) = (sample.translation, pose.get(origin)) {
+                    translation = std::array::from_fn(|c| origin.translation[c] + offset[c]);
+                }
+            }
             if Some(node) == self.pelvis {
                 // The pelvis slot stores its offset from the bind position.
                 if let Some(offset) = samples
@@ -869,10 +964,26 @@ impl RunnerRig {
             pose.push(Transform {
                 rotation,
                 translation,
+                scale: 1.0,
             });
         }
         pose
     }
+}
+
+/// How far, in units of a source's packed position range, `skinning` carries
+/// its vertices from where they were authored.
+pub fn packed_space_reach(skinning: &[Transform], scale: f32, offset: [f32; 3]) -> f32 {
+    skinning
+        .iter()
+        .map(|transform| {
+            let rotated = quat_rotate(transform.rotation, offset).map(|c| c * transform.scale);
+            (0..3)
+                .map(|c| ((rotated[c] + transform.translation[c] - offset[c]) / scale).powi(2))
+                .sum::<f32>()
+                .sqrt()
+        })
+        .fold(0.0, f32::max)
 }
 
 /// Dual quaternion rows (real, dual) the skinning producer blends, for a mesh whose
@@ -894,6 +1005,38 @@ pub fn packed_space_dual_quaternions(
                 transform.rotation,
             );
             [transform.rotation, dual]
+        })
+        .collect()
+}
+
+/// Whether any bone of `skinning` resizes what it carries; dual quaternions
+/// cannot express that, so such a mesh is blended with matrices instead.
+pub fn skinning_scales(skinning: &[Transform]) -> bool {
+    skinning.iter().any(|transform| (transform.scale - 1.0).abs() > 1e-4)
+}
+
+/// Matrix rows (three per bone, each `[x axis, y axis, z axis, translation]`
+/// components of one output coordinate) the skinning producer blends linearly,
+/// for a mesh whose packed positions decode as `object = packed * scale + offset`.
+pub fn packed_space_matrices(skinning: &[Transform], scale: f32, offset: [f32; 3]) -> Vec<[f32; 4]> {
+    skinning
+        .iter()
+        .flat_map(|transform| {
+            let axes: [[f32; 3]; 3] = std::array::from_fn(|axis| {
+                let mut unit = [0.0; 3];
+                unit[axis] = transform.scale;
+                quat_rotate(transform.rotation, unit)
+            });
+            let moved = quat_rotate(transform.rotation, offset).map(|c| c * transform.scale);
+            let rows: [[f32; 4]; 3] = std::array::from_fn(|c| {
+                [
+                    axes[0][c],
+                    axes[1][c],
+                    axes[2][c],
+                    (moved[c] + transform.translation[c] - offset[c]) / scale,
+                ]
+            });
+            rows
         })
         .collect()
 }
@@ -932,6 +1075,9 @@ pub fn runner_clips() -> &'static [ClipInfo] {
 #[derive(Debug, Clone, Default)]
 pub struct ModelPose {
     pub sources: Vec<Option<Vec<Transform>>>,
+    /// Draws left out of this frame, by index: a prop not spawned yet, or the
+    /// holstered copy of one being held.
+    pub hidden_draws: Vec<usize>,
 }
 
 impl ModelPose {
@@ -947,32 +1093,29 @@ impl ModelPose {
         clip: &Clip,
         frame: f32,
     ) -> Option<Self> {
-        let candidates = skeletons.iter().flatten();
-        let driven = if clip.control_rig {
-            candidates
-                .filter(|skeleton| skeleton.is_runner())
-                .max_by_key(|skeleton| skeleton.names.len())?
-        } else {
-            candidates
-                .filter(|skeleton| skeleton.names.len() == clip.slots)
-                .next()?
-        };
-        let pose = if frame < 0.0 {
-            driven.bind.clone()
-        } else if clip.control_rig {
-            RunnerRig::new(driven, clip.slots).pose(&clip.sample(frame))
-        } else {
-            driven.local_pose(&clip.sample(frame))
-        };
+        let (driven, pose) = clip.driven_pose(skeletons, frame)?;
+        let moved = driven
+            .names
+            .iter()
+            .copied()
+            .zip(driven.skinning_transforms(&pose))
+            .collect();
         let named = driven.names.iter().copied().zip(pose).collect();
+        // Props the clip spawns ride a socket of the driven skeleton and play
+        // their own paired clip.
+        let props = if frame < 0.0 { Default::default() } else { clip.props() };
         Some(Self {
             sources: skeletons
                 .iter()
                 .map(|skeleton| {
                     let skeleton = (*skeleton)?;
-                    Some(skeleton.skinning_transforms(&skeleton.retarget(&named)))
+                    match props.iter().find(|prop| prop.skeleton.tag == skeleton.tag) {
+                        Some(prop) => Some(skeleton.skinning_transforms(&prop.pose(driven, &named, frame)?)),
+                        None => Some(skeleton.skinning_transforms(&skeleton.retarget(&moved))),
+                    }
                 })
                 .collect(),
+            hidden_draws: vec![],
         })
     }
 }
@@ -1820,6 +1963,9 @@ impl RigIndex {
 /// Sparse (dominant bone, object-space position) pairs from a packed layout-7
 /// source, enough to match the mesh to the skeleton it indexes.
 pub fn bone_samples(source: &crate::geometry::AuthoredGeometryInput) -> Vec<BoneSample> {
+    if let Some(samples) = float_bone_samples(source) {
+        return samples;
+    }
     let (Some(stream), Some(palette), Some(transform)) = (
         source.vertex_streams.iter().find(|stream| stream.stream_index == 0 && stream.stride == 24),
         source.skinning_buffer.as_ref(),
@@ -1848,6 +1994,56 @@ pub fn bone_samples(source: &crate::geometry::AuthoredGeometryInput) -> Vec<Bone
             })
         })
         .collect()
+}
+
+/// Bone influences of a float-format vertex: its skin stream holds four
+/// weights then four bone indices, a byte each, with unused lanes weighted 0.
+pub fn float_vertex_skin(record: &[u8]) -> [(u16, f32); 4] {
+    std::array::from_fn(|lane| match (record.get(lane), record.get(4 + lane)) {
+        (Some(weight), Some(bone)) if *weight > 0 => (u16::from(*bone), f32::from(*weight) / 255.0),
+        _ => (0, 0.0),
+    })
+}
+
+/// The position and skin streams of a float-format source (48-byte vertices
+/// of float position, normal and tangent; 8-byte skin records).
+pub fn float_source_streams(
+    source: &crate::geometry::AuthoredGeometryInput,
+) -> Option<(&crate::geometry::AuthoredVertexStreamRef, &crate::geometry::AuthoredVertexStreamRef)> {
+    let vertices = source.vertex_streams.iter().find(|stream| stream.stream_index == 0 && stream.stride == 48)?;
+    let skin = source
+        .vertex_streams
+        .iter()
+        .find(|stream| stream.stream_index == 2 && stream.stride == 8 && stream.element_count == vertices.element_count)?;
+    Some((vertices, skin))
+}
+
+/// `bone_samples` for a float-format source.
+fn float_bone_samples(source: &crate::geometry::AuthoredGeometryInput) -> Option<Vec<BoneSample>> {
+    let (vertices, skin) = float_source_streams(source)?;
+    let transform = source.position_transform?;
+    let vertices = package_manager().read_tag(vertices.data_tag).ok()?;
+    let skin = package_manager().read_tag(skin.data_tag).ok()?;
+    let step = (vertices.len() / 48 / 512).max(1);
+    Some(
+        vertices
+            .chunks_exact(48)
+            .zip(skin.chunks_exact(8))
+            .step_by(step)
+            .filter_map(|(vertex, record)| {
+                let (bone, _) = float_vertex_skin(record)
+                    .into_iter()
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .filter(|(_, weight)| *weight > 0.0)?;
+                Some(BoneSample {
+                    bone: u32::from(bone),
+                    position: std::array::from_fn(|lane| {
+                        f32_at(vertex, lane * 4).unwrap_or(0.0) * transform.scale[lane] + transform.offset[lane]
+                    }),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Entity definitions gathering each skeleton pattern.
@@ -1902,4 +2098,401 @@ pub fn definitions_of_skeleton(skeleton: &Skeleton) -> Vec<TagHash> {
     found.sort_by_key(|tag| tag.0);
     found.dedup();
     found
+}
+
+const CLASS_GEOMETRY: u32 = 0x8080881C;
+/// Hash of the empty string: the key of entries no other set pairs with.
+const NO_SYNC_KEY: u32 = 0x811C9DC5;
+
+/// 32-bit tags by their 64-bit hash.
+fn tags_by_hash64() -> &'static rustc_hash::FxHashMap<u64, TagHash> {
+    static TAGS: OnceLock<rustc_hash::FxHashMap<u64, TagHash>> = OnceLock::new();
+    TAGS.get_or_init(|| {
+        package_manager().lookup.tag32_to_tag64.iter().map(|(tag32, tag64)| (tag64.0, *tag32)).collect()
+    })
+}
+
+fn tag_class(tag: TagHash) -> Option<u32> {
+    Some(package_manager().get_entry(tag)?.reference)
+}
+
+/// Components an entity definition gathers.
+fn definition_components(definition: TagHash) -> Vec<TagHash> {
+    let Ok(data) = package_manager().read_tag(definition) else {
+        return vec![];
+    };
+    let mut components = embedded_words(&data)
+        .map(TagHash)
+        .filter(|tag| tag_class(*tag) == Some(CLASS_PATTERN))
+        .collect::<Vec<_>>();
+    components.sort_by_key(|tag| tag.0);
+    components.dedup();
+    components
+}
+
+/// Sync keys of every animation set entry playing a clip. An entity spawned
+/// alongside plays the entry of its own set carrying the same key.
+fn clip_sync_keys(clip: TagHash) -> &'static [u32] {
+    static KEYS: OnceLock<rustc_hash::FxHashMap<TagHash, Vec<u32>>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let mut keys = rustc_hash::FxHashMap::<TagHash, Vec<u32>>::default();
+        for (set, _) in package_manager().get_all_by_reference(CLASS_ANIMATION_SET) {
+            for entry in animation_set_entries(set, tags_by_hash64()) {
+                if entry.hashes[1] != NO_SYNC_KEY {
+                    keys.entry(entry.clip).or_default().push(entry.hashes[1]);
+                }
+            }
+        }
+        keys
+    })
+    .get(&clip)
+    .map_or(&[], Vec::as_slice)
+}
+
+/// A prop a clip spawns into one of its entity's sockets for as long as it
+/// plays: Sentinel takes the Defender System off his thigh this way.
+#[derive(Debug, Clone)]
+pub struct ClipProp {
+    /// Name hash of the socket the prop is attached to.
+    pub socket: u32,
+    /// Frame of the spawning clip at which the prop appears.
+    pub start: usize,
+    pub geometry: Vec<TagHash>,
+    pub skeleton: &'static Skeleton,
+    /// The prop's own clip paired with the spawning one, when its set has one.
+    pub clip: Option<std::sync::Arc<Clip>>,
+}
+
+impl Clip {
+    /// Props the clip spawns.
+    ///
+    /// The clip lists what it starts while playing (array at 0x160): sounds
+    /// and sequences, each with the socket it concerns. A sequence is an
+    /// entity definition whose components name the prop's definition; the
+    /// prop brings a skeleton, geometry and an animation set of its own.
+    pub fn props(&self) -> std::sync::Arc<Vec<ClipProp>> {
+        type Props = rustc_hash::FxHashMap<TagHash, std::sync::Arc<Vec<ClipProp>>>;
+        static PROPS: OnceLock<std::sync::Mutex<Props>> = OnceLock::new();
+        let cache = PROPS.get_or_init(Default::default);
+        if let Some(props) = cache.lock().unwrap().get(&self.tag) {
+            return props.clone();
+        }
+        let props = std::sync::Arc::new(self.spawned_props());
+        cache.lock().unwrap().insert(self.tag, props.clone());
+        props
+    }
+
+    fn spawned_props(&self) -> Vec<ClipProp> {
+        let data = &self.data;
+        let Some((count, start)) = array_at(data, 0x160) else {
+            return vec![];
+        };
+        let sync_keys = clip_sync_keys(self.tag);
+        (0..count)
+            .filter_map(|index| {
+                // Each entry points at its record: timing, socket, name, tag.
+                let pointer = start + index * 8;
+                let record = pointer + u64::from_le_bytes(data.get(pointer..pointer + 8)?.try_into().ok()?) as usize;
+                let start_frame = usize::from(u16_at(data, record)?);
+                let socket = u32_at(data, record + 0x8)?;
+                let started = *tags_by_hash64()
+                    .get(&u64::from_le_bytes(data.get(record + 0x20..record + 0x28)?.try_into().ok()?))?;
+                (tag_class(started) == Some(CLASS_ENTITY_DEFINITION)).then_some(())?;
+                // The sequence's components name the definitions it spawns.
+                let spawned = definition_components(started)
+                    .into_iter()
+                    .filter_map(|component| package_manager().read_tag(component).ok())
+                    .flat_map(|component| {
+                        component
+                            .windows(8)
+                            .step_by(4)
+                            .filter_map(|hash| tags_by_hash64().get(&u64::from_le_bytes(hash.try_into().ok()?)).copied())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|tag| *tag != started && tag_class(*tag) == Some(CLASS_ENTITY_DEFINITION));
+                spawned.into_iter().find_map(|definition| {
+                    let components = definition_components(definition);
+                    let skeleton = all_skeletons().iter().find(|skeleton| components.contains(&skeleton.tag))?;
+                    let referenced = |class: u32| {
+                        let mut tags = components
+                            .iter()
+                            .filter_map(|component| package_manager().read_tag(*component).ok())
+                            .flat_map(|component| embedded_words(&component).map(TagHash).collect::<Vec<_>>())
+                            .filter(|tag| tag_class(*tag) == Some(class))
+                            .collect::<Vec<_>>();
+                        tags.sort_by_key(|tag| tag.0);
+                        tags.dedup();
+                        tags
+                    };
+                    let geometry = referenced(CLASS_GEOMETRY);
+                    (!geometry.is_empty()).then_some(())?;
+                    let clip = referenced(CLASS_ANIMATION_SET)
+                        .into_iter()
+                        .flat_map(|set| animation_set_entries(set, tags_by_hash64()))
+                        .find(|entry| sync_keys.contains(&entry.hashes[1]))
+                        .and_then(|entry| Clip::load(entry.clip))
+                        .map(std::sync::Arc::new);
+                    Some(ClipProp { socket, start: start_frame, geometry, skeleton, clip })
+                })
+            })
+            .collect()
+    }
+}
+
+/// Where a named socket sits on a skeleton: the node it hangs off and its
+/// offset from that node.
+///
+/// Entities built on the skeleton list their sockets in a component, each a
+/// rotation, a translation, the node index and the socket's name hash.
+fn skeleton_socket(skeleton: &'static Skeleton, socket: u32) -> Option<(u32, Transform)> {
+    type Sockets = rustc_hash::FxHashMap<(TagHash, u32), Option<(u32, Transform)>>;
+    static SOCKETS: OnceLock<std::sync::Mutex<Sockets>> = OnceLock::new();
+    let cache = SOCKETS.get_or_init(Default::default);
+    if let Some(found) = cache.lock().unwrap().get(&(skeleton.tag, socket)) {
+        return *found;
+    }
+    let found = definitions_of_skeleton(skeleton)
+        .into_iter()
+        .flat_map(definition_components)
+        .filter_map(|component| package_manager().read_tag(component).ok())
+        .find_map(|data| {
+            (0x28..data.len().saturating_sub(4)).step_by(4).find_map(|offset| {
+                (u32_at(&data, offset)? == socket).then_some(())?;
+                let node = *skeleton.names.get(u32_at(&data, offset - 4)? as usize)?;
+                let value = |index: usize| f32_at(&data, offset - 0x28 + index * 4);
+                let rotation = [value(0)?, value(1)?, value(2)?, value(3)?];
+                let length = rotation.iter().map(|c| c * c).sum::<f32>();
+                // A socket record: unit rotation, unit scale, a zero word
+                // before the node index and an instance id after the name.
+                ((length - 1.0).abs() < 1e-3
+                    && (value(7)? - 1.0).abs() < 1e-2
+                    && u32_at(&data, offset - 8)? == 0
+                    && u32_at(&data, offset + 4)? >> 24 == 0x84)
+                    .then_some(())?;
+                Some((node, Transform { rotation, translation: [value(4)?, value(5)?, value(6)?], scale: 1.0 }))
+            })
+        });
+    cache.lock().unwrap().insert((skeleton.tag, socket), found);
+    found
+}
+
+fn compose(parent: Transform, child: Transform) -> Transform {
+    let rotated = quat_rotate(parent.rotation, child.translation);
+    Transform {
+        rotation: normalize(quat_mul(parent.rotation, child.rotation)),
+        translation: std::array::from_fn(|c| parent.translation[c] + rotated[c] * parent.scale),
+        scale: parent.scale * child.scale,
+    }
+}
+
+/// `child` in the frame of `parent`.
+fn relative(parent: Transform, child: Transform) -> Transform {
+    let inverse = quat_conjugate(parent.rotation);
+    Transform {
+        rotation: normalize(quat_mul(inverse, child.rotation)),
+        translation: quat_rotate(
+            inverse,
+            std::array::from_fn(|c| child.translation[c] - parent.translation[c]),
+        ),
+        scale: 1.0,
+    }
+}
+
+/// How far apart two placements are: metres, and one minus the cosine of
+/// half the angle between their orientations.
+fn placement_gap(a: Transform, b: Transform) -> (f32, f32) {
+    let distance = (0..3)
+        .map(|c| (a.translation[c] - b.translation[c]).powi(2))
+        .sum::<f32>()
+        .sqrt();
+    let dot = (0..4).map(|c| a.rotation[c] * b.rotation[c]).sum::<f32>().abs();
+    (distance, 1.0 - dot.min(1.0))
+}
+
+/// A stowed socket stays within this of where the clip parks it: 5 mm and
+/// about a degree and a half.
+const STOWED_GAP: (f32, f32) = (0.005, 1.0e-4);
+/// Object channel a clip raises for as long as the item it spawns is out of
+/// its holster (Triage's drone fidget: from the spawn frame until the frame
+/// the drone is seated again).
+const CHANNEL_ITEM_OUT: u32 = 0xB74F5FD9;
+
+impl Clip {
+    /// The skeleton of `skeletons` this clip plays on and its object-space
+    /// pose at `frame` (the bind pose for a negative frame).
+    fn driven_pose(
+        &self,
+        skeletons: &[Option<&'static Skeleton>],
+        frame: f32,
+    ) -> Option<(&'static Skeleton, Vec<Transform>)> {
+        let mut candidates = skeletons.iter().flatten().copied();
+        let driven = if self.control_rig {
+            candidates
+                .filter(|skeleton| skeleton.is_runner())
+                .max_by_key(|skeleton| skeleton.names.len())?
+        } else {
+            candidates.find(|skeleton| skeleton.names.len() == self.slots)?
+        };
+        let pose = if frame < 0.0 {
+            driven.bind.clone()
+        } else if self.control_rig {
+            RunnerRig::cached(driven, self.slots).pose(&self.sample(frame))
+        } else {
+            driven.local_pose(&self.sample(frame))
+        };
+        Some((driven, pose))
+    }
+
+    /// Whether a prop this clip spawns is stowed at `frame`: its socket is
+    /// where the clip leaves it on the body once the item is put away. A clip
+    /// takes an item from its holster and returns it there, so the socket sits
+    /// in one place on one body node both just before the spawn and at the end
+    /// of the clip. The holder's own stowed copy is what shows then.
+    pub fn prop_stowed(
+        &self,
+        prop: &ClipProp,
+        skeletons: &[Option<&'static Skeleton>],
+        frame: f32,
+    ) -> bool {
+        // A clip that says outright when its item is out is taken at its word.
+        if let Some((_, out)) = self
+            .channel_values(frame.max(0.0))
+            .into_iter()
+            .find(|(channel, _)| *channel == CHANNEL_ITEM_OUT)
+        {
+            return out < 0.5;
+        }
+        let Some((driven, _)) = self.driven_pose(skeletons, frame.max(0.0)) else {
+            return false;
+        };
+        // Once the item is back it stays put away: the end of a clip eases
+        // the whole rig back to its idle pose, and the socket drifts off its
+        // holster again on the way without anything being taken out.
+        type Returns = rustc_hash::FxHashMap<(TagHash, u32, TagHash), Option<(usize, usize)>>;
+        static RETURNS: OnceLock<std::sync::Mutex<Returns>> = OnceLock::new();
+        let key = (self.tag, prop.socket, driven.tag);
+        let cached = RETURNS.get_or_init(Default::default).lock().unwrap().get(&key).copied();
+        let out = cached.unwrap_or_else(|| {
+            let out = self.out_of_holster(prop, skeletons, driven);
+            RETURNS.get_or_init(Default::default).lock().unwrap().insert(key, out);
+            out
+        });
+        match out {
+            Some((taken, returned)) => frame < taken as f32 || frame >= returned as f32,
+            None => false,
+        }
+    }
+
+    /// The frames a spawned prop spends away from its holster: the first on
+    /// which its socket has left its stowed place, and the first after that on
+    /// which it is back. `None` when the clip never stows the item.
+    fn out_of_holster(
+        &self,
+        prop: &ClipProp,
+        skeletons: &[Option<&'static Skeleton>],
+        driven: &'static Skeleton,
+    ) -> Option<(usize, usize)> {
+        let (socket, anchor, place) = self.parked(prop, skeletons, driven)?;
+        let stowed = |frame: usize| {
+            self.driven_pose(skeletons, frame as f32).is_some_and(|(_, pose)| {
+                let gap = placement_gap(relative(pose[anchor], pose[socket]), place);
+                gap.0 <= STOWED_GAP.0 && gap.1 <= STOWED_GAP.1
+            })
+        };
+        let taken = (prop.start..self.frames).find(|frame| !stowed(*frame))?;
+        let returned = (taken..self.frames).find(|frame| stowed(*frame)).unwrap_or(self.frames);
+        Some((taken, returned))
+    }
+
+    /// `parked_socket`, worked out once per clip, prop and skeleton.
+    fn parked(
+        &self,
+        prop: &ClipProp,
+        skeletons: &[Option<&'static Skeleton>],
+        driven: &'static Skeleton,
+    ) -> Option<(usize, usize, Transform)> {
+        type Parked = rustc_hash::FxHashMap<(TagHash, u32, TagHash), Option<(usize, usize, Transform)>>;
+        static PARKED: OnceLock<std::sync::Mutex<Parked>> = OnceLock::new();
+        let key = (self.tag, prop.socket, driven.tag);
+        let cached = PARKED.get_or_init(Default::default).lock().unwrap().get(&key).copied();
+        cached.unwrap_or_else(|| {
+            let parked = self.parked_socket(prop, skeletons);
+            PARKED.get_or_init(Default::default).lock().unwrap().insert(key, parked);
+            parked
+        })
+    }
+
+    /// Where a spawned prop's socket is relative to its holster at `frame`:
+    /// the body node the holster is on, how far the socket is from its stowed
+    /// place there, and the socket's object-space position. Only the prop
+    /// hand-off correction (`gui/prop_handoff.rs`) uses this.
+    pub fn prop_stow(
+        &self,
+        prop: &ClipProp,
+        skeletons: &[Option<&'static Skeleton>],
+        frame: f32,
+    ) -> Option<(usize, f32, [f32; 3])> {
+        let (driven, pose) = self.driven_pose(skeletons, frame.max(0.0))?;
+        let (socket, anchor, place) = self.parked(prop, skeletons, driven)?;
+        let gap = placement_gap(relative(pose[anchor], pose[socket]), place);
+        Some((anchor, gap.0, pose[socket].translation))
+    }
+
+    /// The socket node of a spawned prop, the body node it rests on while the
+    /// item is put away, and its placement on that node.
+    fn parked_socket(
+        &self,
+        prop: &ClipProp,
+        skeletons: &[Option<&'static Skeleton>],
+    ) -> Option<(usize, usize, Transform)> {
+        // A prop out from the first frame was never stowed.
+        let before = prop.start.checked_sub(1)?;
+        let last = self.frames.checked_sub(1).filter(|last| *last > prop.start)?;
+        let (driven, first) = self.driven_pose(skeletons, last as f32)?;
+        let socket = skeleton_socket(driven, prop.socket)?.0;
+        let socket = driven.names.iter().position(|name| *name == socket)?;
+        // The frame before the spawn, and a little before the end.
+        let later = [before, last.saturating_sub(4).max(prop.start)]
+            .map(|frame| self.driven_pose(skeletons, frame as f32).map(|(_, pose)| pose));
+        let [Some(middle), Some(end)] = later else {
+            return None;
+        };
+        // The limb carrying the socket moves with it whether or not the item
+        // is stowed: everything from where that limb leaves the torso.
+        let torso = ["b_pelvis", "b_spine_1", "b_spine_2", "b_spine_3"].map(|name| driven.node(name));
+        let parent = |node: usize| usize::try_from(driven.parents[node]).ok();
+        let mut limb = socket;
+        while let Some(above) = parent(limb).filter(|above| !torso.contains(&Some(*above)) && parent(*above).is_some()) {
+            limb = above;
+        }
+        let carried = (0..driven.names.len())
+            .map(|node| std::iter::successors(Some(node), |node| parent(*node)).any(|node| node == limb))
+            .collect::<Vec<_>>();
+        (0..driven.names.len())
+            .filter(|node| !carried[*node])
+            .map(|node| {
+                let place = relative(first[node], first[socket]);
+                let gap = [&middle, &end]
+                    .map(|pose| placement_gap(relative(pose[node], pose[socket]), place));
+                let worst = (gap[0].0.max(gap[1].0), gap[0].1.max(gap[1].1));
+                (node, place, worst)
+            })
+            .filter(|(_, _, worst)| worst.0 <= STOWED_GAP.0 && worst.1 <= STOWED_GAP.1)
+            .min_by(|a, b| a.2.0.total_cmp(&b.2.0))
+            .map(|(node, place, _)| (socket, node, place))
+    }
+}
+
+impl ClipProp {
+    /// The prop's nodes in the object space of the entity holding it, whose
+    /// own posed nodes are `holder` (by node name) on skeleton `held_by`.
+    fn pose(&self, held_by: &'static Skeleton, holder: &rustc_hash::FxHashMap<u32, Transform>, frame: f32) -> Option<Vec<Transform>> {
+        let (node, offset) = skeleton_socket(held_by, self.socket)?;
+        let socket = compose(*holder.get(&node)?, offset);
+        let local = match &self.clip {
+            Some(clip) => self.skeleton.local_pose(&clip.sample(frame.min((clip.frames - 1) as f32))),
+            None => self.skeleton.bind.clone(),
+        };
+        Some(local.into_iter().map(|node| compose(socket, node)).collect())
+    }
 }

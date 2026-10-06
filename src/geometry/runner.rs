@@ -15,6 +15,11 @@ pub struct RunnerShellAssembly {
     /// The runner's own entity definition, when the caller knows which runner
     /// this shell belongs to. Its default gear is rendered with the shell.
     pub runner: Option<TagHash>,
+    /// Row of the runner's dye table this skin uses, from its item definition.
+    pub dye_row: Option<u32>,
+    /// Geometry of the props the clip being played spawns.
+    pub props: Vec<TagHash>,
+
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +94,8 @@ impl RunnerShellAssembly {
             nested_patterns,
             parts,
             runner: None,
+            dye_row: None,
+            props: vec![],
         })
     }
 
@@ -204,6 +211,26 @@ impl RunnerShellAssembly {
             .collect()
     }
 
+    /// Geometry of the runner's own gear and spawned props, rendered with the shell.
+    pub(crate) fn gear(&self, cache: &TagCache) -> Vec<TagHash> {
+        let worn = self.geometry();
+        self.runner.map_or_else(Vec::new, |runner| {
+            Self::runner_gear(cache, runner)
+                .into_iter()
+                .chain(self.props.iter().copied())
+                .filter(|gear| !worn.contains(gear))
+                .collect()
+        })
+    }
+
+    /// Channel values the skin's dye row gives every material of its runner.
+    pub(crate) fn dye_channels(&self) -> Vec<(u32, [f32; 4])> {
+        self.runner
+            .zip(self.dye_row)
+            .and_then(|(runner, row)| runner_dye_rows(runner).into_iter().nth(row as usize))
+            .map_or_else(Vec::new, |(_, row)| row.into_iter().collect())
+    }
+
     pub fn load(&self, cache: Arc<TagCache>) -> Option<GeometryTagPreview> {
         let entry = package_manager().get_entry(self.pattern)?;
         let mut model = load_model_preview_from_tags(
@@ -221,8 +248,11 @@ impl RunnerShellAssembly {
                 Some(runner) => Self::runner_gear(&cache, runner).into_iter().filter(|gear| !self.geometry().contains(gear)).collect(),
                 None => self.default_gear(&cache, &wireframe.authored_inputs),
             });
-        if !gear.is_empty() {
-            let geometry = self.geometry().into_iter().chain(gear).collect();
+        // Props a playing clip spawns are rendered with the shell as well.
+        let extra = gear.into_iter().chain(self.props.iter().copied()).collect::<Vec<_>>();
+        if !extra.is_empty() {
+            let geometry = self.geometry().into_iter().chain(extra).collect();
+
             model = load_model_preview_from_tags(cache.clone(), self.pattern, &entry, "Runner shell", geometry, &[]);
         }
         // Cosmetic channels belong to this shell's immediate components. Never
@@ -270,3 +300,49 @@ impl RunnerShellAssembly {
         })
     }
 }
+
+/// Rows of a runner's dye table, one per skin, keyed by the skin's codename.
+const CLASS_RUNNER_DYE_ROWS: u32 = 0x80809627;
+
+/// Channel values one skin gives its runner's dyed materials.
+type DyeRow = rustc_hash::FxHashMap<u32, [f32; 4]>;
+
+/// The dye table of a runner: a component of its entity definition holding,
+/// per skin codename, a value for each dye channel its gear materials read.
+fn runner_dye_rows(runner: TagHash) -> Vec<(u32, DyeRow)> {
+    let endian = package_manager().version.endian();
+    let Ok(definition) = package_manager().read_tag(runner) else {
+        return vec![];
+    };
+    let offset_in = |data: &[u8], part: &[u8]| part.as_ptr() as usize - data.as_ptr() as usize;
+    definition
+        .chunks_exact(4)
+        .map(|word| TagHash(u32::from_le_bytes(word.try_into().unwrap())))
+        .filter(|tag| {
+            package_manager().get_entry(*tag).is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
+        })
+        .unique()
+        .filter_map(|component| package_manager().read_tag(component).ok())
+        .find_map(|data| {
+            let table = scan_arrays(&data, endian).into_iter().find(|array| array.class == CLASS_RUNNER_DYE_ROWS)?;
+            let rows = array_records(&data, table, 0x18)
+                .into_iter()
+                .filter_map(|record| {
+                    let record_offset = offset_in(&data, record);
+                    let entries = read_array(&data, record_offset + 0x08, 0x48, endian)?;
+                    let entries_offset = offset_in(&data, entries);
+                    let values = (0..entries.len() / 0x48)
+                        .filter_map(|index| {
+                            let entry = entries_offset + index * 0x48;
+                            let value = read_array(&data, entry + 0x20, 0x10, endian)?;
+                            Some((read_u32_at(&data, entry, endian)?, read_vec4_f32(value, 0, endian)?))
+                        })
+                        .collect();
+                    Some((read_u32_at(record, 0, endian)?, values))
+                })
+                .collect::<Vec<_>>();
+            Some(rows)
+        })
+        .unwrap_or_default()
+}
+

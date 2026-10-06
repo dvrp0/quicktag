@@ -58,6 +58,12 @@ pub enum DescriptorAbi {
     ClothB152VertexStorage,
     /// EC03: CB1/CB12, three generated scalar streams and 30-row CB0.
     DisplacementEC03VertexStorage,
+    /// D8B4: A60029's graph plus a 31-row CB0 whose second row pushes the
+    /// position out along the normal; EC03's six-resource layout.
+    ShellOffsetD8B4VertexStorage,
+    /// C7F6: D8B4's graph with EC03's 30-row CB0, whose first row is the
+    /// offset along the normal; EC03's six-resource layout and producer.
+    ShellOffsetC7F6VertexStorage,
     /// C107: t0 float4 colors, t2/t3/t4 scalar generated streams, cb12/cb1.
     VertexColorStorage,
     /// Hair pixel bindings compacted to cb0/cb1/cb12, t0..t4, s1/s2.
@@ -96,6 +102,8 @@ pub enum DescriptorAbi {
     BodyMeshB152BEComputeStorage,
     /// B7C5: exact Body graph with 15 rows, no leading-row shift.
     BodyMesh15RowComputeStorage,
+    /// D8C1: Body graph with every row one higher and a 16-row image.
+    BodyMesh16RowD8C1ComputeStorage,
     /// Head producer80A9A2D3, exactsource module with the verified rigid ABI.
     HeadMeshComputeStorage,
     /// EC0B: original A2D3 math, unused trailing 15th row; no leading shift.
@@ -108,8 +116,10 @@ pub enum DescriptorAbi {
 
 impl DescriptorAbi {
     pub(crate) fn vertex_constant_contract(self) -> Option<(usize, usize)> {
-        if self == Self::DisplacementEC03VertexStorage {
+        if matches!(self, Self::DisplacementEC03VertexStorage | Self::ShellOffsetC7F6VertexStorage) {
             Some((1, 30))
+        } else if self == Self::ShellOffsetD8B4VertexStorage {
+            Some((2, 31))
         } else {
             self.auxiliary_vertex_contract().map(|(authored, declared, _)| (authored, declared))
         }
@@ -117,8 +127,10 @@ impl DescriptorAbi {
 
     /// Producer pairing belongs to exact source identity, not IA or character.
     pub(crate) fn static_vertex_producer(self) -> Option<Self> {
-        if self == Self::DisplacementEC03VertexStorage {
+        if matches!(self, Self::DisplacementEC03VertexStorage | Self::ShellOffsetC7F6VertexStorage) {
             Some(Self::HeadMeshEC0BComputeStorage)
+        } else if self == Self::ShellOffsetD8B4VertexStorage {
+            Some(Self::BodyMesh16RowD8C1ComputeStorage)
         } else {
             self.auxiliary_vertex_contract().map(|(_, _, producer)| producer)
         }
@@ -230,6 +242,27 @@ pub const PROGRAMS: &[AuthoredProgram] = &[
         spirv_sha256: decode_sha256("4247940cd629434b5b7e2bc777f256be9264776c701fd785e1847573ae058809"),
         descriptor_abi: DescriptorAbi::DisplacementEC03VertexStorage,
         spirv: include_bytes!("../../assets/authored/goliath/runner-80A9EC03.vs.spv"),
+    },
+    AuthoredProgram {
+        shader_tag: TagHash(0x80A7D8B4), stage: ShaderStage::Vertex,
+        source_sha256: decode_sha256("9486690f6f8e91eb1731a56be6dc7eb110bce943739c74d6f37814a6911e20ba"),
+        spirv_sha256: decode_sha256("6b869d13df07588f38fdc9ab5b09ab5bd6c6a2fdef85f308041f332e8727e643"),
+        descriptor_abi: DescriptorAbi::ShellOffsetD8B4VertexStorage,
+        spirv: include_bytes!("../../assets/authored/goliath/runner-80A7D8B4.vs.spv"),
+    },
+    AuthoredProgram {
+        shader_tag: TagHash(0x80A7C7F6), stage: ShaderStage::Vertex,
+        source_sha256: decode_sha256("9c5f8b0bc0a315e904830b9cf4d9906476d7961bc31202833022499f91581a07"),
+        spirv_sha256: decode_sha256("c995775859baaf4fbfa0c204ed811dfd298797a0a0e8c76f281fb4ab0466c1df"),
+        descriptor_abi: DescriptorAbi::ShellOffsetC7F6VertexStorage,
+        spirv: include_bytes!("../../assets/authored/goliath/runner-80A7C7F6.vs.spv"),
+    },
+    AuthoredProgram {
+        shader_tag: TagHash(0x80A7D8C1), stage: ShaderStage::Compute,
+        source_sha256: decode_sha256("f61912609b8667d541cd68c8487e385b5b972525d07aa45482aac568124950b0"),
+        spirv_sha256: decode_sha256("5aad29c9c4a1360abc9364c5eb1f62093062d7e864dc4b8ba0d59364bd5b0d4d"),
+        descriptor_abi: DescriptorAbi::BodyMesh16RowD8C1ComputeStorage,
+        spirv: include_bytes!("../../assets/authored/goliath/runner-80A7D8C1.compute.ssbo.spv"),
     },
     AuthoredProgram {
         shader_tag: TagHash(0x80A9EC0B), stage: ShaderStage::Compute,

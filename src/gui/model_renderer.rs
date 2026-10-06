@@ -166,6 +166,10 @@ struct ModelDraw {
     native_surface: Option<NativeSurfaceSource>,
     native_decal: Option<NativeDecalSource>,
     native_rejection: Option<&'static str>,
+    /// A transparent effect drawn with a stand-in material whose own material
+    /// reads an object channel nothing drives. The game raises such a channel
+    /// to bring the effect up; at rest the effect is not there.
+    resting_effect: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -592,6 +596,7 @@ fn create_gpu_authored_geometry_input(
                 abi,
                 DescriptorAbi::BodyMeshComputeStorage
                     | DescriptorAbi::BodyMesh15RowComputeStorage
+                    | DescriptorAbi::BodyMesh16RowD8C1ComputeStorage
                     | DescriptorAbi::HeadMeshComputeStorage
                     | DescriptorAbi::HeadMeshEC0BComputeStorage
                     | DescriptorAbi::HeadMesh15RowA60035ComputeStorage
@@ -784,7 +789,60 @@ fn model_vertex_skin(vertices: &[ModelVertex], sources: &[AuthoredGeometryInput]
             by_position.insert(key(position), (source_index as u32, skin));
         }
     }
+    // Float-format sources keep their influences in a stream of their own.
+    for (source_index, source) in sources.iter().enumerate() {
+        let (Some((stream, skin)), Some(transform)) = (crate::animation::float_source_streams(source), source.position_transform) else { continue; };
+        let (Ok(data), Ok(skin)) = (package_manager().read_tag(stream.data_tag), package_manager().read_tag(skin.data_tag)) else { continue; };
+        for (vertex, record) in data.chunks_exact(48).zip(skin.chunks_exact(8)) {
+            let position = std::array::from_fn(|lane| {
+                f32::from_le_bytes(vertex[lane * 4..lane * 4 + 4].try_into().unwrap()) * transform.scale[lane] + transform.offset[lane]
+            });
+            by_position.insert(key(position), (source_index as u32, crate::animation::float_vertex_skin(record)));
+        }
+    }
     vertices.iter().map(|vertex| by_position.get(&key(vertex.position)).copied().unwrap_or((0, [(0, 0.0); 4]))).collect()
+}
+
+/// The rest vertices and bone influences of a float-format source, by the
+/// tags of its two streams.
+fn float_source_rest(vertices: TagHash, skin: TagHash) -> Option<std::sync::Arc<(Vec<u8>, Vec<VertexSkin>)>> {
+    type Rest = HashMap<TagHash, Option<std::sync::Arc<(Vec<u8>, Vec<VertexSkin>)>>>;
+    static REST: std::sync::OnceLock<std::sync::Mutex<Rest>> = std::sync::OnceLock::new();
+    REST.get_or_init(Default::default).lock().unwrap().entry(vertices).or_insert_with(|| {
+        let data = package_manager().read_tag(vertices).ok()?;
+        let skin = package_manager().read_tag(skin).ok()?;
+        let skin = skin.chunks_exact(8).map(crate::animation::float_vertex_skin).collect_vec();
+        (skin.len() * 48 == data.len()).then(|| std::sync::Arc::new((data, skin)))
+    }).clone()
+}
+
+/// A float-format source's vertices under a bone pose: position, normal and
+/// tangent blended across each vertex's influences, kept in the source's own
+/// position space (`object = stored * scale + offset`).
+fn float_source_posed(rest: &[u8], skin: &[VertexSkin], bones: &[crate::animation::Transform], scale: [f32; 3], offset: [f32; 3]) -> Vec<u8> {
+    let mut posed = rest.to_vec();
+    for (vertex, skin) in posed.chunks_exact_mut(48).zip(skin) {
+        let read = |vertex: &[u8], lane: usize| -> [f32; 3] { std::array::from_fn(|c| f32::from_le_bytes(vertex[(lane + c) * 4..(lane + c) * 4 + 4].try_into().unwrap())) };
+        let stored = read(vertex, 0);
+        let (position, normal, tangent): ([f32; 3], [f32; 3], [f32; 3]) = (std::array::from_fn(|c| stored[c] * scale[c] + offset[c]), read(vertex, 4), read(vertex, 8));
+        let (mut moved, mut turned, mut swung, mut total) = ([0.0f32; 3], [0.0f32; 3], [0.0f32; 3], 0.0f32);
+        for (bone, weight) in skin.iter().filter(|(_, weight)| *weight > 0.0) {
+            let Some(bone) = bones.get(usize::from(*bone)) else { continue; };
+            let at = crate::animation::quat_rotate(bone.rotation, position.map(|c| c * bone.scale));
+            let (n, t) = (crate::animation::quat_rotate(bone.rotation, normal), crate::animation::quat_rotate(bone.rotation, tangent));
+            for c in 0..3 { moved[c] += (at[c] + bone.translation[c]) * weight; turned[c] += n[c] * weight; swung[c] += t[c] * weight; }
+            total += weight;
+        }
+        if total <= 0.0 { continue; }
+        let unit = |v: [f32; 3]| { let length = v.iter().map(|c| c * c).sum::<f32>().sqrt().max(1.0e-12); v.map(|c| c / length) };
+        let (turned, swung) = (unit(turned), unit(swung));
+        for c in 0..3 {
+            vertex[c * 4..c * 4 + 4].copy_from_slice(&((moved[c] / total - offset[c]) / scale[c]).to_le_bytes());
+            vertex[(4 + c) * 4..(4 + c) * 4 + 4].copy_from_slice(&turned[c].to_le_bytes());
+            vertex[(8 + c) * 4..(8 + c) * 4 + 4].copy_from_slice(&swung[c].to_le_bytes());
+        }
+    }
+    posed
 }
 
 pub(crate) struct GpuModelPreview {
@@ -810,8 +868,28 @@ impl GpuModelPreview {
     fn posed_vertices(&self, pose: &crate::animation::ModelPose) -> Vec<ModelVertex> {
         let bones = pose.sources.iter().map(|source| source.as_ref()
             .map(|source| crate::animation::packed_space_dual_quaternions(source, 1.0, [0.0; 3]))).collect_vec();
+        let matrices = pose.sources.iter().map(|source| source.as_ref().filter(|source| crate::animation::skinning_scales(source))
+            .map(|source| crate::animation::packed_space_matrices(source, 1.0, [0.0; 3]))).collect_vec();
         self.vertices.iter().zip(&self.vertex_skin).map(|(vertex, (source, skin))| {
             let Some(bones) = bones.get(*source as usize).and_then(Option::as_ref) else { return *vertex; };
+            // A source with resized bones is blended with matrices, as the producer does.
+            if let Some(matrices) = matrices.get(*source as usize).and_then(Option::as_ref) {
+                let mut rows = [[0.0f32; 4]; 3];
+                for (bone, weight) in skin.iter().filter(|(_, weight)| *weight > 0.0) {
+                    let Some(bone) = matrices.get(usize::from(*bone) * 3..usize::from(*bone) * 3 + 3) else { continue; };
+                    for (row, bone) in rows.iter_mut().zip(bone) { for c in 0..4 { row[c] += bone[c] * weight; } }
+                }
+                let turn = |v: [f32; 3]| -> [f32; 3] { std::array::from_fn(|r| rows[r][0] * v[0] + rows[r][1] * v[1] + rows[r][2] * v[2]) };
+                let unit = |v: [f32; 3]| { let length = v.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-12); v.map(|c| c / length) };
+                let position = turn(vertex.position);
+                let tangent = unit(turn([vertex.tangent[0], vertex.tangent[1], vertex.tangent[2]]));
+                return ModelVertex {
+                    position: std::array::from_fn(|c| position[c] + rows[c][3]),
+                    normal: unit(turn(vertex.normal)),
+                    tangent: [tangent[0], tangent[1], tangent[2], vertex.tangent[3]],
+                    ..*vertex
+                };
+            }
             let (mut real, mut dual) = ([0.0f32; 4], [0.0f32; 4]);
             let mut pivot: Option<[f32; 4]> = None;
             for (bone, weight) in skin.iter().filter(|(_, weight)| *weight > 0.0) {
@@ -866,7 +944,159 @@ impl GpuModelPreview {
     /// One clip frame as a pose for this model, or `None` when no source is
     /// skinned to a runner body. A negative frame yields the bind pose.
     pub(crate) fn clip_pose(&self, clip: &crate::animation::Clip, frame: f32) -> Option<crate::animation::ModelPose> {
-        crate::animation::ModelPose::from_clip(self.source_skeletons(), clip, frame)
+        // A prop the clip spawns is skinned to its own skeleton, whatever its
+        // bones happen to lie close to.
+        let props = clip.props();
+        let skeletons = self.source_skeletons().iter().zip(&self.authored_inputs).map(|(skeleton, input)| {
+            let geometry = input.as_ref()?.geometry;
+            props.iter().find(|prop| prop.geometry.contains(&geometry)).map_or(*skeleton, |prop| Some(prop.skeleton))
+        }).collect_vec();
+        let mut pose = crate::animation::ModelPose::from_clip(&skeletons, clip, frame)?;
+        // A prop exists from the frame its clip spawns it until the clip has
+        // put it back where it was stowed. While it is out, the copy the
+        // runner carries holstered is not: that is every other draw with the
+        // same material as one of the prop's.
+        let prop_of = |draw: &ModelDraw| {
+            let geometry = self.authored_inputs.get(draw.authored_source?)?.as_ref()?.geometry;
+            props.iter().find(|prop| prop.geometry.contains(&geometry))
+        };
+        let spawned = |prop: &crate::animation::ClipProp| frame >= prop.start as f32 && !clip.prop_stowed(prop, &skeletons, frame);
+        // A draw's material: the pixel program it runs and its first texture.
+        // (Copies of one item may bind different shared textures after it.)
+        fn material(draw: &ModelDraw) -> Option<(crate::render::authored_program::DescriptorAbi, Option<TagHash>)> {
+            draw.native_surface.as_ref().map(|surface| (surface.program, surface.textures.first().copied()))
+                .or_else(|| draw.native_decal.as_ref().map(|decal| (decal.program, decal.textures.first().copied())))
+        }
+        let held = self.draws.iter()
+            .filter(|draw| prop_of(draw).is_some_and(spawned))
+            .filter_map(material)
+            .collect_vec();
+        // The holstered copy sits in the sources sharing a textured material
+        // with the prop; there its untextured materials count as well.
+        let holsters = self.draws.iter()
+            .filter(|draw| prop_of(draw).is_none())
+            .filter(|draw| material(draw).is_some_and(|found| found.1.is_some() && held.contains(&found)))
+            .filter_map(|draw| draw.authored_source)
+            .collect_vec();
+        pose.hidden_draws = self.draws.iter().chain(&self.authored_shadow_draws).enumerate()
+            .filter(|(_, draw)| match prop_of(draw) {
+                Some(prop) => !spawned(prop),
+                None => draw.authored_source.is_some_and(|source| holsters.contains(&source))
+                    && material(draw).is_some_and(|found| held.contains(&found)),
+            })
+            .map(|(index, _)| index)
+            .collect();
+        // --- Prop hand-off correction: viewer approximation, see gui/prop_handoff.rs ---
+        for prop in props.iter().filter(|prop| spawned(prop)) {
+            self.correct_handoff(clip, prop, &skeletons, frame, &mut pose);
+        }
+        // --- end of prop hand-off correction ---
+        Some(pose)
+    }
+
+    /// Part of the prop hand-off correction (gui/prop_handoff.rs): nudge a
+    /// stowed prop onto the holstered copy, less the further it is from home.
+    fn correct_handoff(
+        &self,
+        clip: &crate::animation::Clip,
+        prop: &crate::animation::ClipProp,
+        skeletons: &[Option<&'static crate::animation::Skeleton>],
+        frame: f32,
+        pose: &mut crate::animation::ModelPose,
+    ) -> Option<()> {
+        use super::prop_handoff as handoff;
+        let (anchor, distance, pivot) = clip.prop_stow(prop, skeletons, frame)?;
+        let weight = (1.0 - distance / handoff::REACH).clamp(0.0, 1.0);
+        (weight > 0.0).then_some(())?;
+        let weight = weight * weight * (3.0 - 2.0 * weight);
+        let (prop_source, copy_source, offset) = self.handoff_offset(clip, prop, skeletons, anchor)?;
+        // The offset rides the body node the holster is on.
+        let carrier = *pose.sources.get(copy_source)?.as_ref()?.get(anchor)?;
+        let correction = handoff::compose(handoff::compose(carrier, offset), handoff::inverse(carrier));
+        let nudge = handoff::blended(correction, pivot, weight);
+        for bone in pose.sources.get_mut(prop_source)?.as_mut()? {
+            *bone = handoff::compose(nudge, *bone);
+        }
+        Some(())
+    }
+
+    /// The prop's source, the holstered copy's source and the offset between
+    /// the stowed prop and that copy, in the frame of the copy's body node.
+    fn handoff_offset(
+        &self,
+        clip: &crate::animation::Clip,
+        prop: &crate::animation::ClipProp,
+        skeletons: &[Option<&'static crate::animation::Skeleton>],
+        anchor: usize,
+    ) -> Option<(usize, usize, crate::animation::Transform)> {
+        use super::prop_handoff as handoff;
+        type Offsets = rustc_hash::FxHashMap<(TagHash, u32, TagHash, usize), Option<(usize, usize, crate::animation::Transform)>>;
+        static OFFSETS: std::sync::OnceLock<std::sync::Mutex<Offsets>> = std::sync::OnceLock::new();
+        let key = (clip.tag, prop.socket, *prop.geometry.first()?, self.vertices.len());
+        if let Some(found) = OFFSETS.get_or_init(Default::default).lock().unwrap().get(&key) {
+            return *found;
+        }
+        let measured = (|| {
+            let of_prop = |draw: &ModelDraw| {
+                let geometry = self.authored_inputs.get(draw.authored_source?)?.as_ref()?.geometry;
+                Some(prop.geometry.contains(&geometry))
+            };
+            fn material(draw: &ModelDraw) -> Option<(crate::render::authored_program::DescriptorAbi, TagHash)> {
+                draw.native_surface.as_ref().and_then(|surface| Some((surface.program, *surface.textures.first()?)))
+                    .or_else(|| draw.native_decal.as_ref().and_then(|decal| Some((decal.program, *decal.textures.first()?))))
+            }
+            let prop_source = self.draws.iter().find(|draw| of_prop(draw) == Some(true))?.authored_source?;
+            let held = self.draws.iter().filter(|draw| of_prop(draw) == Some(true)).filter_map(material).collect_vec();
+            let copies = self.draws.iter()
+                .filter(|draw| of_prop(draw) == Some(false))
+                .filter(|draw| material(draw).is_some_and(|found| held.contains(&found)))
+                .collect_vec();
+            let copy_source = copies.first()?.authored_source?;
+            // The clip's last frame has the item stowed.
+            let stowed = crate::animation::ModelPose::from_clip(skeletons, clip, (clip.frames - 1) as f32)?;
+            let prop_bones = stowed.sources.get(prop_source)?.as_ref()?;
+            let carrier = *stowed.sources.get(copy_source)?.as_ref()?.get(anchor)?;
+            let lead = |vertex: usize| self.vertex_skin[vertex].1.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(bone, _)| usize::from(bone));
+            let point = |vertex: usize| (self.vertices[vertex].position, self.vertices[vertex].uv);
+            // Parts the stowed pose shrinks away are not on the copy.
+            let prop_vertices = (0..self.vertices.len())
+                .filter(|vertex| self.vertex_skin[*vertex].0 as usize == prop_source)
+                .filter(|vertex| lead(*vertex).and_then(|bone| prop_bones.get(bone)).is_some_and(|bone| bone.scale > 0.5))
+                .collect_vec();
+            let copy_vertices = copies.iter()
+                .flat_map(|draw| self.indices[draw.indices.start as usize..draw.indices.end as usize].iter().map(|index| *index as usize))
+                .unique()
+                .collect_vec();
+            let (fitted, agreeing) = handoff::register(
+                &prop_vertices.iter().map(|vertex| point(*vertex)).collect_vec(),
+                &copy_vertices.iter().map(|vertex| point(*vertex)).collect_vec(),
+            )?;
+            // The item's body is the set of bones moving as one that most of
+            // the agreeing surface hangs on; parts the stowed pose folds away
+            // from where the copy has them are left to differ.
+            let rigid = |bone: usize| prop_bones.get(bone).map(|bone| {
+                let sign = if bone.rotation[3] < 0.0 { -1.0 } else { 1.0 };
+                (bone.rotation.map(|c| (c * sign * 1.0e3).round() as i32), bone.translation.map(|c| (c * 1.0e4).round() as i32))
+            });
+            let body = agreeing.iter()
+                .filter_map(|index| lead(prop_vertices[*index]))
+                .filter_map(|bone| Some((rigid(bone)?, bone)))
+                .into_group_map()
+                .into_values()
+                .max_by_key(Vec::len)?;
+            let body = *prop_bones.get(*body.first()?)?;
+            let offset = handoff::compose(handoff::compose(fitted, handoff::inverse(body)), carrier);
+            // What it does to the stowed prop: nothing worth applying, or too much to trust.
+            let jump = handoff::compose(handoff::compose(carrier, offset), handoff::inverse(carrier));
+            let centre = handoff::apply(body, self.vertices[prop_vertices[agreeing[0]]].position);
+            let moved = handoff::apply(jump, centre);
+            let shift = (0..3).map(|c| (moved[c] - centre[c]).powi(2)).sum::<f32>().sqrt();
+            let turn = 2.0 * jump.rotation[3].abs().min(1.0).acos().to_degrees();
+            log::info!("prop hand-off correction for clip {} socket {:08X}: {} surface points agree, {:.1} mm, {:.2} deg", clip.tag, prop.socket, agreeing.len(), shift * 1000.0, turn);
+            ((shift > 0.001 || turn > 0.25) && shift < 0.12 && turn < 20.0).then_some((prop_source, copy_source, offset))
+        })();
+        OFFSETS.get_or_init(Default::default).lock().unwrap().insert(key, measured);
+        measured
     }
 
     fn authored_index_format(&self, stable_index: usize) -> wgpu::IndexFormat {
@@ -919,7 +1149,8 @@ impl GpuModelPreview {
                 let evaluation=draw.native_surface.as_ref().map(|s|format!("source {:?}",s.program))
                     .or_else(||draw.native_decal.as_ref().map(|s|format!("source {:?}",s.program)))
                     .or_else(||draw.native_c827.map(|_|"source C827".to_string()))
-                    .unwrap_or_else(||format!("generic; {}",draw.native_rejection.unwrap_or("no authored material contract")));
+                    .unwrap_or_else(||if draw.resting_effect { "not drawn; its state channel is at rest".to_string() } else {
+                        format!("generic; {}",draw.native_rejection.unwrap_or("no authored material contract")) });
                 format!(
                     "#{index} lod={:?} stage={:?} tech={:?} family={:?} evaluation=[{}] passes={:?} authored=[{}] source={} tfx=[{}] warnings={:?}",
                     draw.packet.raw_lod_category,
@@ -1083,6 +1314,13 @@ impl GpuModelPreview {
             }
             draw.native_c827=native_c827_constants(draw.packet.technique.as_ref(),draw.authored_stage,draw.pipeline,
                 scoped.as_ref().unwrap_or(runtime_inputs));
+            let stand_in=draw.native_surface.is_none() && draw.native_decal.is_none() && draw.native_c827.is_none();
+            draw.resting_effect=stand_in && draw.packet.raw_render_stage == Some(8)
+                && draw.packet.technique.as_ref().is_some_and(|technique|technique.stages.iter()
+                    .flat_map(|stage|&stage.tfx.ops)
+                    .filter(|op|op.name == "push_object_channel")
+                    .filter_map(|op|crate::render::channels::parse_hex_id(&op.detail))
+                    .any(|channel|!runtime_inputs.driven_channels.contains(&channel)));
         }
         if draws.is_empty() {
             return None;
@@ -1411,6 +1649,7 @@ fn model_draw_from_source(
         native_surface: None,
         native_decal: None,
         native_rejection: None,
+        resting_effect: false,
     }
 }
 
@@ -1525,6 +1764,7 @@ fn model_draws(
             native_surface: None,
             native_decal: None,
             native_rejection: None,
+            resting_effect: false,
         });
     }
 
@@ -1961,8 +2201,8 @@ impl Default for ModelEnvironment {
             specular_ibl_intensity: 0.2,
             // The default source faces the world origin, preserving the
             // historical key-light orientation while using finite lighting.
-            light_target: [-0.183, 0.017, -0.483],
-            light_orbit_position: [0.2562, 0.3389, 0.9053],
+            light_target: [0.218, -0.106, -0.789],
+            light_orbit_position: [0.1367, 0.8696, 0.4745],
             light_orbit_center: [0.174, -0.045, -0.117],
             light_orbit_radius: 1.0,
             light_range: 4.0,
@@ -2435,6 +2675,9 @@ impl ModelPaintCallback {
             );
         for (is_authored_shadow, stable_index, draw) in draw_sources {
             if !is_authored_shadow && draw.sticker_proxy && !show_stickers {
+                continue;
+            }
+            if draw.resting_effect {
                 continue;
             }
             if !is_authored_shadow && draw.native_c827.is_some() {
@@ -2916,7 +3159,27 @@ impl ModelPaintCallback {
 
     /// Pose the model with per-bone skinning transforms (bind object space to
     /// posed object space). `None` keeps the unposed model.
+    /// Factor a source's packed position range is widened by for the current
+    /// pose: enough to hold the mesh wherever its bones carry it, so a small
+    /// prop moved far from where it was authored is not clipped.
+    fn posed_range(&self, source_index: usize) -> f32 {
+        let least = crate::render::static_mesh::POSED_POSITION_RANGE;
+        let reach = (|| {
+            let pose = self.pose.as_ref()?.sources.get(source_index)?.as_ref()?;
+            let packing = self.preview.authored_inputs.get(source_index)?.as_ref()?.position_transform?;
+            Some(crate::animation::packed_space_reach(pose, packing.procedural_scale, packing.offset))
+        })();
+        // The mesh itself spans two units of its own range around the reach.
+        reach.map_or(least, |reach| (reach + 2.0).max(least))
+    }
+
     pub(crate) fn with_pose(mut self, pose: Option<Arc<crate::animation::ModelPose>>) -> Self {
+        if let Some(pose) = pose.as_ref().filter(|pose| !pose.hidden_draws.is_empty()) {
+            self.draws.retain(|draw| !pose.hidden_draws.contains(&draw.stable_index));
+            self.shadow_draws.retain(|draw| !pose.hidden_draws.contains(&draw.stable_index));
+            self.native_surfaces.retain(|surface| !pose.hidden_draws.contains(&surface.stable_index));
+            self.native_decals.retain(|decal| !pose.hidden_draws.contains(&decal.stable_index));
+        }
         self.pose = pose;
         self
     }
@@ -4623,7 +4886,9 @@ impl CallbackTrait for ModelPaintCallback {
                     _ => create_model_texture_view(&t.handle,&Default::default()),
                 }).collect_vec();
                 let samplers=spec.samplers.iter().map(|desc|create_native_authored_sampler(device,desc)).collect_vec();
-                let vertex=if spec.vertex_program == crate::render::authored_program::DescriptorAbi::DisplacementEC03VertexStorage {
+                let vertex=if matches!(spec.vertex_program, crate::render::authored_program::DescriptorAbi::DisplacementEC03VertexStorage
+                    | crate::render::authored_program::DescriptorAbi::ShellOffsetD8B4VertexStorage
+                    | crate::render::authored_program::DescriptorAbi::ShellOffsetC7F6VertexStorage) {
                     let mesh = mesh.expect("exact EC03 static producer");
                     assert_eq!(mesh.producer, spec.vertex_program.static_vertex_producer().unwrap());
                     let cb0 = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -5974,7 +6239,8 @@ impl CallbackTrait for ModelPaintCallback {
                 let mut object=if let Some(surface)=&draw.native_surface {
                     native_surface_object_image(surface.vertex_program,source)
                 } else { c827_static_skinning(source) };
-                for row in [12,13] { object[row][3]*=crate::render::static_mesh::POSED_POSITION_RANGE; }
+                let range=self.posed_range(source_index);
+                for row in [12,13] { object[row][3]*=range; }
                 _queue.write_buffer(buffer,0,bytemuck::cast_slice(&object));
             }
         }
@@ -5990,8 +6256,16 @@ impl CallbackTrait for ModelPaintCallback {
             let producer=&pipelines.authored_compute_pipelines.iter().find(|(abi,_)|*abi==mesh.producer).expect("exact compute source").1;
             // Posed bones live in each source's packed coordinate space.
             let source=self.preview.authored_inputs[*index].as_ref().expect("native geometry");
-            let bones=self.pose.as_ref().and_then(|pose|pose.sources.get(*index)?.as_ref()).zip(source.position_transform).map(|(pose,p)|crate::animation::packed_space_dual_quaternions(pose,p.procedural_scale,p.offset));
-            mesh.set_pose(_queue,bones.as_deref());
+            let bones=self.pose.as_ref().and_then(|pose|pose.sources.get(*index)?.as_ref()).zip(source.position_transform).map(|(pose,p)|if crate::animation::skinning_scales(pose){(crate::animation::packed_space_matrices(pose,p.procedural_scale,p.offset),3)}else{(crate::animation::packed_space_dual_quaternions(pose,p.procedural_scale,p.offset),2)});
+            mesh.set_pose(_queue,bones.as_ref().map(|(rows,per_bone)|(rows.as_slice(),*per_bone)),self.posed_range(*index));
+            if !mesh.poseable() {
+                // A float-format source is skinned here: the producer has no palette for it.
+                let streams=source.vertex_streams.iter().find(|stream|stream.stream_index==0&&stream.stride==48).zip(source.vertex_streams.iter().find(|stream|stream.stream_index==2&&stream.stride==8));
+                if let Some(rest)=streams.and_then(|(vertices,skin)|float_source_rest(vertices.data_tag,skin.data_tag)) {
+                    let posed=self.pose.as_ref().and_then(|pose|pose.sources.get(*index)?.as_ref()).zip(source.position_transform).map(|(pose,p)|float_source_posed(&rest.0,&rest.1,pose,p.scale,p.offset));
+                    mesh.set_float_pose(_queue,posed.as_deref(),&rest.0);
+                }
+            }
             mesh.encode_once(egui_encoder,producer,bindings);
         }
 
@@ -7839,7 +8113,7 @@ fn create_authored_surface_pipelines(
         match vertex {
             D::RigidVertexDirectIa => rigid_vertex_layout,
             D::VertexColorStorage => color_vertex_layout,
-            D::DisplacementEC03VertexStorage => displacement_vertex_layout,
+            D::DisplacementEC03VertexStorage | D::ShellOffsetD8B4VertexStorage | D::ShellOffsetC7F6VertexStorage => displacement_vertex_layout,
             D::HairVertexStorage | D::Hair14580VertexStorage | D::Hair120RowVertexStorage | D::HairBA67VertexStorage
                 | D::BodyProceduralVertexStorage | D::BodyC9C5VertexStorage | D::ClothVertexStorage | D::ClothB152VertexStorage => auxiliary_vertex_layout,
             _ => vertex_layout,

@@ -2,6 +2,9 @@
 use super::*;
 use anyhow::{Context, Result, ensure};
 
+/// Radians-to-degrees factor of the authored display programs (808028FB).
+const DISPLAY_DEGREES: f32 = 57.3;
+
 #[derive(Clone, Debug)]
 pub(in crate::gui) struct WeaponModStatChange {
     pub name: &'static str,
@@ -19,6 +22,13 @@ pub(in crate::gui) struct WeaponModRawStat {
     pub name: String,
     pub rating_id: u32,
     pub value: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::gui) struct WeaponBaseRating {
+    pub name: String,
+    pub rating_id: u32,
+    pub value: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +119,15 @@ fn sample(curve: &CurveGroup, column: usize, rating: f32) -> Result<f32> {
     Ok(value)
 }
 
+/// Several installed mods may move the same rating; their points add.
+pub(super) fn rating_deltas(ratings: &[WeaponModRawStat]) -> FxHashMap<u32, i32> {
+    let mut deltas = FxHashMap::default();
+    for rating in ratings {
+        *deltas.entry(rating.rating_id).or_default() += rating.value;
+    }
+    deltas
+}
+
 impl WeaponStatResolver<'_> {
     pub(in crate::gui) fn mod_raw_stats(
         &self,
@@ -130,6 +149,59 @@ impl WeaponStatResolver<'_> {
                 value: row.delta,
             })
             .collect())
+    }
+
+    /// Diagnostic: every gameplay component reachable from the weapon's
+    /// Patterns, with the curves each one carries.
+    pub(in crate::gui) fn debug_components(&self, weapon: TagHash) -> String {
+        let pm = package_manager();
+        let Some(patterns) = pm
+            .read_tag(weapon)
+            .ok()
+            .and_then(|definition| definition_pattern_index(&definition))
+            .and_then(|index| self.pattern_globals.get(index as usize))
+            .and_then(|global| self.assignments.get(global))
+        else {
+            return "  no patterns\n".to_owned();
+        };
+        let mut out = String::new();
+        // Every (0xC, pattern-global index) pair the definition holds, not
+        // only the render Pattern.
+        let definition = pm.read_tag(weapon).unwrap_or_default();
+        let mut linked = vec![];
+        for offset in (0..definition.len().saturating_sub(7)).step_by(4) {
+            if read_u32(&definition, offset) != Some(0xc) {
+                continue;
+            }
+            let Some(index) = read_u32(&definition, offset + 4) else { continue };
+            let Some(global) = self.pattern_globals.get(index as usize) else { continue };
+            let resolved = self.assignments.get(global).cloned().unwrap_or_default();
+            out += &format!("  LINK {offset:#x} index={index:#x} global={global:08X} patterns={resolved:?}\n");
+            linked.extend(resolved);
+        }
+        linked.sort_unstable();
+        linked.dedup();
+        for pattern in patterns.iter().chain(linked.iter().filter(|pattern| !patterns.contains(pattern))) {
+            out += &format!("  PATTERN {pattern}\n");
+            for tag in model_gameplay_components(self.cache, *pattern) {
+                let Ok(bytes) = pm.read_tag(tag) else { continue };
+                let curves = CurveSet::parse(&bytes);
+                out += &format!(
+                    "    COMPONENT {tag} {} bytes properties={} score={:?} semantics={:?}\n",
+                    bytes.len(),
+                    PropertyProgram::parse(&bytes).map_or(0, |program| program.rows().len()),
+                    curves.as_ref().map(CurveSet::layout_score),
+                    curves.map(|curves| {
+                        curves
+                            .0
+                            .iter()
+                            .map(|curve| (curve.semantic, curve.values[0].len()))
+                            .collect::<Vec<_>>()
+                    }),
+                );
+            }
+        }
+        out
     }
 
     /// Cacheable weapon half of mod evaluation. Curves and base ratings are
@@ -183,34 +255,98 @@ impl WeaponStatResolver<'_> {
         })
     }
 
-    /// `metadata` is the registry-selected 808092D6 definition.
     /// This handles direct investment ratings, not conditional effect execution.
-
-
     pub(in crate::gui) fn mod_stat_changes_for_ratings(
         &self,
         context: &WeaponModWeaponContext,
         ratings: &[WeaponModRawStat],
-        metadata: &[u8],
     ) -> Result<WeaponModEvaluation> {
-        context.evaluate(ratings, metadata)
+        let metadata = self
+            .rating_metadata
+            .as_deref()
+            .context("weapon rating routes are unavailable")?;
+        context.evaluate(ratings, metadata, self.display_programs.as_ref())
     }
 }
 
 impl WeaponModWeaponContext {
-    fn sample_curves(
-        &self,
-        ratings: &[WeaponModRawStat],
-        metadata: &[u8],
-    ) -> Result<Vec<WeaponModCurveChange>> {
-        let mut deltas = FxHashMap::default();
-        for rating in ratings {
-            ensure!(
-                deltas.insert(rating.rating_id, rating.value).is_none(),
-                "duplicate modifier rating {}",
-                rating.rating_id
+    /// The frame's own investment ratings, before any plug moves them.
+    pub(in crate::gui) fn base_ratings(&self) -> Vec<WeaponBaseRating> {
+        let mut ratings = self
+            .base
+            .iter()
+            .map(|(id, value)| WeaponBaseRating {
+                name: raw_rating_name(*id),
+                rating_id: *id,
+                value: *value,
+            })
+            .collect::<Vec<_>>();
+        ratings.sort_by_key(|rating| rating.rating_id);
+        ratings
+    }
+
+    /// Diagnostic text for `--dump-weapon-stats`: every authored input and
+    /// every evaluated property, before any presentation rule is applied.
+    pub(in crate::gui) fn debug_dump(&self, ratings: &[WeaponModRawStat], metadata: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let deltas = rating_deltas(ratings);
+        let delta = |id: u32| deltas.get(&id).copied().unwrap_or_default();
+        let mut base = self.base.iter().collect::<Vec<_>>();
+        base.sort_by_key(|(id, _)| **id);
+        for (id, rating) in base {
+            let _ = writeln!(out, "  RATING {id:3} = {rating} ({:+}) {}", delta(*id), raw_rating_name(*id));
+        }
+        let sampled = self.sample_properties(&deltas, metadata);
+        for (index, (curve, values)) in self.curves.0.iter().zip(&sampled).enumerate() {
+            let width = curve.values.first().map_or(0, Vec::len);
+            let route = rating_route(metadata, curve.semantic, width).ok();
+            let rating = route.and_then(|id| self.base.get(&id).copied());
+            let _ = writeln!(
+                out,
+                "  CURVE {index:2} semantic={:2} width={width} route={route:?} rating={rating:?} ({:+})\n      all    ={:?}\n      sampled={values:?}",
+                curve.semantic,
+                route.map_or(0, delta),
+                curve.values,
             );
         }
+        for row in self.properties.rows() {
+            let _ = writeln!(
+                out,
+                "  ROW dst=({},{:#x}) op={:#x} a={:x?} b={:x?} order={}",
+                row[0], row[1], row[4], &row[5..11], &row[11..17], row[23]
+            );
+        }
+        let mut properties = self.properties.evaluate(&sampled).into_iter().collect::<Vec<_>>();
+        properties.sort_by_key(|(key, _)| *key);
+        for ((group, field), value) in properties {
+            let _ = writeln!(out, "  PROP ({group},{field:#04x}) = {value}");
+        }
+        out
+    }
+
+    /// The modified rating of a routed curve; `None` when the weapon does not
+    /// carry the rating, so no mod can move it.
+    fn curve_rating(
+        &self,
+        curve: &CurveGroup,
+        deltas: &FxHashMap<u32, i32>,
+        metadata: &[u8],
+    ) -> Option<(u32, Option<(f32, f32)>)> {
+        let width = curve.values.first()?.len();
+        let id = rating_route(metadata, curve.semantic, width).ok()?;
+        let ratings = self.base.get(&id).map(|base| {
+            let delta = deltas.get(&id).copied().unwrap_or_default();
+            (*base, (base + delta as f32).clamp(0.0, 100.0))
+        });
+        Some((id, ratings))
+    }
+
+    fn sample_curves(
+        &self,
+        deltas: &FxHashMap<u32, i32>,
+        metadata: &[u8],
+    ) -> Result<Vec<WeaponModCurveChange>> {
         let mut occurrences = FxHashMap::<u32, usize>::default();
         let mut sampled = vec![];
         for curve in &self.curves.0 {
@@ -220,14 +356,10 @@ impl WeaponModWeaponContext {
             let width = curve.values.first().context("empty stat curve")?.len();
             // Unrouted semantics have no investment input. Keep the authored
             // rating visible, but do not invent a route or base value.
-            let Ok(id) = rating_route(metadata, curve.semantic, width) else {
+            let Some((id, Some((base, modified)))) = self.curve_rating(curve, deltas, metadata)
+            else {
                 continue;
             };
-            let Some(&base) = self.base.get(&id) else {
-                continue;
-            };
-            let modified =
-                (base + deltas.get(&id).copied().unwrap_or_default() as f32).clamp(0.0, 100.0);
             sampled.push(WeaponModCurveChange {
                 semantic: curve.semantic,
                 occurrence: ordinal,
@@ -245,6 +377,26 @@ impl WeaponModWeaponContext {
         Ok(sampled)
     }
 
+    /// Curve inputs of the property program, one entry per authored curve.
+    /// A routed curve whose rating the weapon lacks rests at rating zero.
+    fn sample_properties(
+        &self,
+        deltas: &FxHashMap<u32, i32>,
+        metadata: &[u8],
+    ) -> Vec<Option<Vec<f32>>> {
+        self.curves
+            .0
+            .iter()
+            .map(|curve| {
+                let (_, ratings) = self.curve_rating(curve, deltas, metadata)?;
+                let rating = ratings.map_or(0.0, |(_, modified)| modified);
+                (0..curve.values.first()?.len())
+                    .map(|column| sample(curve, column, rating).ok())
+                    .collect()
+            })
+            .collect()
+    }
+
     fn is_volt(&self) -> bool {
         self.curves.0.iter().any(|curve| {
             curve.semantic == 1
@@ -259,267 +411,188 @@ impl WeaponModWeaponContext {
         &self,
         ratings: &[WeaponModRawStat],
         metadata: &[u8],
+        display: Option<&StatDisplayPrograms>,
     ) -> Result<WeaponModEvaluation> {
-        let sampled = self.sample_curves(ratings, metadata)?;
-        let changes = present_curves(&sampled, self.is_volt())
-            .into_iter()
-            .filter(|change| change.delta().abs() > 0.000001)
-            .collect();
+        let deltas = rating_deltas(ratings);
+        let sampled = self.sample_curves(&deltas, metadata)?;
+        // Both endpoints run the authored property program, the same path as
+        // the weapon panel, so a delta is always the difference of two
+        // displayed values.
+        let before = self.stats(TagHash(0), &FxHashMap::default(), metadata, display);
+        let after = self.stats(TagHash(0), &deltas, metadata, display);
         Ok(WeaponModEvaluation {
-            changes,
+            changes: stat_changes(&before, &after, &sampled),
             curves: sampled
                 .into_iter()
-                .filter(|curve| {
-                    ratings
-                        .iter()
-                        .any(|rating| rating.rating_id == curve.rating_id)
-                })
+                .filter(|curve| deltas.contains_key(&curve.rating_id))
                 .collect(),
         })
     }
 
-    pub(super) fn baseline(&self, definition_tag: TagHash, metadata: &[u8]) -> Result<WeaponStats> {
-        let sampled = self
-            .curves
-            .0
-            .iter()
-            .map(|curve| {
-                let width = curve.values.first()?.len();
-                let id = rating_route(metadata, curve.semantic, width).ok()?;
-                let rating = self.base.get(&id).copied().unwrap_or(0.0);
-                (0..width)
-                    .map(|column| sample(curve, column, rating).ok())
-                    .collect()
-            })
-            .collect::<Vec<Option<Vec<f32>>>>();
+    /// Displayed weapon stats with `deltas` rating points installed.
+    pub(super) fn stats(
+        &self,
+        definition_tag: TagHash,
+        deltas: &FxHashMap<u32, i32>,
+        metadata: &[u8],
+        display: Option<&StatDisplayPrograms>,
+    ) -> WeaponStats {
+        let sampled = self.sample_properties(deltas, metadata);
         let properties = self.properties.evaluate(&sampled);
         let value = |group, field| properties.get(&(group, field)).copied();
         let average = |group, first, second| {
             value(group, first)
                 .zip(value(group, second))
-                .map(|(a, b)| (a + b) * 0.5)
+                .map(|(a, b)| (a + b) * 0.5 * DISPLAY_DEGREES)
         };
-        let curves = self.sample_curves(&[], metadata)?;
-        let displayed = present_curves(&curves, self.is_volt());
-        let raw_value = |name| {
-            displayed
+        let curve = |semantic| {
+            self.curves
+                .0
                 .iter()
-                .find(|stat| stat.name == name)
-                .map(|stat| stat.before)
+                .position(|curve| curve.semantic == semantic)
+                .and_then(|index| sampled[index].as_deref())
         };
+        let volt = self.is_volt();
         let pellet = self
             .curves
             .0
             .iter()
             .any(|curve| curve.semantic == 4 && curve.values[0].len() == 1);
-        let bullets_per_shot = if pellet && !self.is_volt() {
-            self.curves
-                .0
-                .iter()
-                .position(|curve| curve.semantic == 0)
-                .and_then(|index| sampled[index].as_ref()?.get(2).copied())
-                .filter(|value| *value > 1.0)
-        } else {
-            None
-        };
-        let volley_damage = value(2, 0x25);
-        let damage = volley_damage.map(|damage| damage / bullets_per_shot.unwrap_or(1.0));
-        let precision = value(2, 0x29).map(|bonus| bonus + 1.0);
-        Ok(WeaponStats {
+        let bullets_per_shot = (pellet && !volt)
+            .then(|| curve(0)?.get(2).copied())
+            .flatten()
+            .filter(|value| *value > 1.0);
+        // (2,0x25) is damage per projectile; the authored row already divides
+        // a shotgun's volley by its pellet count.
+        let damage = value(2, 0x25);
+        let precision_bonus = value(2, 0x29);
+        let firepower = damage.zip(precision_bonus).and_then(|(damage, bonus)| {
+            display
+                .and_then(|display| display.firepower(damage, bonus, bullets_per_shot))
+                .or(Some(damage * (bonus + 1.0) * bullets_per_shot.unwrap_or(1.0)))
+        });
+        let volt_drain_percent = curve(1).filter(|_| volt).and_then(|cell| {
+            let volt_cell = cell.len() >= 3 && cell[0] == 1000.0;
+            match (volt_cell, cell.len()) {
+                (true, 4) => Some(cell[1]),
+                (true, _) => Some(cell[2] / cell[0] * 100.0),
+                (false, _) => cell.first().map(|charge| charge / 10.0),
+            }
+        });
+        WeaponStats {
             definition_tag,
-            firepower: if bullets_per_shot.is_some() {
-                volley_damage
-            } else {
-                damage
-                    .zip(precision)
-                    .map(|(damage, precision)| damage * precision)
-            },
+            firepower,
             damage,
-            headshot_multiplier: precision,
+            headshot_multiplier: precision_bonus.map(|bonus| bonus + 1.0),
             bullets_per_shot,
             // No authored formula has been established for these composite scores.
             accuracy: None,
             handling: None,
             rounds_per_minute: value(2, 1).map(|rate| rate * 60.0),
-            magazine: if self.is_volt() { None } else { value(1, 0) },
-            volt_drain_percent: raw_value("Volt Drain"),
+            magazine: if volt { None } else { value(1, 0) },
+            volt_drain_percent,
             range_metres: value(0, 9),
             zoom: value(0, 3),
             equip_seconds: value(0, 0),
             aim_seconds: value(0, 4),
             reload_seconds: value(3, 1),
+            charge_seconds: value(4, 0),
             weight: value(0, 5),
             hip_fire_spread_degrees: if pellet {
                 None
             } else {
-                average(2, 0x0e, 0x0f).map(f32::to_degrees)
+                average(2, 0x0e, 0x0f)
             },
-            ads_spread_degrees: average(2, 0x10, 0x11).map(f32::to_degrees),
+            ads_spread_degrees: average(2, 0x10, 0x11),
             crouch_spread_bonus: value(2, 0x13),
-            movement_accuracy_loss: value(2, 0x14),
+            // WeaponStats stores a fraction; the authored UI program returns percent.
+            movement_accuracy_loss: value(2, 0x14).and_then(|loss| {
+                display?
+                    .single_property((2, 0x14), loss)
+                    .map(|percent| percent / 100.0)
+            }),
             recoil: value(2, 0x46),
-            aim_correction_degrees: value(0, 0x0b).map(f32::to_degrees),
-            shotgun_spread_degrees: if pellet {
-                raw_value("Spread Angle")
-            } else {
-                None
-            },
-        })
+            aim_correction_degrees: value(0, 0x0b).map(|angle| angle * DISPLAY_DEGREES),
+            shotgun_spread_degrees: value(2, 0x2c).filter(|_| pellet),
+        }
     }
 }
 
-/// Human display interpretation is separate from the exhaustive curve evaluator.
-/// Unknown semantics and additional channels remain available in `curves`.
-fn present_curves(curves: &[WeaponModCurveChange], volt: bool) -> Vec<WeaponModStatChange> {
-    let magazine = curves.iter().find(|curve| curve.semantic == 1);
-    let volt_cell = volt
-        && magazine.is_some_and(|curve| {
-            curve.before.len() >= 3 && curve.before[0] == 1000.0 && curve.after[0] == 1000.0
-        });
-    let pellet = curves
+type StatRow = (
+    &'static str,
+    &'static str,
+    Option<u32>,
+    fn(&WeaponStats) -> Option<f32>,
+);
+
+/// Mod-panel rows: name, unit, the curve semantic whose rating normally drives
+/// the stat (for the hover text only), and the displayed value.
+const STAT_ROWS: [StatRow; 20] = [
+    ("Rate of Fire", "RPM", Some(0), |stats| stats.rounds_per_minute),
+    ("Magazine", "rounds", Some(1), |stats| stats.magazine),
+    ("Volt Drain", "percentage points", Some(1), |stats| stats.volt_drain_percent),
+    ("Zoom", "x", Some(3), |stats| stats.zoom),
+    ("Spread Angle", "degrees", Some(4), |stats| stats.shotgun_spread_degrees),
+    ("Hipfire Spread", "degrees", Some(4), |stats| stats.hip_fire_spread_degrees),
+    ("ADS spread", "degrees", Some(5), |stats| stats.ads_spread_degrees),
+    ("Recoil", "percentage points", Some(6), |stats| stats.recoil.map(|value| value * 100.0)),
+    ("Range", "m", Some(8), |stats| stats.range_metres),
+    ("Reload time", "s", Some(10), |stats| stats.reload_seconds),
+    ("Charge Time", "s", Some(11), |stats| stats.charge_seconds),
+    ("Damage", "", Some(12), |stats| stats.damage),
+    ("Precision", "x", Some(13), |stats| stats.headshot_multiplier),
+    ("Equip time", "s", Some(15), |stats| stats.equip_seconds),
+    ("ADS time", "s", Some(16), |stats| stats.aim_seconds),
+    ("Weight", "percentage points", Some(17), |stats| stats.weight.map(|value| value * 100.0)),
+    ("Aim Assist", "", Some(18), |stats| stats.aim_correction_degrees),
+    ("Crouch Spread Bonus", "percentage points", Some(32), |stats| {
+        stats.crouch_spread_bonus.map(|value| value * 100.0)
+    }),
+    ("Moving Inaccuracy", "percentage points", Some(33), |stats| {
+        stats.movement_accuracy_loss.map(|value| value * 100.0)
+    }),
+    ("Firepower", "", None, |stats| stats.firepower),
+];
+
+fn stat_changes(
+    before: &WeaponStats,
+    after: &WeaponStats,
+    curves: &[WeaponModCurveChange],
+) -> Vec<WeaponModStatChange> {
+    STAT_ROWS
         .iter()
-        .any(|curve| curve.semantic == 4 && curve.before.len() == 1);
-    let mut changes = vec![];
-    let mut push = |curve: &WeaponModCurveChange, name, unit, before: f32, after: f32| {
-        if before.is_finite() && after.is_finite() {
-            changes.push(WeaponModStatChange {
-                name,
-                unit,
-                rating_id: curve.rating_id,
-                base_rating: curve.base_rating,
-                modified_rating: curve.modified_rating,
+        .filter_map(|(name, unit, semantic, value)| {
+            let (before, after) = value(before).zip(value(after))?;
+            if !before.is_finite() || !after.is_finite() || (after - before).abs() <= 0.000001 {
+                return None;
+            }
+            // Range has a four-channel gameplay curve ahead of its display curve.
+            let source = semantic.and_then(|semantic| {
+                curves
+                    .iter()
+                    .filter(|curve| curve.semantic == semantic)
+                    .find(|curve| semantic != 8 || curve.before.len() == 2)
+            });
+            // A property may combine curves, so the stat's own rating can be at rest.
+            let source = source.filter(|curve| curve.base_rating != curve.modified_rating);
+            Some(WeaponModStatChange {
+                name: *name,
+                unit: *unit,
+                rating_id: source.map_or(0, |curve| curve.rating_id),
+                base_rating: source.map_or(0.0, |curve| curve.base_rating),
+                modified_rating: source.map_or(0.0, |curve| curve.modified_rating),
                 before,
                 after,
-                derived_from: None,
-            });
-        }
-    };
-    for curve in curves {
-        let a = &curve.before;
-        let b = &curve.after;
-        if a.is_empty() {
-            continue;
-        }
-        match (curve.semantic, a.len(), curve.occurrence) {
-            (0, width, _) => {
-                let column = if !pellet && width >= 3 && (volt || a[2] == 0.0) {
-                    1
-                } else if !pellet && width >= 3 && a[2] > 0.0 {
-                    2
-                } else {
-                    0
-                };
-                push(
-                    curve,
-                    "Rate of Fire",
-                    "RPM",
-                    a[column] * 60.0,
-                    b[column] * 60.0,
-                );
-            }
-            (1, 4, _) if volt_cell => push(curve, "Volt Drain", "percentage points", a[1], b[1]),
-            (1, _, _) if volt_cell => push(
-                curve,
-                "Volt Drain",
-                "percentage points",
-                a[2] / a[0] * 100.0,
-                b[2] / b[0] * 100.0,
-            ),
-            (1, _, _) if volt => push(
-                curve,
-                "Volt Drain",
-                "percentage points",
-                a[0] / 10.0,
-                b[0] / 10.0,
-            ),
-            (1, _, _) => push(curve, "Magazine", "rounds", a[0], b[0]),
-            (3, _, _) => push(curve, "Zoom", "x", a[0], b[0]),
-            (4, 1, _) => push(curve, "Spread Angle", "degrees", a[0], b[0]),
-            (4, width, _) if width >= 2 => push(
-                curve,
-                "Hipfire Spread",
-                "degrees",
-                ((a[0] + a[1]) * 0.5).to_degrees(),
-                ((b[0] + b[1]) * 0.5).to_degrees(),
-            ),
-            (5, width, _) if width >= 2 => push(
-                curve,
-                "ADS spread",
-                "degrees",
-                ((a[0] + a[1]) * 0.5).to_degrees(),
-                ((b[0] + b[1]) * 0.5).to_degrees(),
-            ),
-            (6, width, _) if width >= 2 => push(
-                curve,
-                "Recoil",
-                "percentage points",
-                a[1] * 100.0,
-                b[1] * 100.0,
-            ),
-            (8, 2, _) => push(curve, "Range", "m", a[0], b[0]),
-            (10, _, _) => push(curve, "Reload time", "s", a[0], b[0]),
-            (11, _, _) => push(curve, "Charge Time", "s", a[0], b[0]),
-            (12, _, _) => push(curve, "Damage", "", a[0], b[0]),
-            (13, _, _) => push(curve, "Precision", "x", a[0], b[0]),
-            (15, _, _) => push(curve, "Equip time", "s", a[0], b[0]),
-            (16, _, _) => push(curve, "ADS time", "s", a[0], b[0]),
-            (17, width, _) if width >= 2 => push(
-                curve,
-                "Weight",
-                "percentage points",
-                a[1] * 100.0,
-                b[1] * 100.0,
-            ),
-            (18, _, 0) => {
-                let scale = if pellet { 1.0 } else { 1.2 };
-                push(
-                    curve,
-                    "Aim Assist",
-                    "",
-                    a[0].to_degrees() / scale,
-                    b[0].to_degrees() / scale,
-                );
-            }
-            (32, _, _) => push(
-                curve,
-                "Crouch Spread Bonus",
-                "percentage points",
-                a[0] * 100.0,
-                b[0] * 100.0,
-            ),
-            (33, _, _) => push(
-                curve,
-                "Moving Inaccuracy",
-                "percentage points",
-                a[0] * 100.0,
-                b[0] * 100.0,
-            ),
-            _ => {}
-        }
-    }
-    if let (Some(damage), Some(precision)) = (
-        curves.iter().find(|curve| curve.semantic == 12),
-        curves.iter().find(|curve| curve.semantic == 13),
-    ) {
-        // Recompute the composite at both endpoints; multiplying individual
-        // deltas would omit cross terms when multiple inputs change together.
-        let source = if damage.base_rating != damage.modified_rating {
-            damage
-        } else {
-            precision
-        };
-        push(
-            source,
-            "Firepower",
-            "",
-            damage.before[0] * precision.before[0],
-            damage.after[0] * precision.after[0],
-        );
-    }
-    if let Some(firepower) = changes.iter_mut().find(|change| change.name == "Firepower") {
-        firepower.derived_from = Some("Damage × Precision (recomputed before and after)");
-    }
-    changes
+                derived_from: match (source, *name) {
+                    (Some(_), _) => None,
+                    (None, "Firepower") => {
+                        Some("Damage × Precision (recomputed before and after)")
+                    }
+                    (None, _) => Some("Authored property program (recomputed before and after)"),
+                },
+            })
+        })
+        .collect()
 }
 
 fn raw_rating_name(id: u32) -> String {
@@ -538,6 +611,8 @@ fn raw_rating_name(id: u32) -> String {
         23 => "Equip speed",
         25 => "ADS assist",
         26 => "Charge time",
+        64 => "Crouch accuracy",
+        65 => "Moving accuracy",
         66 => "ADS accuracy",
         _ => return format!("Rating {id}"),
     };

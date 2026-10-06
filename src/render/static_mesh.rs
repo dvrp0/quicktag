@@ -99,7 +99,8 @@ pub(crate) struct StaticMesh {
 /// Bone capacity of the palette image: palette records index bones with one byte.
 const MAX_BONES: usize = 256;
 
-/// Factor by which a posed mesh widens its packed position range.
+/// Least factor by which a posed mesh widens its packed position range. A
+/// pose carrying the mesh further than that widens it more.
 pub(crate) const POSED_POSITION_RANGE: f32 = 4.0;
 
 impl StaticMesh {
@@ -122,10 +123,12 @@ impl StaticMesh {
             producer,
             super::authored_program::DescriptorAbi::HeadMesh15RowA60035ComputeStorage
                 | super::authored_program::DescriptorAbi::HeadMesh15RowB8BDComputeStorage
+                | super::authored_program::DescriptorAbi::BodyMesh16RowD8C1ComputeStorage
         );
         assert!(matches!(
             producer,
             super::authored_program::DescriptorAbi::BodyMeshComputeStorage
+                | super::authored_program::DescriptorAbi::BodyMesh16RowD8C1ComputeStorage
                 | super::authored_program::DescriptorAbi::BodyMeshB4CBComputeStorage
                 | super::authored_program::DescriptorAbi::BodyMesh15RowComputeStorage
                 | super::authored_program::DescriptorAbi::HeadMeshComputeStorage
@@ -219,6 +222,10 @@ impl StaticMesh {
             constants[4] = [step*2.0, source_stride as f32, format, 0.0];
             constants[8][0] = f32::from_bits(count);
             constants[13][0] = f32::from_bits(count);
+            // D8C1 declares one more row than the shifted heads; nothing reads it.
+            if producer == super::authored_program::DescriptorAbi::BodyMesh16RowD8C1ComputeStorage {
+                constants.push([0.0; 4]);
+            }
             constants
         } else {
             let mut constants = [[0.0f32; 4]; 14];
@@ -292,7 +299,7 @@ impl StaticMesh {
             bones: buffer(
                 "viewer bone dual quaternions",
                 bytemuck::cast_slice(
-                    &(0..MAX_BONES)
+                    &(0..MAX_BONES * 3 / 2)
                         .flat_map(|_| [[0.0f32, 0.0, 0.0, 1.0], [0.0; 4]])
                         .collect::<Vec<_>>(),
                 ),
@@ -418,24 +425,40 @@ impl StaticMesh {
         &self.bones
     }
 
-    /// Upload a posed bone palette (two rows per bone) and regenerate the
-    /// packed positions, or return to the unposed pass-through with `None`.
-    pub fn set_pose(&self, queue: &wgpu::Queue, bones: Option<&[[f32; 4]]>) {
+    /// Upload a posed bone palette and regenerate the packed positions, or
+    /// return to the unposed pass-through with `None`. `rows` per bone is 2 for
+    /// dual quaternions (producer mode 1) or 3 for matrices (mode 2).
+    /// `range` is the factor the packed position range is widened by while posed.
+    pub fn set_pose(&self, queue: &wgpu::Queue, bones: Option<(&[[f32; 4]], usize)>, range: f32) {
         let Some(row) = self.pose_mode_row else { return };
         let relaxed = std::sync::atomic::Ordering::Relaxed;
         // An unposed mesh stays generated once; only leaving a pose regenerates it.
         if !self.posed.swap(bones.is_some(), relaxed) && bones.is_none() { return; }
-        if let Some(bones) = bones {
-            let bones = &bones[..bones.len().min(MAX_BONES * 2)];
+        if let Some((bones, _)) = bones {
+            let bones = &bones[..bones.len().min(MAX_BONES * 3)];
             queue.write_buffer(&self.bones, 0, bytemuck::cast_slice(bones));
         }
         // Batch word 2 scales positions before packing: a posed mesh may leave its
         // bind bounds, so pack it over a wider range its consumers undo.
-        let pack_scale = if bones.is_some() { 1.0 / POSED_POSITION_RANGE } else { 1.0f32 };
+        let pack_scale = if bones.is_some() { 1.0 / range } else { 1.0f32 };
         queue.write_buffer(&self.batch, 8, bytemuck::bytes_of(&pack_scale));
-        let mode = [if bones.is_some() { 1.0f32 } else { 0.0 }, 0.0, 0.0, 0.0];
+        let mode = [bones.map_or(0.0f32, |(_, rows)| if rows == 3 { 2.0 } else { 1.0 }), 0.0, 0.0, 0.0];
         queue.write_buffer(&self.constants, row * 16, bytemuck::cast_slice(&mode));
         self.generated.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Pose a float-sourced mesh. It has no palette for the producer to blend
+    /// with, so the caller skins its vertices and hands them over; `None`
+    /// puts back the `rest` vertices. Its draws read the float vertices
+    /// directly, so no packed range is involved.
+    pub fn set_float_pose(&self, queue: &wgpu::Queue, vertices: Option<&[u8]>, rest: &[u8]) {
+        if self.pose_mode_row.is_some() { return; }
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        if !self.posed.swap(vertices.is_some(), relaxed) && vertices.is_none() { return; }
+        let data = vertices.unwrap_or(rest);
+        if data.len() as u64 != self.source.size() { return; }
+        queue.write_buffer(&self.source, 0, data);
+        self.generated.store(false, relaxed);
     }
 
     /// Whether `set_pose` can drive this mesh.

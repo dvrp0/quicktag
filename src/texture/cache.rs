@@ -93,6 +93,23 @@ impl TextureCache {
     }
 
     pub(crate) fn get_or_load_material(&self, hash: TagHash) -> Option<LoadedTexture> {
+        // A slot a technique leaves empty reads as zero, like an unbound
+        // shader resource: one transparent black texel stands for it.
+        if hash == TagHash::NONE {
+            let key = (hash, false);
+            if let Some(Either::Left(Some(found))) = self.cache.read().get(&key) {
+                return Some(found.clone());
+            }
+            let texture = Texture::from_rgba8(&self.render_state, 1, 1, vec![0; 4], Some("empty texture slot".into())).ok()?;
+            let id = self.render_state.renderer.write().register_native_texture(
+                &self.render_state.device,
+                &texture.view,
+                wgpu::FilterMode::Linear,
+            );
+            let loaded = (Arc::new(texture), id);
+            self.cache.write().insert(key, Left(Some(loaded.clone())));
+            return Some(loaded);
+        }
         self.get_or_load_with_alpha_mode(hash, false)
     }
 

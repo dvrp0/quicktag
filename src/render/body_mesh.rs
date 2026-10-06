@@ -95,6 +95,7 @@ impl BodyMeshProducer {
             | super::authored_program::DescriptorAbi::HeadMesh15RowB8BDComputeStorage
             | super::authored_program::DescriptorAbi::HeadMeshEC0BComputeStorage
             | super::authored_program::DescriptorAbi::BodyMesh15RowComputeStorage => 15,
+            super::authored_program::DescriptorAbi::BodyMesh16RowD8C1ComputeStorage => 16,
             super::authored_program::DescriptorAbi::BodyMeshComputeStorage
             | super::authored_program::DescriptorAbi::BodyMeshB4CBComputeStorage
             | super::authored_program::DescriptorAbi::HeadMeshComputeStorage => 14,

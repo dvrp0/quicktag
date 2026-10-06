@@ -329,6 +329,10 @@ pub struct ModelsView {
     gpu_model_preview: Option<Arc<GpuModelPreview>>,
     preview_channels: Option<ModelChannels>,
     preview_runtime_inputs: Option<TfxRuntimeInputs>,
+    /// Object channel values the playing clip last gave the preview.
+    clip_channels: Vec<(u32, f32)>,
+    /// Geometry of the props the playing clip spawns, loaded with the model.
+    clip_props: Vec<TagHash>,
     channel_render_error: Option<String>,
     preview_camera_frame: Option<ModelCameraFrame>,
     weapon_export_camera: Option<ModelExportCamera>,
@@ -393,8 +397,17 @@ impl ModelsView {
         let entry = package_manager()
             .get_entry(tag)
             .ok_or_else(|| anyhow::anyhow!("model {tag} is unavailable"))?;
-        let preview = if let Some(mut shell) = RunnerShellAssembly::resolve(&cache, tag) {
-            shell.runner = super::gear::GearView::runner_for_skin(&cache, tag);
+        let runner_shell = RunnerShellAssembly::resolve(&cache, tag).map(|mut shell| {
+            if let Some((runner, dye_row)) = super::gear::GearView::runner_for_skin(&cache, tag) {
+                shell.runner = Some(runner);
+                shell.dye_row = dye_row;
+            }
+            if let Some(clip) = clip.and_then(|(clip_tag, _)| crate::animation::Clip::load(clip_tag)) {
+                shell.props = clip.props().iter().flat_map(|prop| prop.geometry.clone()).collect();
+            }
+            shell
+        });
+        let preview = if let Some(shell) = &runner_shell {
             shell.load(cache.clone())
         } else {
             // A weapon skin is assembled as the Models panel does it: on its
@@ -429,7 +442,15 @@ impl ModelsView {
         let fallback_color = wireframe_preview_textures(wireframe, &model.textures)
             .first()
             .copied();
-        let runtime_inputs = TfxRuntimeInputs::for_model_preview(&cache, tag);
+        let mut runtime_inputs = TfxRuntimeInputs::for_model_preview(&cache, tag);
+        if let Some(shell) = &runner_shell {
+            runtime_inputs.apply_runner_dye(&shell.dye_channels(), &shell.gear(&cache));
+        }
+        if let Some((clip_tag, frame)) = clip {
+            if let Some(clip) = crate::animation::Clip::load(clip_tag) {
+                runtime_inputs.apply_clip_channels(&clip.channel_values(frame));
+            }
+        }
         let gpu = Arc::new(
             GpuModelPreview::create(&render_state.device, wireframe, fallback_color, &runtime_inputs)
                 .ok_or_else(|| anyhow::anyhow!("failed to create GPU preview for {tag}"))?,
@@ -621,6 +642,8 @@ impl ModelsView {
             gpu_model_preview: None,
             preview_channels: None,
             preview_runtime_inputs: None,
+            clip_channels: vec![],
+            clip_props: vec![],
             channel_render_error: None,
             preview_camera_frame: None,
             weapon_export_camera: None,
@@ -1047,10 +1070,18 @@ impl ModelsView {
         (value as f64 / u32::MAX as f64) as f32
     }
 
+    /// The runner shell behind a skin model, with the props of the playing clip.
+    fn runner_shell(&self, model: TagHash) -> Option<RunnerShellAssembly> {
+        let mut shell = self.runner_models.get(&model)?.clone();
+        shell.props = self.clip_props.clone();
+        Some(shell)
+    }
+
     fn rebuild_model_preview(&mut self) {
         self.preview = None;
         self.gpu_model_preview = None;
         self.preview_runtime_inputs = None;
+        self.clip_channels.clear();
         self.channel_render_error = None;
 
         let Some(tag) = self.selected_model else {
@@ -1072,7 +1103,7 @@ impl ModelsView {
         let weapon_owner = active_weapon
             .map(|weapon| weapon.socket_owner.unwrap_or(weapon.owner_tag))
             .unwrap_or(tag);
-        self.preview = if let Some(composition) = self.runner_models.get(&tag) {
+        self.preview = if let Some(composition) = self.runner_shell(tag) {
             composition.load(self.cache.clone())
         } else if model_info_for_reference(entry.reference).is_some() {
             GeometryTagPreview::load_model_with_weapon_mod_attachments(
@@ -1097,7 +1128,10 @@ impl ModelsView {
                     .map(ModelCameraFrame::from_wireframe)
             });
         }
-        let runtime_inputs = TfxRuntimeInputs::for_model_preview(&self.cache, weapon_pattern);
+        let mut runtime_inputs = TfxRuntimeInputs::for_model_preview(&self.cache, weapon_pattern);
+        if let Some(shell) = self.runner_shell(tag) {
+            runtime_inputs.apply_runner_dye(&shell.dye_channels(), &shell.gear(&self.cache));
+        }
         let previous_channels = self.preview_channels.take();
         self.preview_channels = self.preview.as_ref().and_then(|preview| {
             let GeometryPreviewKind::Model(model) = &preview.kind else { return None; };
@@ -1136,6 +1170,7 @@ impl ModelsView {
         let Some(wireframe) = model.wireframe.as_ref() else { return; };
         let mut inputs = base.clone();
         channels.apply(&mut inputs);
+        inputs.apply_clip_channels(&self.clip_channels);
         if let Some(updated) = gpu.with_channels(&self.texture_cache.render_state.device, wireframe, &inputs) {
             self.gpu_model_preview = Some(Arc::new(updated));
             self.channel_render_error = None;
@@ -1214,6 +1249,7 @@ fn runner_model_index(
         .filter_map(|skin| {
             let mut assembly = RunnerShellAssembly::resolve(cache, skin.model_tag)?;
             assembly.runner = skin.runner;
+            assembly.dye_row = skin.dye_row;
             Some((assembly.pattern, assembly))
         })
         .collect()
@@ -1253,7 +1289,26 @@ impl View for ModelsView {
                     .collect(),
             );
         }
+        // Object channels the playing clip animates reach the materials too.
+        let clip_channels = animation
+            .clip
+            .as_ref()
+            .map_or_else(Vec::new, |clip| clip.channel_values(animation.frame));
+        // Props the clip spawns are part of the model while it plays.
+        let clip_props = animation.clip.as_ref().map_or_else(Vec::new, |clip| {
+            clip.props().iter().flat_map(|prop| prop.geometry.clone()).collect()
+        });
         animation.store(ui.ctx());
+        if clip_props != self.clip_props {
+            self.clip_props = clip_props;
+            if self.selected_model.is_some_and(|model| self.runner_models.contains_key(&model)) {
+                self.rebuild_model_preview();
+            }
+        }
+        if clip_channels != self.clip_channels && self.gpu_model_preview.is_some() {
+            self.clip_channels = clip_channels;
+            self.apply_preview_channels();
+        }
 
         egui::SidePanel::left("models_left_panel")
             .resizable(true)

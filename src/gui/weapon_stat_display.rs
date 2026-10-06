@@ -69,6 +69,37 @@ impl StatDisplayPrograms {
         Some(Self(programs))
     }
 
+    pub(super) fn debug_dump(&self) -> String {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(index, program)| {
+                format!(
+                    "  DISPLAY {index:2} inputs={:x?} constants={:?} code={:02x?}\n",
+                    program.inputs, program.constants, program.code
+                )
+            })
+            .collect()
+    }
+
+    /// Firepower from damage per projectile and the precision bonus. A pellet
+    /// weapon uses the program authored for its pellet count; any other weapon,
+    /// or a pellet count without its own program, uses the plain product.
+    pub(super) fn firepower(&self, damage: f32, bonus: f32, pellets: Option<f32>) -> Option<f32> {
+        let mut programs = self
+            .0
+            .iter()
+            .filter(|program| program.inputs.as_slice() == [(2, 0x25), (2, 0x29)]);
+        let program = pellets
+            .and_then(|pellets| {
+                programs
+                    .clone()
+                    .find(|program| program.constants.len() == 2 && program.constants[1] == pellets)
+            })
+            .or_else(|| programs.find(|program| program.constants.len() == 1))?;
+        program.evaluate(&[damage, bonus])
+    }
+
     /// Resolve only unambiguous single-property displays. Variant-dependent rows
     /// require their authored UI selection binding, never a first-match fallback.
     pub(super) fn single_property(&self, property: (u32, u32), value: f32) -> Option<f32> {

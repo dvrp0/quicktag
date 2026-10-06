@@ -23,7 +23,8 @@ use super::item_effect::{ItemEffect, ItemEffectResolver};
 use super::profile_texture::resolve_profile_textures;
 use super::sticker_texture::resolve_sticker_texture;
 use super::weapon_stats::{
-    WeaponModDetails, WeaponModStatChange, WeaponModWeaponStats, WeaponStatResolver, WeaponStats,
+    WeaponBaseRating, WeaponModDetails, WeaponModRawStat, WeaponModStatChange,
+    WeaponModWeaponStats, WeaponStatResolver, WeaponStats, preset_plugs,
 };
 use super::{TOASTS, ViewAction, common::ResponseExt};
 
@@ -240,6 +241,8 @@ struct GearItem {
     mod_family: Option<String>,
     mod_is_universal: bool,
     compatible_weapons: Vec<String>,
+    /// Definitions of the plugs a weapon ships with in its sockets.
+    preset_plugs: Vec<TagHash>,
     classification: Option<String>,
     types: Vec<String>,
     internal_categories: Vec<String>,
@@ -276,12 +279,188 @@ struct GearExportRecord<'a> {
     effects: Vec<GearExportEffect<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     implant_stats: Vec<GearExportStat<'a>>,
+    rarity_code: Option<&'static str>,
+    /// Owner of a skin or core, whatever the item type.
+    applies_to: Option<&'a str>,
+    mod_is_universal: bool,
+    /// `description` without the colour markup.
+    description_text: Option<&'a str>,
+    implant_slot: Option<&'static str>,
+    icon_texture: Option<String>,
+    detail_textures: Vec<String>,
+    model_tag: Option<String>,
+    definition_group_key: Option<String>,
+    definition_type_code: Option<String>,
+    raw_category_hash: Option<String>,
+    raw_subcategory_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weapon_stats: Option<GearExportWeaponStats>,
+    /// Frame ratings before `preset_mods`; `weapon_stats` has them applied.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    base_ratings: Vec<GearExportRating<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preset_mods: Vec<GearExportPresetMod<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compatible_mods: Vec<GearExportModSlot<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mod_stats: Option<GearExportModStats<'a>>,
+    /// Raw gameplay data behind `effects`: perk constants and hop-on stat modifiers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    perks: Vec<super::perk_data::PerkExport>,
 }
 
 #[derive(Serialize)]
 struct GearExportEffect<'a> {
     name: &'a str,
     description: String,
+    description_text: &'a str,
+}
+
+/// Values in the units of the Gear panel's weapon card, unrounded.
+#[derive(Serialize)]
+struct GearExportWeaponStats {
+    firepower: Option<f32>,
+    damage: Option<f32>,
+    precision_multiplier: Option<f32>,
+    rate_of_fire_rpm: Option<f32>,
+    pellets_per_shot: Option<f32>,
+    charge_time_seconds: Option<f32>,
+    accuracy: Option<f32>,
+    hipfire_spread_degrees: Option<f32>,
+    ads_spread_degrees: Option<f32>,
+    moving_inaccuracy_percent: Option<f32>,
+    handling: Option<f32>,
+    equip_speed_seconds: Option<f32>,
+    ads_speed_seconds: Option<f32>,
+    weight_percent: Option<f32>,
+    recoil_percent: Option<f32>,
+    aim_assist: Option<f32>,
+    reload_speed_seconds: Option<f32>,
+    crouch_spread_bonus_percent: Option<f32>,
+    range_metres: Option<f32>,
+    spread_angle_degrees: Option<f32>,
+    volt_drain_percent: Option<f32>,
+    magazine: Option<f32>,
+    zoom: Option<f32>,
+}
+
+impl From<&WeaponStats> for GearExportWeaponStats {
+    fn from(stats: &WeaponStats) -> Self {
+        let percent = |value: Option<f32>| value.map(|value| value * 100.0);
+        Self {
+            firepower: stats.firepower,
+            damage: stats.damage,
+            precision_multiplier: stats.headshot_multiplier,
+            rate_of_fire_rpm: stats.rounds_per_minute,
+            pellets_per_shot: stats.bullets_per_shot,
+            charge_time_seconds: stats.charge_seconds,
+            accuracy: stats.accuracy,
+            hipfire_spread_degrees: stats.hip_fire_spread_degrees,
+            ads_spread_degrees: stats.ads_spread_degrees,
+            moving_inaccuracy_percent: percent(stats.movement_accuracy_loss),
+            handling: stats.handling,
+            equip_speed_seconds: stats.equip_seconds,
+            ads_speed_seconds: stats.aim_seconds,
+            weight_percent: percent(stats.weight),
+            recoil_percent: percent(stats.recoil),
+            aim_assist: stats.aim_correction_degrees,
+            reload_speed_seconds: stats.reload_seconds,
+            crouch_spread_bonus_percent: percent(stats.crouch_spread_bonus),
+            range_metres: stats.range_metres,
+            spread_angle_degrees: stats.shotgun_spread_degrees,
+            volt_drain_percent: stats.volt_drain_percent,
+            magazine: stats.magazine,
+            zoom: stats.zoom,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct GearExportRating<'a> {
+    rating_id: u32,
+    name: &'a str,
+    value: f32,
+}
+
+impl<'a> From<&'a WeaponModRawStat> for GearExportRating<'a> {
+    fn from(rating: &'a WeaponModRawStat) -> Self {
+        Self {
+            rating_id: rating.rating_id,
+            name: &rating.name,
+            value: rating.value as f32,
+        }
+    }
+}
+
+/// A plug without a Gear entry is an intrinsic of the weapon.
+#[derive(Serialize)]
+struct GearExportPresetMod<'a> {
+    definition_tag: String,
+    #[serde(flatten)]
+    item: Option<GearExportItemRef<'a>>,
+    ratings: Vec<GearExportRating<'a>>,
+}
+
+#[derive(Serialize)]
+struct GearExportItemRef<'a> {
+    hash: String,
+    name: &'a str,
+    rarity: Option<&'static str>,
+}
+
+impl<'a> From<&'a GearItem> for GearExportItemRef<'a> {
+    fn from(item: &'a GearItem) -> Self {
+        Self {
+            hash: item.display_tag.to_string(),
+            name: &item.name,
+            rarity: item.rarity.map(GearRarity::label),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct GearExportModSlot<'a> {
+    slot: String,
+    mods: Vec<GearExportItemRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct GearExportModStats<'a> {
+    ratings: Vec<GearExportRating<'a>>,
+    weapons: Vec<GearExportModWeapon<'a>>,
+}
+
+#[derive(Serialize)]
+struct GearExportModWeapon<'a> {
+    weapon: &'a str,
+    changes: Vec<GearExportModChange>,
+    curves: Vec<GearExportModCurve<'a>>,
+}
+
+#[derive(Serialize)]
+struct GearExportModChange {
+    name: &'static str,
+    unit: &'static str,
+    before: f32,
+    after: f32,
+    delta: f32,
+    display: String,
+    /// The rating that drives the stat; absent when it is recomputed.
+    rating_id: Option<u32>,
+    base_rating: Option<f32>,
+    modified_rating: Option<f32>,
+    derived_from: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct GearExportModCurve<'a> {
+    semantic: u32,
+    occurrence: usize,
+    rating_id: u32,
+    base_rating: f32,
+    modified_rating: f32,
+    before: &'a [f32],
+    after: &'a [f32],
 }
 
 #[derive(Serialize)]
@@ -294,6 +473,10 @@ struct GearExportStat<'a> {
 pub struct GearView {
     items: Vec<GearItem>,
     weapon_stats: FxHashMap<TagHash, WeaponStats>,
+    /// Frame ratings of each weapon, before its preset plugs.
+    weapon_base_ratings: FxHashMap<TagHash, Vec<WeaponBaseRating>>,
+    /// Ratings of every preset plug, by the plug's definition tag.
+    preset_plug_ratings: FxHashMap<TagHash, Vec<WeaponModRawStat>>,
     weapon_mod_stats: FxHashMap<TagHash, WeaponModDetails>,
     implant_details: FxHashMap<TagHash, ImplantDetails>,
     weapon_mod_effects: FxHashMap<TagHash, Vec<ItemEffect>>,
@@ -341,6 +524,8 @@ pub(super) struct ModelRunnerSkinEntry {
     pub(super) archetype: Option<String>,
     /// The runner's own entity definition, which carries its default gear.
     pub(super) runner: Option<TagHash>,
+    /// Row of the runner's dye table the skin's item definition selects.
+    pub(super) dye_row: Option<u32>,
     pub(super) model_tag: TagHash,
     pub(super) color: Color32,
 }
@@ -395,6 +580,8 @@ impl GearView {
                 let mut view = Self {
                     items,
                     weapon_stats: FxHashMap::default(),
+                    weapon_base_ratings: FxHashMap::default(),
+                    preset_plug_ratings: FxHashMap::default(),
                     weapon_mod_stats: FxHashMap::default(),
                     implant_details,
                     weapon_mod_effects,
@@ -416,6 +603,8 @@ impl GearView {
             Err(error) => Self {
                 items: vec![],
                 weapon_stats: FxHashMap::default(),
+                weapon_base_ratings: FxHashMap::default(),
+                preset_plug_ratings: FxHashMap::default(),
                 weapon_mod_stats: FxHashMap::default(),
                 implant_details: FxHashMap::default(),
                 weapon_mod_effects: FxHashMap::default(),
@@ -485,6 +674,25 @@ impl GearView {
         Ok(exported)
     }
 
+    /// Write every Gear record, with weapon and mod stats resolved, as JSON.
+    pub(crate) fn export_json(output: &Path, language: LocalizedLanguage) -> Result<usize, String> {
+        let strings = Arc::new(
+            quicktag_strings::localized::create_stringmap_for_language(language)
+                .map_err(|error| format!("Failed to load localized strings: {error:#}"))?,
+        );
+        let mut view = Self::new_for_language(strings, language);
+        if let Some(error) = view.load_error() {
+            return Err(error.to_owned());
+        }
+        view.reconcile_weapon_skin_models(&quicktag_scanner::load_tag_cache());
+        let json = view
+            .filtered_export_json()
+            .map_err(|error| format!("Could not encode Gear JSON: {error}"))?;
+        std::fs::write(output, json)
+            .map_err(|error| format!("Could not write {}: {error}", output.display()))?;
+        Ok(view.filtered_indices.len())
+    }
+
     /// The model catalogue as the Models panel receives it.
     fn load_model_catalog(cache: &quicktag_scanner::TagCache) -> Result<ModelWeaponCatalog, String> {
         let strings = Arc::new(
@@ -506,26 +714,157 @@ impl GearView {
     }
 
     /// Print every runner and weapon skin of the model catalogue with its root tag.
-    /// The entity definition of the runner a skin model belongs to.
-    pub(crate) fn runner_for_skin(cache: &quicktag_scanner::TagCache, skin: TagHash) -> Option<TagHash> {
-        Self::load_model_catalog(cache)
-            .ok()?
-            .runner_skins
-            .iter()
-            .find(|entry| entry.model_tag == skin)?
-            .runner
+    /// The entity definition of the runner a skin model belongs to, and the
+    /// row of that runner's dye table the skin uses.
+    pub(crate) fn runner_for_skin(cache: &quicktag_scanner::TagCache, skin: TagHash) -> Option<(TagHash, Option<u32>)> {
+        let catalog = Self::load_model_catalog(cache).ok()?;
+        let entry = catalog.runner_skins.iter().find(|entry| entry.model_tag == skin)?;
+        Some((entry.runner?, entry.dye_row))
+    }
+
+    /// Print the decoded stat inputs of every weapon or weapon mod whose name
+    /// contains one of `filters`, with `mods` (definition tags) applied.
+    pub(crate) fn dump_weapon_stats(
+        filters: &[String],
+        mods: &[TagHash],
+        language: LocalizedLanguage,
+    ) -> Result<(), String> {
+        let cache = quicktag_scanner::load_tag_cache();
+        let strings = Arc::new(
+            quicktag_strings::localized::create_stringmap_for_language(language)
+                .map_err(|error| format!("Failed to load localized strings: {error:#}"))?,
+        );
+        let view = Self::new_for_language(strings, language);
+        if let Some(error) = view.load_error() {
+            return Err(error.to_owned());
+        }
+        let resolver = WeaponStatResolver::load(&cache);
+        print!("{}", resolver.debug_display_programs());
+        if filters.iter().any(|filter| filter == "*all") {
+            for item in view.items.iter().filter(|item| is_authored_weapon(item)) {
+                println!(
+                    "WEAPON {:?} rarity={:?} price={:?} presets={} {:?}",
+                    item.name,
+                    item.rarity,
+                    item.price,
+                    item.preset_plugs.len(),
+                    item.definition_tag
+                        .and_then(|definition| resolver.extract(definition, &item.preset_plugs)),
+                );
+            }
+            return Ok(());
+        }
+        for item in &view.items {
+            let lower = item.name.to_lowercase();
+            let display = item.display_tag.to_string().to_lowercase();
+            if !filters
+                .iter()
+                .map(|filter| filter.to_lowercase())
+                .any(|filter| lower.contains(&filter) || display == filter)
+            {
+                continue;
+            }
+            println!(
+                "ITEM {:?} type={:?} sub={:?} rarity={:?} price={:?} def={:?} display={} internal={:?} universal={} compatible={:?} categories={:?}",
+                item.name,
+                item.item_type,
+                item.subcategory,
+                item.rarity,
+                item.price,
+                item.definition_tag,
+                item.display_tag,
+                item.internal_name,
+                item.mod_is_universal,
+                item.compatible_weapons,
+                item.internal_categories,
+            );
+            let Some(definition) = item.definition_tag else {
+                continue;
+            };
+            match item.item_type.as_deref() {
+                Some("Weapon Mod") => {
+                    let ratings = resolver.mod_raw_stats(definition);
+                    println!("  RAW {ratings:?}");
+                    print!("{}", resolver.debug_components(definition));
+                    println!("  DESC {:?}", item.description);
+                    for perk in super::perk_data::perk_data_for(definition).iter() {
+                        println!(
+                            "  PERK {} effect={:#x} tag={} scalars={:?} labels={:?}",
+                            perk.title(),
+                            perk.effect_index,
+                            perk.tag,
+                            perk.scalars,
+                            perk.labels
+                                .iter()
+                                .map(|label| label.name.map_or_else(|| format!("#{:08X}", label.hash), str::to_owned))
+                                .collect::<Vec<_>>(),
+                        );
+                        for constant in &perk.constants {
+                            println!("    CONST {:#06x} {} after {:08X}", constant.offset, constant.value, constant.class);
+                        }
+                        for hop_on in &perk.hop_ons {
+                            println!("    HOPON {}", hop_on.pattern);
+                            for modifier in &hop_on.modifiers {
+                                let (stat, amount) = modifier.describe();
+                                println!("      {stat}: {amount}");
+                            }
+                        }
+                    }
+                    for weapon in view.items.iter().filter(|weapon| {
+                        is_authored_weapon(weapon)
+                            && weapon.rarity == Some(GearRarity::Standard)
+                            && item.compatible_weapons.contains(&weapon.name)
+                    }) {
+                        let changes = weapon
+                            .definition_tag
+                            .and_then(|tag| resolver.mod_weapon_context(tag).ok())
+                            .zip(ratings.as_ref().ok())
+                            .and_then(|(context, ratings)| {
+                                resolver.mod_stat_changes_for_ratings(&context, ratings).ok()
+                            });
+                        for change in changes.iter().flat_map(|evaluation| &evaluation.changes) {
+                            println!(
+                                "  ON {:?}: {} {} -> {} ({}) rating {} {}->{} {:?}",
+                                weapon.name,
+                                change.name,
+                                change.before,
+                                change.after,
+                                format_weapon_mod_change(change),
+                                change.rating_id,
+                                change.base_rating,
+                                change.modified_rating,
+                                change.derived_from,
+                            );
+                        }
+                    }
+                    for effect in view.weapon_mod_effects.get(&item.display_tag).into_iter().flatten() {
+                        println!("  EFFECT {:?}: {:?}", effect.name, effect.description);
+                    }
+                }
+                Some("Weapon") => {
+                    for (plug, label) in item.preset_plugs.iter().zip(preset_plug_labels(&view.items, item)) {
+                        println!("  PRESET {plug} {label} {:?}", resolver.mod_raw_stats(*plug));
+                    }
+                    let applied = if mods.is_empty() { item.preset_plugs.as_slice() } else { mods };
+                    print!("{}", resolver.debug_dump(definition, applied));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn print_skin_catalog() -> Result<(), String> {
         let catalog = Self::load_model_catalog(&quicktag_scanner::load_tag_cache())?;
         for skin in &catalog.runner_skins {
             println!(
-                "SKIN\trunner\t{}\t{}\t{}\t{}\t{}",
+                "SKIN\trunner\t{}\t{}\t{}\t{}\t{}\t{}",
                 skin.shell_name,
                 skin.name,
                 skin.model_tag,
                 skin.archetype.as_deref().unwrap_or("-"),
-                skin.runner.map_or("-".to_string(), |runner| runner.to_string())
+                skin.runner.map_or("-".to_string(), |runner| runner.to_string()),
+                skin.dye_row.map_or("-".to_string(), |row| row.to_string())
             );
         }
         for weapon in &catalog.weapons {
@@ -666,6 +1005,7 @@ impl GearView {
                     name: item.name.clone(),
                     shell_name: item.applies_to.clone()?,
                     runner: None,
+                    dye_row: item.definition_tag.and_then(runner_skin_dye_row),
                     archetype: item
                         .internal_name
                         .as_deref()
@@ -889,29 +1229,36 @@ impl GearView {
         reconcile_distinct_weapon_variant_skins(&mut self.items, cache, GEOMETRY_FRAME_TOLERANCE);
         assign_legacy_unresolved_skin_owners(&mut self.items);
         self.reconcile_weapon_mod_models(cache);
-        self.extract_weapon_stats(cache);
-        self.extract_weapon_mod_stats(cache);
+        let resolver = WeaponStatResolver::load(cache);
+        self.extract_weapon_stats(&resolver);
+        self.extract_weapon_mod_stats(&resolver);
         self.update_filter();
     }
 
-    fn extract_weapon_stats(&mut self, cache: &quicktag_scanner::TagCache) {
-        let resolver = WeaponStatResolver::load(cache);
-        self.weapon_stats = self
-            .items
-            .iter()
-            .filter(|item| is_authored_weapon(item))
-            .filter_map(|item| Some((item.display_tag, resolver.extract(item.definition_tag?)?)))
-            .collect();
+    fn extract_weapon_stats(&mut self, resolver: &WeaponStatResolver) {
+        self.weapon_stats.clear();
+        self.weapon_base_ratings.clear();
+        self.preset_plug_ratings.clear();
+        for item in self.items.iter().filter(|item| is_authored_weapon(item)) {
+            for plug in &item.preset_plugs {
+                if !self.preset_plug_ratings.contains_key(plug)
+                    && let Ok(ratings) = resolver.mod_raw_stats(*plug)
+                {
+                    self.preset_plug_ratings.insert(*plug, ratings);
+                }
+            }
+            let Some((stats, ratings)) = item
+                .definition_tag
+                .and_then(|tag| resolver.extract_with_ratings(tag, &item.preset_plugs))
+            else {
+                continue;
+            };
+            self.weapon_stats.insert(item.display_tag, stats);
+            self.weapon_base_ratings.insert(item.display_tag, ratings);
+        }
     }
 
-    fn extract_weapon_mod_stats(&mut self, cache: &quicktag_scanner::TagCache) {
-        let manager = package_manager();
-        let metadata = quicktag_core::implant::ImplantStatResolver::load(&manager)
-            .and_then(|resolver| manager.read_tag(resolver.semantic_table))
-            .inspect_err(|error| log::warn!("Failed to load weapon rating routes: {error:#}"))
-            .ok();
-        let resolver = WeaponStatResolver::load(cache);
-
+    fn extract_weapon_mod_stats(&mut self, resolver: &WeaponStatResolver) {
         let mut candidates = self
             .items
             .iter()
@@ -962,14 +1309,12 @@ impl GearView {
                 item.compatible_weapons.as_slice()
             };
             let mut contextual = vec![];
-            if !ratings.is_empty()
-                && let Some(metadata) = metadata.as_deref()
-            {
+            if !ratings.is_empty() {
                 for weapon in targets {
                     let Some(context) = weapons.get(weapon) else {
                         continue;
                     };
-                    match resolver.mod_stat_changes_for_ratings(context, &ratings, metadata) {
+                    match resolver.mod_stat_changes_for_ratings(context, &ratings) {
                         Ok(evaluation) if !evaluation.curves.is_empty() => {
                             contextual.push(WeaponModWeaponStats {
                                 weapon: weapon.clone(),
@@ -1174,6 +1519,11 @@ impl GearView {
 
 impl GearView {
     fn filtered_export_json(&self) -> Result<String, serde_json::Error> {
+        let by_definition = self
+            .items
+            .iter()
+            .filter_map(|item| Some((item.definition_tag?, item)))
+            .collect::<FxHashMap<_, _>>();
         let records = self
             .filtered_indices
             .iter()
@@ -1195,6 +1545,7 @@ impl GearView {
                             &effect.description,
                             &effect.description_parts,
                         ),
+                        description_text: &effect.description,
                     })
                     .collect();
                 let implant_stats = implant
@@ -1207,6 +1558,38 @@ impl GearView {
                         value: stat.value,
                     })
                     .collect();
+                let preset_mods = item
+                    .preset_plugs
+                    .iter()
+                    .map(|plug| GearExportPresetMod {
+                        definition_tag: plug.to_string(),
+                        item: by_definition.get(plug).map(|item| (*item).into()),
+                        ratings: self
+                            .preset_plug_ratings
+                            .get(plug)
+                            .into_iter()
+                            .flatten()
+                            .map(Into::into)
+                            .collect(),
+                    })
+                    .collect();
+                let compatible_mods = compatible_mod_sections(&self.items, item)
+                    .into_iter()
+                    .map(|(slot, indices)| GearExportModSlot {
+                        slot,
+                        mods: indices
+                            .into_iter()
+                            .map(|index| (&self.items[index]).into())
+                            .collect(),
+                    })
+                    .collect();
+                let mod_stats =
+                    self.weapon_mod_stats
+                        .get(&item.display_tag)
+                        .map(|details| GearExportModStats {
+                            ratings: details.ratings.iter().map(Into::into).collect(),
+                            weapons: details.weapons.iter().map(export_mod_weapon).collect(),
+                        });
 
                 GearExportRecord {
                     hash: item.display_tag.to_string(),
@@ -1239,6 +1622,49 @@ impl GearView {
                     internal_categories: &item.internal_categories,
                     effects,
                     implant_stats,
+                    rarity_code: item.rarity.map(GearRarity::export_code),
+                    applies_to: item.applies_to.as_deref(),
+                    mod_is_universal: item.mod_is_universal,
+                    description_text: item.description.as_deref(),
+                    implant_slot: implant_slot(item),
+                    icon_texture: item.icon_tag.map(|tag| tag.to_string()),
+                    detail_textures: item
+                        .detail_texture_tags
+                        .iter()
+                        .map(|tag| tag.to_string())
+                        .collect(),
+                    model_tag: item.model_tag.map(|tag| tag.to_string()),
+                    definition_group_key: item
+                        .definition_group_key
+                        .map(|key| format!("{key:08X}")),
+                    definition_type_code: item
+                        .definition_type_code
+                        .map(|code| format!("{code:04X}")),
+                    raw_category_hash: item.raw_category_hash.map(|hash| format!("{hash:08X}")),
+                    raw_subcategory_hash: item
+                        .raw_subcategory_hash
+                        .map(|hash| format!("{hash:08X}")),
+                    weapon_stats: self.weapon_stats.get(&item.display_tag).map(Into::into),
+                    base_ratings: self
+                        .weapon_base_ratings
+                        .get(&item.display_tag)
+                        .into_iter()
+                        .flatten()
+                        .map(|rating| GearExportRating {
+                            rating_id: rating.rating_id,
+                            name: &rating.name,
+                            value: rating.value,
+                        })
+                        .collect(),
+                    preset_mods,
+                    compatible_mods,
+                    mod_stats,
+                    perks: item
+                        .definition_tag
+                        .map(|definition| {
+                            super::perk_data::export(&super::perk_data::perk_data_for(definition))
+                        })
+                        .unwrap_or_default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1753,9 +2179,16 @@ impl GearView {
                         }
                     }
 
+                    if let Some(definition) = item.definition_tag {
+                        super::perk_data::perk_data_panel(
+                            ui,
+                            &super::perk_data::perk_data_for(definition),
+                        );
+                    }
+
                     ui.add_space(12.0);
                     if let Some(stats) = self.weapon_stats.get(&item.display_tag) {
-                        weapon_stats_table(ui, stats);
+                        weapon_stats_table(ui, stats, &preset_plug_labels(&self.items, item));
                         ui.add_space(12.0);
                     }
 
@@ -1925,6 +2358,44 @@ fn weapon_mod_stats_panel(ui: &mut egui::Ui, details: &WeaponModDetails) {
     }
 }
 
+fn export_mod_weapon(weapon: &WeaponModWeaponStats) -> GearExportModWeapon<'_> {
+    GearExportModWeapon {
+        weapon: &weapon.weapon,
+        changes: weapon
+            .changes
+            .iter()
+            .map(|change| {
+                let rated = change.derived_from.is_none();
+                GearExportModChange {
+                    name: change.name,
+                    unit: change.unit,
+                    before: change.before,
+                    after: change.after,
+                    delta: change.delta(),
+                    display: format_weapon_mod_change(change),
+                    rating_id: rated.then_some(change.rating_id),
+                    base_rating: rated.then_some(change.base_rating),
+                    modified_rating: rated.then_some(change.modified_rating),
+                    derived_from: change.derived_from,
+                }
+            })
+            .collect(),
+        curves: weapon
+            .curves
+            .iter()
+            .map(|curve| GearExportModCurve {
+                semantic: curve.semantic,
+                occurrence: curve.occurrence,
+                rating_id: curve.rating_id,
+                base_rating: curve.base_rating,
+                modified_rating: curve.modified_rating,
+                before: &curve.before,
+                after: &curve.after,
+            })
+            .collect(),
+    }
+}
+
 fn format_weapon_mod_change(change: &WeaponModStatChange) -> String {
     let delta = change.delta();
     match change.unit {
@@ -2074,146 +2545,92 @@ fn export_html_text(text: &str) -> String {
         .replace(['\r', '\n'], "<br>")
 }
 
-fn weapon_stats_table(ui: &mut egui::Ui, stats: &WeaponStats) {
+fn weapon_stats_table(ui: &mut egui::Ui, stats: &WeaponStats, preset_plugs: &[String]) {
     ui.add_space(12.0);
     ui.heading("Weapon stats");
     ui.separator();
     ui.add_space(4.0);
+    if !preset_plugs.is_empty() {
+        ui.weak(format!("With preset mods: {}", preset_plugs.join(", ")));
+        ui.add_space(4.0);
+    }
 
-    ui.horizontal(|ui| {
-        ui.strong("Firepower");
-        ui.label(format_optional(stats.firepower, 1, ""));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Damage");
-        ui.label(format_optional(stats.damage, 1, ""));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Precision");
-        ui.label(format_optional(stats.headshot_multiplier, 2, "×"));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Rate of Fire");
-        ui.label(format_optional(stats.rounds_per_minute, 0, " RPM"));
-    });
-    if stats.bullets_per_shot.is_some() {
+    // Values are rounded as the game's weapon card rounds them; the decoded
+    // value is on hover.
+    let group = |ui: &mut egui::Ui, name: &str, value: Option<f32>, decimals: usize, suffix: &str| {
+        ui.horizontal(|ui| {
+            ui.strong(name);
+            stat_value_label(ui, value, decimals, suffix);
+        });
+    };
+    let row = |ui: &mut egui::Ui, name: &str, value: Option<f32>, decimals: usize, suffix: &str| {
         ui.horizontal(|ui| {
             ui.add_space(18.0);
-            ui.weak("Pellets per Shot");
-            ui.label(format_optional(stats.bullets_per_shot, 0, ""));
+            ui.weak(name);
+            stat_value_label(ui, value, decimals, suffix);
         });
+    };
+    let percent = |value: Option<f32>| value.map(|value| value * 100.0);
+
+    group(ui, "Firepower", stats.firepower, 1, "");
+    row(ui, "Damage", stats.damage, 1, "");
+    row(ui, "Precision", stats.headshot_multiplier, 1, "×");
+    row(ui, "Rate of Fire", stats.rounds_per_minute, 0, " RPM");
+    if stats.bullets_per_shot.is_some() {
+        row(ui, "Pellets per Shot", stats.bullets_per_shot, 0, "");
+    }
+    // Weapons without a charge author a one-millisecond placeholder.
+    if stats.charge_seconds.is_some_and(|seconds| seconds >= 0.01) {
+        row(ui, "Charge Time", stats.charge_seconds, 2, " s");
     }
 
-    ui.horizontal(|ui| {
-        ui.strong("Accuracy");
-        ui.label(format_optional(stats.accuracy, 1, ""));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Hipfire Spread");
-        ui.label(format_optional(stats.hip_fire_spread_degrees, 2, "°"));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("ADS Spread");
-        ui.label(format_optional(stats.ads_spread_degrees, 2, "°"));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Moving Inaccuracy");
-        ui.label(format_optional(
-            stats.movement_accuracy_loss.map(|value| value * 100.0),
-            1,
-            "%",
-        ));
-    });
+    group(ui, "Accuracy", stats.accuracy, 1, "");
+    row(ui, "Hipfire Spread", stats.hip_fire_spread_degrees, 2, "°");
+    row(ui, "ADS Spread", stats.ads_spread_degrees, 2, "°");
+    row(ui, "Moving Inaccuracy", percent(stats.movement_accuracy_loss), 1, "%");
 
-    ui.horizontal(|ui| {
-        ui.strong("Handling");
-        ui.label(format_optional(stats.handling, 0, ""));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Equip Speed");
-        ui.label(format_optional(stats.equip_seconds, 2, " s"));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("ADS Speed");
-        ui.label(format_optional(stats.aim_seconds, 2, " s"));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Weight");
-        ui.label(format_optional(
-            stats.weight.map(|value| value * 100.0),
-            1,
-            "%",
-        ));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Recoil");
-        ui.label(format_optional(
-            stats.recoil.map(|value| value * 100.0),
-            1,
-            "%",
-        ));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Aim Assist");
-        ui.label(format_optional(stats.aim_correction_degrees, 2, "°"));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Reload Speed");
-        ui.label(format_optional(stats.reload_seconds, 2, " s"));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.weak("Crouch Spread Bonus");
-        ui.label(format_optional(
-            stats.crouch_spread_bonus.map(|value| value * 100.0),
-            1,
-            "%",
-        ));
-    });
+    group(ui, "Handling", stats.handling, 0, "");
+    // The card prints these two to hundredths without trailing zeros
+    // (0.94s, 0.36s, but 1.2s and 0.4s).
+    let hundredths = |value: Option<f32>| {
+        value.map(|value| format!("{value:.2}").parse::<f32>().unwrap_or(value))
+    };
+    let decimals = |value: Option<f32>| {
+        let tenths = value.map_or(0.0, |value| value * 10.0);
+        usize::from((tenths - tenths.round()).abs() > 0.001) + 1
+    };
+    let equip = hundredths(stats.equip_seconds);
+    let aim = hundredths(stats.aim_seconds);
+    row(ui, "Equip Speed", stats.equip_seconds, decimals(equip), " s");
+    row(ui, "ADS Speed", stats.aim_seconds, decimals(aim), " s");
+    row(ui, "Weight", percent(stats.weight), 1, "%");
+    row(ui, "Recoil", percent(stats.recoil), 1, "%");
+    row(ui, "Aim Assist", stats.aim_correction_degrees, 2, "");
+    row(ui, "Reload Speed", stats.reload_seconds, 2, " s");
+    row(ui, "Crouch Spread Bonus", percent(stats.crouch_spread_bonus), 1, "%");
 
-    ui.horizontal(|ui| {
-        ui.strong("Range");
-        ui.label(format_optional(stats.range_metres, 0, " m"));
-    });
+    group(ui, "Range", stats.range_metres, 0, " m");
     if stats.shotgun_spread_degrees.is_some() {
-        ui.horizontal(|ui| {
-            ui.strong("Spread Angle");
-            ui.label(format_optional(stats.shotgun_spread_degrees, 1, "°"));
-        });
+        group(ui, "Spread Angle", stats.shotgun_spread_degrees, 1, "°");
     }
     if stats.volt_drain_percent.is_some() {
-        ui.horizontal(|ui| {
-            ui.strong("Volt Drain");
-            ui.label(format_optional(stats.volt_drain_percent, 1, "%"));
-        });
+        group(ui, "Volt Drain", stats.volt_drain_percent, 1, "%");
     } else {
-        ui.horizontal(|ui| {
-            ui.strong("Magazine");
-            ui.label(format_optional(stats.magazine, 0, ""));
-        });
+        group(ui, "Magazine", stats.magazine, 0, "");
     }
-    ui.horizontal(|ui| {
-        ui.strong("Zoom");
-        ui.label(format_optional(stats.zoom, 1, "×"));
-    });
+    group(ui, "Zoom", stats.zoom, 1, "×");
 }
 
-fn format_optional(value: Option<f32>, _decimals: usize, suffix: &str) -> String {
-    value
-        .map(|value| format!("{}{suffix}", format_display_float(value, false)))
-        .unwrap_or_else(|| "—".to_owned())
+fn stat_value_label(ui: &mut egui::Ui, value: Option<f32>, decimals: usize, suffix: &str) {
+    match value {
+        Some(value) => {
+            ui.label(format!("{value:.decimals$}{suffix}"))
+                .on_hover_text(format!("{}{suffix}", format_display_float(value, false)));
+        }
+        None => {
+            ui.label("—");
+        }
+    }
 }
 
 fn gear_item_button(
@@ -2762,6 +3179,7 @@ fn load_gear_resolved(
             mod_family: None,
             mod_is_universal: false,
             compatible_weapons: vec![],
+            preset_plugs: vec![],
             classification,
             types: extract_types(&data, &wordlist),
             internal_categories,
@@ -2855,6 +3273,7 @@ fn load_gear_resolved(
     propagate_runner_skin_taxonomy(&mut items);
     assign_runner_owners(&mut items);
     assign_skin_weapons(&mut items);
+    assign_weapon_preset_plugs(&mut items);
     items.sort_by(|a, b| {
         a.name
             .to_lowercase()
@@ -2862,6 +3281,63 @@ fn load_gear_resolved(
             .then(a.display_tag.cmp(&b.display_tag))
     });
     Ok(items)
+}
+
+/// Unique weapons ship with plugs preset in their sockets, one of them in a
+/// socket the standard frame lacks. The game prices and rates the weapon with
+/// those plugs installed.
+fn assign_weapon_preset_plugs(items: &mut [GearItem]) {
+    let tables = package_manager().get_all_by_reference(HASH_TO_DEFINITION_REFERENCE);
+    // Sockets address plugs by position, which is only defined within one table.
+    let [(table, _)] = tables.as_slice() else {
+        log::warn!("Expected one hash-to-definition table, found {}", tables.len());
+        return;
+    };
+    let Ok(table) = package_manager().read_tag(*table) else {
+        return;
+    };
+    let definitions = parse_hash_tag_pairs(&table, |definition_tag| {
+        package_manager()
+            .get_entry(definition_tag)
+            .is_some_and(|entry| entry.reference == GEAR_DEFINITION_REFERENCE)
+    })
+    .into_iter()
+    .map(|(_, definition)| definition)
+    .collect::<Vec<_>>();
+    for item in items.iter_mut().filter(|item| is_authored_weapon(item)) {
+        let Some(definition) = item
+            .definition_tag
+            .and_then(|tag| package_manager().read_tag(tag).ok())
+        else {
+            continue;
+        };
+        item.preset_plugs = preset_plugs(&definition, &definitions);
+        let plug_prices = item
+            .preset_plugs
+            .iter()
+            .filter_map(|plug| parse_price(&package_manager().read_tag(*plug).ok()?))
+            .sum::<u32>();
+        item.price = item.price.map(|price| price + plug_prices);
+    }
+}
+
+/// Display names of a weapon's preset plugs; a plug without a Gear entry is
+/// an intrinsic of the weapon and is named by its definition tag.
+fn preset_plug_labels(items: &[GearItem], weapon: &GearItem) -> Vec<String> {
+    weapon
+        .preset_plugs
+        .iter()
+        .map(|plug| {
+            items
+                .iter()
+                .find(|item| item.definition_tag == Some(*plug))
+                .map(|item| match item.rarity {
+                    Some(rarity) => format!("{} ({})", item.name, rarity.label()),
+                    None => item.name.clone(),
+                })
+                .unwrap_or_else(|| format!("Intrinsic {plug}"))
+        })
+        .collect()
 }
 
 fn implant_slot(item: &GearItem) -> Option<&'static str> {
@@ -5852,4 +6328,20 @@ fn read_i64(data: &[u8], offset: usize) -> Option<i64> {
     Some(i64::from_le_bytes(
         data.get(offset..offset + 8)?.try_into().ok()?,
     ))
+}
+
+/// Name of a runner's dye table. A runner skin's item definition lists it
+/// with the row of the table the skin dyes its runner's gear with.
+const RUNNER_DYE_TABLE: u32 = 0x69CBE8DD;
+
+/// The dye table row a runner skin's item definition selects.
+fn runner_skin_dye_row(definition: TagHash) -> Option<u32> {
+    let data = package_manager().read_tag(definition).ok()?;
+    // {table name, array of (slot, row)}
+    let record = data
+        .chunks_exact(4)
+        .position(|word| u32::from_le_bytes(word.try_into().unwrap()) == RUNNER_DYE_TABLE)?
+        * 4;
+    let range = table_range(&data, record + 8, 8)?;
+    read_u32(&data, range.start + 4)
 }

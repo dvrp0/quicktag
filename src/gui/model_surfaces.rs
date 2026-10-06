@@ -147,7 +147,7 @@ pub(super) fn resolve_source(
         | D::EyesVertexStorage | D::RunnerVertexScalarStorage | D::RigidVertexDirectIa | D::FloatVertexScalarStorage
         | D::HairVertexStorage | D::Hair14580VertexStorage | D::Hair120RowVertexStorage | D::HairBA67VertexStorage
         | D::BodyProceduralVertexStorage | D::VertexColorStorage | D::ClothVertexStorage | D::ClothB152VertexStorage
-        | D::DisplacementEC03VertexStorage | D::BodyC9C5VertexStorage) {
+        | D::DisplacementEC03VertexStorage | D::ShellOffsetD8B4VertexStorage | D::ShellOffsetC7F6VertexStorage | D::BodyC9C5VertexStorage) {
         return Err("unsupported vertex runtime ABI");
     }
     if matches!(vertex_program,D::RigidVertexDirectIa|D::FloatVertexScalarStorage) != (authored.input_layout_id == 13) {
@@ -182,8 +182,13 @@ pub(super) fn resolve_source(
     if ps.constant_buffer_slot != Some(0) { return Err("unexpected constant buffer slot"); }
     if state.constant_registers.len() != rows { return Err("constant row count mismatch"); }
     let mut constants = state.constant_registers;
-    zero_unresolved_rows(&mut constants, &state.unresolved_dependencies, |_| false)?;
-    let animation = AnimatedConstants::new(ps, runtime_inputs, |_| false);
+    // A texture slot the technique leaves empty is not a missing input: the
+    // shader reads zero from it, as from any unbound resource.
+    fn empty_texture_slot(dependency: &str) -> bool {
+        dependency.starts_with("texture Pixel slot ") && dependency.ends_with("<- authored_resource")
+    }
+    zero_unresolved_rows(&mut constants, &state.unresolved_dependencies, empty_texture_slot)?;
+    let animation = AnimatedConstants::new(ps, runtime_inputs, empty_texture_slot);
     let vertex_constants = if let Some((written_rows, declared_rows)) = vertex_program.vertex_constant_contract() {
         let mut state = vs.runtime_state(runtime_inputs);
         if vs.constant_buffer_slot != Some(0) || state.constant_registers.len() != written_rows
@@ -204,7 +209,11 @@ pub(super) fn resolve_source(
                 .bindings
                 .iter()
                 .find(|b| b.kind == "texture" && u32::from(b.slot) == slot)?;
-            let tag = binding.resolved?;
+            let Some(tag) = binding.resolved else {
+                // An empty slot: plain 2D only, the shape the stand-in texel has.
+                return (binding.source == "authored_resource" && Some(slot) != cube && Some(slot) != volume)
+                    .then_some(TagHash::NONE);
+            };
             let desc = Texture::load_desc(tag).ok()?;
             let layers = if Some(slot) == cube { 6 } else { 1 };
             if desc.array_size != layers || (desc.depth > 1) != (Some(slot) == volume) {

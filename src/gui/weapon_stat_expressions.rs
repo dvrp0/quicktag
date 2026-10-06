@@ -21,6 +21,10 @@ impl PropertyProgram {
         Some(Self(rows))
     }
 
+    pub(super) fn rows(&self) -> &[[u32; 24]] {
+        &self.0
+    }
+
     pub(super) fn evaluate(&self, curves: &[Option<Vec<f32>>]) -> FxHashMap<(u32, u32), f32> {
         let mut properties = FxHashMap::default();
         for row in &self.0 {
