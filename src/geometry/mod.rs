@@ -1,3 +1,12 @@
+mod cache;
+mod runner;
+pub use runner::RunnerShellAssembly;
+
+/// Schema names participate in technique classification during model decoding.
+pub(crate) fn invalidate_cached_models() {
+    cache::invalidate();
+}
+
 use anyhow::{Context, bail};
 use binrw::Endian;
 use itertools::Itertools;
@@ -11,14 +20,11 @@ use wgpu::util::DeviceExt;
 
 use crate::material::{
     MaterialPreviewKind, MaterialTagPreview, TechniqueMaterialConstants, TechniqueTextureBinding,
-    interpret_tfx_stack_with_object_channels, interpret_tfx_stack_with_runtime_inputs,
-    is_technique_entry, material_constants_for_technique, primary_sampler_for_technique,
-    render_state_for_technique, texture_bindings_for_technique,
+    interpret_tfx_stack_with_object_channels, is_technique_entry, material_constants_for_technique,
+    primary_sampler_for_technique, render_state_for_technique, sampler_for_technique_slot,
+    texture_bindings_for_technique, tfx_has_marathon_decal_abi,
 };
 use crate::texture::Texture;
-
-#[cfg(test)]
-use crate::material::tfx_texture_bindings_for_technique;
 
 const MAX_PREVIEW_VERTICES: usize = 200_000;
 const MAX_PREVIEW_INDICES: usize = 900_000;
@@ -34,6 +40,7 @@ const CLASS_ENTITY_RESOURCE: u32 = 0x80809B06;
 const CLASS_PATTERN: u32 = 0x8080BAAD;
 const CLASS_PATTERN_COMPONENT: u32 = 0x8080BADB;
 const CLASS_DECORATOR: u32 = 0x80806C98;
+const SEMANTIC_POSITION: u8 = 0x00;
 const SEMANTIC_NORMAL: u8 = 0x03;
 const SEMANTIC_TEXCOORD: u8 = 0x05;
 const SEMANTIC_TANGENT: u8 = 0x06;
@@ -116,7 +123,8 @@ impl ModelTagInfo {
     /// Whether this tag represents a complete, user-facing model rather than one
     /// of the implementation tags consumed while assembling that model.
     pub fn is_catalog_entry(self) -> bool {
-        matches!(self.role, ModelTagRole::Dynamic) && self.label != "Dynamic mesh"
+        (matches!(self.role, ModelTagRole::Dynamic) && self.label != "Dynamic mesh")
+            || matches!(self.role, ModelTagRole::Container)
     }
 }
 
@@ -212,6 +220,75 @@ struct VertexInputElement {
     format: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredVertexElementDescriptor {
+    pub semantic: u8,
+    pub semantic_index: u8,
+    pub format: u8,
+    pub offset: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredVertexStreamLayoutDescriptor {
+    pub stream_index: u8,
+    pub element_set_index: u32,
+    pub instanced: bool,
+    pub elements: Vec<AuthoredVertexElementDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredInputLayoutDescriptor {
+    pub layout_id: u8,
+    pub streams: Vec<AuthoredVertexStreamLayoutDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredVertexStreamRef {
+    pub stream_index: u8,
+    pub header_tag: TagHash,
+    pub data_tag: TagHash,
+    pub stride: u16,
+    pub vertex_type: u16,
+    pub data_size: u32,
+    pub element_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredIndexBufferRef {
+    pub header_tag: TagHash,
+    pub data_tag: TagHash,
+    pub is_32bit: bool,
+    pub data_size: u64,
+    pub index_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeometryPositionTransform {
+    pub scale: [f32; 3],
+    pub offset: [f32; 3],
+    pub procedural_scale: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredStageInputLayout {
+    pub raw_stage: u8,
+    pub layout_id: u8,
+    pub descriptor: Option<AuthoredInputLayoutDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoredGeometryInput {
+    pub geometry: TagHash,
+    pub vertex_streams: Vec<AuthoredVertexStreamRef>,
+    pub color_buffer: Option<AuthoredVertexStreamRef>,
+    pub skinning_buffer: Option<AuthoredVertexStreamRef>,
+    pub index_buffer: Option<AuthoredIndexBufferRef>,
+    pub stage_layouts: Vec<AuthoredStageInputLayout>,
+    pub position_transform: Option<GeometryPositionTransform>,
+    pub uv_transform: Option<UvTransformPreview>,
+    pub attachment_pose: Option<WeaponModAttachmentPose>,
+}
+
 impl std::fmt::Display for InputLayoutFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
@@ -240,6 +317,9 @@ pub struct WireframePreview {
     pub position_format: &'static str,
     pub uv_format: Option<String>,
     pub vertices: Vec<[f32; 3]>,
+    /// Rigid skeleton node selected by POSITION.w. Present only for layouts
+    /// whose fourth position component is an authored bone index.
+    pub rigid_indices: Option<Vec<u16>>,
     pub normals: Option<Vec<[f32; 3]>>,
     /// Raw shader-input POSITION consumed by common-surface procedural passes.
     /// For `R16G16B16A16_SNORM` geometry this is the hardware-decoded
@@ -253,22 +333,73 @@ pub struct WireframePreview {
     pub tangent_format: Option<String>,
     pub indices: Vec<u32>,
     pub material_ranges: Vec<WireframeMaterialRange>,
+    /// Package-native vertex/input ABI retained for Strict Tiger rendering.
+    /// Unsupported authored paths may fall back to reconstructed arrays.
+    pub authored_inputs: Vec<AuthoredGeometryInput>,
+    /// Exact highest-detail parts authored for Marathon ShadowGenerate.
+    ///
+    /// These are deliberately kept separate from the visible preview ranges:
+    /// visible geometry deduplicates repeated stage records, while the strict
+    /// shadow renderer must retain the package-authored stage-4 draw contract.
+    pub authored_shadow_ranges: Vec<WireframeAuthoredStageRange>,
     pub min: [f32; 3],
     pub max: [f32; 3],
     pub vertex_count_total: usize,
     pub index_count_total: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireframeAuthoredDrawMetadata {
+    pub part_index: usize,
+    pub source_index_start: u32,
+    pub source_index_count: u32,
+    pub primitive_type: u8,
+    pub variant_shader_index: u16,
+    pub flags: u32,
+    pub lod_run: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct WireframeMaterialRange {
     pub index_start: usize,
     pub index_count: usize,
+    /// Raw game/build-specific LOD membership byte. Never normalized here.
+    pub raw_lod_category: Option<u8>,
     pub render_stage: Option<u8>,
     pub technique: Option<TagHash>,
     pub gear_dye_change_color_index: Option<u8>,
+    /// Index into `WireframePreview::authored_inputs` for this draw.
+    pub authored_source: Option<usize>,
+    /// Original package IA range before preview triangle-list reconstruction.
+    /// Geometry resources populate this so strict stage paths can bind the
+    /// authored index buffer/topology instead of the flattened preview copy.
+    pub authored_draw: Option<WireframeAuthoredDrawMetadata>,
     /// Rigid-model `position_offset.w` / skinning `offset_scale.w` consumed
     /// by common-surface procedural branches through `scope_skinning[5].w`.
     pub procedural_scale: f32,
+    pub texture: Option<TagHash>,
+    pub textures: WireframeMaterialTextures,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireframeAuthoredStageRange {
+    pub render_stage: u8,
+    pub input_layout_id: u8,
+    pub part_index: usize,
+    pub source_index_start: u32,
+    pub source_index_count: u32,
+    pub primitive_type: u8,
+    pub raw_lod_category: u8,
+    pub variant_shader_index: u16,
+    pub flags: u32,
+    pub lod_run: u8,
+    pub technique: Option<TagHash>,
+    pub gear_dye_change_color_index: Option<u8>,
+    /// Index into `WireframePreview::authored_inputs` for this authored draw.
+    pub authored_source: Option<usize>,
+    pub procedural_scale: f32,
+    /// Triangle-list indices into the parent WireframePreview vertex array.
+    pub indices: Vec<u32>,
     pub texture: Option<TagHash>,
     pub textures: WireframeMaterialTextures,
 }
@@ -280,12 +411,133 @@ pub struct GearDyeMaterial {
     pub metal_remap: [f32; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CharacterSurfaceMaterial {
+    /// 1 = common detail-gate, 2 = palette-mask, 3 = physical-only common surface.
+    pub mode: u8,
+    pub surface: TagHash,
+    pub selector: TagHash,
+    pub detail_color: TagHash,
+    pub detail_normal: TagHash,
+    /// Optional object-space procedural field used by palette-mask runner
+    /// shaders (Arata t2). Kept separate from the UV selector and normal map.
+    pub procedural: Option<TagHash>,
+    pub detail_transform: [f32; 4],
+    pub detail_base: [f32; 4],
+    pub detail_scale: [f32; 4],
+    pub detail_gate: f32,
+    pub extra: [[f32; 4]; 2],
+    pub palette: [[f32; 4]; 2],
+    pub procedural_constants: [[f32; 4]; 11],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunnerLayeredSurfaceMaterial {
+    /// 1 = full9 dual gated layers, 2 = t1.r switched dual layer,
+    /// 3 = full10 four-layer runner surface, 4 = procedural full9 dual layer,
+    /// 5 = t1.r-gated single detail layer, 6 = local full9 four-detail stack,
+    /// 8 = procedural full8 with a t1.r-gated t3 detail over base t4,
+    /// 9 = local full10 three-detail stack, 10 = full11 four-detail stack,
+    /// 11 = full10 A/G/B/R-gated three-detail stack,
+    /// 12 = local full11 A/G/B/R-gated three-detail stack,
+    /// 13 = A/B/R selected three-detail stack, 14 = G/B/R selected stack,
+    /// 15 = procedural A/B/G/R-gated dual-detail stack,
+    /// 16 = A/B-gated dual-detail stack with material response,
+    /// 17 = A/G/B/R-selected four-detail stack,
+    /// 18 = G/B/R-selected dual-detail stack with material response,
+    /// 19 = procedural pattern/mask surface with an authored detail normal,
+    /// 20 = G/B/R-selected stack with two authored R variants,
+    /// 21 = A/G/B/R-selected stack with two authored R variants,
+    /// 22 = A/G-gated stack with a B-selected authored detail and response,
+    /// 23 = local full9 stack with response, 24 = expanded local full9 with response,
+    /// 25 = local three-detail stack with response,
+    /// 26 = A/G-gated B/R-selected dual-detail stack,
+    /// 27 = G/B/R-selected stack with two R variants plus response/AO,
+    /// 28 = procedural A/G/B/R stack with response/AO,
+    /// 29 = A/G-gated dual B/R switch stack,
+    /// 30 = A/G/B/R-gated procedural stack with response/AO,
+    /// 31 = character full11 A/B/R-selected three-detail stack,
+    /// 32 = character full13 A/G/B/R-selected four-detail stack,
+    /// 33 = character full11 A/B/R stack sharing the B/R detail texture,
+    /// 34 = procedural character full11 A/G/B/R stack,
+    /// 35 = compact character A/R-selected dual-detail stack,
+    /// 36 = local panel R-selected single-detail stack with response,
+    /// 37 = package-394 full13 A/G/B/R four-detail stack,
+    /// 41 = runner skin/subsurface surface with authored pore mask and AO,
+    /// 42/43 = generated procedural full12/compact sibling stacks.
+    pub mode: u8,
+    /// Packed surface/selector response sampled at the mesh UV.
+    pub surface: TagHash,
+    /// Optional two-channel field sampled at the mesh UV. Red controls the
+    /// layered normal response and green contributes authored roughness.
+    pub material_response: Option<TagHash>,
+    /// Authored detail normals selected by channels from the packed surface.
+    pub detail_normal_a: TagHash,
+    pub detail_normal_b: TagHash,
+    pub detail_normal_c: Option<TagHash>,
+    pub detail_normal_d: Option<TagHash>,
+    /// Optional object-space procedural field used by generated runner
+    /// material branches. It shares no draw ABI with weapon gear patterns.
+    pub procedural: Option<TagHash>,
+    /// Optional authored sRGB colour mask. This is independent from the
+    /// packed selector, material-response, and object-space procedural maps.
+    pub color_overlay: Option<TagHash>,
+    /// Shader-family constants for the optional colour layer. Kept separate
+    /// from normal-stack constants because wide runner shaders use all 24
+    /// normal rows already.
+    pub color_overlay_constants: [[f32; 4]; 7],
+    /// Optional runner condition stack: UV scratch mask, RG distortion field,
+    /// and UV breakup field. This ABI occupies t9..t11 in 80A9E4DB.
+    pub procedural_wear: Option<[TagHash; 3]>,
+    /// Shader-family constants in the semantic layout decoded below.
+    pub constants: [[f32; 4]; 24],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerOcclusionMaterial {
+    pub texture: TagHash,
+    pub channel: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlphaMaskMaterial {
+    /// PS t1 scalar coverage texture. Tiger samples this independently from
+    /// the t0 colour texture; using t0 alpha turns runner cutouts into blocks.
+    pub texture: TagHash,
+    /// Coverage = sample.r * remap[1] + remap[0]. Some compiled runner
+    /// surfaces amplify their scalar mask before the authored cutoff.
+    pub remap: [f32; 2],
+    pub threshold: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SharedAtlasDetailMaterial {
+    /// Linear PS t1 field multiplied into the direct sRGB PS t0 atlas.
+    pub detail: TagHash,
+    pub projection: [f32; 4],
+    pub exponent: f32,
+    pub base: [f32; 3],
+    pub scale: [f32; 3],
+    /// Constant RT2.g written by this audited material ABI.
+    pub ambient_occlusion: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct WireframeMaterialTextures {
     pub color: Option<TagHash>,
     pub normal: Option<TagHash>,
     pub emissive: Option<TagHash>,
     pub control: Option<TagHash>,
+    /// Compiled character common-surface ABI. PS t0 remains local albedo; this
+    /// block preserves t1/t2/t3/t7 and the constants that compose detail.
+    pub character_surface: Option<CharacterSurfaceMaterial>,
+    /// Additional packed/detail layers consumed by audited runner shaders.
+    pub runner_layered_surface: Option<RunnerLayeredSurfaceMaterial>,
+    /// Independent runner AO mask. The audited alpha/physical shader averages
+    /// this scalar with its geometry/procedural occlusion before RT2.g.
+    pub runner_occlusion: Option<RunnerOcclusionMaterial>,
+    pub alpha_mask: Option<AlphaMaskMaterial>,
+    pub shared_atlas_detail: Option<SharedAtlasDetailMaterial>,
     pub roughness_channel: u8,
     pub sampler: Option<TagHash>,
     pub aux: Vec<TagHash>,
@@ -295,11 +547,14 @@ pub struct WireframeMaterialTextures {
     pub gear_dye: Option<GearDyeMaterial>,
     pub gear_dye_default: Option<[f32; 4]>,
     pub gear_dye_palette: Option<[GearDyeMaterial; 6]>,
-    pub mod_wear: Option<WeaponModWearMaterial>,
-    /// Time-driven common-surface overlay used by animated inventory skins.
-    /// Detection comes from the compiled PS/TFX ABI: a slot-7 field atlas,
-    /// frame-driven outputs 66/67/71, and the authored response constants.
-    pub animated_dither: Option<AnimatedDitherMaterial>,
+    /// Inherited GearDye `Worn Dye` object-channel contribution. Compiled
+    /// shaders add this to the selected Dye channel before sampling t0.
+    pub gear_worn_dye_palette: Option<[[f32; 4]; 6]>,
+    /// Mod-local GearDye `Dye Detail` contribution. This is independent from
+    /// the physical t5/t6/t7 rarity wear maps.
+    pub gear_dye_detail_palette: Option<[[f32; 4]; 6]>,
+    pub mod_wear: Option<WeaponModConditionMaterial>,
+    pub surface_condition: Option<WeaponSurfaceConditionMaterial>,
     /// Object-space contour/detail layer decoded from the common gear surface
     /// shader. The control map selects which material IDs receive the layer;
     /// the bound field texture perturbs the authored tri-planar line function.
@@ -319,12 +574,69 @@ pub struct WireframeMaterialTextures {
     pub solid_color: Option<[f32; 4]>,
     /// Authored `(roughness, metalness)` for a decoded textureless material.
     pub solid_surface: Option<[f32; 2]>,
+    /// Authored discrete iridescence/material-response selector. `None` means
+    /// shader ABI exposes no such channel; renderer must display ID 0.
+    pub iridescence_id: Option<f32>,
+    /// Authored colour filters used by stage-8 transmission/distortion
+    /// shaders. Colours come from compiled pixel-shader material blocks;
+    /// stage 8 itself stores displacement, not a universal blue surface.
+    pub transmission: Option<TransmissionMaterial>,
+    /// Shader-proven stage-8 forward coating. Presence comes from compiled
+    /// PS/TFX ABI and resource shape, never weapon or skin identity.
+    pub forward_coating: Option<ForwardCoatingMaterial>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransmissionMaterial {
+    pub colors: [[f32; 4]; 2],
+    /// `(roughness, metalness, _, _)` paired with each decoded colour.
+    pub surfaces: [[f32; 4]; 2],
+    pub color_count: u8,
+    /// `(opacity, scene gain)` of a refractive-glass program. Its colours are
+    /// the near and far absorption tints applied to the scene behind it.
+    pub absorption: Option<[f32; 2]>,
+    /// Rows of a halftone-glow program: scroll rates, noise remap, dot grid
+    /// and dot/alpha remap. Its colours are the two glow tints (gain in the
+    /// first alpha) and its surfaces the two noise transforms at time zero.
+    pub halftone: Option<[[f32; 4]; 4]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForwardCoatingMaterial {
+    /// Linear PS t1 procedural response sampled with object-space triplanar UVs.
+    pub detail: TagHash,
+    /// PS t2 authored environment cubemap. Quicktag uses scene IBL for preview
+    /// lighting but retains this dependency as part of material evidence.
+    pub environment: TagHash,
+    /// Authored PS sampler bound to the local environment cubemap at s2.
+    pub environment_sampler: TagHash,
+    pub colors: [[f32; 4]; 2],
+    pub incidence_remap: [f32; 2],
+    pub coverage: f32,
+    pub projection: [f32; 4],
+    pub projection_exponent: f32,
+    pub detail_remap: [f32; 2],
+    pub response_remap: [f32; 2],
+    /// Minimum/maximum authored mip floor selected by the detail response.
+    pub environment_lod: [f32; 2],
+    pub environment_remap: [f32; 2],
+    pub environment_strength: f32,
+    /// `(base scale, base bias, _, _)` applied before the local cubemap term.
+    pub environment_params: [f32; 4],
+    pub specular_colors: [[f32; 4]; 2],
+    pub specular_exponents: [f32; 2],
+    pub specular_strengths: [f32; 2],
+    /// Normal-direction scales used by the two authored grazing lobes.
+    pub lobe_direction_scales: [f32; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvestmentDecalMode {
     SelectorMask,
     DetailSelectorMask,
+    /// Stage-2 decals whose pixel shader consumes the already-rendered
+    /// screen-space surface normal as its external t2 input.
+    SceneNormalColorMask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,7 +698,7 @@ pub struct WeaponModPreviewAttachment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WeaponModWearMaterial {
+pub struct WeaponModConditionMaterial {
     /// Additional common-surface texture authored at PS t5.
     pub scratches: TagHash,
     /// Additional common-surface texture authored at PS t6.
@@ -419,6 +731,32 @@ pub struct WeaponModWearMaterial {
     pub rarity: Option<WeaponModRarity>,
 }
 
+/// Common weapon-body condition pass. Unlike detachable-mod wear, this ABI
+/// owns one packed breakup field at PS t6 and changes albedo, roughness, and
+/// detail-normal response together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeaponSurfaceConditionMaterial {
+    /// PS t2 authored material response. Common weapon shaders remap red to
+    /// G-buffer metalness; it is not the control atlas roughness channel.
+    pub response: TagHash,
+    /// PS t4 object-space material-detail field selected by t3 RGB IDs.
+    pub detail: TagHash,
+    pub breakup: TagHash,
+    pub detail_projection: [f32; 4],
+    pub detail_exponent: f32,
+    /// Material-class fallback roughness mixed with PS t3.a by the projected
+    /// t4 field. These are physical-surface parameters, never albedo gains.
+    pub detail_roughness: f32,
+    pub detail_remap: [f32; 2],
+    pub projection: [f32; 4],
+    pub phase: f32,
+    pub triangle: [f32; 4],
+    pub orientation: [f32; 2],
+    pub albedo: [f32; 3],
+    pub roughness: f32,
+    pub normal_flatten: f32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WireframeMaterialLayer {
     pub color: Option<TagHash>,
@@ -433,6 +771,11 @@ impl Default for WireframeMaterialTextures {
             normal: None,
             emissive: None,
             control: None,
+            character_surface: None,
+            runner_layered_surface: None,
+            runner_occlusion: None,
+            alpha_mask: None,
+            shared_atlas_detail: None,
             roughness_channel: 0,
             sampler: None,
             aux: vec![],
@@ -442,14 +785,19 @@ impl Default for WireframeMaterialTextures {
             gear_dye: None,
             gear_dye_default: None,
             gear_dye_palette: None,
+            gear_worn_dye_palette: None,
+            gear_dye_detail_palette: None,
             mod_wear: None,
-            animated_dither: None,
+            surface_condition: None,
             gear_pattern: None,
             authored_shared_atlas: false,
             investment_decal: None,
             emissive_strength: 0,
             solid_color: None,
             solid_surface: None,
+            iridescence_id: None,
+            transmission: None,
+            forward_coating: None,
         }
     }
 }
@@ -472,51 +820,6 @@ pub struct GearPatternMaterial {
     pub colors: [[f32; 4]; 2],
 }
 
-/// Decoded parameters for Tiger's animated circular/dither surface branch.
-///
-/// The game scrolls two scales of the shared slot-7 atlas in object space,
-/// converts its blue/alpha pair into a triangular time mask, gates it by the
-/// authored object-space face normal, then reshapes the material colour.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AnimatedDitherMaterial {
-    pub field: TagHash,
-    /// Slot-6 technical LUT sampled with mesh UVs before the animated response.
-    pub technical_mask: TagHash,
-    /// Per control-material affine remaps (PS constants 82..88).
-    pub technical_mask_remap: [[f32; 2]; 7],
-    /// Common-surface detail branch (PS t5). Engine projects this field in
-    /// object space and routes it into roughness, not base colour.
-    pub dot_detail: Option<AnimatedDotDetailMaterial>,
-    pub phase_speed: f32,
-    /// xy = object-space scale, zw = scroll rate.
-    pub primary_transform: [f32; 4],
-    /// xy = object-space scale, zw = scroll rate.
-    pub secondary_transform: [f32; 4],
-    /// x = waveform numerator, y = divisor, z/w = affine remap.
-    pub waveform: [f32; 4],
-    /// xy = normal-facing affine gate, z = response scale (c75*c76*c77 default),
-    /// w = authored wave strength (c74 default).
-    pub facing_response: [f32; 4],
-    /// x = colour exponent, y = colour scale, z = normal response, w = mask exponent.
-    pub surface_response: [f32; 4],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AnimatedDotDetailMaterial {
-    pub texture: TagHash,
-    pub position_scale: [f32; 3],
-    pub position_offset: [f32; 3],
-    /// PS c4: coarse triplanar projection used by control material IDs 0, 1, 3, and 4.
-    pub projection: [f32; 4],
-    /// PS c5: fine triplanar projection used only by control material ID 2.
-    pub fine_projection: [f32; 4],
-    pub normal_power: f32,
-    /// PS c89.x: roughness selected by the projected field.
-    pub roughness_target: f32,
-    /// PS c90.xy: affine remap applied to the projected field.
-    pub roughness_remap: [f32; 2],
-}
-
 #[derive(Debug, Clone)]
 pub struct MeshSourcePreview {
     pub kind: &'static str,
@@ -525,6 +828,8 @@ pub struct MeshSourcePreview {
     pub index_start: u32,
     pub index_count: u32,
     pub primitive_type: u8,
+    pub raw_lod_category: u8,
+    /// Viewer-friendly LOD level derived from `raw_lod_category`.
     pub lod_category: u8,
     pub input_layout_index: Option<u8>,
     pub index_buffer: TagHash,
@@ -647,32 +952,6 @@ impl GeometryTagPreview {
         }
     }
 
-    pub fn load_model_with_weapon_mods(
-        cache: Arc<TagCache>,
-        tag: TagHash,
-        entry: &UEntryHeader,
-        weapon_owner: TagHash,
-        attachments: &[TagHash],
-    ) -> Option<Self> {
-        let attachments = attachments
-            .iter()
-            .copied()
-            .map(|model_tag| WeaponModPreviewAttachment {
-                model_tag,
-                rarity: None,
-                unique_id: 0.5,
-            })
-            .collect_vec();
-        Self::load_model_with_weapon_mod_attachments(
-            cache,
-            tag,
-            entry,
-            tag,
-            weapon_owner,
-            &attachments,
-        )
-    }
-
     pub fn load_model_with_weapon_mod_attachments(
         cache: Arc<TagCache>,
         tag: TagHash,
@@ -747,7 +1026,8 @@ impl GeometryTagPreview {
         let attachment_poses = explicit_geometry_by_attachment
             .iter()
             .map(
-                |(_attachment, geometry, pose, rarity, unique_id)| ResolvedWeaponModAttachment {
+                |(attachment, geometry, pose, rarity, unique_id)| ResolvedWeaponModAttachment {
+                    pattern: *attachment,
                     geometry: *geometry,
                     pose: *pose,
                     rarity: *rarity,
@@ -775,13 +1055,45 @@ const CLASS_SKELETON_NODE_HIERARCHY: u32 = 0x8080AF42;
 const CLASS_SKELETON_TRANSFORMS: u32 = 0x8080BF47;
 const CLASS_VECTOR4: u32 = 0x80800090;
 const CLASS_PATTERN_VECTOR_BINDINGS: u32 = 0x8080AF85;
+const CLASS_PATTERN_OBJECT_CHANNELS: u32 = 0x8080AF86;
 const PATTERN_LOCAL_SCOPE_HASH: u32 = 0x811C9DC5;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PatternObjectChannelEvidence {
+    pub owner: TagHash,
+    pub depth: usize,
+    pub vectors: Vec<[f32; 4]>,
+    pub channels: Vec<PatternObjectChannelDeclaration>,
+    pub bindings: Vec<PatternVectorBindingEvidence>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PatternObjectChannelDeclaration {
+    pub hash: u32,
+    pub bytecode: Vec<u8>,
+    pub constants: Vec<[f32; 4]>,
+    pub interpolation: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PatternVectorBindingEvidence {
+    pub scope: u32,
+    pub parameter: u32,
+    pub vector_index: u32,
+    pub value: Option<[f32; 4]>,
+}
 
 // The pattern compiler hashes the six material parameters independently from
 // their serialized vector positions. Those positions are intentionally
 // shuffled between patterns, so the binding table is the source of truth.
 const GEAR_DYE_COLOR_PARAMETERS: [u32; 6] = [
     0x1B3D64F3, 0x1B3D64F6, 0x1B3D64F0, 0x1B3D64F1, 0x1B3D64F7, 0x1B3D64F4,
+];
+const GEAR_WORN_DYE_COLOR_PARAMETERS: [u32; 6] = [
+    0xC8939EBF, 0xC8939EBA, 0xC8939EBC, 0xC8939EBD, 0xC8939EBB, 0xC8939EB8,
+];
+const GEAR_DYE_DETAIL_COLOR_PARAMETERS: [u32; 6] = [
+    0x3CC0E32F, 0x3CC0E32A, 0x3CC0E32C, 0x3CC0E32D, 0x3CC0E32B, 0x3CC0E328,
 ];
 const GEAR_DYE_ROUGHNESS_PARAMETERS: [u32; 6] = [
     0xBF1554A8, 0xBF1554AA, 0xBF1554AB, 0xBF1554AD, 0xBF1554AC, 0xBF1554AF,
@@ -792,6 +1104,7 @@ const GEAR_DYE_METAL_PARAMETERS: [u32; 6] = [
 
 #[derive(Debug, Clone, Copy)]
 struct ResolvedWeaponModAttachment {
+    pattern: TagHash,
     geometry: TagHash,
     pose: WeaponModAttachmentPose,
     rarity: Option<WeaponModRarity>,
@@ -806,6 +1119,7 @@ pub struct WeaponModAttachmentPose {
     pub bone_index: u32,
     pub rotation: [f32; 4],
     pub translation: [f32; 3],
+    pub scale: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -813,6 +1127,13 @@ struct ObjectSpaceTransform {
     rotation: [f32; 4],
     translation: [f32; 3],
     scale: f32,
+}
+
+#[derive(Debug, Clone)]
+struct SkeletonPreview {
+    node_hashes: Vec<u32>,
+    parents: Vec<i32>,
+    transforms: Vec<ObjectSpaceTransform>,
 }
 
 /// Resolves a mod pattern against the selected weapon's authored socket table.
@@ -847,28 +1168,112 @@ pub fn weapon_mod_attachment_pose(
         .into_iter()
         .find(|(_node, pose)| pose.family_id == matched_family)
         .map(|(_node, pose)| pose)?;
-    if pose.bone_index != 0 {
-        let bone = weapon_skeleton_bone_transform(cache, weapon, pose.bone_index as usize)?;
+    let bone = weapon_skeleton_bone_transform(cache, weapon, pose.bone_index as usize);
+    if pose.bone_index != 0 && bone.is_none() {
+        return None;
+    }
+    if let Some(bone) = bone {
         let local_translation = pose.translation.map(|value| value * bone.scale);
         let rotated_translation = rotate_quaternion(local_translation, bone.rotation);
         pose.translation =
             std::array::from_fn(|axis| bone.translation[axis] + rotated_translation[axis]);
         pose.rotation = multiply_quaternions(bone.rotation, pose.rotation);
+        pose.scale *= bone.scale;
+    }
+    // A visual mod is itself a Pattern entity. Its visual binding names the
+    // local attachment frame that must meet the weapon socket. Tiger therefore
+    // places it as `weapon_socket * inverse(mod_attachment_frame)`, not by
+    // treating the mod mesh origin as the socket origin.
+    if let Some(anchor) = weapon_mod_local_attachment_anchor(cache, modification, matched_family) {
+        let socket = ObjectSpaceTransform {
+            rotation: pose.rotation,
+            translation: pose.translation,
+            scale: pose.scale,
+        };
+        let placed =
+            compose_object_space_transforms(socket, inverse_object_space_transform(anchor)?);
+        pose.rotation = placed.rotation;
+        pose.translation = placed.translation;
+        pose.scale = placed.scale;
     }
     Some(pose)
 }
 
-/// Geometry branch spawned by one visual-mod Pattern. Kept public so Models
-/// integration and live-package verification use same nearest-branch rule as
-/// preview assembly.
-pub fn weapon_mod_geometry_tags(cache: &TagCache, modification: TagHash) -> Vec<TagHash> {
-    if package_manager()
-        .get_entry(modification)
-        .is_some_and(|entry| entry.reference == CLASS_GEOMETRY_RESOURCE)
-    {
-        vec![modification]
-    } else {
-        pattern_nearest_geometry_tags(cache, modification)
+fn weapon_mod_local_attachment_anchor(
+    cache: &TagCache,
+    modification: TagHash,
+    socket_family: u32,
+) -> Option<ObjectSpaceTransform> {
+    let endian = package_manager().version.endian();
+    let anchor_families = descendant_pattern_nodes(cache, modification, 8)
+        .into_iter()
+        .filter_map(|node| package_manager().read_tag(node).ok())
+        .flat_map(|data| {
+            (0..data.len().saturating_sub(11))
+                .step_by(4)
+                .filter_map(move |offset| {
+                    (read_u32_at(&data, offset, endian) == Some(CLASS_WEAPON_MOD_VISUAL_BINDING)
+                        && read_u32_at(&data, offset + 4, endian) == Some(socket_family))
+                    .then(|| read_u32_at(&data, offset + 8, endian))
+                    .flatten()
+                    .filter(|family| *family != 0)
+                })
+                .collect_vec()
+        })
+        .unique()
+        .collect_vec();
+    let [anchor_family] = anchor_families.as_slice() else {
+        return None;
+    };
+
+    let mut anchors = descendant_pattern_nodes(cache, modification, 12)
+        .into_iter()
+        .flat_map(weapon_attachment_poses)
+        .filter(|pose| pose.family_id == *anchor_family)
+        .map(|pose| ObjectSpaceTransform {
+            rotation: pose.rotation,
+            translation: pose.translation,
+            scale: pose.scale,
+        });
+    let first = anchors.next()?;
+    anchors
+        .all(|anchor| object_space_transforms_match(first, anchor))
+        .then_some(first)
+}
+
+fn inverse_object_space_transform(transform: ObjectSpaceTransform) -> Option<ObjectSpaceTransform> {
+    (transform.scale.is_finite() && transform.scale.abs() > f32::EPSILON).then(|| {
+        let rotation = [
+            -transform.rotation[0],
+            -transform.rotation[1],
+            -transform.rotation[2],
+            transform.rotation[3],
+        ];
+        let inverse_scale = transform.scale.recip();
+        let translation = rotate_quaternion(
+            transform.translation.map(|value| -value * inverse_scale),
+            rotation,
+        );
+        ObjectSpaceTransform {
+            rotation,
+            translation,
+            scale: inverse_scale,
+        }
+    })
+}
+
+fn compose_object_space_transforms(
+    parent: ObjectSpaceTransform,
+    child: ObjectSpaceTransform,
+) -> ObjectSpaceTransform {
+    let local_translation = child.translation.map(|value| value * parent.scale);
+    let rotated_translation = rotate_quaternion(local_translation, parent.rotation);
+    ObjectSpaceTransform {
+        rotation: multiply_quaternions(parent.rotation, child.rotation),
+        translation: std::array::from_fn(|axis| {
+            parent.translation[axis] + rotated_translation[axis]
+        }),
+        scale: parent.scale * child.scale,
     }
 }
 
@@ -1352,32 +1757,6 @@ pub fn weapon_mod_authored_families(
     families
 }
 
-#[cfg(test)]
-pub(crate) fn debug_weapon_mod_visual_binding_words(
-    cache: &TagCache,
-    modification: TagHash,
-) -> Vec<(TagHash, usize, [u32; 6])> {
-    let endian = package_manager().version.endian();
-    descendant_pattern_nodes(cache, modification, 8)
-        .into_iter()
-        .filter_map(|node| Some((node, package_manager().read_tag(node).ok()?)))
-        .flat_map(|(node, data)| {
-            (0..data.len().saturating_sub(23))
-                .step_by(4)
-                .filter_map(move |offset| {
-                    (read_u32_at(&data, offset, endian) == Some(CLASS_WEAPON_MOD_VISUAL_BINDING))
-                        .then(|| {
-                            let words = std::array::from_fn(|index| {
-                                read_u32_at(&data, offset + index * 4, endian).unwrap_or_default()
-                            });
-                            (node, offset, words)
-                        })
-                })
-                .collect_vec()
-        })
-        .collect()
-}
-
 fn unique_family(families: rustc_hash::FxHashSet<u32>) -> Option<u32> {
     (families.len() == 1)
         .then(|| families.into_iter().next())
@@ -1426,27 +1805,325 @@ fn object_space_transforms_match(left: ObjectSpaceTransform, right: ObjectSpaceT
 }
 
 fn skeleton_bone_transform(tag: TagHash, bone_index: usize) -> Option<ObjectSpaceTransform> {
+    skeleton_object_space_transforms(tag)
+        .get(bone_index)
+        .copied()
+}
+
+fn skeleton_object_space_transforms(tag: TagHash) -> Vec<ObjectSpaceTransform> {
+    let endian = package_manager().version.endian();
+    let Ok(data) = package_manager().read_tag(tag) else {
+        return vec![];
+    };
+    let arrays = scan_arrays(&data, endian);
+    let Some(hierarchy_index) = arrays
+        .iter()
+        .position(|array| array.class == CLASS_SKELETON_NODE_HIERARCHY)
+    else {
+        return vec![];
+    };
+    let hierarchy_count = arrays[hierarchy_index].count;
+    let Some(transforms) = arrays
+        .iter()
+        .skip(hierarchy_index + 1)
+        .find(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == hierarchy_count)
+    else {
+        return vec![];
+    };
+    array_records(&data, *transforms, 0x20)
+        .into_iter()
+        .filter_map(|record| {
+            let rotation = read_vec4_f32(record, 0, endian)?;
+            let translation = read_vec4_f32(record, 0x10, endian)?;
+            Some(ObjectSpaceTransform {
+                rotation,
+                translation: [translation[0], translation[1], translation[2]],
+                scale: translation[3],
+            })
+        })
+        .collect()
+}
+
+fn skeleton_preview(tag: TagHash) -> Option<SkeletonPreview> {
     let endian = package_manager().version.endian();
     let data = package_manager().read_tag(tag).ok()?;
     let arrays = scan_arrays(&data, endian);
-    let hierarchy_index = arrays.iter().position(|array| {
-        array.class == CLASS_SKELETON_NODE_HIERARCHY && array.count > bone_index
-    })?;
-    let hierarchy_count = arrays[hierarchy_index].count;
+    let hierarchy_index = arrays
+        .iter()
+        .position(|array| array.class == CLASS_SKELETON_NODE_HIERARCHY)?;
+    let hierarchy = arrays[hierarchy_index];
     let transforms = arrays
         .iter()
         .skip(hierarchy_index + 1)
-        .find(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == hierarchy_count)?;
-    let record = array_records(&data, *transforms, 0x20)
-        .get(bone_index)
-        .copied()?;
-    let rotation = read_vec4_f32(record, 0, endian)?;
-    let translation = read_vec4_f32(record, 0x10, endian)?;
-    Some(ObjectSpaceTransform {
-        rotation,
-        translation: [translation[0], translation[1], translation[2]],
-        scale: translation[3],
-    })
+        .find(|array| array.class == CLASS_SKELETON_TRANSFORMS && array.count == hierarchy.count)?;
+    let hierarchy_records = array_records(&data, hierarchy, 0x10);
+    let node_hashes = hierarchy_records
+        .iter()
+        .filter_map(|record| read_u32_at(record, 0, endian))
+        .collect_vec();
+    let parents = hierarchy_records
+        .iter()
+        .filter_map(|record| read_u32_at(record, 4, endian).map(|value| value as i32))
+        .collect_vec();
+    let transforms = array_records(&data, *transforms, 0x20)
+        .into_iter()
+        .filter_map(|record| {
+            let rotation = read_vec4_f32(record, 0, endian)?;
+            let translation = read_vec4_f32(record, 0x10, endian)?;
+            Some(ObjectSpaceTransform {
+                rotation,
+                translation: [translation[0], translation[1], translation[2]],
+                scale: translation[3],
+            })
+        })
+        .collect_vec();
+    (node_hashes.len() == hierarchy.count
+        && parents.len() == hierarchy.count
+        && transforms.len() == hierarchy.count)
+        .then_some(SkeletonPreview {
+            node_hashes,
+            parents,
+            transforms,
+        })
+}
+
+fn related_skeletons(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+    model_tags: impl IntoIterator<Item = TagHash>,
+) -> Vec<SkeletonPreview> {
+    let mut frontier = std::collections::VecDeque::from_iter(
+        std::iter::once(selected_pattern)
+            .chain(model_tags)
+            .map(|tag| (tag, 0_usize)),
+    );
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut candidates = rustc_hash::FxHashSet::default();
+    while let Some((tag, depth)) = frontier.pop_front() {
+        if !seen.insert(tag) {
+            continue;
+        }
+        candidates.insert(tag);
+        if depth >= 6 {
+            continue;
+        }
+        let neighbors = pattern_graph_children(cache, tag).into_iter().chain(
+            cache
+                .hashes
+                .get(&tag)
+                .into_iter()
+                .flat_map(|scan| scan.references.iter().copied()),
+        );
+        for neighbor in neighbors.unique() {
+            if package_manager().get_entry(neighbor).is_some_and(|entry| {
+                matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
+            }) {
+                frontier.push_back((neighbor, depth + 1));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            package_manager()
+                .get_entry(*candidate)
+                .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
+        })
+        .filter_map(skeleton_preview)
+        .collect()
+}
+
+fn apply_inventory_rigid_chain_visibility(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+    parts: &mut [(TagHash, MeshSourcePreview, WireframePreview)],
+) {
+    let skeletons = related_skeletons(cache, selected_pattern, parts.iter().map(|part| part.0));
+    if skeletons.is_empty() {
+        return;
+    }
+    for (_tag, _source, wireframe) in parts {
+        let Some(rigid_indices) = wireframe.rigid_indices.as_ref() else {
+            continue;
+        };
+        if rigid_indices.len() != wireframe.vertices.len() {
+            continue;
+        }
+        let mut counts = rustc_hash::FxHashMap::<usize, usize>::default();
+        for index in rigid_indices {
+            *counts.entry(*index as usize).or_default() += 1;
+        }
+        let best = skeletons
+            .iter()
+            .filter_map(|skeleton| {
+                let chain = longest_repeated_rigid_chain(skeleton, &counts);
+                (!chain.is_empty()).then_some((skeleton, chain))
+            })
+            .max_by_key(|(_skeleton, chain)| chain.len());
+        let Some((skeleton, chain)) = best else {
+            continue;
+        };
+        if chain.len() < 7 {
+            continue;
+        }
+        retain_rigid_chain_window(wireframe, skeleton, &chain);
+    }
+}
+
+fn longest_repeated_rigid_chain(
+    skeleton: &SkeletonPreview,
+    counts: &rustc_hash::FxHashMap<usize, usize>,
+) -> Vec<usize> {
+    let eligible = counts
+        .iter()
+        .filter_map(|(&index, &count)| {
+            (count >= 64 && index < skeleton.parents.len() && index < skeleton.transforms.len())
+                .then_some((index, count))
+        })
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut best = vec![];
+    for &tail in eligible.keys() {
+        let mut chain = vec![tail];
+        let mut current = tail;
+        while let Some(parent) = skeleton.parents.get(current).copied() {
+            let Ok(parent) = usize::try_from(parent) else {
+                break;
+            };
+            let (Some(&child_count), Some(&parent_count)) =
+                (eligible.get(&current), eligible.get(&parent))
+            else {
+                break;
+            };
+            let ratio = child_count as f32 / parent_count as f32;
+            if !(0.75..=1.25).contains(&ratio) {
+                break;
+            }
+            chain.push(parent);
+            current = parent;
+        }
+        chain.reverse();
+        if chain.len() > best.len() {
+            best = chain;
+        }
+    }
+    best
+}
+
+fn retain_rigid_chain_window(
+    wireframe: &mut WireframePreview,
+    skeleton: &SkeletonPreview,
+    chain: &[usize],
+) {
+    let Some(rigid_indices) = wireframe.rigid_indices.as_ref() else {
+        return;
+    };
+    let centers = chain
+        .iter()
+        .map(|&bone| {
+            skeleton
+                .transforms
+                .get(bone)
+                .map(|transform| transform.translation)
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(centers) = centers else { return };
+    // The bind pose contains the complete 11-round state chain. Static item
+    // presentation exposes only the rounds between two package-authored
+    // endpoints: b_bolt at the receiver and the duplicated magazine anchor.
+    // The five rounds in that interval already have the correct parallel pose;
+    // neither their transforms nor their spacing may be changed.
+    let chain_set = chain.iter().copied().collect::<rustc_hash::FxHashSet<_>>();
+    let Some(visible) = rigid_chain_window_bones(skeleton, chain, &centers) else {
+        return;
+    };
+    for triangle in wireframe.indices.chunks_exact_mut(3) {
+        let hides_chain_vertex = triangle.iter().any(|index| {
+            let bone = rigid_indices[*index as usize] as usize;
+            chain_set.contains(&bone) && !visible.contains(&bone)
+        });
+        if hides_chain_vertex {
+            triangle[1] = triangle[0];
+            triangle[2] = triangle[0];
+        }
+    }
+}
+
+fn rigid_chain_window_bones(
+    skeleton: &SkeletonPreview,
+    chain: &[usize],
+    centers: &[[f32; 3]],
+) -> Option<rustc_hash::FxHashSet<usize>> {
+    if centers.len() != chain.len() || centers.len() < 2 {
+        return None;
+    }
+    let chain_set = chain.iter().copied().collect::<rustc_hash::FxHashSet<_>>();
+    let rest = vec3_normalize(vec3_sub(*centers.last()?, centers[0]));
+    let chain_start = centers[0];
+    let chain_length = vec3_length(vec3_sub(*centers.last()?, chain_start));
+    let bolt_hash = quicktag_core::util::fnv1(b"b_bolt");
+    let upper = skeleton
+        .node_hashes
+        .iter()
+        .position(|hash| *hash == bolt_hash)
+        .and_then(|index| skeleton.transforms.get(index))
+        .map(|transform| vec3_dot(vec3_sub(transform.translation, chain_start), rest))?;
+    let mut lower = None::<f32>;
+    for (left_index, left) in skeleton.transforms.iter().enumerate() {
+        if chain_set.contains(&left_index) {
+            continue;
+        }
+        let duplicate = skeleton
+            .transforms
+            .iter()
+            .enumerate()
+            .skip(left_index + 1)
+            .any(|(right_index, right)| {
+                !chain_set.contains(&right_index)
+                    && vec3_length(vec3_sub(left.translation, right.translation)) < 0.00001
+            });
+        if !duplicate {
+            continue;
+        }
+        let along = vec3_dot(vec3_sub(left.translation, chain_start), rest);
+        if (upper..=chain_length).contains(&along) && lower.is_none_or(|current| along < current) {
+            lower = Some(along);
+        }
+    }
+    let lower = lower?;
+    let spacing = centers
+        .windows(2)
+        .map(|pair| vec3_length(vec3_sub(pair[1], pair[0])))
+        .sum::<f32>()
+        / (centers.len() - 1) as f32;
+    let visible = chain
+        .iter()
+        .zip(centers)
+        .filter_map(|(&bone, center)| {
+            let along = vec3_dot(vec3_sub(*center, chain_start), rest);
+            ((upper - spacing * 0.25..=lower + spacing * 0.25).contains(&along)).then_some(bone)
+        })
+        .collect::<rustc_hash::FxHashSet<_>>();
+    (visible.len() >= 2 && visible.len() < chain.len()).then_some(visible)
+}
+
+fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|i| a[i] - b[i])
+}
+fn vec3_scale(v: [f32; 3], scale: f32) -> [f32; 3] {
+    v.map(|value| value * scale)
+}
+fn vec3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a.into_iter().zip(b).map(|(a, b)| a * b).sum()
+}
+fn vec3_length(v: [f32; 3]) -> f32 {
+    vec3_dot(v, v).sqrt()
+}
+fn vec3_try_normalize(v: [f32; 3]) -> Option<[f32; 3]> {
+    let length = vec3_length(v);
+    (length > 0.000001).then(|| vec3_scale(v, length.recip()))
+}
+fn vec3_normalize(v: [f32; 3]) -> [f32; 3] {
+    vec3_try_normalize(v).unwrap_or([0.0, 0.0, 1.0])
 }
 
 fn descendant_pattern_nodes(cache: &TagCache, root: TagHash, max_depth: usize) -> Vec<TagHash> {
@@ -1509,6 +2186,82 @@ fn descendant_pattern_nodes_with_depth(
     result
 }
 
+/// Captures authored Pattern object-channel declarations and their serialized
+/// vector bindings without assigning runtime semantics to either structure.
+/// A declaration's expression and a binding-table value are distinct evidence;
+/// callers must not treat one as the other's default implicitly.
+pub(crate) fn pattern_object_channel_evidence(
+    cache: &TagCache,
+    root: TagHash,
+) -> Vec<PatternObjectChannelEvidence> {
+    let endian = package_manager().version.endian();
+    descendant_pattern_nodes_with_depth(cache, root, 8)
+        .into_iter()
+        .filter_map(|(owner, depth)| {
+            let data = package_manager().read_tag(owner).ok()?;
+            let arrays = scan_arrays(&data, endian);
+            let channels = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_PATTERN_OBJECT_CHANNELS)
+                .flat_map(|array| {
+                    array_records(&data, array, 0x70)
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| {
+                            let record_offset = array.data_offset + index * 0x70;
+                            Some(PatternObjectChannelDeclaration {
+                                hash: read_u32_at(record, 0, endian)?,
+                                bytecode: read_array(&data, record_offset + 0x08, 1, endian)?
+                                    .to_vec(),
+                                constants: read_array(&data, record_offset + 0x18, 0x10, endian)?
+                                    .chunks_exact(0x10)
+                                    .filter_map(|value| read_vec4_f32(value, 0, endian))
+                                    .collect(),
+                                interpolation: read_u64_at(record, 0x60, endian)?,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            if channels.is_empty() {
+                return None;
+            }
+            let vectors = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_VECTOR4)
+                .flat_map(|array| array_records(&data, array, 0x10))
+                .filter_map(|value| read_vec4_f32(value, 0, endian))
+                .collect::<Vec<_>>();
+            let bindings = arrays
+                .iter()
+                .copied()
+                .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+                .flat_map(|array| array_records(&data, array, 0x0c))
+                .filter_map(|record| {
+                    let scope = read_u32_at(record, 0, endian)?;
+                    let parameter = read_u32_at(record, 4, endian)?;
+                    let vector_index = read_u32_at(record, 8, endian)?;
+                    Some(PatternVectorBindingEvidence {
+                        scope,
+                        parameter,
+                        vector_index,
+                        value: vectors.get(vector_index as usize).copied(),
+                    })
+                })
+                .collect();
+            Some(PatternObjectChannelEvidence {
+                owner,
+                depth,
+                vectors,
+                channels,
+                bindings,
+            })
+        })
+        .collect()
+}
+
 fn weapon_attachment_poses(tag: TagHash) -> Vec<WeaponModAttachmentPose> {
     let endian = package_manager().version.endian();
     let Ok(data) = package_manager().read_tag(tag) else {
@@ -1530,6 +2283,7 @@ fn weapon_attachment_poses(tag: TagHash) -> Vec<WeaponModAttachmentPose> {
                 bone_index,
                 rotation,
                 translation: [translation[0], translation[1], translation[2]],
+                scale: translation[3],
             })
         })
         .collect()
@@ -1616,10 +2370,85 @@ pub fn model_label_for_reference(reference: u32) -> Option<&'static str> {
 }
 
 pub fn is_model_catalog_reference(reference: u32) -> bool {
-    // Marathon gear is exposed through top-level patterns. Pattern components
-    // use CLASS_PATTERN_COMPONENT and are only implementation nodes beneath it.
-    reference == CLASS_PATTERN
-        || model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
+    // Components remain loadable by the assembler, but never get catalog rows.
+    reference != CLASS_PATTERN_COMPONENT
+        && model_info_for_reference(reference).is_some_and(ModelTagInfo::is_catalog_entry)
+}
+
+/// Fast catalog-only test for whether a model can lead to renderable geometry.
+/// This deliberately stays on the prebuilt TagCache graph: it does not read tag
+/// payloads, decode materials, build wireframes, or populate the model cache.
+/// Finding either a vertex or index-buffer header is sufficient to prove the
+/// entry is not literally empty.
+pub fn model_has_render_geometry(
+    cache: &TagCache,
+    root: TagHash,
+    memo: &mut rustc_hash::FxHashMap<TagHash, bool>,
+) -> bool {
+    if let Some(&result) = memo.get(&root) {
+        return result;
+    }
+
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut parent = rustc_hash::FxHashMap::default();
+    let mut frontier = vec![root];
+    while let Some(tag) = frontier.pop() {
+        if !seen.insert(tag) {
+            continue;
+        }
+        if let Some(&known) = memo.get(&tag) {
+            if !known {
+                continue;
+            }
+            let mut current = tag;
+            memo.insert(current, true);
+            while let Some(&owner) = parent.get(&current) {
+                memo.insert(owner, true);
+                current = owner;
+            }
+            return true;
+        }
+        let Some(scan) = cache.hashes.get(&tag) else {
+            continue;
+        };
+        for child in scan
+            .file_hashes
+            .iter()
+            .map(|reference| reference.hash)
+            .chain(
+                scan.file_hashes64
+                    .iter()
+                    .filter_map(|reference| tag64_to_hash32(reference.hash)),
+            )
+        {
+            let Some(entry) = package_manager().get_entry(child) else {
+                continue;
+            };
+            let tag_type = TagType::from_type_subtype(entry.file_type, entry.file_subtype);
+            if matches!(
+                tag_type,
+                TagType::VertexBuffer { is_header: true }
+                    | TagType::IndexBuffer { is_header: true }
+            ) {
+                let mut current = tag;
+                memo.insert(current, true);
+                while let Some(&owner) = parent.get(&current) {
+                    memo.insert(owner, true);
+                    current = owner;
+                }
+                return true;
+            }
+            if tag_type.is_tag() && !seen.contains(&child) {
+                parent.entry(child).or_insert(tag);
+                frontier.push(child);
+            }
+        }
+    }
+
+    for tag in seen {
+        memo.insert(tag, false);
+    }
+    false
 }
 
 fn load_vertex_buffer_preview_for_tag(
@@ -1980,6 +2809,34 @@ fn load_model_preview_from_tags(
     model_tags: Vec<TagHash>,
     attachments: &[ResolvedWeaponModAttachment],
 ) -> ModelPreview {
+    cache::model(
+        &cache,
+        tag,
+        entry.reference,
+        label,
+        &model_tags,
+        attachments,
+        || {
+            decode_model_preview_from_tags(
+                cache.clone(),
+                tag,
+                entry,
+                label,
+                &model_tags,
+                attachments,
+            )
+        },
+    )
+}
+
+fn decode_model_preview_from_tags(
+    cache: Arc<TagCache>,
+    tag: TagHash,
+    entry: &UEntryHeader,
+    label: &'static str,
+    model_tags: &[TagHash],
+    attachments: &[ResolvedWeaponModAttachment],
+) -> ModelPreview {
     let class_name = get_class_by_id(entry.reference).map(|c| c.name.to_string());
     let model_entries = model_tags
         .iter()
@@ -2024,6 +2881,7 @@ fn load_model_preview_from_tags(
                 .map(|(source, wireframe)| (*model_tag, source, wireframe))
         })
         .collect_vec();
+    apply_inventory_rigid_chain_visibility(&cache, tag, &mut parsed);
     apply_weapon_mod_attachment_poses(&mut parsed, attachments);
     let mesh_source = parsed
         .iter()
@@ -2035,16 +2893,19 @@ fn load_model_preview_from_tags(
         .map(|attachment| {
             (
                 attachment.geometry,
-                (attachment.rarity, attachment.unique_id),
+                (attachment.pattern, attachment.rarity, attachment.unique_id),
             )
         })
         .collect::<rustc_hash::FxHashMap<_, _>>();
     let gear_dye_palette = (!attached_geometry.is_empty())
         .then(|| weapon_skin_gear_dye_palette(&cache, tag))
         .flatten();
+    let gear_worn_dye_palette = (!attached_geometry.is_empty())
+        .then(|| pattern_gear_dye_color_contribution(&cache, tag, GEAR_WORN_DYE_COLOR_PARAMETERS))
+        .flatten();
     for (model_tag, _source, wireframe) in &mut parsed {
         assign_wireframe_material_textures(wireframe, &cache, &textures);
-        if let Some((rarity, unique_id)) = attached_geometry.get(model_tag).copied() {
+        if let Some((_pattern, rarity, unique_id)) = attached_geometry.get(model_tag).copied() {
             for range in &mut wireframe.material_ranges {
                 if let Some(wear) = &mut range.textures.mod_wear {
                     wear.rarity = rarity;
@@ -2055,40 +2916,35 @@ fn load_model_preview_from_tags(
         if attached_geometry.contains_key(model_tag)
             && let Some(palette) = gear_dye_palette
         {
-            // A selected skin supplies all six GearDye object channels. Mod
-            // Patterns consume those exact materials; their other local
-            // vectors are fallback/category data and must not be promoted to
-            // a color offset.
+            let detail_palette =
+                attached_geometry
+                    .get(model_tag)
+                    .and_then(|(pattern, _rarity, _unique_id)| {
+                        pattern_gear_dye_color_contribution(
+                            &cache,
+                            *pattern,
+                            GEAR_DYE_DETAIL_COLOR_PARAMETERS,
+                        )
+                    });
+            // The compiled GearDye outputs are the exact sum of three
+            // independently-authored channels. Base Dye is inherited from the
+            // selected skin, Worn Dye may also be inherited, and Dye Detail is
+            // local to the attached mod Pattern.
             let attachment_palette = palette;
             for range in &mut wireframe.material_ranges {
+                let Some(default) = range.technique.and_then(technique_default_gear_dye_color)
+                else {
+                    continue;
+                };
                 if let Some(dye) = range
                     .gear_dye_change_color_index
                     .and_then(|index| attachment_palette.get(index as usize).copied())
                 {
                     range.textures.gear_dye = Some(dye);
-                    range.textures.gear_dye_default =
-                        range.technique.and_then(technique_default_gear_dye_color);
+                    range.textures.gear_dye_default = Some(default);
                     range.textures.gear_dye_palette = Some(attachment_palette);
-                }
-            }
-        }
-        if wireframe
-            .material_ranges
-            .iter()
-            .any(|range| range.textures.animated_dither.is_some())
-            && let Some(palette) =
-                gear_dye_palette.or_else(|| weapon_skin_gear_dye_palette(&cache, tag))
-        {
-            for range in &mut wireframe.material_ranges {
-                if range.textures.animated_dither.is_some()
-                    && let Some(dye) = range
-                        .gear_dye_change_color_index
-                        .and_then(|index| palette.get(index as usize).copied())
-                {
-                    range.textures.gear_dye = Some(dye);
-                    range.textures.gear_dye_default =
-                        range.technique.and_then(technique_default_gear_dye_color);
-                    range.textures.gear_dye_palette = Some(palette);
+                    range.textures.gear_worn_dye_palette = gear_worn_dye_palette;
+                    range.textures.gear_dye_detail_palette = detail_palette;
                 }
             }
         }
@@ -2105,7 +2961,7 @@ fn load_model_preview_from_tags(
         techniques,
         textures,
         shaders,
-        geometry_parts: model_tags,
+        geometry_parts: model_tags.to_vec(),
         wireframe,
     }
 }
@@ -2119,23 +2975,1587 @@ fn technique_default_gear_dye_color(technique: TagHash) -> Option<[f32; 4]> {
         .stages
         .into_iter()
         .find(|stage| stage.stage == "PS")?;
-    // The common Tiger GearDye material reserves cbuffer outputs 8..13 for
-    // the six change-color regions. Output 7 is initialized from inline
-    // constant 7 and is the seventh/default (black-ID) material color.
-    let gear_dye_shader = (8..=13).all(|output| {
-        pixel.bytecode.expressions.iter().any(|expression| {
-            expression.target == format!("output[{output}]")
-                && expression.expression.contains("object_channel")
+    // GearDye shaders map material IDs 1..6 to six consecutive cbuffer
+    // outputs. ID 0 reads the immediately preceding inline output. Output
+    // bases vary between shader families (8 in older gear shaders, 11 in the
+    // D54 optic), so derive the ABI layout from the authored channel hashes.
+    let material_id_parameters = [
+        GEAR_DYE_COLOR_PARAMETERS[0],
+        GEAR_DYE_COLOR_PARAMETERS[2],
+        GEAR_DYE_COLOR_PARAMETERS[3],
+        GEAR_DYE_COLOR_PARAMETERS[1],
+        GEAR_DYE_COLOR_PARAMETERS[4],
+        GEAR_DYE_COLOR_PARAMETERS[5],
+    ];
+    let first_output = pixel
+        .bytecode
+        .expressions
+        .iter()
+        .filter(|expression| {
+            expression
+                .expression
+                .contains(&format!("0x{:08X}", material_id_parameters[0]))
         })
-    });
-    let color = gear_dye_shader.then(|| pixel.inline_constants.get(7).copied())??;
+        .filter_map(|expression| {
+            expression
+                .target
+                .strip_prefix("output[")?
+                .strip_suffix(']')?
+                .parse::<usize>()
+                .ok()
+        })
+        .find(|first_output| {
+            material_id_parameters
+                .into_iter()
+                .enumerate()
+                .all(|(material_id, parameter)| {
+                    let target = format!("output[{}]", first_output + material_id);
+                    pixel.bytecode.expressions.iter().any(|expression| {
+                        expression.target == target
+                            && expression
+                                .expression
+                                .contains(&format!("0x{parameter:08X}"))
+                    })
+                })
+        })?;
+    let default_output = first_output.checked_sub(1)?;
+    let color = pixel.inline_constants.get(default_output).copied()?;
     valid_dye_color(color).then_some(color)
 }
 
-fn weapon_skin_gear_dye_palette(
+fn bindings_use_character_gear_surface(
+    bindings: &[TechniqueTextureBinding],
+    normal_slot: Option<u32>,
+) -> bool {
+    bindings.iter().any(|binding| binding.slot >= 10)
+        && [0, 1, 2, 3]
+            .into_iter()
+            .all(|slot| bindings.iter().any(|binding| binding.slot == slot))
+        && bindings
+            .iter()
+            .any(|binding| binding.slot == 0 && texture_is_srgb(binding.tag))
+        // Caller already resolved the compiled shader's exact normal ABI.
+        // Re-running generic inference here rejects legitimate shared runner
+        // normals and silently drops the whole character material.
+        && normal_slot.is_some()
+}
+
+fn bindings_use_compact_character_surface(
+    bindings: &[TechniqueTextureBinding],
+    normal_slot: Option<u32>,
+) -> bool {
+    let max_slot = bindings
+        .iter()
+        .map(|binding| binding.slot)
+        .max()
+        .unwrap_or(0);
+    (5..10).contains(&max_slot)
+        && bindings
+            .iter()
+            .any(|binding| binding.slot == 0 && texture_is_srgb(binding.tag))
+        && [2, 3].into_iter().all(|slot| {
+            bindings.iter().any(|binding| {
+                binding.slot == slot
+                    && !texture_is_srgb(binding.tag)
+                    && material_control_texture_candidate(binding.tag)
+            })
+        })
+        && normal_slot.is_some()
+}
+
+fn runner_alpha_mask_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<AlphaMaskMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+
+    // Match compiled shader ABIs, never skin hashes.
+    let (remap, threshold) = match pixel.shader {
+        // t0 supplies RGB; t1.r supplies coverage; c1.x is the cutoff.
+        Some(TagHash(0x80A9BE22)) => ([0.0, 1.0], pixel.inline_constants.get(1)?[0]),
+        // Two-mask runner surface: coverage = c89.y * t1.r + c89.x, then
+        // discard below c90.x. t2 is a separate material mask.
+        Some(TagHash(0x80A9A9D3)) => {
+            let c89 = *pixel.inline_constants.get(89)?;
+            ([c89[0], c89[1]], pixel.inline_constants.get(90)?[0])
+        }
+        _ => return None,
+    };
+    let texture = bindings
+        .iter()
+        .find(|binding| binding.slot == 1 && texture_preview_format(binding.tag).contains("Bc4"))?
+        .tag;
+    (remap.into_iter().all(f32::is_finite)
+        && threshold.is_finite()
+        && (0.0..=1.0).contains(&threshold))
+    .then_some(AlphaMaskMaterial {
+        texture,
+        remap,
+        threshold,
+    })
+}
+
+fn runner_solid_surface_material(technique: TagHash) -> Option<[f32; 2]> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let shader = preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .shader?;
+    match shader {
+        // 80A9B032 writes RT1.a = 0.67 and RT2.r = 0.0. Its PS t1 is a
+        // shared 1D lighting lookup, not an ORM texture.
+        TagHash(0x80A9B032) => Some([0.67, 0.0]),
+        // Skin/subsurface PS writes literal RT1.a = 0.67 and RT2.r = 0.
+        TagHash(0x80A9B860) => Some([0.67, 0.0]),
+        _ => None,
+    }
+}
+
+fn runner_layered_surface_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<RunnerLayeredSurfaceMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+
+    let tag_at = |slot| {
+        bindings
+            .iter()
+            .find(|binding| binding.slot == slot)
+            .map(|binding| binding.tag)
+    };
+    let (
+        mode,
+        surface,
+        detail_normal_a,
+        detail_normal_b,
+        detail_normal_c,
+        detail_normal_d,
+        material_response,
+        constants,
+    ) = match pixel.shader? {
+        // Runner skin/subsurface ABI. t0 is authored pore/feature field, t1
+        // is a shared cellular response LUT (never direct albedo), t2 is
+        // scalar AO, and t3 is tangent normal. c121/c122/c123 provide primary,
+        // variation, and recessed-feature colours; c130 is subsurface tint.
+        TagHash(0x80A9B860) if pixel.inline_constants.len() >= 233 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[121];
+            rows[1] = pixel.inline_constants[122];
+            rows[2] = pixel.inline_constants[123];
+            rows[3] = pixel.inline_constants[130];
+            rows[4] = pixel.inline_constants[120];
+            rows[5] = pixel.inline_constants[127];
+            rows[6] = pixel.inline_constants[159];
+            rows[7] = pixel.inline_constants[231];
+            rows[8] = pixel.inline_constants[232];
+            rows[9] = pixel.inline_constants[124];
+            (
+                41,
+                tag_at(0)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full9: t4/t5 with c29..c38, selected by t1.b/t1.r, base t6.
+        TagHash(0x80A9B07B) if pixel.inline_constants.len() >= 39 => {
+            (1, tag_at(2)?, tag_at(4)?, tag_at(5)?, None, None, None, {
+                let mut rows = [[0.0; 4]; 24];
+                rows[0] = pixel.inline_constants[13];
+                rows[1..=10].copy_from_slice(&pixel.inline_constants[29..=38]);
+                rows
+            })
+        }
+        // Switched dual layer: t1.r < c83 chooses t2; otherwise t3. c77..c82
+        // are the two affine UV/remap triples and t4 is the base normal.
+        TagHash(0x80A9B855) if pixel.inline_constants.len() >= 87 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[83];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[77..=79]);
+            rows[4..=6].copy_from_slice(&pixel.inline_constants[80..=82]);
+            rows[7] = pixel.inline_constants[86];
+            (
+                2,
+                tag_at(1)?,
+                tag_at(2)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full10: t4 is always applied. t5/t6/t7 are gated by t2 G/B/R;
+        // t6 owns two authored transforms selected by the literal c10.x.
+        // The base normal is t8 and remains resolved by the normal-slot ABI.
+        TagHash(0x80A9C244) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[10];
+            rows[1..=21].copy_from_slice(&pixel.inline_constants[21..=41]);
+            (
+                3,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(7)?),
+                None,
+                rows,
+            )
+        }
+        // Procedural full9: t4/t5 authored normals are gated by t2 G/B.
+        // t6 is the base normal; t9 is an independent object-space field.
+        TagHash(0x80A9AFB4) if pixel.inline_constants.len() >= 48 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[38..=42]);
+            rows[6..=10].copy_from_slice(&pixel.inline_constants[43..=47]);
+            (
+                4,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Sibling switched surfaces: t1.r < c15 gates t2; c12/c13/c14 are
+        // its affine UV and normal remap. t3 is the base normal.
+        TagHash(0x80A9B857) | TagHash(0x80A9B85A) if pixel.inline_constants.len() >= 16 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[15];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[12..=14]);
+            (
+                5,
+                tag_at(1)?,
+                tag_at(2)?,
+                tag_at(2)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Local full9 stack: t3 is G-gated, t4 is B-selected, and t5 carries
+        // the two R-selected transforms. t6 is the base normal.
+        TagHash(0x80A9B93E) | TagHash(0x80A9BBDD) | TagHash(0x80A9DC9A)
+            if pixel.inline_constants.len() >= 41 =>
+        {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[24..=40]);
+            (
+                6,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        // Same local full9 normal ABI with the normal block at c24..c40.
+        TagHash(0x80A9DEEC) if pixel.inline_constants.len() >= 41 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[24..=40]);
+            (
+                23,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // E4DB embeds the same local full9+response ABI before its larger
+        // procedural material branch. Normal rows are shifted to c16..c32.
+        TagHash(0x80A9E4DB) if pixel.inline_constants.len() >= 135 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[16..=32]);
+            // UV transforms shared by t9/t11, six authored t11 exponents,
+            // then the final two condition remaps packed into one row.
+            rows[18..=20].copy_from_slice(&pixel.inline_constants[107..=109]);
+            rows[21] = [
+                pixel.inline_constants[126][0],
+                pixel.inline_constants[127][0],
+                pixel.inline_constants[128][0],
+                pixel.inline_constants[129][0],
+            ];
+            rows[22] = [
+                pixel.inline_constants[130][0],
+                pixel.inline_constants[131][0],
+                pixel.inline_constants[84][0],
+                pixel.inline_constants[114][0],
+            ];
+            rows[23] = [
+                pixel.inline_constants[133][0],
+                pixel.inline_constants[133][1],
+                pixel.inline_constants[134][0],
+                pixel.inline_constants[134][1],
+            ];
+            (
+                23,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Same generated full9 ABI with six fewer preceding material rows.
+        TagHash(0x80A9CBAE) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=17].copy_from_slice(&pixel.inline_constants[18..=34]);
+            (
+                6,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        // Expanded local full9 stack: t1 A/G independently gate t3/t4,
+        // t1 B selects t3, and t1 R selects between two t5 transforms.
+        TagHash(0x80A9D6FD) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=18].copy_from_slice(&pixel.inline_constants[24..=41]);
+            (
+                7,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        // A-expanded sibling of the local full9 ABI: c24..c41 contains the
+        // A/G gates, B range, and two authored t5 transforms.
+        TagHash(0x80A9E0FD) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=18].copy_from_slice(&pixel.inline_constants[24..=41]);
+            (
+                24,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(5)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Procedural full8: t4 is the base tangent normal. t3 is transformed
+        // by c17/c18, remapped by c19, then applied only while t1.r lies
+        // between c20/c21. t5/t6 are later object-space procedural fields,
+        // not substitutes for the base normal.
+        TagHash(0x80A9AFB6) if pixel.inline_constants.len() >= 22 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[17..=21]);
+            (
+                8,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Same generated procedural ABI with thirteen preceding material
+        // rows: t4 base, transformed t3, t1.r band c33/c34.
+        TagHash(0x80A9BBBE) | TagHash(0x80A9BBBF) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[30..=34]);
+            (
+                8,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Full10 three-detail stack: t7 is base normal. t4 is selected by
+        // round(t2.g-c24), t5 by the c28/c29 t2.b band, and t6 by the
+        // c33/c34 t2.r band.
+        TagHash(0x80A9C3F6) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[21..=34]);
+            (
+                9,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Generated sibling of the Full10 three-detail ABI with three more
+        // material rows before the normal block: t7 base; t4/t5/t6 selected
+        // by t2 G/B/R using c24..c37.
+        TagHash(0x80A9B610) if pixel.inline_constants.len() >= 38 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[24..=37]);
+            (
+                9,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Full9 sibling of the same generated three-detail stack. Its
+        // selector/detail/base resources are shifted down one register:
+        // t1 selects t3/t4/t5 and t6 is the base tangent normal. LLVM shows
+        // the identical c24..c37 G/B/R gate and affine-transform block.
+        TagHash(0x80A9E76C) if pixel.inline_constants.len() >= 38 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[24..=37]);
+            (
+                25,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full11 surface: t4 is the packed selector. Its G channel selects
+        // t5/t6, B selects either authored transform of t7, and R gates t8.
+        // t9 is the base tangent normal. The two generated siblings differ
+        // only by the number of material rows preceding this shared ABI.
+        TagHash(0x80A9A9AD) if pixel.inline_constants.len() >= 105 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows.copy_from_slice(&pixel.inline_constants[81..=104]);
+            (
+                10,
+                tag_at(4)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(8)?),
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9A9B1) if pixel.inline_constants.len() >= 72 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows.copy_from_slice(&pixel.inline_constants[48..=71]);
+            (
+                10,
+                tag_at(4)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(8)?),
+                None,
+                rows,
+            )
+        }
+        // Earlier full11 runner-skin permutation. DXIL uses the identical
+        // 24-row normal ABI at c24..c47, shifted resources: t1 selector;
+        // t3/t4/t5/t6 details (t5 has two transforms); t7 base tangent
+        // normal. t2 independently supplies response and green-channel AO.
+        TagHash(0x80A9A8CF) if pixel.inline_constants.len() >= 48 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows.copy_from_slice(&pixel.inline_constants[24..=47]);
+            (
+                10,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(6)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Generated full12 runner surface. t4 is the packed A/G/B/R
+        // selector; t6/t7/t8 are its authored normal layers and t9 is the
+        // base tangent normal. The normal program occupies c53..c71.
+        TagHash(0x80A9AD5D) if pixel.inline_constants.len() >= 72 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[..=18].copy_from_slice(&pixel.inline_constants[53..=71]);
+            (
+                42,
+                tag_at(4)?,
+                tag_at(6)?,
+                tag_at(7)?,
+                Some(tag_at(8)?),
+                None,
+                Some(tag_at(5)?),
+                rows,
+            )
+        }
+        // Compact sibling of AD5D. t3 selects authored t5/t6 over the t7
+        // base tangent normal. c46..c61 is the complete normal/response ABI.
+        TagHash(0x80A9AD68) if pixel.inline_constants.len() >= 62 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[..=15].copy_from_slice(&pixel.inline_constants[46..=61]);
+            (
+                43,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                None,
+                None,
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // B71C compact A/G/B/R surface. t1 is selector; all four selector
+        // tests gate transformed t3 over base t4. Local t2 is response/AO.
+        TagHash(0x80A9B71C) if pixel.inline_constants.len() >= 37 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[..=8].copy_from_slice(&pixel.inline_constants[24..=32]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[35..=36]);
+            (
+                44,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full10 A/G/B/R stack: t1 is the selector, t3 is A/G gated,
+        // t4 is B selected, t5 is R selected, and t6 is the base normal.
+        TagHash(0x80A9B065) if pixel.inline_constants.len() >= 43 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[24..=42]);
+            (
+                11,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Response/AO-bearing sibling of B065. LLVM has the identical
+        // c24..c42 A/G/B/R normal program; local t2 additionally supplies
+        // material response and green-channel AO.
+        TagHash(0x80A9B06A) if pixel.inline_constants.len() >= 43 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[24..=42]);
+            (
+                11,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        TagHash(0x80A9DE77) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[16..=34]);
+            (
+                11,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Local full11: t2 selector, t4 A/G controlled, t5 B selected,
+        // t6 R gated, t7 base. c38..c56 are the complete normal ABI.
+        TagHash(0x80A9DB9A) if pixel.inline_constants.len() >= 57 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[38..=56]);
+            (
+                12,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9AE19) if pixel.inline_constants.len() >= 39 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=19].copy_from_slice(&pixel.inline_constants[20..=38]);
+            (
+                12,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9C27C) if pixel.inline_constants.len() >= 38 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[27];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[24..=26]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[28..=30]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[31..=32]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[33..=35]);
+            rows[13..=14].copy_from_slice(&pixel.inline_constants[36..=37]);
+            (
+                13,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9DAC9) if pixel.inline_constants.len() >= 40 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[28];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[25..=27]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[33..=34]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[35..=37]);
+            rows[13..=14].copy_from_slice(&pixel.inline_constants[38..=39]);
+            (
+                14,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9AFBF) if pixel.inline_constants.len() >= 49 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[40];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[37..=39]);
+            rows[5] = pixel.inline_constants[41];
+            rows[6..=7].copy_from_slice(&pixel.inline_constants[42..=43]);
+            rows[8..=10].copy_from_slice(&pixel.inline_constants[44..=46]);
+            rows[11..=12].copy_from_slice(&pixel.inline_constants[47..=48]);
+            (
+                15,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80AA0261) if pixel.inline_constants.len() >= 31 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[25];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[26..=28]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[29..=30]);
+            (
+                16,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        TagHash(0x80AA0263) if pixel.inline_constants.len() >= 33 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[27];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[24..=26]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[28..=30]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[31..=32]);
+            (
+                16,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        TagHash(0x80A9B86A) if pixel.inline_constants.len() >= 31 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1] = pixel.inline_constants[10];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[11..=13]);
+            rows[5] = pixel.inline_constants[14];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[15..=17]);
+            rows[9..=11].copy_from_slice(&pixel.inline_constants[18..=20]);
+            rows[12..=13].copy_from_slice(&pixel.inline_constants[21..=22]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[23..=25]);
+            rows[17..=19].copy_from_slice(&pixel.inline_constants[26..=28]);
+            rows[20..=21].copy_from_slice(&pixel.inline_constants[29..=30]);
+            (
+                17,
+                tag_at(6)?,
+                tag_at(2)?,
+                tag_at(3)?,
+                Some(tag_at(4)?),
+                Some(tag_at(5)?),
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9D952) if pixel.inline_constants.len() >= 65 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[47..=49]);
+            rows[4..=5].copy_from_slice(&pixel.inline_constants[50..=51]);
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[52..=54]);
+            rows[9..=11].copy_from_slice(&pixel.inline_constants[55..=57]);
+            rows[12..=13].copy_from_slice(&pixel.inline_constants[58..=59]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[60..=62]);
+            rows[17..=18].copy_from_slice(&pixel.inline_constants[63..=64]);
+            (
+                18,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                None,
+                None,
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // Procedural runner panel family. DXIL uses t2 as the packed selector,
+        // t4 as the scalar pattern atlas, t5 as its RG procedural field, t6 as
+        // the local panel mask, t8 as the authored detail normal, and t9 as the
+        // base tangent normal. The generated AFB8/AFBA siblings share this ABI.
+        TagHash(0x80A9AFB8) | TagHash(0x80A9AFBA) if pixel.inline_constants.len() >= 103 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[94..=96]);
+            rows[4..=6].copy_from_slice(&pixel.inline_constants[60..=62]);
+            rows[7..=9].copy_from_slice(&pixel.inline_constants[78..=80]);
+            rows[10..=13].copy_from_slice(&pixel.inline_constants[90..=93]);
+            rows[14] = pixel.inline_constants[97];
+            rows[15] = pixel.inline_constants[98];
+            rows[16] = pixel.inline_constants[101];
+            rows[17] = pixel.inline_constants[102];
+            (
+                19,
+                tag_at(2)?,
+                tag_at(8)?,
+                tag_at(4)?,
+                Some(tag_at(6)?),
+                None,
+                Some(tag_at(5)?),
+                rows,
+            )
+        }
+        // Full10 generated siblings: t2.g gates t4, t2.b gates t5, and t2.r
+        // selects either authored transform of t6 before the t7 base normal.
+        TagHash(0x80A9BD17) if pixel.inline_constants.len() >= 39 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[7];
+            rows[1] = pixel.inline_constants[21];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[18..=20]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[25..=26]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[27..=29]);
+            rows[13..=15].copy_from_slice(&pixel.inline_constants[30..=32]);
+            rows[16..=17].copy_from_slice(&pixel.inline_constants[33..=34]);
+            (
+                20,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(6)?),
+                None,
+                rows,
+            )
+        }
+        TagHash(0x80A9DA29) if pixel.inline_constants.len() >= 40 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[7];
+            rows[1] = pixel.inline_constants[22];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[19..=21]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[23..=25]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[26..=27]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[28..=30]);
+            rows[13..=15].copy_from_slice(&pixel.inline_constants[31..=33]);
+            rows[16..=17].copy_from_slice(&pixel.inline_constants[34..=35]);
+            (
+                20,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(6)?),
+                None,
+                rows,
+            )
+        }
+        // Expanded sibling also gates t4 from t2.a. Its normal block starts
+        // four rows later but otherwise shares the dual-R ABI above.
+        TagHash(0x80A9E64F) if pixel.inline_constants.len() >= 43 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[7];
+            rows[1] = pixel.inline_constants[21];
+            rows[2] = pixel.inline_constants[25];
+            rows[3..=5].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[26..=28]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[29..=30]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[31..=33]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[34..=36]);
+            rows[17..=18].copy_from_slice(&pixel.inline_constants[37..=38]);
+            (
+                21,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(6)?),
+                None,
+                rows,
+            )
+        }
+        // Full9 A/G/B stack. t1.a gates the composite, t1.g gates t3,
+        // t1.b selects the authored t4 detail, and t5 is the base tangent
+        // normal. DXIL c24..c33 owns the exact gate/transform block.
+        TagHash(0x80A9C31E) if pixel.inline_constants.len() >= 34 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1] = pixel.inline_constants[24];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[25..=27]);
+            rows[5] = pixel.inline_constants[28];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[32..=33]);
+            (
+                22,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // DCF8 compact dual-detail ABI. t2 carries A/G/B/R selectors; B
+        // selects transformed t4 and R selects transformed t5 over t6 base.
+        TagHash(0x80A9DCF8) if pixel.inline_constants.len() >= 35 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[9];
+            rows[1..=2].copy_from_slice(&pixel.inline_constants[20..=21]);
+            rows[3..=5].copy_from_slice(&pixel.inline_constants[22..=24]);
+            rows[6..=7].copy_from_slice(&pixel.inline_constants[25..=26]);
+            rows[8..=10].copy_from_slice(&pixel.inline_constants[27..=29]);
+            rows[11..=12].copy_from_slice(&pixel.inline_constants[30..=31]);
+            rows[13] = pixel.inline_constants[34];
+            (
+                26,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // C96F wide runner stack: t3 selector; t5 G detail; t6 B detail;
+        // t7 has two R-selected transforms; t8 base. t4.r/t4.g provide
+        // authored normal response and AO respectively.
+        TagHash(0x80A9C96F) if pixel.inline_constants.len() >= 44 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[14];
+            rows[1] = pixel.inline_constants[28];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[25..=27]);
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[8..=9].copy_from_slice(&pixel.inline_constants[32..=33]);
+            rows[10..=12].copy_from_slice(&pixel.inline_constants[34..=36]);
+            rows[13..=15].copy_from_slice(&pixel.inline_constants[37..=39]);
+            rows[16..=17].copy_from_slice(&pixel.inline_constants[40..=41]);
+            // Object-space t2 field: B-band thresholds, tri-planar
+            // exponent/projection, then authored colour base and scale. This
+            // generated technique's object transform is identity/zero.
+            rows[18] = pixel.inline_constants[11];
+            rows[19] = pixel.inline_constants[12];
+            rows[20] = pixel.inline_constants[2];
+            rows[21] = pixel.inline_constants[8];
+            rows[22] = pixel.inline_constants[9];
+            rows[23] = pixel.inline_constants[10];
+            (
+                27,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(7)?),
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // D3FC combines a large procedural material branch with the standard
+        // A/G/B/R normal ABI. t3 selects t5/t6/t7 over t8 base; t4.r/t4.g
+        // remain the authored normal response and AO channels.
+        TagHash(0x80A9D3FC) if pixel.inline_constants.len() >= 62 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[43];
+            rows[1] = pixel.inline_constants[44];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[46..=48]);
+            rows[5] = pixel.inline_constants[45];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[49..=51]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[52..=53]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[54..=56]);
+            rows[14..=15].copy_from_slice(&pixel.inline_constants[57..=58]);
+            // Object-space t0 field. c0/c1 are identity/zero for this
+            // generated technique; c2 is the tri-planar exponent, c3 the
+            // projection, and c4/c5 the authored colour base/scale.
+            rows[16] = pixel.inline_constants[2];
+            rows[17] = pixel.inline_constants[3];
+            rows[18] = pixel.inline_constants[4];
+            rows[19] = pixel.inline_constants[5];
+            (
+                28,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                None,
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // D2D7: t2 A/G gates the authored stack. B switches t4/t5; R
+        // switches t6/t7; t8 is the base tangent normal.
+        TagHash(0x80A9D2D7) if pixel.inline_constants.len() >= 61 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[38];
+            rows[1] = pixel.inline_constants[39];
+            rows[2] = pixel.inline_constants[43];
+            rows[3..=5].copy_from_slice(&pixel.inline_constants[40..=42]);
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[44..=46]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[47..=48]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[49..=51]);
+            rows[14..=16].copy_from_slice(&pixel.inline_constants[52..=54]);
+            rows[17..=18].copy_from_slice(&pixel.inline_constants[55..=56]);
+            (
+                29,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(7)?),
+                None,
+                rows,
+            )
+        }
+        // D569: t4 is selector; A gates t6, G gates t7, B/R jointly gate
+        // t8 over t9 base. t5.r/t5.g provide material response and AO.
+        TagHash(0x80A9D569) if pixel.inline_constants.len() >= 72 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[52];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[53..=55]);
+            rows[4] = pixel.inline_constants[56];
+            rows[5..=7].copy_from_slice(&pixel.inline_constants[57..=59]);
+            rows[8] = pixel.inline_constants[60];
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[61..=62]);
+            rows[11..=13].copy_from_slice(&pixel.inline_constants[63..=65]);
+            rows[14..=15].copy_from_slice(&pixel.inline_constants[66..=67]);
+            (
+                30,
+                tag_at(4)?,
+                tag_at(6)?,
+                tag_at(7)?,
+                Some(tag_at(8)?),
+                None,
+                Some(tag_at(5)?),
+                rows,
+            )
+        }
+        // Full character surface used by Emerald Impact. t2.a gates t4,
+        // t2.b selects t5, and t2.r selects t6 over the remapped t7 base.
+        // Unlike the compact character path these authored normals are a
+        // visible part of the shell material and cannot be discarded merely
+        // because the same shader also owns procedural t1/t9/t10 effects.
+        TagHash(0x80A9F4E5) if pixel.inline_constants.len() >= 33 => {
+            let mut rows = [[0.0; 4]; 24];
+            let detail_scale = pixel.inline_constants[0];
+            rows[0] = [detail_scale[0], 0.0, detail_scale[2], 0.0];
+            rows[14] = [0.0, detail_scale[1], detail_scale[3], 0.0];
+            rows[1] = pixel.inline_constants[18];
+            rows[2] = pixel.inline_constants[19];
+            rows[3..=7].copy_from_slice(&pixel.inline_constants[20..=24]);
+            rows[8..=12].copy_from_slice(&pixel.inline_constants[25..=29]);
+            rows[13] = pixel.inline_constants[32];
+            (
+                31,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Emerald Impact sibling: t2 selects t4/t5/t6/t7 through A/G/B/R,
+        // then t8 supplies the authored base normal. LLVM establishes the
+        // normal block at c18..c35; t6/t7 share c24/c25 UV transforms.
+        TagHash(0x80A9F500) if pixel.inline_constants.len() >= 36 => {
+            let mut rows = [[0.0; 4]; 24];
+            let a_uv = pixel.inline_constants[0];
+            rows[0] = [a_uv[0], 0.0, a_uv[2], 0.0];
+            rows[1] = [0.0, a_uv[1], a_uv[3], 0.0];
+            rows[2..=3].copy_from_slice(&pixel.inline_constants[18..=19]);
+            rows[4..=7].copy_from_slice(&pixel.inline_constants[20..=23]);
+            rows[8..=12].copy_from_slice(&pixel.inline_constants[24..=28]);
+            rows[13] = pixel.inline_constants[29];
+            rows[14..=15].copy_from_slice(&pixel.inline_constants[30..=31]);
+            rows[16] = pixel.inline_constants[34];
+            rows[17] = pixel.inline_constants[35];
+            (
+                32,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(7)?),
+                None,
+                rows,
+            )
+        }
+        // Compact Emerald sibling: A selects t4. B and R independently
+        // select two authored transforms of t5, over the remapped t7 base.
+        TagHash(0x80A9F518) if pixel.inline_constants.len() >= 36 => {
+            let mut rows = [[0.0; 4]; 24];
+            let a_uv = pixel.inline_constants[0];
+            rows[0] = [a_uv[0], 0.0, a_uv[2], 0.0];
+            rows[1] = [0.0, a_uv[1], a_uv[3], 0.0];
+            rows[2..=3].copy_from_slice(&pixel.inline_constants[18..=19]);
+            rows[4..=8].copy_from_slice(&pixel.inline_constants[20..=24]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[25..=26]);
+            rows[11..=15].copy_from_slice(&pixel.inline_constants[28..=32]);
+            rows[16] = pixel.inline_constants[35];
+            (
+                33,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(5)?),
+                None,
+                None,
+                rows,
+            )
+        }
+        // Procedural Emerald sibling. Its normal block is shifted to c42:
+        // t4 A, t5 G, t6 B, a second t4 transform for R, then t7 base.
+        TagHash(0x80A9F4B3) if pixel.inline_constants.len() >= 64 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0..=3].copy_from_slice(&pixel.inline_constants[42..=45]);
+            rows[4..=7].copy_from_slice(&pixel.inline_constants[46..=49]);
+            rows[8..=15].copy_from_slice(&pixel.inline_constants[50..=57]);
+            rows[16..=18].copy_from_slice(&pixel.inline_constants[50..=52]);
+            rows[19..=20].copy_from_slice(&pixel.inline_constants[58..=59]);
+            rows[21..=22].copy_from_slice(&pixel.inline_constants[62..=63]);
+            rows[23] = pixel.inline_constants[31];
+            (
+                34,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                Some(tag_at(4)?),
+                None,
+                rows,
+            )
+        }
+        // Compact character surface: t2.a gates transformed t4, t2.r selects
+        // t5, and t6 is the remapped base normal (80A9F528 LLVM c18..c28).
+        TagHash(0x80A9F528) if pixel.inline_constants.len() >= 29 => {
+            let mut rows = [[0.0; 4]; 24];
+            let a_uv = pixel.inline_constants[0];
+            rows[0] = [a_uv[0], 0.0, a_uv[2], 0.0];
+            rows[1] = [0.0, a_uv[1], a_uv[3], 0.0];
+            rows[2..=3].copy_from_slice(&pixel.inline_constants[18..=19]);
+            rows[4..=8].copy_from_slice(&pixel.inline_constants[20..=24]);
+            rows[9..=10].copy_from_slice(&pixel.inline_constants[27..=28]);
+            (
+                35,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                None,
+                None,
+                None,
+                rows,
+            )
+        }
+        // Local panel/face surface: t1.r selects transformed t3 over t4.
+        // t2 is its independent material-response field.
+        TagHash(0x80A9F589) if pixel.inline_constants.len() >= 23 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0..=4].copy_from_slice(&pixel.inline_constants[14..=18]);
+            rows[5..=6].copy_from_slice(&pixel.inline_constants[21..=22]);
+            (
+                36,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Full13 package-394 surface. t3 carries A/G/B/R selectors; t5/t6
+        // provide A/G, t7/t8 are authored B alternatives, t7 is reused for
+        // R, and t9 is base tangent normal. DXIL c43..c66 is exact ABI block.
+        TagHash(0x80B142A5) if pixel.inline_constants.len() >= 67 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[32];
+            rows[1..=5].copy_from_slice(&pixel.inline_constants[43..=47]);
+            rows[6..=10].copy_from_slice(&pixel.inline_constants[48..=52]);
+            rows[11..=18].copy_from_slice(&pixel.inline_constants[53..=60]);
+            rows[19..=20].copy_from_slice(&pixel.inline_constants[61..=62]);
+            rows[21..=22].copy_from_slice(&pixel.inline_constants[65..=66]);
+            (
+                37,
+                tag_at(3)?,
+                tag_at(5)?,
+                tag_at(6)?,
+                Some(tag_at(7)?),
+                Some(tag_at(8)?),
+                Some(tag_at(4)?),
+                rows,
+            )
+        }
+        // Package-394 full10 surface. t1 is an A/G/B/R selector. G gates
+        // t3, B and R select t4/t5, and t6 is the authored base normal.
+        // The response/AO field remains independently packed in t2.
+        TagHash(0x80B143A0) if pixel.inline_constants.len() >= 42 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=15].copy_from_slice(&pixel.inline_constants[24..=38]);
+            rows[16] = pixel.inline_constants[41];
+            (
+                38,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Package-394 full10 siblings. t2 selects the t4/t5/t6 stack using
+        // G/B/R; t7 is the remapped base and t3 is response/AO. The shaders
+        // differ only by two preceding constant rows.
+        TagHash(0x80B1444E) if pixel.inline_constants.len() >= 39 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[11];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[22..=35]);
+            rows[15] = pixel.inline_constants[38];
+            (
+                39,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                Some(tag_at(3)?),
+                rows,
+            )
+        }
+        TagHash(0x80B14BF9) if pixel.inline_constants.len() >= 41 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=14].copy_from_slice(&pixel.inline_constants[24..=37]);
+            rows[15] = pixel.inline_constants[40];
+            (
+                39,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(5)?,
+                Some(tag_at(6)?),
+                None,
+                Some(tag_at(3)?),
+                rows,
+            )
+        }
+        // Package-394 expanded full11 surface. t1 G selects t3/t4, B selects
+        // two transforms of t5, R gates t6, and t7 is the remapped base.
+        // t2 owns response/AO.
+        TagHash(0x80B14701) if pixel.inline_constants.len() >= 48 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=21].copy_from_slice(&pixel.inline_constants[24..=44]);
+            rows[22] = pixel.inline_constants[47];
+            (
+                40,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                Some(tag_at(5)?),
+                Some(tag_at(6)?),
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Woven runner fabric. t1 is the packed selector, t3 is a broad
+        // authored detail normal, t4 is the tiled weave normal, t5 is the
+        // base tangent normal, and t2 carries material response/AO.
+        TagHash(0x80A9C430) if pixel.inline_constants.len() >= 45 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[13];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[24..=26]);
+            rows[4] = pixel.inline_constants[27];
+            rows[5] = pixel.inline_constants[28];
+            rows[6..=8].copy_from_slice(&pixel.inline_constants[29..=31]);
+            rows[9] = pixel.inline_constants[44];
+            (
+                45,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Compact woven runner fabric. t1 selects transformed t3 relief over
+        // the authored t4 base normal; t2 carries response/AO.
+        TagHash(0x80A9C65C) if pixel.inline_constants.len() >= 25 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[1];
+            rows[1..=3].copy_from_slice(&pixel.inline_constants[14..=16]);
+            rows[4] = pixel.inline_constants[24];
+            (
+                46,
+                tag_at(1)?,
+                tag_at(3)?,
+                tag_at(3)?,
+                None,
+                None,
+                Some(tag_at(2)?),
+                rows,
+            )
+        }
+        // Dual-gated armor relief. t2.a/t2.g gate transformed t4 over the
+        // authored t5 base normal; t3 supplies material response/AO.
+        TagHash(0x80A9CBEE) if pixel.inline_constants.len() >= 49 => {
+            let mut rows = [[0.0; 4]; 24];
+            rows[0] = pixel.inline_constants[37];
+            rows[1] = pixel.inline_constants[41];
+            rows[2..=4].copy_from_slice(&pixel.inline_constants[38..=40]);
+            rows[5] = pixel.inline_constants[48];
+            (
+                47,
+                tag_at(2)?,
+                tag_at(4)?,
+                tag_at(4)?,
+                None,
+                None,
+                Some(tag_at(3)?),
+                rows,
+            )
+        }
+        _ => return None,
+    };
+    let procedural = match pixel.shader? {
+        TagHash(0x80A9B860) => Some(tag_at(1)?),
+        TagHash(0x80A9C96F) => Some(tag_at(2)?),
+        TagHash(0x80A9D3FC) => Some(tag_at(0)?),
+        TagHash(0x80A9AD5D) => Some(tag_at(3)?),
+        TagHash(0x80A9AD68) => Some(tag_at(10)?),
+        _ => None,
+    };
+    let color_overlay = match pixel.shader? {
+        TagHash(0x80A9D569) => Some(tag_at(1)?),
+        TagHash(0x80B142A5) => Some(tag_at(2)?),
+        _ => None,
+    };
+    let mut color_overlay_constants = [[0.0; 4]; 7];
+    match pixel.shader? {
+        TagHash(0x80A9D569) => {
+            // c0 colour, c1/c2 UV rows, c3 selector-alpha reference.
+            color_overlay_constants[0..=3].copy_from_slice(&pixel.inline_constants[0..=3]);
+        }
+        TagHash(0x80B142A5) => {
+            // c24/c25 UV rows, c28/c29 colour remap, c30 selector-G reference.
+            for (target, source) in [24usize, 25, 28, 29, 30].into_iter().enumerate() {
+                color_overlay_constants[target] = pixel.inline_constants[source];
+            }
+        }
+        _ => {}
+    }
+    let procedural_wear = match pixel.shader? {
+        TagHash(0x80A9E4DB) => Some([tag_at(9)?, tag_at(10)?, tag_at(11)?]),
+        _ => None,
+    };
+    constants
+        .iter()
+        .chain(color_overlay_constants.iter())
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(RunnerLayeredSurfaceMaterial {
+            mode,
+            surface,
+            detail_normal_a,
+            detail_normal_b,
+            detail_normal_c,
+            detail_normal_d,
+            procedural,
+            color_overlay,
+            color_overlay_constants,
+            procedural_wear,
+            material_response,
+            constants,
+        })
+}
+
+fn runner_occlusion_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<RunnerOcclusionMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let shader = preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .shader?;
+    let (slot, channel) = match shader {
+        TagHash(0x80A9A9D3) | TagHash(0x80A9B860) => (2, 0),
+        TagHash(0x80A9A8CF) => (2, 1),
+        // AF8D/AF93 sample local t2 at mesh UV. DXIL routes t2.g into RT2.g
+        // by averaging it with the generated geometry/procedural occlusion.
+        TagHash(0x80A9AF8D) | TagHash(0x80A9AF93) => (2, 1),
+        TagHash(0x80A9B06A) => (2, 1),
+        TagHash(0x80A9B71C) => (2, 1),
+        // Face/skin surface: t3.g is written into RT2.g after combining with
+        // the generated response. t2 is the independent packed dye selector.
+        TagHash(0x80A9B85C) => (3, 1),
+        TagHash(0x80A9C430) => (2, 1),
+        TagHash(0x80A9C65C) => (2, 1),
+        TagHash(0x80A9CBEE) => (3, 1),
+        TagHash(0x80A9AFB6) | TagHash(0x80A9B75C) | TagHash(0x80A9B93E) | TagHash(0x80A9BBBE)
+        | TagHash(0x80A9BBBF) | TagHash(0x80A9BBDD) | TagHash(0x80A9CBAE) | TagHash(0x80A9D6FD)
+        | TagHash(0x80A9DC9A) => (2, 1),
+        TagHash(0x80A9C3F6) => (3, 1),
+        TagHash(0x80A9AE19) | TagHash(0x80A9AFBF) | TagHash(0x80A9DAC9) | TagHash(0x80A9DB9A) => {
+            (3, 1)
+        }
+        TagHash(0x80A9A9AD) | TagHash(0x80A9A9B1) | TagHash(0x80A9AFC1) | TagHash(0x80A9B065)
+        | TagHash(0x80A9C27C) | TagHash(0x80A9DE77) | TagHash(0x80AA02A7) => (2, 1),
+        // These generated runner surfaces use t2.r as normal response and
+        // feed t2.g into RT2.g AO. Keep both roles bound independently.
+        TagHash(0x80A9C31E) | TagHash(0x80A9DEEC) | TagHash(0x80A9E0FD) | TagHash(0x80A9E4DB)
+        | TagHash(0x80A9E76C) => (2, 1),
+        TagHash(0x80A9C96F) | TagHash(0x80A9D3FC) => (4, 1),
+        TagHash(0x80A9D569) => (5, 1),
+        TagHash(0x80B142A5) => (4, 1),
+        TagHash(0x80B143A0) | TagHash(0x80B14701) => (2, 1),
+        TagHash(0x80B1444E) | TagHash(0x80B14BF9) => (3, 1),
+        _ => return None,
+    };
+    Some(RunnerOcclusionMaterial {
+        texture: bindings.iter().find(|binding| binding.slot == slot)?.tag,
+        channel,
+    })
+}
+
+fn character_surface_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+    normal_slot: Option<u32>,
+) -> Option<CharacterSurfaceMaterial> {
+    if !bindings_use_character_gear_surface(bindings, normal_slot)
+        && !bindings_use_compact_character_surface(bindings, normal_slot)
+    {
+        return None;
+    }
+    let tag_at = |slot| {
+        bindings
+            .iter()
+            .find(|binding| binding.slot == slot)
+            .map(|binding| binding.tag)
+    };
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let constants = &preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .inline_constants;
+    let detail_transform = *constants.first()?;
+    let detail_base = *constants.get(3)?;
+    let detail_scale = *constants.get(4)?;
+    let detail_gate = constants.get(5)?[0];
+    let common_valid = detail_transform
+        .iter()
+        .chain(&detail_base)
+        .chain(&detail_scale)
+        .all(|value| value.is_finite())
+        && detail_transform[0].abs() > 0.0001
+        && detail_transform[1].abs() > 0.0001
+        && detail_transform[..2]
+            .iter()
+            .all(|value| value.abs() <= 1024.0)
+        // Common-character c3 is an authored linear RGBA colour. Several
+        // unrelated runner shaders share the same wide t0..tn resource shape,
+        // but place UV/scalar rows in c3/c4 and leave c3.a at zero. Treating
+        // those rows as RGB produced the vivid cyan/green/red shell panels.
+        && (detail_base[3] - 1.0).abs() <= 0.0001
+        && detail_base[..3]
+            .iter()
+            .all(|value| (0.0..=1.0).contains(value))
+        && detail_scale[..3]
+            .iter()
+            .all(|value| (-1.0..=1.0).contains(value))
+        && (0.0..=1.0).contains(&detail_gate)
+        && texture_is_srgb(tag_at(1)?);
+    if common_valid {
+        return Some(CharacterSurfaceMaterial {
+            mode: 1,
+            surface: tag_at(2)?,
+            selector: tag_at(3)?,
+            detail_color: tag_at(1)?,
+            detail_normal: tag_at(normal_slot?)?,
+            procedural: None,
+            detail_transform,
+            detail_base,
+            detail_scale,
+            detail_gate,
+            extra: [[0.0; 4]; 2],
+            palette: [[1.0; 4]; 2],
+            procedural_constants: [[0.0; 4]; 11],
+        });
+    }
+
+    // Newer runner cosmetics use two transformed samples from t1 as a
+    // procedural palette mask. t4.g selects that palette over local t0; t3
+    // contributes the authored secondary mask. This is the literal layout in
+    // Arata-family DXIL, detected by its four affine UV rows rather than tags.
+    let palette = [*constants.first()?, *constants.get(1)?];
+    let transforms = [
+        *constants.get(2)?,
+        *constants.get(3)?,
+        *constants.get(4)?,
+        *constants.get(5)?,
+    ];
+    let palette_gate = constants.get(25)?[0];
+    let palette_valid = palette
+        .iter()
+        .flatten()
+        .chain(transforms.iter().flatten())
+        .all(|value| value.is_finite())
+        && palette
+            .iter()
+            .all(|color| color[..3].iter().all(|value| (0.0..=1.0).contains(value)))
+        && transforms
+            .iter()
+            .all(|row| row[..2].iter().any(|value| value.abs() > 0.0001))
+        && (0.0..=1.0).contains(&palette_gate)
+        && texture_preview_format(tag_at(2)?).contains("Rg16")
+        && texture_is_srgb(tag_at(3)?)
+        && !texture_is_srgb(tag_at(4)?)
+        && normal_slot.is_some();
+    if palette_valid {
+        return Some(CharacterSurfaceMaterial {
+            mode: 2,
+            surface: tag_at(4)?,
+            selector: tag_at(3)?,
+            detail_color: tag_at(1)?,
+            detail_normal: tag_at(normal_slot?)?,
+            procedural: Some(tag_at(2)?),
+            detail_transform: transforms[0],
+            detail_base: transforms[1],
+            detail_scale: transforms[2],
+            detail_gate: palette_gate,
+            extra: [transforms[3], [0.0; 4]],
+            palette,
+            procedural_constants: [
+                *constants.get(6)?,
+                *constants.get(10)?,
+                *constants.get(11)?,
+                *constants.get(12)?,
+                *constants.get(13)?,
+                *constants.get(14)?,
+                *constants.get(15)?,
+                *constants.get(20)?,
+                *constants.get(22)?,
+                *constants.get(23)?,
+                *constants.get(24)?,
+            ],
+        });
+    }
+
+    // A wide resource table is not a material ABI. These remaining shaders
+    // are separate cloth/skin/eye/layer families; routing all of them through
+    // one invented palette branch caused the missing and white runner panels.
+    // Leave them unclassified until their compiled shader contract is decoded.
+    None
+}
+
+pub(crate) fn weapon_skin_gear_dye_palette(
     cache: &TagCache,
     selected_pattern: TagHash,
 ) -> Option<[GearDyeMaterial; 6]> {
+    weapon_skin_gear_dye_palette_with_source(cache, selected_pattern)
+        .map(|(palette, _object_channels)| palette)
+}
+
+fn weapon_skin_gear_dye_palette_with_source(
+    cache: &TagCache,
+    selected_pattern: TagHash,
+) -> Option<([GearDyeMaterial; 6], bool)> {
     let mut queue = std::collections::VecDeque::from([(selected_pattern, 0usize)]);
     let mut seen = rustc_hash::FxHashSet::default();
     seen.insert(selected_pattern);
@@ -2144,7 +4564,7 @@ fn weapon_skin_gear_dye_palette(
         let entry = package_manager().get_entry(tag)?;
         if entry.reference == CLASS_PATTERN_COMPONENT
             && let Ok(data) = package_manager().read_tag(tag)
-            && let Some(palette) = decode_weapon_skin_gear_dye_palette(&data)
+            && let Some(palette) = decode_weapon_skin_gear_dye_palette_with_source(&data)
         {
             return Some(palette);
         }
@@ -2173,17 +4593,132 @@ fn weapon_skin_gear_dye_palette(
     None
 }
 
+/// Resolves one six-channel GearDye contribution from authored Pattern object
+/// channels. Worn Dye may be inherited from the selected skin; Dye Detail is
+/// normally local to the attached mod. The compiled material selects these by
+/// parameter hash, never by serialized vector position.
+fn pattern_gear_dye_color_contribution(
+    cache: &TagCache,
+    root: TagHash,
+    parameters: [u32; 6],
+) -> Option<[[f32; 4]; 6]> {
+    let endian = package_manager().version.endian();
+    let mut values = [None; 6];
+    for (node, _depth) in descendant_pattern_nodes_with_depth(cache, root, 8) {
+        let Ok(data) = package_manager().read_tag(node) else {
+            continue;
+        };
+        for channel_array in scan_arrays(&data, endian)
+            .into_iter()
+            .filter(|array| array.class == CLASS_PATTERN_OBJECT_CHANNELS)
+        {
+            for (index, record) in array_records(&data, channel_array, 0x70)
+                .into_iter()
+                .enumerate()
+            {
+                let Some(parameter) = read_u32_at(record, 0, endian) else {
+                    continue;
+                };
+                let Some(slot) = parameters
+                    .iter()
+                    .position(|candidate| *candidate == parameter)
+                else {
+                    continue;
+                };
+                if values[slot].is_some() {
+                    continue;
+                }
+                let record_offset = channel_array.data_offset + index * 0x70;
+                let Some(constants) = read_array(&data, record_offset + 0x18, 0x10, endian) else {
+                    continue;
+                };
+                // These contribution records are constant TFX expressions.
+                // Reject compound expressions instead of treating an arbitrary
+                // literal pool entry as the channel output.
+                if constants.len() != 0x10
+                    || read_array(&data, record_offset + 0x08, 1, endian)
+                        .is_none_or(|bytecode| bytecode.is_empty())
+                {
+                    continue;
+                }
+                let Some(mut value) = read_vec4_f32(constants, 0, endian) else {
+                    continue;
+                };
+                if value[..3]
+                    .iter()
+                    .any(|component| !component.is_finite() || !(-4.0..=4.0).contains(component))
+                {
+                    continue;
+                }
+                value[3] = 0.0;
+                values[slot] = Some(value);
+            }
+        }
+    }
+    values
+        .into_iter()
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()
+}
+
 fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 6]> {
+    decode_weapon_skin_gear_dye_palette_with_source(data).map(|(palette, _object_channels)| palette)
+}
+
+fn decode_weapon_skin_gear_dye_palette_with_source(
+    data: &[u8],
+) -> Option<([GearDyeMaterial; 6], bool)> {
     let endian = package_manager().version.endian();
     let arrays = scan_arrays(data, endian);
+    // Updated Goliath components bind parameters to object-channel expression
+    // records. Read each record's authored Vector4 constant by binding index;
+    // singleton Vector4 arrays alone lose gaps occupied by scalar expressions.
+    for binding_array in arrays
+        .iter()
+        .copied()
+        .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
+    {
+        let parameter_indices = array_records(data, binding_array, 0x0c)
+            .into_iter()
+            .filter_map(|record| {
+                (read_u32_at(record, 0x00, endian)? == PATTERN_LOCAL_SCOPE_HASH).then_some(())?;
+                Some((
+                    read_u32_at(record, 0x04, endian)?,
+                    usize::try_from(read_u32_at(record, 0x08, endian)?).ok()?,
+                ))
+            })
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        for channel_array in arrays
+            .iter()
+            .copied()
+            .filter(|array| array.class == CLASS_PATTERN_OBJECT_CHANNELS)
+        {
+            let channel_records = array_records(data, channel_array, 0x70);
+            let parameter_vector = |parameter: u32| {
+                let index = *parameter_indices.get(&parameter)?;
+                let record = *channel_records.get(index)?;
+                (read_u32_at(record, 0, endian)? == parameter).then_some(())?;
+                let record_offset = channel_array.data_offset + index * 0x70;
+                let constants = read_array(data, record_offset + 0x18, 0x10, endian)?;
+                let mut value = read_vec4_f32(constants.get(..0x10)?, 0, endian)?;
+                value[3] = 1.0;
+                Some(value)
+            };
+            if let Some(palette) = decode_gear_dye_palette(parameter_vector) {
+                return Some((palette, true));
+            }
+        }
+    }
+
     let singleton_vectors = arrays
         .iter()
         .copied()
         .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
         .collect_vec();
-    if singleton_vectors.len() != 29 {
-        return None;
-    }
+    // Goliath Pattern components can carry unrelated extension vectors. The
+    // authored local-scope binding table, not a build-specific total count,
+    // identifies the 18 GearDye color/roughness/metal vectors.
     let vectors = singleton_vectors
         .iter()
         .copied()
@@ -2202,12 +4737,18 @@ fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 
             ))
         })
         .collect::<rustc_hash::FxHashMap<_, _>>();
-    let parameter_vector = |parameter: u32| {
+    decode_gear_dye_palette(|parameter| {
         parameter_indices
             .get(&parameter)
             .and_then(|index| vectors.get(*index))
             .copied()
-    };
+    })
+    .map(|palette| (palette, false))
+}
+
+fn decode_gear_dye_palette(
+    parameter_vector: impl Fn(u32) -> Option<[f32; 4]>,
+) -> Option<[GearDyeMaterial; 6]> {
     let palette = std::array::from_fn(|slot| GearDyeMaterial {
         color: parameter_vector(GEAR_DYE_COLOR_PARAMETERS[slot]).unwrap_or_default(),
         roughness_remap: parameter_vector(GEAR_DYE_ROUGHNESS_PARAMETERS[slot]).unwrap_or_default(),
@@ -2233,10 +4774,14 @@ fn decode_weapon_skin_gear_dye_palette(data: &[u8]) -> Option<[GearDyeMaterial; 
 
 fn read_serialized_dye_vector(data: &[u8], array: TagArray, endian: Endian) -> Option<[f32; 4]> {
     let record = data.get(array.data_offset..array.data_offset + 0x10)?;
+    read_dye_vector(record, endian)
+}
+
+fn read_dye_vector(record: &[u8], endian: Endian) -> Option<[f32; 4]> {
     Some([
-        read_f32(&record[0x0..0x4], endian),
-        read_f32(&record[0x4..0x8], endian),
-        read_f32(&record[0x8..0xc], endian),
+        read_f32(record.get(0x0..0x4)?, endian),
+        read_f32(record.get(0x4..0x8)?, endian),
+        read_f32(record.get(0x8..0xc)?, endian),
         1.0,
     ])
 }
@@ -2265,6 +4810,9 @@ fn apply_weapon_mod_attachment_poses(
         let Some(pose) = attachment_poses.get(tag) else {
             continue;
         };
+        for authored in &mut wireframe.authored_inputs {
+            authored.attachment_pose = Some(*pose);
+        }
         // Common-surface VS forwards raw shader-input POSITION/NORMAL directly
         // to PS procedural varyings. Preserve those before socket transforms.
         wireframe
@@ -2274,7 +4822,8 @@ fn apply_weapon_mod_attachment_poses(
             wireframe.procedural_normals = wireframe.normals.clone();
         }
         for vertex in &mut wireframe.vertices {
-            let rotated = rotate_quaternion(*vertex, pose.rotation);
+            let local = vertex.map(|value| value * pose.scale);
+            let rotated = rotate_quaternion(local, pose.rotation);
             *vertex = [
                 rotated[0] + pose.translation[0],
                 rotated[1] + pose.translation[1],
@@ -2631,6 +5180,9 @@ fn merge_model_wireframes(
     let has_complete_tangents = parts
         .iter()
         .all(|(_tag, _source, wireframe)| wireframe.tangents.is_some());
+    let has_complete_rigid_indices = parts
+        .iter()
+        .all(|(_tag, _source, wireframe)| wireframe.rigid_indices.is_some());
     let normal_format = has_complete_normals
         .then(|| {
             parts
@@ -2667,6 +5219,7 @@ fn merge_model_wireframes(
             .format(" + ")
     );
     let mut vertices = Vec::new();
+    let mut rigid_indices = has_complete_rigid_indices.then(Vec::new);
     let mut normals = has_complete_normals.then(Vec::new);
     let mut procedural_positions = Some(Vec::new());
     let mut procedural_normals = has_complete_normals.then(Vec::new);
@@ -2674,6 +5227,9 @@ fn merge_model_wireframes(
     let mut uvs = has_complete_uvs.then(Vec::new);
     let mut indices = Vec::new();
     let mut material_ranges = Vec::new();
+    let mut authored_inputs = Vec::new();
+    let mut authored_shadow_ranges = Vec::new();
+    let mut authored_shadow_index_count = 0usize;
 
     for (_tag, source, wireframe) in parts {
         let available_vertices = MAX_PREVIEW_VERTICES.saturating_sub(vertices.len());
@@ -2683,6 +5239,9 @@ fn merge_model_wireframes(
         let copied_vertices = wireframe.vertices.len().min(available_vertices);
         let vertex_base = vertices.len() as u32;
         vertices.extend(wireframe.vertices.iter().copied().take(copied_vertices));
+        if let (Some(output), Some(part)) = (&mut rigid_indices, &wireframe.rigid_indices) {
+            output.extend(part.iter().copied().take(copied_vertices));
+        }
         if let Some(output_positions) = &mut procedural_positions {
             output_positions.extend(
                 wireframe
@@ -2723,13 +5282,47 @@ fn merge_model_wireframes(
             }));
         }
 
+        let authored_source_base = authored_inputs.len();
+        let authored_source_count = wireframe.authored_inputs.len();
+        authored_inputs.extend(wireframe.authored_inputs.iter().cloned());
+
+        for mut range in wireframe.authored_shadow_ranges {
+            range.authored_source = range
+                .authored_source
+                .filter(|source| *source < authored_source_count)
+                .map(|source| authored_source_base + source);
+            let available = MAX_PREVIEW_INDICES.saturating_sub(authored_shadow_index_count);
+            if available < 3 {
+                break;
+            }
+            let mut remapped = Vec::new();
+            for triangle in range.indices.chunks_exact(3) {
+                if remapped.len() + 3 > available
+                    || triangle
+                        .iter()
+                        .any(|index| *index as usize >= copied_vertices)
+                {
+                    continue;
+                }
+                remapped.extend(triangle.iter().map(|index| index + vertex_base));
+            }
+            if !remapped.is_empty() {
+                authored_shadow_index_count += remapped.len();
+                range.indices = remapped;
+                authored_shadow_ranges.push(range);
+            }
+        }
+
         let ranges = if wireframe.material_ranges.is_empty() {
             vec![WireframeMaterialRange {
                 index_start: 0,
                 index_count: wireframe.indices.len(),
+                raw_lod_category: Some(source.raw_lod_category),
                 render_stage: None,
                 technique: None,
                 gear_dye_change_color_index: None,
+                authored_source: (authored_source_count != 0).then_some(authored_source_base),
+                authored_draw: None,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -2737,7 +5330,11 @@ fn merge_model_wireframes(
         } else {
             wireframe.material_ranges
         };
-        for range in ranges {
+        for mut range in ranges {
+            range.authored_source = range
+                .authored_source
+                .filter(|source| *source < authored_source_count)
+                .map(|source| authored_source_base + source);
             let source = wireframe
                 .indices
                 .get(
@@ -2764,9 +5361,12 @@ fn merge_model_wireframes(
                 material_ranges.push(WireframeMaterialRange {
                     index_start,
                     index_count,
+                    raw_lod_category: range.raw_lod_category,
                     render_stage: range.render_stage,
                     technique: range.technique,
                     gear_dye_change_color_index: range.gear_dye_change_color_index,
+                    authored_source: range.authored_source,
+                    authored_draw: range.authored_draw,
                     procedural_scale: range.procedural_scale,
                     texture: range.texture,
                     textures: range.textures,
@@ -2784,6 +5384,7 @@ fn merge_model_wireframes(
         position_format,
         uv_format,
         vertices,
+        rigid_indices,
         normals,
         procedural_positions,
         procedural_normals,
@@ -2793,6 +5394,8 @@ fn merge_model_wireframes(
         tangent_format,
         indices,
         material_ranges,
+        authored_inputs,
+        authored_shadow_ranges,
         min,
         max,
         vertex_count_total,
@@ -2938,7 +5541,7 @@ struct TexturePreviewRank {
 }
 
 fn texture_preview_rank(tag: TagHash) -> TexturePreviewRank {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(tag, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(tag) else {
         return TexturePreviewRank {
             shape: 100,
             format: 100,
@@ -2997,10 +5600,11 @@ fn assign_wireframe_material_textures(
     cache: &TagCache,
     textures: &[(TagHash, UEntryHeader)],
 ) {
-    if wireframe.material_ranges.is_empty() {
+    if wireframe.material_ranges.is_empty() && wireframe.authored_shadow_ranges.is_empty() {
         return;
     }
 
+    let mut materials = rustc_hash::FxHashMap::default();
     for range in &mut wireframe.material_ranges {
         let Some(technique) = range.technique else {
             range.texture = textures.first().map(|(tag, _entry)| *tag);
@@ -3008,7 +5612,24 @@ fn assign_wireframe_material_textures(
             continue;
         };
 
-        range.textures = material_textures_for_technique(technique, cache, textures);
+        range.textures = materials
+            .entry(technique)
+            .or_insert_with(|| material_textures_for_technique(technique, cache, textures))
+            .clone();
+        range.texture = range.textures.color;
+    }
+
+    for range in &mut wireframe.authored_shadow_ranges {
+        let Some(technique) = range.technique else {
+            range.texture = textures.first().map(|(tag, _entry)| *tag);
+            range.textures.color = range.texture;
+            continue;
+        };
+
+        range.textures = materials
+            .entry(technique)
+            .or_insert_with(|| material_textures_for_technique(technique, cache, textures))
+            .clone();
         range.texture = range.textures.color;
     }
 }
@@ -3039,22 +5660,35 @@ fn material_textures_for_technique(
         .filter(|binding| binding.stage == "PS")
         .sorted_by_key(|binding| texture_binding_rank(*binding))
         .collect_vec();
-    let normal_slot = material_normal_texture_slot(&candidates);
-    let control_slot = material_control_texture_slot(&candidates, normal_slot);
+    let normal_slot = material_normal_texture_slot_for_technique(technique, &candidates);
+    let control_slot = material_control_texture_slot(technique, &candidates, normal_slot);
+    let color_slot = material_color_texture_slot_for_technique(technique, &candidates);
+    let character_surface = character_surface_material(technique, &candidates, normal_slot);
+    let runner_layered_surface = runner_layered_surface_material(technique, &candidates);
+    let runner_occlusion = runner_occlusion_material(technique, &candidates);
+    let alpha_mask = runner_alpha_mask_material(technique, &candidates);
     let investment_decal = investment_decal_for_technique(technique, &candidates);
     let direct_shared_color_atlas = direct_shared_color_atlas_for_technique(technique, &candidates);
+    material.shared_atlas_detail = direct_shared_color_atlas
+        .and_then(|_| shared_atlas_detail_material(technique, &candidates));
     material.mod_wear = weapon_mod_wear_material(technique, &candidates);
-    material.animated_dither = animated_dither_material(technique, &candidates);
+    material.surface_condition = weapon_surface_condition_material(technique, &candidates);
     // Both families can expose eight PS textures, but slots 5..7 mean physical
     // age/wear when the TFX wear ABI is present. Never reinterpret those wear
     // resources as decorative contour inputs.
-    material.gear_pattern = (material.mod_wear.is_none() && material.animated_dither.is_none())
+    material.gear_pattern = (material.mod_wear.is_none())
         .then(|| gear_pattern_material(technique, &candidates))
         .flatten();
 
     for binding in &candidates {
         let binding = *binding;
-        let mut role = material_texture_role(binding, normal_slot, control_slot);
+        let mut role = if color_slot == Some(binding.slot) {
+            MaterialTextureRole::Color
+        } else if color_slot.is_some() && binding.slot == 0 {
+            MaterialTextureRole::Aux
+        } else {
+            material_texture_role(binding, normal_slot, control_slot)
+        };
         if investment_decal
             .as_ref()
             .is_some_and(|decal| decal.color() == binding.tag)
@@ -3062,10 +5696,39 @@ fn material_textures_for_technique(
             role = MaterialTextureRole::Color;
         } else if direct_shared_color_atlas == Some(binding.tag) {
             role = MaterialTextureRole::Color;
-        } else if fallback_aux_texture(binding.tag) {
+        } else if fallback_aux_texture(binding.tag)
+            && !matches!(
+                role,
+                MaterialTextureRole::Control(_) | MaterialTextureRole::Normal
+            )
+        {
             role = MaterialTextureRole::Aux;
         }
         assign_material_texture(&mut material, binding.tag, role);
+    }
+
+    material.character_surface = character_surface;
+    material.runner_layered_surface = runner_layered_surface;
+    material.runner_occlusion = runner_occlusion;
+    material.alpha_mask = alpha_mask;
+    if let Some(alpha_mask) = alpha_mask {
+        material.control = Some(alpha_mask.texture);
+        material
+            .aux
+            .retain(|texture| *texture != alpha_mask.texture);
+    }
+
+    // Compact character permutations omit the extended t10+ character block,
+    // but their compiled shaders write the same Goliath MRT contract as the
+    // full family: RT1.a = 0.67 roughness and RT2.r = 0 metalness. Their t2/t3
+    // textures are selectors/packed masks, not an ORM map.
+    if material.character_surface.is_none()
+        && bindings_use_compact_character_surface(&candidates, normal_slot)
+    {
+        material.solid_surface = Some([0.67, 0.0]);
+    }
+    if material.solid_surface.is_none() {
+        material.solid_surface = runner_solid_surface_material(technique);
     }
 
     if let Some(investment_decal) = investment_decal {
@@ -3085,6 +5748,14 @@ fn material_textures_for_technique(
         material.color = Some(atlas);
         material.authored_shared_atlas = true;
         material.aux.retain(|texture| *texture != atlas);
+        if material.shared_atlas_detail.is_some() {
+            // Audited MRT ABI: RT1.a = 0.67 and RT2.r = 0 for this direct
+            // atlas + linear triplanar-response family.
+            material.solid_surface = Some([0.67, 0.0]);
+        }
+    }
+    if let Some(condition) = material.surface_condition {
+        material.aux.retain(|texture| *texture != condition.breakup);
     }
 
     for texture in textures
@@ -3107,6 +5778,12 @@ fn material_textures_for_technique(
     }
 
     promote_auxiliary_preview_color(&mut material, technique);
+    material.forward_coating = forward_coating_material_for_technique(technique);
+    material.transmission = material
+        .forward_coating
+        .is_none()
+        .then(|| transmission_material_for_technique(technique))
+        .flatten();
 
     if material.color.is_none()
         && let Some(flat) = textureless_flat_material_for_technique(technique)
@@ -3118,22 +5795,433 @@ fn material_textures_for_technique(
     {
         material.solid_color = Some(surface.color);
         material.solid_surface = Some([surface.roughness, surface.metalness]);
-    } else if material.color.is_none()
-        && let Some(surface) = animated_flat_material_for_technique(technique)
-    {
-        material.solid_color = Some(surface.color);
-        material.solid_surface = Some([surface.roughness, surface.metalness]);
     }
 
     material
+}
+
+/// Decode Tiger's authored forward-coating ABI.
+///
+/// Signature is deliberately narrow: dedicated PS, premultiplied stage state,
+/// direct linear-detail/cubemap resources, fixed material block, and TFX
+/// coverage driven by object channel 0x37CD36CF. Only material ranges that
+/// author this shader contract receive coating.
+fn forward_coating_material_for_technique(technique: TagHash) -> Option<ForwardCoatingMaterial> {
+    const FORWARD_COATING_PS: TagHash = TagHash(0x80A9FBAC);
+    const COVERAGE_OBJECT_CHANNEL: u32 = 0x37CD36CF;
+
+    if render_state_for_technique(technique).blend != Some(8) {
+        return None;
+    }
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    if pixel.shader != Some(FORWARD_COATING_PS) || pixel.inline_constants.len() < 44 {
+        return None;
+    }
+
+    let bindings = texture_bindings_for_technique(&entry, &data)
+        .into_iter()
+        .filter(|binding| binding.stage == "PS")
+        .collect_vec();
+    let detail = bindings.iter().find(|binding| binding.slot == 1)?.tag;
+    let environment = bindings.iter().find(|binding| binding.slot == 2)?.tag;
+    let environment_sampler = sampler_for_technique_slot(&entry, &data, "PS", 2)?;
+    if Texture::load_desc(detail).ok()?.kind() != crate::texture::TextureType::Texture2D
+        || Texture::load_desc(environment).ok()?.kind() != crate::texture::TextureType::TextureCube
+    {
+        return None;
+    }
+
+    let constants = &pixel.inline_constants;
+    let finite = |value: &[f32; 4]| value.iter().all(|component| component.is_finite());
+    for index in [
+        15, 16, 17, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 41, 42, 43,
+    ] {
+        if !finite(constants.get(index)?) {
+            return None;
+        }
+    }
+    let projection_exponent = constants[15][0];
+    let incidence_remap = [constants[24][0], constants[24][1]];
+    let authored_coverage = constants[25][0];
+    let lobe_direction_scales = [constants[39][0], constants[43][0]];
+    if !(1.0..=128.0).contains(&projection_exponent)
+        || constants[16][0].abs() <= 0.0001
+        || constants[16][1].abs() <= 0.0001
+        || !(0.0..=4.0).contains(&incidence_remap[0])
+        || !(0.0..=1.0).contains(&authored_coverage)
+        || !(0.0..=4.0).contains(&lobe_direction_scales[0])
+        || !(0.0..=4.0).contains(&lobe_direction_scales[1])
+    {
+        return None;
+    }
+
+    let channel = format!("0x{COVERAGE_OBJECT_CHANNEL:08X}");
+    let coverage_channel = pixel
+        .bytecode
+        .ops
+        .iter()
+        .any(|op| op.name == "push_object_channel" && op.detail == channel);
+    let coverage_output = pixel.bytecode.expressions.iter().any(|expression| {
+        expression.target == "output[131]"
+            && expression.expression.contains("spline4_const")
+            && expression
+                .expression
+                .contains(&format!("object_channel({channel})"))
+    });
+    if !coverage_channel || !coverage_output {
+        return None;
+    }
+    let object_channels = std::collections::HashMap::from([(COVERAGE_OBJECT_CHANNEL, [1.0; 4])]);
+    let (_, expressions) = interpret_tfx_stack_with_object_channels(
+        &pixel.bytecode.ops,
+        &pixel.constants,
+        &object_channels,
+    );
+    let coverage_input = expressions
+        .iter()
+        .find(|expression| expression.target == "output[131]")
+        .and_then(|expression| expression.value)?[0];
+    if !coverage_input.is_finite() {
+        return None;
+    }
+
+    Some(ForwardCoatingMaterial {
+        detail,
+        environment,
+        environment_sampler,
+        colors: [
+            [constants[22][0], constants[22][1], constants[22][2], 1.0],
+            [constants[23][0], constants[23][1], constants[23][2], 1.0],
+        ],
+        incidence_remap,
+        coverage: (authored_coverage * coverage_input).clamp(0.0, 1.0),
+        projection: constants[16],
+        projection_exponent,
+        detail_remap: [constants[17][0], constants[17][1]],
+        response_remap: [constants[31][0], constants[31][1]],
+        environment_lod: [constants[29][0], constants[30][0]],
+        environment_remap: [constants[32][0], constants[32][1]],
+        environment_strength: constants[33][0],
+        environment_params: constants[34],
+        specular_colors: [constants[36], constants[40]],
+        specular_exponents: [constants[37][0], constants[41][0]],
+        specular_strengths: [constants[38][0], constants[42][0]],
+        lobe_direction_scales,
+    })
+}
+
+/// Decode common stage-8 transmission material block.
+///
+/// Marathon surface permutations keep each base colour followed by metalness
+/// at +17 vectors and roughness at +21. Transmission permutations reuse this
+/// ABI for one or two absorption colours. Locating relative surface fields
+/// avoids shader/tag/weapon-specific constant indices.
+fn transmission_material_for_technique(technique: TagHash) -> Option<TransmissionMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let stage = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+    refractive_glass_material(stage)
+        .or_else(|| halftone_glow_material(technique, stage))
+        .or_else(|| transmission_material_from_constants(&stage.inline_constants))
+}
+
+/// Constant rows a halftone-glow pixel program reads, taken from its source:
+/// two scrolling samples of one noise texture are multiplied and remapped,
+/// a dot grid `frac(uv * grid) - centre` is subtracted, and what remains
+/// lights the surface additively in a colour between the two tints.
+struct HalftoneGlowRows {
+    source_sha256: [u8; 32],
+    tints: [usize; 2],
+    noise_transforms: [usize; 2],
+    noise_remap: usize,
+    noise_gain: usize,
+    tint_exponent: usize,
+    grid: usize,
+    centre: usize,
+    dot_remap: usize,
+    alpha_remap: usize,
+    gains: [usize; 2],
+}
+
+const HALFTONE_GLOW_PROGRAMS: &[HalftoneGlowRows] = &[HalftoneGlowRows {
+    // PS 80AA01D0 (Outland Dusk Eliminator side panels).
+    source_sha256: crate::render::authored_program::decode_sha256(
+        "d8e022b69d8f8b1aaed8696dceefebf6ae81286ec5308f3a92e35306982f7c4a",
+    ),
+    tints: [17, 18],
+    noise_transforms: [19, 20],
+    noise_remap: 21,
+    noise_gain: 22,
+    tint_exponent: 23,
+    grid: 24,
+    centre: 25,
+    dot_remap: 27,
+    alpha_remap: 29,
+    gains: [31, 32],
+}];
+
+fn halftone_glow_material(
+    technique: TagHash,
+    stage: &crate::material::TechniqueStagePreview,
+) -> Option<TransmissionMaterial> {
+    use sha2::{Digest, Sha256};
+    let entry = package_manager().get_entry(stage.shader?)?;
+    let payload = package_manager().read_tag(TagHash(entry.reference)).ok()?;
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+    let rows = HALFTONE_GLOW_PROGRAMS.iter().find(|rows| rows.source_sha256 == digest)?;
+    // The noise transforms scroll with the clock: evaluate them a second
+    // apart and hand the shader the rate.
+    let descriptor = crate::render::technique::TechniqueDescriptor::load(technique)?;
+    let pixel = descriptor.stages.iter().find(|stage| stage.stage == crate::render::technique::ShaderStage::Pixel)?;
+    let at = |seconds: f32| {
+        let mut inputs = crate::render::tfx::TfxRuntimeInputs::default();
+        inputs.apply_marathon_global_defaults();
+        inputs.time_seconds = seconds;
+        pixel.runtime_state(&inputs).constant_registers
+    };
+    let (start, later) = (at(0.0), at(1.0));
+    let row = |index: usize| start.get(index).copied();
+    let rate = |index: usize| Some([later.get(index)?[2] - row(index)?[2], later.get(index)?[3] - row(index)?[3]]);
+    let gain = row(rows.gains[0])?[0] * row(rows.gains[1])?[0];
+    let (rate_a, rate_b) = (rate(rows.noise_transforms[0])?, rate(rows.noise_transforms[1])?);
+    Some(TransmissionMaterial {
+        colors: [
+            [row(rows.tints[0])?[0], row(rows.tints[0])?[1], row(rows.tints[0])?[2], gain],
+            [row(rows.tints[1])?[0], row(rows.tints[1])?[1], row(rows.tints[1])?[2], 1.0],
+        ],
+        surfaces: [row(rows.noise_transforms[0])?, row(rows.noise_transforms[1])?],
+        color_count: 2,
+        absorption: None,
+        halftone: Some([
+            [rate_a[0], rate_a[1], rate_b[0], rate_b[1]],
+            [row(rows.noise_remap)?[0], row(rows.noise_remap)?[1], row(rows.noise_gain)?[0], row(rows.tint_exponent)?[0]],
+            [row(rows.grid)?[0], row(rows.grid)?[1], row(rows.centre)?[0], row(rows.centre)?[1]],
+            [row(rows.dot_remap)?[0], row(rows.dot_remap)?[1], row(rows.alpha_remap)?[0], row(rows.alpha_remap)?[1]],
+        ]),
+    })
+}
+
+/// Constant rows a refractive-glass pixel program reads, taken from its source:
+/// the tint is `lerp(near, far, thickness)`, multiplied onto `gain` times the
+/// scene colour behind the surface, and the result is blended at `opacity`.
+struct RefractiveGlassRows {
+    source_sha256: [u8; 32],
+    near: usize,
+    far: usize,
+    gain: usize,
+    opacity: usize,
+}
+
+const REFRACTIVE_GLASS_PROGRAMS: &[RefractiveGlassRows] = &[RefractiveGlassRows {
+    // PS 80B14F45 (Assassin Vox Nocturna arm shell and finger guards).
+    source_sha256: crate::render::authored_program::decode_sha256(
+        "60b2ef28d04f4aae432cbe97143a6b75aeb662b8b48a578f272914296ff69cd9",
+    ),
+    near: 28,
+    far: 29,
+    gain: 24,
+    opacity: 31,
+}];
+
+fn refractive_glass_material(
+    stage: &crate::material::TechniqueStagePreview,
+) -> Option<TransmissionMaterial> {
+    use sha2::{Digest, Sha256};
+    let entry = package_manager().get_entry(stage.shader?)?;
+    let payload = package_manager().read_tag(TagHash(entry.reference)).ok()?;
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+    let rows = REFRACTIVE_GLASS_PROGRAMS.iter().find(|rows| rows.source_sha256 == digest)?;
+    let row = |index: usize| stage.inline_constants.get(index).copied();
+    let color = |index: usize| row(index).map(|value| [value[0], value[1], value[2], 1.0]);
+    Some(TransmissionMaterial {
+        colors: [color(rows.near)?, color(rows.far)?],
+        surfaces: [[0.0; 4]; 2],
+        color_count: 2,
+        absorption: Some([row(rows.opacity)?[0], row(rows.gain)?[0]]),
+        halftone: None,
+    })
+}
+
+fn transmission_material_from_constants(constants: &[[f32; 4]]) -> Option<TransmissionMaterial> {
+    let mut candidates = Vec::new();
+    for (index, mut color) in constants.iter().copied().enumerate() {
+        let Some(metalness) = constants.get(index + 17).map(|value| value[0]) else {
+            continue;
+        };
+        let Some(roughness) = constants.get(index + 21).map(|value| value[0]) else {
+            continue;
+        };
+        let valid_color = color[..3]
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            && color[..3].iter().filter(|value| **value > 0.001).count() >= 2
+            && color[3].is_finite()
+            && (0.0..=1.0).contains(&color[3]);
+        if valid_color
+            && metalness.is_finite()
+            && (0.0..=1.0).contains(&metalness)
+            && roughness.is_finite()
+            && (0.02..=1.0).contains(&roughness)
+        {
+            color[3] = 1.0;
+            candidates.push((index, color, [roughness, metalness, 0.0, 0.0]));
+        }
+    }
+    if candidates.is_empty() {
+        return stage8_alpha_color_material(constants);
+    }
+
+    // Procedural surface blocks carry the same epsilon sentinel used by the
+    // compiled stage-8 shader. Other inline constants can coincidentally look
+    // like valid colour/surface tuples (Vox Nocturna has white and green false
+    // positives before its authored orange block), so sentinel-backed tuples
+    // take precedence. Older permutations without the sentinel retain the
+    // relative-offset fallback.
+    let marked = candidates
+        .iter()
+        .filter(|(index, _, _)| {
+            constants
+                .get(index.saturating_sub(1))
+                .is_some_and(|marker| {
+                    (0.0001..=0.01).contains(&marker[0])
+                        && marker[1..].iter().all(|value| value.abs() < 0.0001)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected = if marked.is_empty() {
+        &candidates
+    } else {
+        &marked
+    };
+    let mut colors = Vec::with_capacity(2);
+    let mut surfaces = Vec::with_capacity(2);
+    for (_, color, surface) in selected {
+        if !colors.contains(color) {
+            colors.push(*color);
+            surfaces.push(*surface);
+        }
+        if colors.len() == 2 {
+            break;
+        }
+    }
+    let color_count = colors.len() as u8;
+    colors.resize(2, colors[0]);
+    surfaces.resize(2, surfaces[0]);
+    Some(TransmissionMaterial {
+        colors: [colors[0], colors[1]],
+        surfaces: [surfaces[0], surfaces[1]],
+        color_count,
+        absorption: None,
+        halftone: None,
+    })
+}
+
+/// Decode the compact stage-8 material ABI used by runner-shell effects.
+///
+/// Unlike the extended surface block above, these permutations mark authored
+/// colours with alpha = 1. A scalar immediately after the colour is roughness;
+/// older variants place that scalar shortly before the colour. Remaining
+/// effect constants have alpha = 0, which keeps this decoder structural rather
+/// than tied to a particular tag or colour.
+fn stage8_alpha_color_material(constants: &[[f32; 4]]) -> Option<TransmissionMaterial> {
+    let mut authored_colors = constants
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, color)| {
+            color[3].is_finite()
+                && (color[3] - 1.0).abs() <= 0.001
+                && color[..3]
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                && color[..3].iter().any(|value| *value > 0.001)
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    if authored_colors.is_empty() {
+        // Procedural runner energy uses an emissive RGB vector with alpha 0,
+        // followed by its signed edge remap (positive scale, negative bias and
+        // epsilon). This is a separate compiled stage-8 ABI from absorption
+        // glass; preserve its authored blue/orange/etc. instead of falling
+        // back to the first bound single-channel mask.
+        authored_colors = constants
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, color)| {
+                color[3].abs() <= 0.001
+                    && color[..3]
+                        .iter()
+                        .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                    && color[..3].iter().filter(|value| **value > 0.01).count() >= 2
+                    && constants.get(index + 1).is_some_and(|remap| {
+                        (1.0..=4.0).contains(&remap[0])
+                            && remap[1] < -1.0
+                            && (-0.1..0.0).contains(&remap[2])
+                            && remap[3].abs() <= 0.001
+                    })
+            })
+            .take(1)
+            .collect();
+        if authored_colors.is_empty() {
+            return None;
+        }
+    }
+
+    let scalar_roughness = |color_index: usize| {
+        let scalar = |value: &[f32; 4]| {
+            value[0].is_finite()
+                && (0.02..=1.0).contains(&value[0])
+                && value[1..].iter().all(|component| component.abs() <= 0.0001)
+        };
+        constants
+            .get(color_index + 1)
+            .filter(|value| scalar(value))
+            .map(|value| value[0])
+            .or_else(|| {
+                (color_index.saturating_sub(6)..color_index)
+                    .rev()
+                    .find_map(|index| constants.get(index).filter(|value| scalar(value)))
+                    .map(|value| value[0])
+            })
+            .unwrap_or(0.5)
+    };
+
+    let mut colors = Vec::with_capacity(2);
+    let mut surfaces = Vec::with_capacity(2);
+    for (index, mut color) in authored_colors {
+        color[3] = 1.0;
+        if !colors.contains(&color) {
+            colors.push(color);
+            surfaces.push([scalar_roughness(index), 0.0, 0.0, 0.0]);
+        }
+    }
+    let color_count = colors.len() as u8;
+    colors.resize(2, colors[0]);
+    surfaces.resize(2, surfaces[0]);
+    Some(TransmissionMaterial {
+        colors: [colors[0], colors[1]],
+        surfaces: [surfaces[0], surfaces[1]],
+        color_count,
+        absorption: None,
+        halftone: None,
+    })
 }
 
 /// Resolve an opaque material whose authored colour is a shared atlas.
 ///
 /// Shared atlases are normally technical resources and must not win generic
 /// albedo guessing. An opaque decal technique, however, can bind that same
-/// atlas as its sole PS t0 colour source. Direct-slot ownership makes that use
-/// unambiguous without naming a weapon or technique tag.
+/// atlas as its direct PS t0 colour source, optionally beside linear response
+/// maps. Direct-slot ownership makes that use unambiguous without naming a
+/// weapon or technique tag.
 fn direct_shared_color_atlas_for_technique(
     technique: TagHash,
     bindings: &[TechniqueTextureBinding],
@@ -3143,12 +6231,7 @@ fn direct_shared_color_atlas_for_technique(
     let preview = MaterialTagPreview::load(&entry, &data)?;
     let MaterialPreviewKind::Technique(preview) = preview.kind;
     let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
-    if pixel
-        .bytecode
-        .expressions
-        .iter()
-        .any(|expression| expression.expression.contains("DecalSetTransform"))
-    {
+    if tfx_has_marathon_decal_abi(&pixel.bytecode) {
         return None;
     }
     let pixel_textures = bindings
@@ -3157,23 +6240,75 @@ fn direct_shared_color_atlas_for_technique(
         .copied()
         .unique_by(|binding| binding.slot)
         .collect_vec();
-    let [atlas] = pixel_textures.as_slice() else {
+    let color_sources = pixel_textures
+        .iter()
+        .filter(|binding| texture_is_srgb(binding.tag))
+        .copied()
+        .collect_vec();
+    let [atlas] = color_sources.as_slice() else {
         return None;
     };
-    (atlas.slot == 0
-        && texture_is_srgb(atlas.tag)
-        && !matches!(render_state_for_technique(technique).blend, Some(26 | 27)))
-    .then_some(atlas.tag)
+    // Shared-atlas surface shaders may pair t0 colour with linear BC4/BC5
+    // response maps. Requiring one total texture discarded the proven t0
+    // colour and replaced it with Quicktag's white fallback.
+    (atlas.slot == 0 && !matches!(render_state_for_technique(technique).blend, Some(26 | 27)))
+        .then_some(atlas.tag)
+}
+
+/// Decode the common two-texture shared-atlas surface ABI.
+///
+/// Its compiled pixel shader writes
+/// `t0.rgb * saturate(base + scale * triplanar(t1)) * 4.5947933` to RT0.
+/// Recognize the binding/constant shape, never a weapon or tag hash.
+fn shared_atlas_detail_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<SharedAtlasDetailMaterial> {
+    let detail = bindings
+        .iter()
+        .find(|binding| {
+            binding.stage == "PS" && binding.slot == 1 && !texture_is_srgb(binding.tag)
+        })?
+        .tag;
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let constants = &preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .inline_constants;
+    let exponent = constants.get(3)?[0];
+    let projection = *constants.get(4)?;
+    let base = constants.get(5)?;
+    let scale = constants.get(6)?;
+    (exponent.is_finite()
+        && exponent > 0.0
+        && projection[0].is_finite()
+        && projection[1].is_finite()
+        && projection[0] > 0.0
+        && projection[1] > 0.0)
+        .then_some(SharedAtlasDetailMaterial {
+            detail,
+            projection,
+            exponent,
+            base: [base[0], base[1], base[2]],
+            scale: [scale[0], scale[1], scale[2]],
+            ambient_occlusion: 0.5,
+        })
 }
 
 /// Resolve Tiger's investment-decal pass.
 ///
 /// Weapon and runner geometry carries decal quads with selector UVs already
-/// baked into the mesh. Their pixel techniques read `DecalSetTransform` and
-/// use either a sole colour atlas or a colour + opacity + detail texture ABI.
-/// Treating these bindings as an ordinary material drops the authored stencil
-/// and renders Quicktag's white fallback. Decode the pass from its blend state,
-/// TFX extern, texture formats, and constant layout; no asset/tag rule is used.
+/// baked into the mesh. Their pixel techniques read Marathon `Decal` extern
+/// fields at raw scope 45 (`normals_read` texture +0x8 and resolution/offset
+/// vec4 +0x30), then use either a sole colour atlas or a colour + opacity +
+/// detail texture ABI. Treating these bindings as an ordinary material drops
+/// the authored stencil and renders Quicktag's white fallback. Decode the pass
+/// from its blend state, TFX extern, texture formats, and constant layout; no
+/// asset/tag rule is used.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum InvestmentDecalResolution {
     Atlas(TagHash),
@@ -3201,15 +6336,7 @@ fn investment_decal_for_technique(
     let preview = MaterialTagPreview::load(&entry, &data)?;
     let MaterialPreviewKind::Technique(preview) = preview.kind;
     let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
-    let reads_decal_transform = pixel
-        .bytecode
-        .expressions
-        .iter()
-        .any(|expression| expression.expression.contains("DecalSetTransform"));
-    if !reads_decal_transform {
-        return None;
-    }
-
+    let has_marathon_decal_abi = tfx_has_marathon_decal_abi(&pixel.bytecode);
     let pixel_textures = bindings
         .iter()
         .filter(|binding| binding.stage == "PS")
@@ -3219,12 +6346,63 @@ fn investment_decal_for_technique(
         .collect_vec();
 
     match pixel_textures.as_slice() {
-        [atlas] => Some(InvestmentDecalResolution::Atlas(atlas.tag)),
+        [atlas] if has_marathon_decal_abi => Some(InvestmentDecalResolution::Atlas(atlas.tag)),
         [color, mask]
-            if texture_is_srgb(color.tag)
+            if color.slot == 3
+                && mask.slot == 4
+                && has_marathon_decal_abi
+                && texture_is_srgb(color.tag)
+                && texture_is_single_channel(mask.tag)
+                && pixel.inline_constants.len() == 9 =>
+        {
+            let constants = &pixel.inline_constants;
+            Some(InvestmentDecalResolution::Shader(InvestmentDecalMaterial {
+                mode: InvestmentDecalMode::SceneNormalColorMask,
+                color: color.tag,
+                mask: mask.tag,
+                detail: None,
+                selector_colors: [[0.0; 4]; 5],
+                selector_color_count: 0,
+                atlas_selector_max: 0,
+                mask_mode: InvestmentDecalMaskMode::Threshold,
+                mask_threshold: constants[1][0],
+                detail_transform: [1.0, 1.0, 0.0, 0.0],
+                detail_base: [1.0; 4],
+                detail_scale: [0.0; 4],
+                grayscale_remap: [0.0, 1.0, 0.0, 0.0],
+                positive_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                negative_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                output_gate: 1.0,
+            }))
+        }
+        [color, mask]
+            if ((color.slot == 2 && mask.slot == 3) || (color.slot == 3 && mask.slot == 4))
+                && texture_is_srgb(color.tag)
                 && texture_is_single_channel(mask.tag)
                 && pixel.inline_constants.len() > 10 =>
         {
+            if color.slot == 2 && mask.slot == 3 && pixel.inline_constants.len() == 18 {
+                let constants = &pixel.inline_constants;
+                return Some(InvestmentDecalResolution::Shader(InvestmentDecalMaterial {
+                    mode: InvestmentDecalMode::SelectorMask,
+                    color: color.tag,
+                    mask: mask.tag,
+                    detail: None,
+                    selector_colors: [[0.0; 4]; 5],
+                    selector_color_count: 0,
+                    atlas_selector_max: 0,
+                    mask_mode: InvestmentDecalMaskMode::Threshold,
+                    mask_threshold: constants[1][0],
+                    detail_transform: [1.0, 1.0, 0.0, 0.0],
+                    detail_base: [1.0; 4],
+                    detail_scale: [0.0; 4],
+                    grayscale_remap: [0.0, 1.0, 0.0, 0.0],
+                    positive_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                    negative_mask_remap: [0.0, 1.0, 0.0, 0.0],
+                    output_gate: constants[17][1].clamp(0.0, 1.0),
+                }));
+            }
+
             let mut selector_colors = [[0.0; 4]; 5];
             selector_colors[0] = pixel.inline_constants[1];
             selector_colors[1] = pixel.inline_constants[2];
@@ -3248,7 +6426,8 @@ fn investment_decal_for_technique(
             }))
         }
         [detail, color, mask]
-            if texture_is_single_channel(detail.tag)
+            if has_marathon_decal_abi
+                && texture_is_single_channel(detail.tag)
                 && texture_is_srgb(color.tag)
                 && texture_is_single_channel(mask.tag)
                 && pixel.inline_constants.len() > 15 =>
@@ -3388,171 +6567,15 @@ fn gear_pattern_material(
     .then_some(decoded)
 }
 
-/// Decode animated inventory-surface branch from shader resources + TFX.
-/// No weapon, skin, package, shader, or texture hash participates in matching.
-fn animated_dither_material(
-    technique: TagHash,
-    bindings: &[TechniqueTextureBinding],
-) -> Option<AnimatedDitherMaterial> {
-    let pixel_bindings = bindings
-        .iter()
-        .filter(|binding| binding.stage == "PS")
-        .copied()
-        .sorted_by_key(|binding| binding.slot)
-        .unique_by(|binding| binding.slot)
-        .collect_vec();
-    let field = pixel_bindings.iter().find(|binding| binding.slot == 7)?.tag;
-    let technical_mask = pixel_bindings.iter().find(|binding| binding.slot == 6)?.tag;
-    if pixel_bindings.first()?.slot != 0
-        || pixel_bindings.last()?.slot != 7
-        || pixel_bindings.len() != 8
-    {
-        return None;
-    }
-
-    let entry = package_manager().get_entry(technique)?;
-    let data = package_manager().read_tag(technique).ok()?;
-    let preview = MaterialTagPreview::load(&entry, &data)?;
-    let MaterialPreviewKind::Technique(preview) = preview.kind;
-    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
-    let expression = |target: &str| {
-        pixel
-            .bytecode
-            .expressions
-            .iter()
-            .find(|expression| expression.target == target)
-            .map(|expression| expression.expression.as_str())
-    };
-    if !expression("output[67]")?.contains("Frame+0x0")
-        || !expression("output[66]")?.contains("Frame+0x0")
-        || !expression("output[71]")?.contains("Frame+0x0")
-    {
-        return None;
-    }
-
-    let tfx = &pixel.constants;
-    let inline = &pixel.inline_constants;
-    let phase_speed = tfx.get(0)?[0];
-    let secondary_scale = *tfx.get(10)?;
-    let secondary_scroll = [tfx.get(11)?[0], tfx.get(12)?[0]];
-    let primary_scale = *tfx.get(14)?;
-    let primary_scroll = [tfx.get(15)?[0], tfx.get(16)?[0]];
-    let waveform = [
-        inline.get(68)?[0],
-        inline.get(69)?[0],
-        inline.get(70)?[0],
-        inline.get(70)?[1],
-    ];
-    // With preview object channels at zero, TFX output c74 evaluates to this
-    // product. Outputs c75 and c77 evaluate to one; c76 is the inline master
-    // response. Keep c74 inside `(1 - wave*c74)`, exactly as the compiled PS.
-    let authored_strength = tfx.get(2)?[0] * tfx.get(4)?[0] * tfx.get(5)?[0] * tfx.get(6)?[0];
-    let response_scale = inline.get(76)?[0];
-    let dot_detail = pixel_bindings
-        .iter()
-        .find(|binding| binding.slot == 5)
-        .map(|binding| AnimatedDotDetailMaterial {
-            texture: binding.tag,
-            position_scale: inline[1][..3].try_into().expect("three-vector"),
-            position_offset: inline[2][..3].try_into().expect("three-vector"),
-            projection: inline[4],
-            fine_projection: inline[5],
-            normal_power: inline[3][0],
-            roughness_target: inline[89][0],
-            roughness_remap: inline[90][..2].try_into().expect("two-vector"),
-        })
-        .filter(|detail| {
-            (1.0..=128.0).contains(&detail.normal_power)
-                && detail.projection[0].abs() > 0.0001
-                && detail.projection[1].abs() > 0.0001
-                && detail.fine_projection[0].abs() > 0.0001
-                && detail.fine_projection[1].abs() > 0.0001
-                && (0.0..=1.0).contains(&detail.roughness_target)
-                && detail.roughness_remap[1] > 0.0
-        });
-    let decoded = AnimatedDitherMaterial {
-        field,
-        technical_mask,
-        technical_mask_remap: std::array::from_fn(|index| {
-            let constant = inline[82 + index];
-            [constant[0], constant[1]]
-        }),
-        dot_detail,
-        phase_speed,
-        primary_transform: [
-            primary_scale[0],
-            primary_scale[1],
-            primary_scroll[0],
-            primary_scroll[1],
-        ],
-        secondary_transform: [
-            secondary_scale[0],
-            secondary_scale[1],
-            secondary_scroll[0],
-            secondary_scroll[1],
-        ],
-        waveform,
-        facing_response: [
-            inline.get(73)?[0],
-            inline.get(73)?[1],
-            response_scale,
-            authored_strength,
-        ],
-        surface_response: [
-            inline.get(78)?[0],
-            inline.get(79)?[0],
-            inline.get(80)?[0],
-            inline.get(81)?[0],
-        ],
-    };
-    let values = [decoded.phase_speed]
-        .into_iter()
-        .chain(decoded.technical_mask_remap.into_iter().flatten())
-        .chain(decoded.dot_detail.into_iter().flat_map(|detail| {
-            detail
-                .position_scale
-                .into_iter()
-                .chain(detail.position_offset)
-                .chain(detail.projection)
-                .chain(detail.fine_projection)
-                .chain([detail.normal_power, detail.roughness_target])
-                .chain(detail.roughness_remap)
-        }))
-        .chain(decoded.primary_transform)
-        .chain(decoded.secondary_transform)
-        .chain(decoded.waveform)
-        .chain(decoded.facing_response)
-        .chain(decoded.surface_response);
-    (values.clone().all(f32::is_finite)
-        && (0.01..=20.0).contains(&decoded.phase_speed)
-        && decoded.primary_transform[..2]
-            .iter()
-            .all(|value| (0.1..=100.0).contains(&value.abs()))
-        && decoded.secondary_transform[..2]
-            .iter()
-            .all(|value| (0.1..=100.0).contains(&value.abs()))
-        && decoded.primary_transform[2..]
-            .iter()
-            .chain(&decoded.secondary_transform[2..])
-            .all(|value| value.abs() <= 2.0)
-        && decoded.waveform[0] > 0.0
-        && decoded.waveform[1] > 0.0
-        && decoded.facing_response[1] > 0.0
-        && decoded.facing_response[2] > 0.0
-        && decoded.surface_response[0] > 0.0
-        && decoded.surface_response[1] > 0.0)
-        .then_some(decoded)
-}
-
 fn texture_is_srgb(texture: TagHash) -> bool {
-    Texture::load_data_d2(texture, false)
-        .map(|(desc, _data, _comment)| format!("{:?}", desc.format).contains("Srgb"))
+    Texture::validated_descriptor_d2(texture)
+        .map(|desc| format!("{:?}", desc.format).contains("Srgb"))
         .unwrap_or(false)
 }
 
 fn texture_is_single_channel(texture: TagHash) -> bool {
-    Texture::load_data_d2(texture, false)
-        .map(|(desc, _data, _comment)| {
+    Texture::validated_descriptor_d2(texture)
+        .map(|desc| {
             let format = format!("{:?}", desc.format);
             format.contains("Bc4") || format.contains("R8Unorm")
         })
@@ -3598,27 +6621,69 @@ fn textureless_flat_material_for_technique(technique: TagHash) -> Option<Texture
         expression.target == "output[3]"
             && expression.expression.contains("object_channel(0xC9A5E5AC)")
     });
-    if !sends_frame_color || !sends_selector {
-        return None;
+    if sends_frame_color && sends_selector {
+        let color = *pixel.inline_constants.get(1)?;
+        let epsilon = pixel.inline_constants.get(4)?.first().copied()?;
+        if !color.iter().all(|value| value.is_finite())
+            || !color[..3].iter().all(|value| (0.0..=1.0).contains(value))
+            || !(0.0..=0.001).contains(&epsilon)
+        {
+            return None;
+        }
+        let metalness = pixel
+            .inline_constants
+            .get(36)
+            .map(|value| value[0].clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        return Some(TexturelessFlatMaterial {
+            color,
+            roughness: 0.5,
+            metalness,
+        });
     }
 
-    let color = *pixel.inline_constants.get(1)?;
-    let epsilon = pixel.inline_constants.get(4)?.first().copied()?;
+    // Animated textureless panels can build their base colour through a TFX
+    // spline/gradient instead of storing one fixed inline vector. Evaluate
+    // every authored object-channel dependency at the preview default (zero),
+    // then consume the proven colour output. Syntax Disrupt resolves through
+    // this path to the gradient's [0.0, 0.4, 1.0, 1.0] endpoint.
+    let color_target = pixel.bytecode.expressions.iter().find(|expression| {
+        expression.target == "output[0]"
+            && expression.expression.contains("gradient4_const")
+            && expression.expression.contains("object_channel(")
+    })?;
+    let object_channels = pixel
+        .bytecode
+        .ops
+        .iter()
+        .filter(|op| op.name == "push_object_channel")
+        .filter_map(|op| {
+            let hash = op.detail.strip_prefix("0x")?;
+            Some((u32::from_str_radix(hash, 16).ok()?, [0.0; 4]))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if object_channels.is_empty() {
+        return None;
+    }
+    let (_bindings, expressions) = interpret_tfx_stack_with_object_channels(
+        &pixel.bytecode.ops,
+        &pixel.constants,
+        &object_channels,
+    );
+    let color = expressions
+        .iter()
+        .find(|expression| expression.target == color_target.target)
+        .and_then(|expression| expression.value)?;
     if !color.iter().all(|value| value.is_finite())
-        || !color[..3].iter().all(|value| (0.0..=1.0).contains(value))
-        || !(0.0..=0.001).contains(&epsilon)
+        || !color.iter().all(|value| (0.0..=1.0).contains(value))
+        || color[3] <= 0.001
     {
         return None;
     }
-    let metalness = pixel
-        .inline_constants
-        .get(36)
-        .map(|value| value[0].clamp(0.0, 1.0))
-        .unwrap_or(0.0);
     Some(TexturelessFlatMaterial {
         color,
         roughness: 0.5,
-        metalness,
+        metalness: 0.0,
     })
 }
 
@@ -3681,78 +6746,109 @@ fn procedural_surface_material_for_technique(
     })
 }
 
-/// Decode Tiger's textureless, TFX-driven G-buffer material family.
-///
-/// These techniques author their visible base colour in TFX output 1 rather
-/// than in a texture. The pixel shader consumes that output as cbuffer[1].rgb;
-/// falling back to Quicktag's white texture therefore produces solid white
-/// panels over otherwise-correct investment decals. Evaluate the same TFX
-/// program at the preview clock origin and use its authored linear colour.
-/// Animated materials still receive a deterministic, valid frame instead of
-/// an invented white albedo.
-fn animated_flat_material_for_technique(technique: TagHash) -> Option<TexturelessFlatMaterial> {
-    let entry = package_manager().get_entry(technique)?;
-    let data = package_manager().read_tag(technique).ok()?;
-    if texture_bindings_for_technique(&entry, &data)
-        .into_iter()
-        .any(|binding| binding.stage == "PS")
-    {
-        return None;
-    }
-
-    let preview = MaterialTagPreview::load(&entry, &data)?;
-    let MaterialPreviewKind::Technique(preview) = preview.kind;
-    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
-    if !pixel
-        .bytecode
-        .expressions
-        .iter()
-        .any(|expression| expression.target == "output[1]")
-    {
-        return None;
-    }
-
-    let object_channels = pixel
-        .bytecode
-        .ops
-        .iter()
-        .filter(|op| op.name == "push_object_channel")
-        .filter_map(|op| {
-            Some((
-                u32::from_str_radix(op.detail.strip_prefix("0x")?, 16).ok()?,
-                [0.0; 4],
-            ))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let extern_values = std::collections::HashMap::from([("Frame+0x0".to_string(), [0.0; 4])]);
-    let (_bindings, expressions) = interpret_tfx_stack_with_runtime_inputs(
-        &pixel.bytecode.ops,
-        &pixel.constants,
-        &object_channels,
-        &extern_values,
-    );
-    let color = expressions
-        .iter()
-        .find(|expression| expression.target == "output[1]")?
-        .value?;
-    if !color.iter().all(|value| value.is_finite())
-        || !color[..3].iter().all(|value| (0.0..=1.0).contains(value))
-    {
-        return None;
-    }
-
-    Some(TexturelessFlatMaterial {
-        color: [color[0], color[1], color[2], color[3].clamp(0.0, 1.0)],
-        roughness: 0.5,
-        metalness: 0.0,
-    })
-}
-
-const WEAPON_MOD_AGE_CHANNEL: u32 = 0x138D_E801;
-const UNIQUE_ID_CHANNEL: u32 = 0xD358_3E54;
+pub(crate) const WEAPON_MOD_AGE_CHANNEL: u32 = 0x138D_E801;
+pub(crate) const UNIQUE_ID_CHANNEL: u32 = 0xD358_3E54;
 const WEAPON_MOD_SCRATCHES_PROJECTION_AGE_DELTA: usize = 10;
 const WEAPON_MOD_SCRATCHES_REMAP_BASE_AGE_DELTA: usize = 9;
 const WEAPON_MOD_SCRATCHES_REMAP_SCALE_AGE_DELTA: usize = 8;
+
+fn weapon_surface_condition_material(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<WeaponSurfaceConditionMaterial> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    let pixel = preview.stages.iter().find(|stage| stage.stage == "PS")?;
+
+    // Compiled common-weapon body ABI. These object-channel expressions are
+    // the stable semantic signature; register numbers move between shader
+    // permutations, so locate the condition gate first and read relative rows.
+    let gate = pixel.bytecode.expressions.iter().find(|expression| {
+        expression.expression.contains("object_channel(0xA590EEC6)")
+            && expression.expression.contains("object_channel(0x714FE9CA)")
+    })?;
+    if !pixel.bytecode.expressions.iter().any(|expression| {
+        expression.expression.contains("object_channel(0xD4FB5E33)")
+            && expression.expression.contains("object_channel(0xEAA8E3CF)")
+    }) {
+        return None;
+    }
+    let gate_index = gate
+        .target
+        .strip_prefix("output[")?
+        .strip_suffix(']')?
+        .parse::<usize>()
+        .ok()?;
+    let row = |delta: isize| {
+        let index = gate_index.checked_add_signed(delta)?;
+        pixel.inline_constants.get(index).copied()
+    };
+    let projection_target = format!("output[{}]", gate_index.checked_sub(4)?);
+    let projection_expression = pixel
+        .bytecode
+        .expressions
+        .iter()
+        .find(|expression| expression.target == projection_target)?;
+    let projection_constant = projection_expression
+        .expression
+        .split("constant[")
+        .nth(1)?
+        .split(']')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    let projection = *pixel.constants.get(projection_constant)?;
+    if projection[0] <= 0.0 || projection[1] <= 0.0 {
+        return None;
+    }
+    let breakup = bindings
+        .iter()
+        .find(|binding| binding.stage == "PS" && binding.slot == 6)?
+        .tag;
+    let response = bindings
+        .iter()
+        .find(|binding| binding.stage == "PS" && binding.slot == 2)?
+        .tag;
+    let detail = bindings
+        .iter()
+        .find(|binding| binding.stage == "PS" && binding.slot == 4)?
+        .tag;
+
+    let detail_projection = row(-70)?;
+    let detail_exponent = row(-71)?[0];
+    let detail_roughness = row(14)?[0];
+    let detail_remap = [row(15)?[0], row(15)?[1]];
+    if !detail_projection.into_iter().all(f32::is_finite)
+        || detail_projection[0] <= 0.0
+        || detail_projection[1] <= 0.0
+        || !detail_exponent.is_finite()
+        || detail_exponent <= 0.0
+        || !detail_roughness.is_finite()
+        || !(0.0..=1.0).contains(&detail_roughness)
+        || !detail_remap.into_iter().all(f32::is_finite)
+    {
+        return None;
+    }
+
+    Some(WeaponSurfaceConditionMaterial {
+        response,
+        detail,
+        breakup,
+        detail_projection,
+        detail_exponent,
+        detail_roughness,
+        detail_remap,
+        projection,
+        phase: row(-8)?[0],
+        triangle: [row(-7)?[0], row(-6)?[0], row(-5)?[0], row(-5)?[1]],
+        orientation: [row(-2)?[0], row(-2)?[1]],
+        albedo: [row(3)?[0], row(4)?[0], row(6)?[0]],
+        roughness: 0.9,
+        normal_flatten: row(5)?[0],
+    })
+}
 
 /// Marathon's common weapon-part shader exposes extra surface inputs at PS
 /// t5..t7. Inventory rarities share one Pattern and texture set. Runtime sends
@@ -3763,7 +6859,7 @@ const WEAPON_MOD_SCRATCHES_REMAP_SCALE_AGE_DELTA: usize = 8;
 fn weapon_mod_wear_material(
     technique: TagHash,
     bindings: &[TechniqueTextureBinding],
-) -> Option<WeaponModWearMaterial> {
+) -> Option<WeaponModConditionMaterial> {
     let entry = package_manager().get_entry(technique)?;
     let data = package_manager().read_tag(technique).ok()?;
     let preview = MaterialTagPreview::load(&entry, &data)?;
@@ -3912,7 +7008,7 @@ fn weapon_mod_wear_material(
             .map(|binding| binding.tag)
             .filter(|texture| local_surface_texture_candidate(*texture, technique))
     };
-    Some(WeaponModWearMaterial {
+    Some(WeaponModConditionMaterial {
         scratches: texture_at(5)?,
         grime: texture_at(6)?,
         damage: texture_at(7)?,
@@ -3950,13 +7046,16 @@ fn promote_auxiliary_preview_color(material: &mut WireframeMaterialTextures, tec
             .copied()
             .find(|texture| preview_mask_candidate(*texture));
     }
+    if let Some(color) = material.color {
+        material.aux.retain(|texture| *texture != color);
+    }
 }
 
 fn local_surface_texture_candidate(texture: TagHash, technique: TagHash) -> bool {
     if texture.pkg_id() != technique.pkg_id() || fallback_aux_texture(texture) {
         return false;
     }
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -3972,7 +7071,7 @@ fn preview_mask_candidate(texture: TagHash) -> bool {
     if fallback_aux_texture(texture) {
         return false;
     }
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -4012,28 +7111,46 @@ fn assign_material_texture(
     texture: TagHash,
     role: MaterialTextureRole,
 ) {
-    if Some(texture) == material.color
-        || Some(texture) == material.normal
-        || Some(texture) == material.emissive
-        || Some(texture) == material.control
-        || material.aux.contains(&texture)
-        || material.layers.iter().any(|layer| {
-            layer.color == Some(texture)
-                || layer.normal == Some(texture)
-                || layer.emissive == Some(texture)
-        })
-    {
-        return;
-    }
-
     match role {
-        MaterialTextureRole::Color => assign_color_layer(material, texture),
-        MaterialTextureRole::Normal => assign_normal_layer(material, texture),
+        MaterialTextureRole::Color => {
+            material.aux.retain(|candidate| *candidate != texture);
+            if !material
+                .layers
+                .iter()
+                .any(|layer| layer.color == Some(texture))
+            {
+                assign_color_layer(material, texture);
+            }
+        }
+        MaterialTextureRole::Normal => {
+            material.aux.retain(|candidate| *candidate != texture);
+            if !material
+                .layers
+                .iter()
+                .any(|layer| layer.normal == Some(texture))
+            {
+                assign_normal_layer(material, texture);
+            }
+        }
         MaterialTextureRole::Control(channel) => {
+            material.aux.retain(|candidate| *candidate != texture);
             material.control = Some(texture);
             material.roughness_channel = channel;
         }
-        _ => material.aux.push(texture),
+        MaterialTextureRole::Aux => {
+            let semantic = Some(texture) == material.color
+                || Some(texture) == material.normal
+                || Some(texture) == material.emissive
+                || Some(texture) == material.control
+                || material.layers.iter().any(|layer| {
+                    layer.color == Some(texture)
+                        || layer.normal == Some(texture)
+                        || layer.emissive == Some(texture)
+                });
+            if !semantic && !material.aux.contains(&texture) {
+                material.aux.push(texture);
+            }
+        }
     }
 }
 
@@ -4101,29 +7218,93 @@ fn material_texture_role(
     }
 }
 
+fn material_color_texture_slot_for_technique(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<u32> {
+    let pixel_shader = package_manager()
+        .get_entry(technique)
+        .zip(package_manager().read_tag(technique).ok())
+        .and_then(|(entry, data)| MaterialTagPreview::load(&entry, &data))
+        .and_then(|preview| {
+            let MaterialPreviewKind::Technique(preview) = preview.kind;
+            preview
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "PS")
+                .and_then(|stage| stage.shader)
+        });
+
+    let exact = match pixel_shader {
+        // B860 generates skin colour from c121/c122/c123. t1 is a shared
+        // cellular response LUT, not model albedo. Keep t0 as the material
+        // key so local normal/AO resources remain attached; mode 41 replaces
+        // its scalar preview colour in WGSL.
+        Some(TagHash(0x80A9B860)) => Some(0),
+        // Compiled hair/fiber shaders bind shared environment lookup at t0
+        // and local strand albedo at t1. Treating t0 as model color discards
+        // every authored hair texture on Thief/Vandal-style three-part shells.
+        Some(TagHash(0x80A4840A)) | Some(TagHash(0x80B073D2)) | Some(TagHash(0x80B08209)) => {
+            Some(1)
+        }
+        _ => None,
+    };
+    if exact.is_some() {
+        return exact;
+    }
+
+    // Scalar t0 cannot supply albedo. Generated procedural runner shaders
+    // place authored sRGB color later in their resource table. Prefer it over
+    // rendering the scalar selector as gray.
+    let slot0_is_scalar = bindings
+        .iter()
+        .any(|binding| binding.slot == 0 && texture_preview_format(binding.tag).contains("Bc4"));
+    if !slot0_is_scalar {
+        return None;
+    }
+    bindings
+        .iter()
+        .filter(|binding| texture_is_srgb(binding.tag) && !fallback_aux_texture(binding.tag))
+        .min_by_key(|binding| (binding.tag.pkg_id() != technique.pkg_id(), binding.slot))
+        .map(|binding| binding.slot)
+}
+
 fn material_control_texture_slot(
+    technique: TagHash,
     bindings: &[TechniqueTextureBinding],
     normal_slot: Option<u32>,
 ) -> Option<(u32, u8)> {
+    // Face/skin surface 80A9B85C binds its packed region selector at t2.
+    // t3 is a shared response field, while t5 is the tangent-space normal.
+    // The compact-family heuristic otherwise mistakes t3 for the dye selector.
+    match material_pixel_shader(technique) {
+        Some(TagHash(0x80A9B85C)) => return Some((2, 4)),
+        Some(TagHash(0x80A9C430)) => return Some((1, 4)),
+        Some(TagHash(0x80A9C65C)) => return Some((1, 4)),
+        Some(TagHash(0x80A9CBEE)) => return Some((2, 4)),
+        _ => {}
+    }
     let max_slot = bindings.iter().map(|binding| binding.slot).max()?;
     let usable = |slot| {
-        bindings.iter().any(|binding| {
-            binding.slot == slot
-                && !fallback_aux_texture(binding.tag)
-                && material_control_texture_candidate(binding.tag)
-        })
+        Some(slot) != normal_slot
+            && bindings.iter().any(|binding| {
+                binding.slot == slot
+                    && !fallback_aux_texture(binding.tag)
+                    && material_control_texture_candidate(binding.tag)
+            })
     };
     let usable_multichannel = |slot| {
-        bindings.iter().any(|binding| {
-            binding.slot == slot
-                && !fallback_aux_texture(binding.tag)
-                && material_control_texture_candidate(binding.tag)
-                && !texture_preview_format(binding.tag).contains("Bc4")
-        })
+        Some(slot) != normal_slot
+            && bindings.iter().any(|binding| {
+                binding.slot == slot
+                    && !fallback_aux_texture(binding.tag)
+                    && material_control_texture_candidate(binding.tag)
+                    && !texture_preview_format(binding.tag).contains("Bc4")
+            })
     };
 
-    if max_slot >= 10 && usable_multichannel(2) {
-        return Some((2, 3));
+    if max_slot >= 10 && usable_multichannel(3) {
+        return Some((3, 3));
     }
     if max_slot <= 4 && normal_slot == Some(2) && usable(1) {
         return Some((1, 1));
@@ -4131,17 +7312,23 @@ fn material_control_texture_slot(
     if (5..10).contains(&max_slot) && usable_multichannel(3) {
         return Some((3, 4));
     }
+    if (5..10).contains(&max_slot) && usable_multichannel(1) {
+        // Compact/full runner gear permutations bind their local packed
+        // region/surface selector at t1. t3 is often the shared 80A613F5
+        // lighting ramp and must never drive GearDye region IDs.
+        return Some((1, 4));
+    }
     None
 }
 
 fn texture_preview_format(texture: TagHash) -> String {
-    Texture::load_data_d2(texture, false)
-        .map(|(desc, _data, _comment)| format!("{:?}", desc.format))
+    Texture::validated_descriptor_d2(texture)
+        .map(|desc| format!("{:?}", desc.format))
         .unwrap_or_default()
 }
 
 fn material_control_texture_candidate(texture: TagHash) -> bool {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -4150,6 +7337,106 @@ fn material_control_texture_candidate(texture: TagHash) -> bool {
         && desc.width > 1
         && desc.height > 1
         && !format.contains("Srgb")
+}
+
+fn material_normal_texture_slot_for_technique(
+    technique: TagHash,
+    bindings: &[TechniqueTextureBinding],
+) -> Option<u32> {
+    // Generated runner shaders do not consistently place their base tangent
+    // normal in the last linear 2D slot. These two audited families append
+    // procedural/detail fields after the base normal:
+    //
+    // 80A9B75C: t3 base normal, t4 procedural 2D field, t5 3D field.
+    // 80A9AFB6: t4 base normal, t3 gated detail normal, t5 procedural field.
+    //
+    // Resolve from compiled PS ABI before applying the generic table rule.
+    let pixel_shader = material_pixel_shader(technique);
+    match pixel_shader {
+        // Two-mask runner surface. PS t1 is scalar coverage, t2 is scalar AO,
+        // and DXIL samples t3 at mesh UV before reconstructing tangent-space Z.
+        Some(TagHash(0x80A9A9D3)) => return Some(3),
+        Some(TagHash(0x80A9B860)) => return Some(3),
+        Some(TagHash(0x80A9B07B)) => return Some(6),
+        Some(TagHash(0x80A9B855)) => return Some(4),
+        Some(TagHash(0x80A9B857)) | Some(TagHash(0x80A9B85A)) => return Some(3),
+        Some(TagHash(0x80A9C244)) => return Some(8),
+        Some(TagHash(0x80A9AFB4)) => return Some(6),
+        Some(TagHash(0x80A9B75C)) => return Some(3),
+        Some(TagHash(0x80A9AFB6)) | Some(TagHash(0x80A9BBBE)) | Some(TagHash(0x80A9BBBF)) => {
+            return Some(4);
+        }
+        Some(TagHash(0x80A9B93E))
+        | Some(TagHash(0x80A9BBDD))
+        | Some(TagHash(0x80A9CBAE))
+        | Some(TagHash(0x80A9D6FD))
+        | Some(TagHash(0x80A9DC9A))
+        | Some(TagHash(0x80A9DEEC))
+        | Some(TagHash(0x80A9E0FD))
+        | Some(TagHash(0x80A9E4DB))
+        | Some(TagHash(0x80A9E76C)) => return Some(6),
+        Some(TagHash(0x80A9B610)) | Some(TagHash(0x80A9C3F6)) => return Some(7),
+        Some(TagHash(0x80A9A8CF)) => return Some(7),
+        Some(TagHash(0x80A9AD5D)) => return Some(9),
+        Some(TagHash(0x80A9AD68)) => return Some(7),
+        Some(TagHash(0x80A9A9AD)) | Some(TagHash(0x80A9A9B1)) => return Some(9),
+        Some(TagHash(0x80A9B065)) | Some(TagHash(0x80A9DE77)) => return Some(6),
+        Some(TagHash(0x80A9B06A)) => return Some(6),
+        Some(TagHash(0x80A9B71C)) => return Some(4),
+        Some(TagHash(0x80A9B85C)) => return Some(5),
+        Some(TagHash(0x80A9C430)) => return Some(5),
+        Some(TagHash(0x80A9C65C)) => return Some(4),
+        Some(TagHash(0x80A9CBEE)) => return Some(5),
+        Some(TagHash(0x80A9C27C)) => return Some(6),
+        Some(TagHash(0x80A9AFBF)) => return Some(6),
+        Some(TagHash(0x80AA0261)) | Some(TagHash(0x80AA0263)) => return Some(5),
+        Some(TagHash(0x80AA02A7)) => return Some(4),
+        Some(TagHash(0x80A9B86A)) => return Some(7),
+        Some(TagHash(0x80A9D952)) => return Some(7),
+        Some(TagHash(0x80A9AE19)) | Some(TagHash(0x80A9DAC9)) | Some(TagHash(0x80A9DB9A)) => {
+            return Some(7);
+        }
+        Some(TagHash(0x80A9AFB8)) | Some(TagHash(0x80A9AFBA)) => return Some(9),
+        Some(TagHash(0x80A9BD17)) | Some(TagHash(0x80A9DA29)) | Some(TagHash(0x80A9E64F)) => {
+            return Some(7);
+        }
+        Some(TagHash(0x80A9C31E)) => return Some(5),
+        Some(TagHash(0x80A9DCF8)) => return Some(6),
+        Some(TagHash(0x80A9C96F)) | Some(TagHash(0x80A9D2D7)) | Some(TagHash(0x80A9D3FC)) => {
+            return Some(8);
+        }
+        Some(TagHash(0x80A9D569)) => return Some(9),
+        Some(TagHash(0x80A9F4E5)) => return Some(7),
+        Some(TagHash(0x80A9F500)) => return Some(8),
+        Some(TagHash(0x80A9F518)) | Some(TagHash(0x80A9F4B3)) => return Some(7),
+        Some(TagHash(0x80A9F528)) => return Some(6),
+        Some(TagHash(0x80A9F589)) => return Some(4),
+        // Runner character permutations below t10 need explicit PS ABI slots;
+        // generic material inference intentionally stays weapon-safe.
+        Some(TagHash(0x80AA043B)) => return Some(5),
+        Some(TagHash(0x80AA046E)) => return Some(6),
+        Some(TagHash(0x80AA0498)) | Some(TagHash(0x80B14062)) => return Some(8),
+        Some(TagHash(0x80B142A5)) => return Some(9),
+        Some(TagHash(0x80B143A0)) => return Some(6),
+        Some(TagHash(0x80B1444E)) | Some(TagHash(0x80B14701)) | Some(TagHash(0x80B14BF9)) => {
+            return Some(7);
+        }
+        _ => {}
+    }
+
+    material_normal_texture_slot(bindings)
+}
+
+fn material_pixel_shader(technique: TagHash) -> Option<TagHash> {
+    let entry = package_manager().get_entry(technique)?;
+    let data = package_manager().read_tag(technique).ok()?;
+    let preview = MaterialTagPreview::load(&entry, &data)?;
+    let MaterialPreviewKind::Technique(preview) = preview.kind;
+    preview
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "PS")?
+        .shader
 }
 
 fn material_normal_texture_slot(bindings: &[TechniqueTextureBinding]) -> Option<u32> {
@@ -4178,7 +7465,7 @@ fn material_normal_texture_slot(bindings: &[TechniqueTextureBinding]) -> Option<
 }
 
 fn normal_surface_texture_candidate(texture: TagHash) -> bool {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -4195,7 +7482,7 @@ fn guessed_related_texture_role(
     technique: TagHash,
     material: &WireframeMaterialTextures,
 ) -> MaterialTextureRole {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return MaterialTextureRole::Aux;
     };
 
@@ -4212,7 +7499,7 @@ fn guessed_related_texture_role(
 }
 
 fn fallback_color_candidate(texture: TagHash, technique: TagHash) -> bool {
-    let Ok((desc, _data, _comment)) = Texture::load_data_d2(texture, false) else {
+    let Ok(desc) = Texture::validated_descriptor_d2(texture) else {
         return false;
     };
     let format = format!("{:?}", desc.format);
@@ -4226,17 +7513,21 @@ fn fallback_color_candidate(texture: TagHash, technique: TagHash) -> bool {
 }
 
 fn fallback_aux_texture(texture: TagHash) -> bool {
-    matches!(
-        texture.0,
-        0x80A60058
-            | 0x80A4050F
-            | 0x80A46D44
-            | 0x80A46D48
-            | 0x80A60055
-            | 0x80A6007D
-            | 0x80A43539
-            | 0x80B6CC6E
-    )
+    texture == TagHash::new(288, 1296)
+        || matches!(
+            texture.0,
+            0x80A60000
+                | 0x80A60058
+                | 0x80A60089
+                | 0x80A613F5
+                | 0x80A4050F
+                | 0x80A46D44
+                | 0x80A46D48
+                | 0x80A60055
+                | 0x80A6007D
+                | 0x80A43539
+                | 0x80B6CC6E
+        )
 }
 
 fn texture_has_parent_technique(cache: &TagCache, texture: TagHash, technique: TagHash) -> bool {
@@ -4469,6 +7760,13 @@ fn parse_model_wireframe(
     tag: TagHash,
     entry: &UEntryHeader,
 ) -> Option<(MeshSourcePreview, WireframePreview)> {
+    cache::mesh(tag, entry, || decode_model_wireframe(tag, entry))
+}
+
+fn decode_model_wireframe(
+    tag: TagHash,
+    entry: &UEntryHeader,
+) -> Option<(MeshSourcePreview, WireframePreview)> {
     match entry.reference {
         0x80806D44 => parse_static_mesh_wireframe(tag),
         0x80806D30 => {
@@ -4500,6 +7798,9 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
     let buffers = read_static_buffer_tuples(data, 0x28, endian);
     let group = groups
         .iter()
+        .filter(|group| {
+            group.render_stage == crate::render::stage::MarathonRenderStage::GenerateGbuffer.raw()
+        })
         .filter_map(|group| {
             parts
                 .get(group.part_index as usize)
@@ -4507,7 +7808,19 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         })
         .min_by_key(|(_group, part)| (lod_selection_rank(part.lod_category), part.index_start))
         .map(|(group, _part)| group)
-        .or_else(|| groups.first())?;
+        .or_else(|| {
+            groups
+                .iter()
+                .filter_map(|group| {
+                    parts
+                        .get(group.part_index as usize)
+                        .map(|part| (group, part))
+                })
+                .min_by_key(|(_group, part)| {
+                    (lod_selection_rank(part.lod_category), part.index_start)
+                })
+                .map(|(group, _part)| group)
+        })?;
     let part = parts.get(group.part_index as usize)?;
     let buffers = buffers.get(part.buffer_index as usize)?;
 
@@ -4519,6 +7832,7 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         index_start: part.index_start,
         index_count: part.index_count,
         primitive_type: part.primitive_type,
+        raw_lod_category: part.lod_category,
         lod_category: lod_preview_value(part.lod_category),
         input_layout_index: Some(group.input_layout_index),
         index_buffer: buffers.index_buffer,
@@ -4534,9 +7848,11 @@ fn parse_static_mesh_data_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, W
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            raw_lod_category: Some(source.raw_lod_category),
             render_stage: None,
             technique: source.technique,
             gear_dye_change_color_index: None,
+            authored_draw: None,
         }],
         source.input_layout_index,
     )?;
@@ -4569,6 +7885,7 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         index_start: part.index_start,
         index_count: part.index_count,
         primitive_type: part.primitive_type,
+        raw_lod_category: part.lod_category,
         lod_category: lod_preview_value(part.lod_category),
         input_layout_index: first_dynamic_input_layout(data),
         index_buffer: TagHash(read_u32(data.get(0x10..0x14)?, endian)),
@@ -4584,9 +7901,11 @@ fn parse_dynamic_mesh_wireframe(data: &[u8]) -> Option<(MeshSourcePreview, Wiref
         &[PreviewIndexRange {
             range: source.index_start as usize..(source.index_start + source.index_count) as usize,
             primitive_type: source.primitive_type,
+            raw_lod_category: Some(source.raw_lod_category),
             render_stage: None,
             technique: source.technique,
             gear_dye_change_color_index: None,
+            authored_draw: None,
         }],
         source.input_layout_index,
     )?;
@@ -4631,6 +7950,7 @@ fn parse_geometry_resource_wireframe(
                 index_count
             },
             primitive_type: range.map(|range| range.primitive_type).unwrap_or(0),
+            raw_lod_category: range.map(|range| range.lod_category).unwrap_or(0),
             lod_category: range
                 .map(|range| lod_preview_value(range.lod_category))
                 .unwrap_or(0),
@@ -4648,6 +7968,24 @@ fn parse_geometry_resource_wireframe(
             index_ranges.as_slice(),
             source.input_layout_index,
         )?;
+        wireframe.authored_inputs = vec![authored_geometry_input(
+            tag,
+            mesh,
+            &data,
+            endian,
+            position_transform,
+            uv_transform,
+        )];
+        for range in &mut wireframe.material_ranges {
+            range.authored_source = Some(0);
+        }
+        wireframe.authored_shadow_ranges = geometry_authored_stage_ranges(
+            &data,
+            endian,
+            source.index_buffer,
+            wireframe.vertices.len(),
+            crate::render::stage::MarathonRenderStage::ShadowGenerate,
+        );
         if let Some(transform) = position_transform {
             apply_geometry_position_transform(&mut wireframe, transform);
         }
@@ -4671,6 +8009,7 @@ fn parse_geometry_resource_wireframe(
             index_count
         },
         primitive_type: range.map(|range| range.primitive_type).unwrap_or(0),
+        raw_lod_category: range.map(|range| range.lod_category).unwrap_or(0),
         lod_category: range
             .map(|range| lod_preview_value(range.lod_category))
             .unwrap_or(0),
@@ -4688,6 +8027,47 @@ fn parse_geometry_resource_wireframe(
         index_ranges.as_slice(),
         source.input_layout_index,
     )?;
+    let stage_layouts = geometry_render_stage_abi(&data, endian)
+        .map(|abi| {
+            abi.input_layouts
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(raw_stage, layout_id)| AuthoredStageInputLayout {
+                    raw_stage: raw_stage as u8,
+                    layout_id,
+                    descriptor: authored_input_layout_descriptor(layout_id),
+                })
+                .collect_vec()
+        })
+        .unwrap_or_default();
+    wireframe.authored_inputs = vec![AuthoredGeometryInput {
+        geometry: tag,
+        vertex_streams: [
+            authored_vertex_stream_ref(0, source.vertex0_buffer),
+            authored_vertex_stream_ref(1, source.vertex1_buffer),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        color_buffer: None,
+        skinning_buffer: None,
+        index_buffer: authored_index_buffer_ref(source.index_buffer),
+        stage_layouts,
+        position_transform,
+        uv_transform,
+        attachment_pose: None,
+    }];
+    for range in &mut wireframe.material_ranges {
+        range.authored_source = Some(0);
+    }
+    wireframe.authored_shadow_ranges = geometry_authored_stage_ranges(
+        &data,
+        endian,
+        source.index_buffer,
+        wireframe.vertices.len(),
+        crate::render::stage::MarathonRenderStage::ShadowGenerate,
+    );
     if let Some(transform) = position_transform {
         apply_geometry_position_transform(&mut wireframe, transform);
     }
@@ -4718,6 +8098,33 @@ fn build_wireframe_from_refs(
         .iter_mut()
         .find_map(|(vertex_tag, preview)| Some((*vertex_tag, preview.wireframe.take()?)))?;
 
+    wireframe.rigid_indices = input_layout_rigid_indices(
+        &vertex_previews,
+        input_layout_index,
+        wireframe.vertices.len(),
+    );
+
+    if input_layout_index == Some(13)
+        && let Some((_position_tag, InputLayoutFormat::R32G32B32A32Float, positions)) =
+            input_layout_vectors(
+                &vertex_previews,
+                input_layout_index,
+                SEMANTIC_POSITION,
+                wireframe.vertices.len(),
+            )
+    {
+        wireframe.vertices = positions
+            .into_iter()
+            .map(|position| [position[0], position[1], position[2]])
+            .collect();
+        wireframe.procedural_positions = Some(wireframe.vertices.clone());
+        wireframe.position_format = "R32G32B32A32_FLOAT POSITION layout 13";
+        if let Some((min, max)) = bounds(&wireframe.vertices) {
+            wireframe.min = min;
+            wireframe.max = max;
+        }
+    }
+
     if let Some((uv_tag, uv_format, uvs)) = input_layout_uvs(
         &vertex_previews,
         input_layout_index,
@@ -4745,8 +8152,8 @@ fn build_wireframe_from_refs(
         ));
         // The compiled common-surface VS forwards input NORMAL to TEXCOORD7
         // without normalization. That raw SNORM vector is also authored data
-        // for procedural facing masks (animated inventory skins). Keep it
-        // byte-faithful there, while normalizing the separate lighting copy.
+        // for procedural object-space masks. Keep it byte-faithful there,
+        // while normalizing the separate lighting copy.
         wireframe.procedural_normals = Some(
             raw_normals
                 .iter()
@@ -4821,9 +8228,12 @@ fn build_wireframe_from_refs(
             wireframe.material_ranges.push(WireframeMaterialRange {
                 index_start,
                 index_count,
+                raw_lod_category: range.raw_lod_category,
                 render_stage: range.render_stage,
                 technique: range.technique,
                 gear_dye_change_color_index: range.gear_dye_change_color_index,
+                authored_source: None,
+                authored_draw: range.authored_draw,
                 procedural_scale: 1.0,
                 texture: None,
                 textures: WireframeMaterialTextures::default(),
@@ -4956,6 +8366,30 @@ fn input_layout_vectors(
     )?;
 
     (vectors.len() == vertex_count).then_some((*tag, layout.format, vectors))
+}
+
+fn input_layout_rigid_indices(
+    vertex_previews: &[(TagHash, VertexBufferPreview)],
+    input_layout_index: Option<u8>,
+    vertex_count: usize,
+) -> Option<Vec<u16>> {
+    let layout = resolved_input_layout_vector(input_layout_index?, SEMANTIC_POSITION, 0)?;
+    if layout.format != InputLayoutFormat::R16G16B16A16Snorm {
+        return None;
+    }
+    let (tag, preview) = vertex_previews.get(layout.buffer_index)?;
+    let entry = package_manager().get_entry(*tag)?;
+    let data = package_manager().read_tag(TagHash(entry.reference)).ok()?;
+    let stride = preview.header.stride as usize;
+    let offset = layout.offset.checked_add(6)?;
+    (stride >= offset + 2).then_some(())?;
+    let endian = package_manager().version.endian();
+    let indices = data
+        .chunks_exact(stride)
+        .take(vertex_count.min(MAX_PREVIEW_VERTICES))
+        .map(|vertex| read_i16(&vertex[offset..offset + 2], endian).max(0) as u16)
+        .collect_vec();
+    (indices.len() == vertex_count).then_some(indices)
 }
 
 fn normalize_input_layout_vector(
@@ -5198,6 +8632,7 @@ struct StaticMeshPartPreview {
 #[derive(Debug, Clone)]
 struct StaticMeshGroupPreview {
     part_index: u16,
+    render_stage: u8,
     input_layout_index: u8,
 }
 
@@ -5230,9 +8665,11 @@ struct GeometryIndexRangePreview {
 struct PreviewIndexRange {
     range: std::ops::Range<usize>,
     primitive_type: u8,
+    raw_lod_category: Option<u8>,
     render_stage: Option<u8>,
     technique: Option<TagHash>,
     gear_dye_change_color_index: Option<u8>,
+    authored_draw: Option<WireframeAuthoredDrawMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -5274,6 +8711,7 @@ fn read_static_mesh_groups(
         .filter_map(|group| {
             Some(StaticMeshGroupPreview {
                 part_index: read_u16(group.get(0x0..0x2)?, endian),
+                render_stage: *group.get(0x2)?,
                 input_layout_index: *group.get(0x3)?,
             })
         })
@@ -5486,32 +8924,227 @@ fn geometry_primary_index_ranges(data: &[u8], endian: Endian) -> Vec<GeometryInd
     ranges
 }
 
-fn geometry_preview_part_indices(data: &[u8], endian: Endian) -> Option<Vec<usize>> {
-    // Marathon adds one render stage: 26 boundaries for 25 stage ranges.
-    const STAGE_BOUNDARY_COUNT: usize = 26;
+const GOLIATH_RENDER_STAGE_COUNT: usize = crate::render::stage::MARATHON_RENDER_STAGE_COUNT;
+const GOLIATH_RENDER_STAGE_BOUNDARY_COUNT: usize = GOLIATH_RENDER_STAGE_COUNT + 1;
+const GOLIATH_RENDER_STAGE_BOUNDARY_OFFSET: usize = 0x30;
+const GOLIATH_RENDER_STAGE_LAYOUT_OFFSET: usize = 0x64;
 
-    let part_count = scan_arrays(data, endian)
+#[derive(Debug, Clone)]
+struct GeometryRenderStageAbi {
+    boundaries: [usize; GOLIATH_RENDER_STAGE_BOUNDARY_COUNT],
+    input_layouts: [u8; GOLIATH_RENDER_STAGE_COUNT],
+    part_count: usize,
+}
+
+impl GeometryRenderStageAbi {
+    fn part_range(&self, stage: usize) -> Option<std::ops::Range<usize>> {
+        (stage < GOLIATH_RENDER_STAGE_COUNT)
+            .then(|| self.boundaries[stage]..self.boundaries[stage + 1])
+    }
+}
+
+/// One package draw record of a geometry, in whichever render stage owns it.
+pub(crate) struct GeometryStagePart {
+    pub stage: Option<u8>,
+    pub technique: TagHash,
+    pub lod_category: u8,
+    pub index_count: u32,
+}
+
+/// Every draw record the package authors for this geometry: all render stages
+/// and all levels of detail, before any preview selection.
+pub(crate) fn geometry_stage_parts(geometry: TagHash) -> Vec<GeometryStagePart> {
+    let Ok(data) = package_manager().read_tag(geometry) else {
+        return vec![];
+    };
+    geometry_index_range_candidates_raw(&data, package_manager().version.endian())
         .into_iter()
+        .map(|range| GeometryStagePart {
+            stage: range.render_stage,
+            technique: range.technique,
+            lod_category: range.lod_category,
+            index_count: range.index_count,
+        })
+        .collect()
+}
+
+/// Authored compute part membership, independent of visible surface selection.
+pub(crate) fn geometry_compute_technique(geometry: TagHash, visible_part: usize,
+    range: std::ops::Range<u32>) -> Option<TagHash> {
+    let data = package_manager().read_tag(geometry).ok()?;
+    let endian = package_manager().version.endian();
+    let abi = geometry_render_stage_abi(&data, endian)?;
+    let parts = scan_arrays(&data, endian).into_iter().find(|a| a.class == CLASS_GEOMETRY_PART)?;
+    if visible_part >= parts.count { return None; }
+    let visible=parts.data_offset+visible_part*0x28;
+    if read_u32_at(&data,visible+8,endian)? != range.start
+        || read_u32_at(&data,visible+12,endian)?.checked_add(range.start)? != range.end {
+        return None;
+    }
+    let lod=*data.get(visible+0x1c)?;
+    let lod_run=*data.get(visible+0x1f)?;
+    let mut found=None;
+    for part in abi.part_range(24)? {
+        let offset=parts.data_offset+part*0x28;
+        let start=read_u32_at(&data,offset+8,endian)?;
+        let count=read_u32_at(&data,offset+12,endian)?;
+        if start==range.start && start.checked_add(count)?==range.end
+            && data.get(offset+0x1c)==Some(&lod) && data.get(offset+0x1f)==Some(&lod_run) {
+            let technique=read_tag_at(&data,offset,endian)?;
+            if found.is_some_and(|existing| existing!=technique) { return None; }
+            found=Some(technique);
+        }
+    }
+    found
+}
+
+fn geometry_render_stage_abi(data: &[u8], endian: Endian) -> Option<GeometryRenderStageAbi> {
+    let arrays = scan_arrays(data, endian);
+    let part_count = arrays
+        .iter()
         .find(|array| array.class == CLASS_GEOMETRY_PART)?
         .count;
-    let buffer_set = scan_arrays(data, endian)
-        .into_iter()
+    let buffer_set = arrays
+        .iter()
         .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)?;
-    let boundaries = (0..STAGE_BOUNDARY_COUNT)
+    let record = data.get(
+        buffer_set.data_offset
+            ..(buffer_set.data_offset + 0x80)
+                .min(buffer_set.end_offset)
+                .min(data.len()),
+    )?;
+    if record.len() < GOLIATH_RENDER_STAGE_LAYOUT_OFFSET + GOLIATH_RENDER_STAGE_COUNT {
+        return None;
+    }
+
+    let boundaries: [usize; GOLIATH_RENDER_STAGE_BOUNDARY_COUNT] = (0
+        ..GOLIATH_RENDER_STAGE_BOUNDARY_COUNT)
         .map(|index| {
-            data.get(buffer_set.data_offset + 0x30 + index * 2..)
+            record
+                .get(GOLIATH_RENDER_STAGE_BOUNDARY_OFFSET + index * 2..)
                 .map(|bytes| read_u16(bytes, endian) as usize)
         })
-        .collect::<Option<Vec<_>>>()?;
-    preview_part_indices_from_boundaries(&boundaries, part_count)
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()?;
+    if boundaries.windows(2).any(|pair| pair[0] > pair[1])
+        || boundaries.last().copied()? > part_count
+    {
+        return None;
+    }
+
+    let input_layouts: [u8; GOLIATH_RENDER_STAGE_COUNT] = record
+        .get(
+            GOLIATH_RENDER_STAGE_LAYOUT_OFFSET
+                ..GOLIATH_RENDER_STAGE_LAYOUT_OFFSET + GOLIATH_RENDER_STAGE_COUNT,
+        )?
+        .try_into()
+        .ok()?;
+
+    Some(GeometryRenderStageAbi {
+        boundaries,
+        input_layouts,
+        part_count,
+    })
+}
+
+fn geometry_authored_stage_ranges(
+    data: &[u8],
+    endian: Endian,
+    index_tag: TagHash,
+    vertex_count: usize,
+    stage: crate::render::stage::MarathonRenderStage,
+) -> Vec<WireframeAuthoredStageRange> {
+    let Some(abi) = geometry_render_stage_abi(data, endian) else {
+        return vec![];
+    };
+    let stage_index = stage.raw() as usize;
+    let Some(part_range) = abi.part_range(stage_index) else {
+        return vec![];
+    };
+
+    let mut candidates = geometry_index_range_candidates_raw(data, endian)
+        .into_iter()
+        .filter(|range| part_range.contains(&range.part_index))
+        .collect_vec();
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    let has_highest_detail = candidates
+        .iter()
+        .any(|range| is_highest_detail_lod(range.lod_category));
+    if has_highest_detail {
+        candidates.retain(|range| is_highest_detail_lod(range.lod_category));
+    } else if let Some(fallback_lod) = candidates
+        .iter()
+        .min_by_key(|range| lod_selection_rank(range.lod_category))
+        .map(|range| range.lod_category)
+    {
+        candidates.retain(|range| range.lod_category == fallback_lod);
+    }
+
+    let Some(index_entry) = package_manager().get_entry(index_tag) else {
+        return vec![];
+    };
+    let Ok(index_header) = package_manager().read_tag(index_tag) else {
+        return vec![];
+    };
+    let Ok(index_preview) =
+        load_index_buffer_preview_for_tag(index_tag, &index_entry, &index_header)
+    else {
+        return vec![];
+    };
+
+    candidates
+        .into_iter()
+        .filter_map(|range| {
+            let source = index_preview.indices.get(
+                range.index_start as usize
+                    ..range.index_start.saturating_add(range.index_count) as usize,
+            )?;
+            let indices = preview_triangles_from_indices(source, range.primitive_type)
+                .chunks_exact(3)
+                .filter(|triangle| {
+                    triangle
+                        .iter()
+                        .all(|index| (*index as usize) < vertex_count)
+                })
+                .flat_map(|triangle| triangle.iter().copied())
+                .collect_vec();
+            (!indices.is_empty()).then_some(WireframeAuthoredStageRange {
+                render_stage: stage.raw(),
+                input_layout_id: abi.input_layouts[stage_index],
+                part_index: range.part_index,
+                source_index_start: range.index_start,
+                source_index_count: range.index_count,
+                primitive_type: range.primitive_type,
+                raw_lod_category: range.lod_category,
+                variant_shader_index: range.variant_shader_index,
+                flags: range.flags,
+                lod_run: range.lod_run,
+                technique: range.technique.is_some().then_some(range.technique),
+                gear_dye_change_color_index: Some(range.gear_dye_change_color_index),
+                authored_source: Some(0),
+                procedural_scale: 1.0,
+                indices,
+                texture: None,
+                textures: WireframeMaterialTextures::default(),
+            })
+        })
+        .collect()
+}
+
+fn geometry_preview_part_indices(data: &[u8], endian: Endian) -> Option<Vec<usize>> {
+    let abi = geometry_render_stage_abi(data, endian)?;
+    preview_part_indices_from_boundaries(&abi.boundaries, abi.part_count)
 }
 
 fn preview_part_indices_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<usize>> {
-    const PREVIEW_STAGES: [usize; 5] = [0, 1, 2, 6, 7];
-    if boundaries.len() <= PREVIEW_STAGES.into_iter().max()? + 1
+    if boundaries.len() < GOLIATH_RENDER_STAGE_BOUNDARY_COUNT
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -5519,8 +9152,7 @@ fn preview_part_indices_from_boundaries(
     }
 
     Some(
-        PREVIEW_STAGES
-            .into_iter()
+        (0..GOLIATH_RENDER_STAGE_COUNT)
             .flat_map(|stage| boundaries[stage]..boundaries[stage + 1])
             .unique()
             .collect(),
@@ -5531,8 +9163,7 @@ fn preview_part_stages_from_boundaries(
     boundaries: &[usize],
     part_count: usize,
 ) -> Option<Vec<Option<u8>>> {
-    const PREVIEW_STAGES: [usize; 5] = [0, 1, 2, 6, 7];
-    if boundaries.len() <= PREVIEW_STAGES.into_iter().max()? + 1
+    if boundaries.len() < GOLIATH_RENDER_STAGE_BOUNDARY_COUNT
         || boundaries.windows(2).any(|pair| pair[0] > pair[1])
         || boundaries.last().copied()? > part_count
     {
@@ -5540,7 +9171,7 @@ fn preview_part_stages_from_boundaries(
     }
 
     let mut stages = vec![None; part_count];
-    for stage in PREVIEW_STAGES {
+    for stage in 0..GOLIATH_RENDER_STAGE_COUNT {
         for part in boundaries[stage]..boundaries[stage + 1] {
             stages[part] = Some(stage as u8);
         }
@@ -5549,22 +9180,8 @@ fn preview_part_stages_from_boundaries(
 }
 
 fn geometry_preview_part_stages(data: &[u8], endian: Endian) -> Option<Vec<Option<u8>>> {
-    const STAGE_BOUNDARY_COUNT: usize = 26;
-    let arrays = scan_arrays(data, endian);
-    let part_count = arrays
-        .iter()
-        .find(|array| array.class == CLASS_GEOMETRY_PART)?
-        .count;
-    let buffer_set = arrays
-        .iter()
-        .find(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)?;
-    let boundaries = (0..STAGE_BOUNDARY_COUNT)
-        .map(|index| {
-            data.get(buffer_set.data_offset + 0x30 + index * 2..)
-                .map(|bytes| read_u16(bytes, endian) as usize)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    preview_part_stages_from_boundaries(&boundaries, part_count)
+    let abi = geometry_render_stage_abi(data, endian)?;
+    preview_part_stages_from_boundaries(&abi.boundaries, abi.part_count)
 }
 
 fn is_highest_detail_lod(lod: u8) -> bool {
@@ -5580,10 +9197,20 @@ fn index_ranges_from_geometry_ranges(
             range: range.index_start as usize
                 ..range.index_start.saturating_add(range.index_count) as usize,
             primitive_type: range.primitive_type,
+            raw_lod_category: Some(range.lod_category),
             render_stage: range.render_stage,
             technique: Some(range.technique),
             gear_dye_change_color_index: (range.gear_dye_change_color_index <= 5)
                 .then_some(range.gear_dye_change_color_index),
+            authored_draw: Some(WireframeAuthoredDrawMetadata {
+                part_index: range.part_index,
+                source_index_start: range.index_start,
+                source_index_count: range.index_count,
+                primitive_type: range.primitive_type,
+                variant_shader_index: range.variant_shader_index,
+                flags: range.flags,
+                lod_run: range.lod_run,
+            }),
         })
         .collect()
 }
@@ -5626,7 +9253,10 @@ fn preview_triangles_from_indices(indices: &[u32], primitive_type: u8) -> Vec<u3
     out
 }
 
-fn geometry_index_range_candidates(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
+fn geometry_index_range_candidates_raw(
+    data: &[u8],
+    endian: Endian,
+) -> Vec<GeometryIndexRangePreview> {
     let mut candidates = Vec::<GeometryIndexRangePreview>::new();
     let part_stages = geometry_preview_part_stages(data, endian).unwrap_or_default();
     let exact_offsets = scan_arrays(data, endian)
@@ -5712,6 +9342,10 @@ fn geometry_index_range_candidates(data: &[u8], endian: Endian) -> Vec<GeometryI
     }
 
     candidates
+}
+
+fn geometry_index_range_candidates(data: &[u8], endian: Endian) -> Vec<GeometryIndexRangePreview> {
+    geometry_index_range_candidates_raw(data, endian)
         .into_iter()
         .unique_by(|range| {
             (
@@ -5776,13 +9410,6 @@ fn read_geometry_uv_transform(data: &[u8], endian: Endian) -> Option<UvTransform
     .then_some(UvTransformPreview { scale, offset })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct GeometryPositionTransform {
-    scale: [f32; 3],
-    offset: [f32; 3],
-    procedural_scale: f32,
-}
-
 fn read_geometry_position_transform(
     data: &[u8],
     endian: Endian,
@@ -5816,26 +9443,38 @@ fn apply_geometry_position_transform(
     wireframe: &mut WireframePreview,
     transform: GeometryPositionTransform,
 ) {
-    if !wireframe.position_format.starts_with("i16") {
-        return;
-    }
+    let quantized = wireframe.position_format.starts_with("i16");
     for position in &mut wireframe.vertices {
         for axis in 0..3 {
-            position[axis] = read_snorm_position(position[axis]) * transform.scale[axis]
-                + transform.offset[axis];
+            let source = if quantized {
+                read_snorm_position(position[axis])
+            } else {
+                position[axis]
+            };
+            position[axis] = source * transform.scale[axis] + transform.offset[axis];
         }
     }
     // Compiled common-surface VS writes input POSITION straight to its
     // procedural varying, while rendered position follows geometry
     // dequantization. Vertex fetch supplies R16G16B16A16_SNORM, so preserve
-    // exactly that normalized pre-transform value for pattern/wear/animation.
-    if let Some(positions) = &mut wireframe.procedural_positions {
+    // exactly that normalized pre-transform value for pattern/wear.
+    if quantized && let Some(positions) = &mut wireframe.procedural_positions {
         for position in positions {
             for axis in 0..3 {
-                position[axis] = read_snorm_position(position[axis]) * transform.scale[axis]
-                    + transform.offset[axis];
+                position[axis] = read_snorm_position(position[axis]);
             }
         }
+    }
+    // The same scope_skinning row that dequantizes POSITION carries a
+    // separate object-space frequency multiplier in .w. Compiled common-
+    // surface shaders apply it before evaluating procedural wear/patterns.
+    // Keep that authored value on every draw range instead of silently using
+    // the preview default (1.0).
+    for range in &mut wireframe.material_ranges {
+        range.procedural_scale = transform.procedural_scale;
+    }
+    for range in &mut wireframe.authored_shadow_ranges {
+        range.procedural_scale = transform.procedural_scale;
     }
     if let Some((min, max)) = bounds(&wireframe.vertices) {
         wireframe.min = min;
@@ -5880,17 +9519,22 @@ fn array_records<'a>(data: &'a [u8], array: TagArray, stride: usize) -> Vec<&'a 
         .collect()
 }
 
-fn vertex_layout_stream_sets_for_any_mapping(layout_id: u8) -> Option<Vec<usize>> {
+fn vertex_layout_stream_bindings_for_any_mapping(
+    layout_id: u8,
+) -> Option<Vec<(usize, usize, bool)>> {
     for layout_tag in tags_by_class(CLASS_VERTEX_INPUT_LAYOUT_MAPPING) {
-        if let Some(stream_sets) = vertex_layout_stream_sets(layout_tag, layout_id) {
-            return Some(stream_sets);
+        if let Some(bindings) = vertex_layout_stream_bindings(layout_tag, layout_id) {
+            return Some(bindings);
         }
     }
 
     None
 }
 
-fn vertex_layout_stream_sets(layout_tag: TagHash, layout_id: u8) -> Option<Vec<usize>> {
+fn vertex_layout_stream_bindings(
+    layout_tag: TagHash,
+    layout_id: u8,
+) -> Option<Vec<(usize, usize, bool)>> {
     let endian = package_manager().version.endian();
     let data = package_manager().read_tag(layout_tag).ok()?;
     for array in scan_arrays(&data, endian) {
@@ -5904,17 +9548,30 @@ fn vertex_layout_stream_sets(layout_tag: TagHash, layout_id: u8) -> Option<Vec<u
                 continue;
             }
 
-            let stream_sets = [0x8, 0xc, 0x10, 0x14]
-                .into_iter()
-                .filter_map(|offset| read_u32_at(record, offset, endian))
-                .filter(|set_index| *set_index != u32::MAX)
-                .map(|set_index| set_index as usize)
+            let bindings = (0..4usize)
+                .filter_map(|stream_index| {
+                    let set_index = read_u32_at(record, 0x8 + stream_index * 4, endian)?;
+                    (set_index != u32::MAX).then_some((
+                        stream_index,
+                        set_index as usize,
+                        record.get(0x18 + stream_index).copied().unwrap_or(0) != 0,
+                    ))
+                })
                 .collect_vec();
-            return (!stream_sets.is_empty()).then_some(stream_sets);
+            return (!bindings.is_empty()).then_some(bindings);
         }
     }
 
     None
+}
+
+fn vertex_layout_stream_sets_for_any_mapping(layout_id: u8) -> Option<Vec<usize>> {
+    Some(
+        vertex_layout_stream_bindings_for_any_mapping(layout_id)?
+            .into_iter()
+            .map(|(_stream_index, set_index, _instanced)| set_index)
+            .collect(),
+    )
 }
 
 fn vertex_input_element_sets(tag: TagHash) -> Vec<Vec<VertexInputElement>> {
@@ -5938,6 +9595,138 @@ fn vertex_input_element_sets(tag: TagHash) -> Vec<Vec<VertexInputElement>> {
                 .collect()
         })
         .collect()
+}
+
+fn authored_input_layout_descriptor(layout_id: u8) -> Option<AuthoredInputLayoutDescriptor> {
+    let bindings = vertex_layout_stream_bindings_for_any_mapping(layout_id)?;
+    for element_tag in tags_by_class(CLASS_VERTEX_INPUT_ELEMENT_SETS) {
+        let sets = vertex_input_element_sets(element_tag);
+        if !bindings
+            .iter()
+            .all(|(_stream_index, set_index, _instanced)| *set_index < sets.len())
+        {
+            continue;
+        }
+
+        let streams = bindings
+            .iter()
+            .map(|(stream_index, set_index, instanced)| {
+                let mut offset = 0usize;
+                let mut elements = Vec::new();
+                for element in sets.get(*set_index)? {
+                    elements.push(AuthoredVertexElementDescriptor {
+                        semantic: element.semantic,
+                        semantic_index: element.semantic_index,
+                        format: element.format,
+                        offset: u16::try_from(offset).ok()?,
+                    });
+                    offset = offset.checked_add(vertex_input_element_size(*element)?)?;
+                }
+                Some(AuthoredVertexStreamLayoutDescriptor {
+                    stream_index: u8::try_from(*stream_index).ok()?,
+                    element_set_index: u32::try_from(*set_index).ok()?,
+                    instanced: *instanced,
+                    elements,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        return Some(AuthoredInputLayoutDescriptor { layout_id, streams });
+    }
+
+    None
+}
+
+fn authored_vertex_stream_ref(
+    stream_index: u8,
+    header_tag: TagHash,
+) -> Option<AuthoredVertexStreamRef> {
+    let entry = package_manager().get_entry(header_tag)?;
+    let header_data = package_manager().read_tag(header_tag).ok()?;
+    let header =
+        VertexBufferHeader::parse(&header_data, package_manager().version.endian()).ok()?;
+    let data_tag = TagHash(entry.reference);
+    let element_count = (header.stride != 0)
+        .then(|| header.data_size / u32::from(header.stride))
+        .unwrap_or(0);
+
+    Some(AuthoredVertexStreamRef {
+        stream_index,
+        header_tag,
+        data_tag,
+        stride: header.stride,
+        vertex_type: header.vtype,
+        data_size: header.data_size,
+        element_count,
+    })
+}
+
+fn authored_index_buffer_ref(header_tag: TagHash) -> Option<AuthoredIndexBufferRef> {
+    let entry = package_manager().get_entry(header_tag)?;
+    let header_data = package_manager().read_tag(header_tag).ok()?;
+    let header = IndexBufferHeader::parse(&header_data, package_manager().version.endian()).ok()?;
+    let data_tag = TagHash(entry.reference);
+    let index_width = if header.is_32bit { 4 } else { 2 };
+    let index_count = u32::try_from(header.data_size / index_width).ok()?;
+
+    Some(AuthoredIndexBufferRef {
+        header_tag,
+        data_tag,
+        is_32bit: header.is_32bit,
+        data_size: header.data_size,
+        index_count,
+    })
+}
+
+fn authored_geometry_input(
+    geometry: TagHash,
+    mesh: &[u8],
+    data: &[u8],
+    endian: Endian,
+    position_transform: Option<GeometryPositionTransform>,
+    uv_transform: Option<UvTransformPreview>,
+) -> AuthoredGeometryInput {
+    let vertex_streams = [0x0usize, 0x4, 0x8, 0xc]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(stream_index, offset)| {
+            authored_vertex_stream_ref(
+                stream_index as u8,
+                read_tag_at(mesh, offset, endian).unwrap_or(TagHash(0)),
+            )
+        })
+        .collect_vec();
+    let color_buffer =
+        authored_vertex_stream_ref(4, read_tag_at(mesh, 0x14, endian).unwrap_or(TagHash(0)));
+    let skinning_buffer =
+        authored_vertex_stream_ref(5, read_tag_at(mesh, 0x18, endian).unwrap_or(TagHash(0)));
+    let index_buffer = read_tag_at(mesh, 0x10, endian).and_then(authored_index_buffer_ref);
+    let stage_layouts = geometry_render_stage_abi(data, endian)
+        .map(|abi| {
+            abi.input_layouts
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(raw_stage, layout_id)| AuthoredStageInputLayout {
+                    raw_stage: raw_stage as u8,
+                    layout_id,
+                    descriptor: authored_input_layout_descriptor(layout_id),
+                })
+                .collect_vec()
+        })
+        .unwrap_or_default();
+
+    AuthoredGeometryInput {
+        geometry,
+        vertex_streams,
+        color_buffer,
+        skinning_buffer,
+        index_buffer,
+        stage_layouts,
+        position_transform,
+        uv_transform,
+        attachment_pose: None,
+    }
 }
 
 fn vertex_input_element_size(element: VertexInputElement) -> Option<usize> {
@@ -6266,20 +10055,6 @@ fn candidate_f16x2_uv(
     })
 }
 
-fn candidate_f32x2_uv(
-    data: &[u8],
-    stride: usize,
-    offset: usize,
-    endian: Endian,
-) -> Option<VertexUvCandidate> {
-    build_uv_candidate(data, stride, offset, UvFormat::F32x2, |bytes| {
-        Some([
-            read_f32(bytes.get(0..4)?, endian),
-            read_f32(bytes.get(4..8)?, endian),
-        ])
-    })
-}
-
 fn build_uv_candidate(
     data: &[u8],
     stride: usize,
@@ -6461,6 +10236,7 @@ fn build_vertex_wireframe(
         vertex_count_total,
         procedural_positions: Some(vertices.clone()),
         vertices,
+        rigid_indices: None,
         normals: None,
         procedural_normals: None,
         tangents: None,
@@ -6469,6 +10245,8 @@ fn build_vertex_wireframe(
         tangent_format: None,
         indices: vec![],
         material_ranges: vec![],
+        authored_inputs: vec![],
+        authored_shadow_ranges: vec![],
         min,
         max,
     })
@@ -6576,10 +10354,6 @@ fn read_snorm16(data: &[u8], endian: Endian) -> f32 {
     (read_i16(data, endian) as f32 / 32767.0).clamp(-1.0, 1.0)
 }
 
-fn read_unorm16(data: &[u8], endian: Endian) -> f32 {
-    read_u16(data, endian) as f32 / 65535.0
-}
-
 fn read_f32(data: &[u8], endian: Endian) -> f32 {
     let bytes = data[0..4].try_into().expect("f32 slice length checked");
     match endian {
@@ -6637,5489 +10411,5 @@ fn read_i64(data: &[u8], endian: Endian) -> i64 {
     match endian {
         Endian::Big => i64::from_be_bytes(bytes),
         Endian::Little => i64::from_le_bytes(bytes),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rotates_decorator_instances_with_normalized_quaternions() {
-        let half = std::f32::consts::FRAC_1_SQRT_2;
-        let rotated = rotate_quaternion([1.0, 0.0, 0.0], [0.0, 0.0, half, half]);
-        assert!(rotated[0].abs() < 0.0001);
-        assert!((rotated[1] - 1.0).abs() < 0.0001);
-        assert!(rotated[2].abs() < 0.0001);
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_geometry_resource_transforms() {
-        init_goliath_test_package_manager();
-        for tag in [
-            TagHash(0x80B14039),
-            TagHash(0x80B140B7),
-            TagHash(0x80B140E6),
-            TagHash(0x80B1477B),
-        ] {
-            let data = package_manager().read_tag(tag).expect("geometry resource");
-            let endian = package_manager().version.endian();
-            eprintln!("{tag} len={}", data.len());
-            for offset in (0..data.len().min(0x130)).step_by(0x10) {
-                let values = (0..4)
-                    .filter_map(|component| {
-                        data.get(offset + component * 4..offset + component * 4 + 4)
-                    })
-                    .map(|bytes| read_f32(bytes, endian))
-                    .collect_vec();
-                eprintln!("  {offset:03X}: {values:?}");
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_problem_surface_materials() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        for tag in [
-            TagHash(0x80B140B7),
-            TagHash(0x80B140E6),
-            TagHash(0x80A9E3DE),
-            TagHash(0x80A9E49B),
-            TagHash(0x80AA03CA),
-            TagHash(0x80B6CD7A),
-        ] {
-            let assembly = related_pattern_geometry_tags(&cache, tag);
-            eprintln!("\n{tag}: assembly={assembly:?}");
-            let entry = package_manager().get_entry(tag).expect("geometry entry");
-            let data = package_manager().read_tag(tag).expect("geometry payload");
-            let techniques = find_model_technique_entries(&cache, tag, &entry);
-            let textures = find_model_textures(&cache, tag, &techniques);
-            let (_, mut wireframe) = parse_model_wireframe(tag, &entry).expect("geometry preview");
-            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
-            let parsed = geometry_primary_index_ranges(&data, package_manager().version.endian());
-            eprintln!(
-                "\n{tag}: ranges={} textures={}",
-                parsed.len(),
-                textures.len()
-            );
-            for (range, material) in parsed.iter().zip(&wireframe.material_ranges) {
-                eprintln!(
-                    "  part={} stage={:?} flags={:#010X} tech={} indices={}+{} selected color={:?} tint={:?} mask={:?} normal={:?} control={:?} aux={:?}",
-                    range.part_index,
-                    range.render_stage,
-                    range.flags,
-                    range.technique,
-                    range.index_start,
-                    range.index_count,
-                    material.textures.color,
-                    material.textures.color_tint,
-                    material.textures.mask_palette,
-                    material.textures.normal,
-                    material.textures.control,
-                    material.textures.aux,
-                );
-                if range.technique == TagHash(0x80B140CC) {
-                    assert!(
-                        material.textures.mask_palette.is_some(),
-                        "hair mask shader must expose authored palette constants"
-                    );
-                }
-                if range.technique == TagHash(0x80A9B3FA) {
-                    assert!(
-                        crate::material::is_sticker_proxy_technique(range.technique),
-                        "solid investment proxy must obey Stickers toggle"
-                    );
-                }
-                let technique_entry = package_manager()
-                    .get_entry(range.technique)
-                    .expect("technique entry");
-                let technique_data = package_manager()
-                    .read_tag(range.technique)
-                    .expect("technique payload");
-                if let Some(preview) =
-                    crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
-                {
-                    let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-                    if let Some(stage) = preview.stages.iter().find(|stage| stage.stage == "PS") {
-                        eprintln!(
-                            "    shader={:?} constants={:?} inline={:?} cbuffer={:?}",
-                            stage.shader,
-                            stage.constants,
-                            stage.inline_constants,
-                            stage
-                                .constant_buffer_preview
-                                .as_ref()
-                                .map(|buffer| &buffer.first_values),
-                        );
-                    }
-                }
-                for binding in texture_bindings_for_technique(&technique_entry, &technique_data)
-                    .into_iter()
-                    .filter(|binding| binding.stage == "PS")
-                {
-                    let descriptor = Texture::load_data_d2(binding.tag, false)
-                        .map(|(desc, _, _)| {
-                            format!("{}x{} {:?}", desc.width, desc.height, desc.format)
-                        })
-                        .unwrap_or_else(|_| "non-texture".into());
-                    eprintln!("    PS t{}={} {descriptor}", binding.slot, binding.tag);
-                }
-                eprintln!(
-                    "    TFX {:?}",
-                    tfx_texture_bindings_for_technique(&technique_entry, &technique_data)
-                        .into_iter()
-                        .filter(|binding| binding.stage == "PS")
-                        .map(|binding| format!(
-                            "t{}:{}+{:?}",
-                            binding.slot,
-                            binding.source_scope.as_deref().unwrap_or("?"),
-                            binding.source_offset
-                        ))
-                        .collect_vec()
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages and GPU"]
-    fn probes_goliath_face_texture_contact_sheet() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let tag = TagHash(0x80B140B7);
-        let entry = package_manager().get_entry(tag).expect("geometry entry");
-        let model = load_model_preview(cache, tag, &entry, "Geometry");
-
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("GPU adapter");
-        let required_features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features,
-            ..Default::default()
-        }))
-        .expect("GPU device");
-        let target_format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let renderer = eframe::egui_wgpu::Renderer::new(
-            &device,
-            target_format,
-            eframe::egui_wgpu::RendererOptions::default(),
-        );
-        let render_state = eframe::egui_wgpu::RenderState {
-            adapter,
-            available_adapters: vec![],
-            device,
-            queue,
-            target_format,
-            renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
-        };
-
-        let candidates = model
-            .textures
-            .iter()
-            .map(|(texture, _)| *texture)
-            .filter(|texture| {
-                Texture::load_desc(*texture).is_ok_and(|desc| {
-                    desc.kind() == crate::texture::TextureType::Texture2D
-                        && format!("{:?}", desc.format).contains("Srgb")
-                        && desc.width > 16
-                        && desc.height > 16
-                })
-            })
-            .unique()
-            .collect_vec();
-        let tile = 160_u32;
-        let columns = 6_u32;
-        let rows = (candidates.len() as u32).div_ceil(columns);
-        let mut sheet = image::RgbaImage::new(columns * tile, rows * tile);
-        let output = std::path::Path::new("target/quicktag-texture-probe");
-        std::fs::create_dir_all(output).expect("probe directory");
-        for (index, texture) in candidates.iter().copied().enumerate() {
-            let loaded = Texture::load(&render_state, texture, false).expect("texture upload");
-            let image = loaded.to_image(&render_state, 0).expect("texture capture");
-            image
-                .save(output.join(format!("{texture}.png")))
-                .expect("texture export");
-            let thumbnail = image.thumbnail(tile, tile).to_rgba8();
-            let x = index as u32 % columns * tile + (tile - thumbnail.width()) / 2;
-            let y = index as u32 / columns * tile + (tile - thumbnail.height()) / 2;
-            image::imageops::overlay(&mut sheet, &thumbnail, x.into(), y.into());
-            eprintln!("tile {index}: {texture}");
-        }
-        sheet
-            .save(output.join(format!("{tag}-sheet.png")))
-            .expect("contact sheet");
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_sample_model_uvs_and_textures() {
-        init_goliath_test_package_manager();
-
-        let tag = TagHash(0x80B14039);
-        let entry = package_manager().get_entry(tag).expect("sample tag entry");
-        assert_eq!(entry.reference, CLASS_GEOMETRY_RESOURCE);
-
-        let (source, mut wireframe) = parse_model_wireframe(tag, &entry).expect("sample wireframe");
-        eprintln!(
-            "mesh kind={} technique={:?} layout={:?} ib={} vb0={} vb1={} index_start={} index_count={} lod={} wireframe verts={} indices={} source={} uv={:?}",
-            source.kind,
-            source.technique,
-            source.input_layout_index,
-            source.index_buffer,
-            source.vertex0_buffer,
-            source.vertex1_buffer,
-            source.index_start,
-            source.index_count,
-            source.lod_category,
-            wireframe.vertices.len(),
-            wireframe.indices.len(),
-            wireframe.source,
-            wireframe.uv_format
-        );
-        assert_eq!(source.lod_category, 0, "sample preview should expose lod0");
-        assert_eq!(source.input_layout_index, Some(7));
-        let normal_layout =
-            resolved_input_layout_vector(7, SEMANTIC_NORMAL, 0).expect("layout 7 normal");
-        assert_eq!(normal_layout.buffer_index, 0);
-        assert_eq!(normal_layout.offset, 8);
-        assert_eq!(normal_layout.format, InputLayoutFormat::R16G16B16A16Snorm);
-        let tangent_layout =
-            resolved_input_layout_vector(7, SEMANTIC_TANGENT, 0).expect("layout 7 tangent");
-        assert_eq!(tangent_layout.buffer_index, 0);
-        assert_eq!(tangent_layout.offset, 16);
-        assert_eq!(tangent_layout.format, InputLayoutFormat::R16G16B16A16Snorm);
-        assert_eq!(source.technique, Some(TagHash(0x80B1247F)));
-        let source_data = package_manager().read_tag(tag).expect("sample resource");
-        for axis in 0..3 {
-            let expected_min = read_f32(
-                source_data
-                    .get(0xe0 + axis * 4..0xe4 + axis * 4)
-                    .expect("resource minimum"),
-                package_manager().version.endian(),
-            );
-            let expected_max = read_f32(
-                source_data
-                    .get(0xf0 + axis * 4..0xf4 + axis * 4)
-                    .expect("resource maximum"),
-                package_manager().version.endian(),
-            );
-            assert!((wireframe.min[axis] - expected_min).abs() < 0.01);
-            assert!((wireframe.max[axis] - expected_max).abs() < 0.01);
-        }
-        assert!(
-            wireframe.uvs.as_ref().is_some_and(|uvs| !uvs.is_empty()),
-            "sample must decode real UVs"
-        );
-        assert!(
-            wireframe
-                .uv_format
-                .as_deref()
-                .is_some_and(|uv| uv.contains("R16G16_SNORM") && uv.contains("layout Some(7)")),
-            "sample must use declared geometry layout UVs, got {:?}",
-            wireframe.uv_format
-        );
-        assert_eq!(
-            wireframe.normals.as_ref().map(Vec::len),
-            Some(wireframe.vertices.len()),
-            "sample must decode authored normals"
-        );
-        assert_eq!(
-            wireframe.tangents.as_ref().map(Vec::len),
-            Some(wireframe.vertices.len()),
-            "sample must decode authored tangents"
-        );
-        assert!(
-            wireframe
-                .normal_format
-                .as_deref()
-                .is_some_and(|format| format.contains("R16G16B16A16_SNORM")),
-            "unexpected normal format: {:?}",
-            wireframe.normal_format
-        );
-        assert!(
-            wireframe
-                .tangents
-                .as_ref()
-                .is_some_and(|tangents| tangents.iter().all(|tangent| tangent[3].abs() == 1.0)),
-            "sample tangent handedness must be normalized"
-        );
-
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let assembled = related_pattern_geometry_tags(&cache, tag);
-        for expected in [
-            TagHash(0x80B14039),
-            TagHash(0x80B140B7),
-            TagHash(0x80B140E6),
-        ] {
-            assert!(
-                assembled.contains(&expected),
-                "root pattern assembly should include {expected}; got {assembled:?}"
-            );
-        }
-        let assembled_preview = load_model_preview(cache.clone(), tag, &entry, "Geometry");
-        assert!(
-            assembled_preview
-                .wireframe
-                .as_ref()
-                .is_some_and(|wireframe| wireframe.source.contains("assembled")),
-            "root pattern geometry should merge into one preview"
-        );
-        assert!(
-            assembled_preview
-                .wireframe
-                .as_ref()
-                .is_some_and(|wireframe| {
-                    wireframe.normals.as_ref().map(Vec::len) == Some(wireframe.vertices.len())
-                        && wireframe.tangents.as_ref().map(Vec::len)
-                            == Some(wireframe.vertices.len())
-                }),
-            "assembled preview should preserve complete authored tangent frames"
-        );
-        let assembled_bounds = assembled_preview
-            .wireframe
-            .as_ref()
-            .expect("assembled bounds");
-        assert!(
-            assembled_bounds.max[2] - assembled_bounds.min[2] > 1.5
-                && assembled_bounds.max[2] - assembled_bounds.min[2] < 2.5,
-            "assembled character should retain authored world scale: {:?}..{:?}",
-            assembled_bounds.min,
-            assembled_bounds.max
-        );
-
-        let second_tag = TagHash(0x80B1477B);
-        let second_entry = package_manager()
-            .get_entry(second_tag)
-            .expect("second character");
-        let second = load_model_preview(cache.clone(), second_tag, &second_entry, "Geometry");
-        let second_wireframe = second.wireframe.as_ref().expect("second assembled preview");
-        let second_extent = (0..3)
-            .map(|axis| second_wireframe.max[axis] - second_wireframe.min[axis])
-            .fold(0.0_f32, f32::max);
-        assert!(
-            second_extent > 1.0 && second_extent < 3.0,
-            "80B1477B sibling parts should share authored scale; extent={second_extent} bounds={:?}..{:?}",
-            second_wireframe.min,
-            second_wireframe.max
-        );
-        let techniques = find_model_technique_entries(&cache, tag, &entry);
-        let technique_tag = TagHash(0x80B1247F);
-        let technique_entry = package_manager()
-            .get_entry(technique_tag)
-            .expect("sample technique entry");
-        let technique_data = package_manager()
-            .read_tag(technique_tag)
-            .expect("sample technique data");
-        let technique_preview =
-            crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
-                .expect("sample technique preview");
-        let crate::material::MaterialPreviewKind::Technique(technique_preview) =
-            technique_preview.kind;
-        let pixel_stage = technique_preview
-            .stages
-            .iter()
-            .find(|stage| stage.stage == "PS")
-            .expect("sample pixel stage");
-        assert_eq!(pixel_stage.shader, Some(TagHash(0x80B12478)));
-        assert_eq!(pixel_stage.textures.len(), 15);
-        assert_eq!(pixel_stage.textures[0].slot, 0);
-        assert_eq!(
-            pixel_stage.textures[0].texture.resolved,
-            Some(TagHash(0x80B14069))
-        );
-        assert!(pixel_stage.bytecode_len > 0);
-        let pixel_bytecode = read_array(
-            &technique_data,
-            0x278 + 0x20,
-            1,
-            package_manager().version.endian(),
-        )
-        .expect("sample pixel bytecode");
-        assert!(
-            pixel_stage.bytecode.decoded_ops > 0,
-            "undecoded Marathon TFX prefix: {:02X?}",
-            &pixel_bytecode[..pixel_bytecode.len().min(64)]
-        );
-        eprintln!(
-            "techniques={:?}",
-            techniques
-                .iter()
-                .take(16)
-                .map(|(tag, _)| format!("{tag}"))
-                .collect_vec()
-        );
-        assert!(!techniques.is_empty(), "sample must resolve techniques");
-        assert_eq!(
-            techniques.first().map(|(tag, _)| *tag),
-            source.technique,
-            "selected geometry technique should rank first"
-        );
-
-        let textures = find_model_textures(&cache, tag, &techniques);
-        eprintln!(
-            "textures={:?}",
-            textures
-                .iter()
-                .take(32)
-                .map(|(tag, entry)| {
-                    let desc = crate::texture::Texture::load_data_d2(*tag, false)
-                        .map(|(desc, _, _)| {
-                            format!(
-                                "{}x{}x{} {:?}",
-                                desc.width, desc.height, desc.depth, desc.format
-                            )
-                        })
-                        .unwrap_or_else(|err| format!("load_err={err}"));
-                    format!("{tag}:{}:{desc}", entry.file_size)
-                })
-                .collect_vec()
-        );
-        assert!(!textures.is_empty(), "sample must resolve textures");
-        assert!(
-            textures.iter().any(|(tag, _)| *tag == TagHash(0x80B14064)),
-            "sample must retain body primary texture"
-        );
-        assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
-        let assigned_textures = wireframe
-            .material_ranges
-            .iter()
-            .filter_map(|range| range.texture)
-            .unique()
-            .collect_vec();
-        eprintln!(
-            "assigned_textures={:?}",
-            assigned_textures
-                .iter()
-                .map(|tag| format!("{tag}"))
-                .collect_vec()
-        );
-        let assigned_normals = wireframe
-            .material_ranges
-            .iter()
-            .filter_map(|range| range.textures.normal)
-            .unique()
-            .collect_vec();
-        let assigned_emissive = wireframe
-            .material_ranges
-            .iter()
-            .filter_map(|range| range.textures.emissive)
-            .unique()
-            .collect_vec();
-        let assigned_layer_colors = wireframe
-            .material_ranges
-            .iter()
-            .flat_map(|range| range.textures.layers.iter())
-            .filter_map(|layer| layer.color)
-            .unique()
-            .collect_vec();
-        eprintln!(
-            "assigned_normals={:?} assigned_emissive={:?} assigned_layer_colors={:?}",
-            assigned_normals
-                .iter()
-                .map(|tag| format!("{tag}"))
-                .collect_vec(),
-            assigned_emissive
-                .iter()
-                .map(|tag| format!("{tag}"))
-                .collect_vec(),
-            assigned_layer_colors
-                .iter()
-                .map(|tag| format!("{tag}"))
-                .collect_vec()
-        );
-        for expected in [
-            TagHash(0x80B14064),
-            TagHash(0x80B14069),
-            TagHash(0x80B1405F),
-            TagHash(0x80B14047),
-        ] {
-            assert!(
-                assigned_textures.contains(&expected),
-                "sample material ranges should use {expected}"
-            );
-        }
-        for expected in [
-            TagHash(0x80B14064),
-            TagHash(0x80B14069),
-            TagHash(0x80B1405F),
-            TagHash(0x80B14047),
-        ] {
-            assert!(
-                assigned_layer_colors.contains(&expected),
-                "sample material layers should preserve {expected}"
-            );
-        }
-        assert!(
-            !assigned_normals.is_empty() || !assigned_emissive.is_empty(),
-            "sample material ranges should classify non-color material textures"
-        );
-
-        let complete_tag = TagHash(0x80B140B7);
-        let complete_entry = package_manager()
-            .get_entry(complete_tag)
-            .expect("sample complete geometry entry");
-        let Some((complete_source, complete_wireframe)) =
-            parse_model_wireframe(complete_tag, &complete_entry)
-        else {
-            panic!("sample complete geometry should parse");
-        };
-        eprintln!(
-            "complete mesh kind={} technique={:?} index_start={} index_count={} lod={} wireframe indices={}",
-            complete_source.kind,
-            complete_source.technique,
-            complete_source.index_start,
-            complete_source.index_count,
-            complete_source.lod_category,
-            complete_wireframe.indices.len()
-        );
-        assert_eq!(complete_source.lod_category, 0);
-        assert!(
-            complete_source.index_count > 3849,
-            "geometry resources should merge all primary ranges, not just the first range"
-        );
-        assert!(
-            complete_wireframe.indices.len() > 3849,
-            "wireframe should include all primary ranges for 80B140B7"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_problem_model_materials() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-
-        for tag in [
-            TagHash(0x80B14039),
-            TagHash(0x80B140B7),
-            TagHash(0x80B140E6),
-            TagHash(0x80B6C372),
-            TagHash(0x80B6E78F),
-            TagHash(0x80B6CDB3),
-            TagHash(0x80B6CDB4),
-        ] {
-            let Some(entry) = package_manager().get_entry(tag) else {
-                eprintln!("{tag}: missing");
-                continue;
-            };
-            let Some((source, mut wireframe)) = parse_model_wireframe(tag, &entry) else {
-                eprintln!("{tag}: no wireframe");
-                continue;
-            };
-            let techniques = find_model_technique_entries(&cache, tag, &entry);
-            let textures = find_model_textures(&cache, tag, &techniques);
-            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
-            let assigned_colors = wireframe
-                .material_ranges
-                .iter()
-                .filter_map(|range| range.texture)
-                .unique()
-                .collect_vec();
-            assert!(
-                !assigned_colors.contains(&TagHash(0x80A60058)),
-                "{tag}: global decal atlas must not become preview albedo"
-            );
-            assert!(
-                !assigned_colors.iter().copied().any(fallback_aux_texture),
-                "{tag}: technical fallback textures must stay out of albedo"
-            );
-            if tag == TagHash(0x80B140B7) {
-                let eye_material =
-                    material_textures_for_technique(TagHash(0x80B14088), &cache, &textures);
-                assert_eq!(
-                    material_textures_for_technique(TagHash(0x80B1248B), &cache, &textures).color,
-                    Some(TagHash(0x80B14062)),
-                    "mask-only detail material should retain its local BC4 primary slot"
-                );
-                assert_eq!(
-                    eye_material.color,
-                    Some(TagHash(0x80B140BB)),
-                    "eye material should promote its local tint texture"
-                );
-                assert_eq!(
-                    eye_material.color_tint,
-                    [196, 66, 13, 255],
-                    "eye BC4 mask should use its authored orange inline tint"
-                );
-                assert_eq!(
-                    material_textures_for_technique(TagHash(0x80B124CC), &cache, &textures).color,
-                    Some(TagHash(0x80B14062)),
-                    "decal material should promote its local BC4 mask"
-                );
-            }
-            if tag == TagHash(0x80B140E6) {
-                assert_eq!(
-                    material_textures_for_technique(TagHash(0x80B140CC), &cache, &textures).color,
-                    Some(TagHash(0x80A613F7)),
-                    "hair mask 80B140EF must not replace its slot-0 surface texture"
-                );
-            }
-            eprintln!(
-                "{tag}: class={:08X} kind={} source={} tech={:?} ranges={} vertices={} indices={} uv={:?}",
-                entry.reference,
-                source.kind,
-                wireframe.source,
-                source.technique,
-                wireframe.material_ranges.len(),
-                wireframe.vertices.len(),
-                wireframe.indices.len(),
-                wireframe.uv_format
-            );
-            eprintln!(
-                "{tag}: assigned_colors={:?}",
-                assigned_colors
-                    .iter()
-                    .map(|tag| format!("{tag}"))
-                    .collect_vec()
-            );
-            eprintln!(
-                "{tag}: textures={:?}",
-                textures
-                    .iter()
-                    .map(|(texture, _)| format!("{texture}"))
-                    .take(16)
-                    .collect_vec()
-            );
-            for (technique, _entry) in techniques.iter().take(4) {
-                let material = material_textures_for_technique(*technique, &cache, &textures);
-                let expected_normal = match technique.0 {
-                    0x80B1247F => Some(TagHash(0x80B1405D)),
-                    0x80B12499 => Some(TagHash(0x80B14057)),
-                    0x80B124B5 => Some(TagHash(0x80B14060)),
-                    0x80B124C1 => Some(TagHash(0x80B14049)),
-                    0x80B1407C => Some(TagHash(0x80B140EB)),
-                    0x80B140CC => Some(TagHash(0x80B140F1)),
-                    0x80A9F7E6 => Some(TagHash(0x80A9F81A)),
-                    _ => None,
-                };
-                if let Some(expected_normal) = expected_normal {
-                    assert_eq!(
-                        material.normal,
-                        Some(expected_normal),
-                        "{technique}: normal must follow its shader-family resource slot"
-                    );
-                }
-                let expected_control = match technique.0 {
-                    0x80B1247F => Some((TagHash(0x80B14052), 3)),
-                    0x80B12499 => Some((TagHash(0x80B14059), 3)),
-                    0x80B124B5 => Some((TagHash(0x80B14051), 3)),
-                    0x80B1407C => Some((TagHash(0x80B140BC), 3)),
-                    0x80B140CC => Some((TagHash(0x80B140EF), 1)),
-                    0x80A9F7E6 => Some((TagHash(0x80A9F814), 4)),
-                    _ => None,
-                };
-                if let Some((expected_control, expected_channel)) = expected_control {
-                    assert_eq!(
-                        (material.control, material.roughness_channel),
-                        (Some(expected_control), expected_channel),
-                        "{technique}: roughness control must follow proven DXIL channel"
-                    );
-                }
-                let expected_sampler = match technique.0 {
-                    0x80B1247F | 0x80B12499 | 0x80B124B5 | 0x80B124C1 | 0x80B1407C => {
-                        Some(TagHash(0x80A60082))
-                    }
-                    0x80B14088 | 0x80B140CC | 0x80A9F7E6 => Some(TagHash(0x80A60020)),
-                    _ => None,
-                };
-                if let Some(expected_sampler) = expected_sampler {
-                    assert_eq!(
-                        material.sampler,
-                        Some(expected_sampler),
-                        "{technique}: PS sampler must follow TFX sampler binding"
-                    );
-                }
-                if *technique != TagHash(0x80B14088) {
-                    assert_eq!(
-                        material.color_tint,
-                        [255, 255, 255, 255],
-                        "{tag}: unresolved TFX constants must not become speculative albedo tint"
-                    );
-                }
-                assert_eq!(material.emissive_strength, 0);
-                let render_state = render_state_for_technique(*technique);
-                eprintln!(
-                    "{tag}: technique={technique} state={render_state:?} color={:?} normal={:?} emissive={:?} control={:?}.{} sampler={:?} aux={:?} layers={:?}",
-                    material.color,
-                    material.normal,
-                    material.emissive,
-                    material.control,
-                    material.roughness_channel,
-                    material.sampler,
-                    material.aux,
-                    material.layers
-                );
-                if let Some(entry) = package_manager().get_entry(*technique)
-                    && let Ok(data) = package_manager().read_tag(*technique)
-                {
-                    let direct_bindings = texture_bindings_for_technique(&entry, &data)
-                        .into_iter()
-                        .filter(|binding| binding.stage == "PS")
-                        .collect_vec();
-                    let normal_slot = material_normal_texture_slot(&direct_bindings);
-                    let control_slot = material_control_texture_slot(&direct_bindings, normal_slot);
-                    eprintln!(
-                        "{tag}: direct={:?}",
-                        direct_bindings
-                            .into_iter()
-                            .map(|binding| format!(
-                                "{}:{} -> role {:?}",
-                                binding.slot,
-                                binding.tag,
-                                material_texture_role(binding, normal_slot, control_slot)
-                            ))
-                            .collect_vec()
-                    );
-                    eprintln!(
-                        "{tag}: tfx={:?}",
-                        tfx_texture_bindings_for_technique(&entry, &data)
-                            .into_iter()
-                            .filter(|binding| binding.stage == "PS")
-                            .map(|binding| format!(
-                                "slot {} {:?}+{:?}",
-                                binding.slot, binding.source_scope, binding.source_offset
-                            ))
-                            .collect_vec()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires current installed Marathon packages"]
-    fn decodes_updated_weapon_flat_materials_without_gear_dye() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let skin = TagHash(0x80A9F63F);
-        let techniques = find_model_technique_entries(
-            &cache,
-            skin,
-            &package_manager().get_entry(skin).expect("V85 Vox Nocturna"),
-        );
-        let textures = find_model_textures(&cache, skin, &techniques);
-        let geometry = TagHash(0x80A9F63A);
-        let geometry_data = package_manager()
-            .read_tag(geometry)
-            .expect("V85 Vox Nocturna geometry");
-        let selected =
-            geometry_primary_index_ranges(&geometry_data, package_manager().version.endian());
-        assert!(selected.iter().any(|range| {
-            range.technique == TagHash(0x80A9FBB1)
-                && range.index_start == 0
-                && range.index_count == 2996
-        }));
-        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
-            cache.clone(),
-            skin,
-            &package_manager().get_entry(skin).expect("V85 Vox Nocturna"),
-            skin,
-            skin,
-            &[],
-        )
-        .expect("V85 model preview");
-        let GeometryPreviewKind::Model(model) = preview.kind else {
-            panic!("V85 must load as model")
-        };
-        let wireframe = model.wireframe.expect("V85 wireframe");
-        let supplemental = wireframe
-            .material_ranges
-            .iter()
-            .find(|range| range.technique == Some(TagHash(0x80A9FBB1)))
-            .expect("procedural surface must be rendered");
-        assert_eq!(
-            supplemental.textures.solid_color,
-            Some([0.44368514, 0.18800727, 0.035853356, 1.0])
-        );
-        assert_eq!(supplemental.textures.solid_surface, Some([0.54, 0.08]));
-        assert_eq!(supplemental.textures.gear_dye, None);
-        let dark = material_textures_for_technique(TagHash(0x80A9F5CD), &cache, &textures);
-        assert_eq!(dark.color, None);
-        assert_eq!(dark.solid_surface, Some([0.5, 0.0]));
-        assert!(dark.solid_color.is_some_and(|color| {
-            color[..3]
-                .iter()
-                .all(|value| (*value - 0.09845916).abs() < 0.000001)
-        }));
-        assert_eq!(dark.gear_dye, None);
-
-        let light = material_textures_for_technique(TagHash(0x80A9FBE0), &cache, &textures);
-        assert_eq!(light.color, None);
-        assert_eq!(light.solid_surface, Some([0.5, 0.25]));
-        assert!(light.solid_color.is_some_and(|color| {
-            color[..3]
-                .iter()
-                .all(|value| (*value - 0.89789754).abs() < 0.000001)
-        }));
-        assert_eq!(light.gear_dye, None);
-
-        let base = material_textures_for_technique(TagHash(0x80A9F5D8), &cache, &textures);
-        assert!(base.color.is_some());
-        assert_eq!(base.solid_color, None);
-        assert_eq!(base.solid_surface, None);
-        assert_eq!(base.gear_dye, None);
-    }
-
-    #[test]
-    #[ignore = "requires current installed Marathon packages"]
-    fn decodes_textureless_tfx_companion_materials() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-
-        let animated = material_textures_for_technique(TagHash(0x80A9B87F), &cache, &[]);
-        assert_eq!(animated.color, None);
-        assert_eq!(animated.solid_color, Some([1.0, 0.617207, 0.040915, 1.0]));
-        assert_eq!(animated.solid_surface, Some([0.5, 0.0]));
-
-        let channel_driven = material_textures_for_technique(TagHash(0x80A9B889), &cache, &[]);
-        assert_eq!(channel_driven.color, None);
-        assert_eq!(channel_driven.solid_color, Some([0.0, 0.4, 1.0, 1.0]));
-        assert_eq!(channel_driven.solid_surface, Some([0.5, 0.0]));
-
-        let shared_atlas = material_textures_for_technique(TagHash(0x80A60033), &cache, &[]);
-        assert_eq!(shared_atlas.color, Some(TagHash(0x80A60058)));
-        assert_eq!(shared_atlas.solid_color, None);
-        assert!(shared_atlas.authored_shared_atlas);
-
-        let blended_atlas = material_textures_for_technique(TagHash(0x80A9B0ED), &cache, &[]);
-        assert_eq!(blended_atlas.color, Some(TagHash(0x80A60058)));
-        assert!(blended_atlas.authored_shared_atlas);
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_visible_render_states() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let mut counts = std::collections::BTreeMap::new();
-        let mut techniques = rustc_hash::FxHashSet::default();
-
-        for (&tag, _scan) in &cache.hashes {
-            let Some(entry) = package_manager().get_entry(tag) else {
-                continue;
-            };
-            if entry.reference != CLASS_GEOMETRY_RESOURCE {
-                continue;
-            }
-            let Ok(data) = package_manager().read_tag(tag) else {
-                continue;
-            };
-            for part in geometry_primary_index_ranges(&data, package_manager().version.endian()) {
-                if techniques.insert(part.technique) {
-                    let state = render_state_for_technique(part.technique);
-                    *counts
-                        .entry((
-                            state.blend,
-                            state.depth_stencil,
-                            state.rasterizer,
-                            state.depth_bias,
-                        ))
-                        .or_insert(0usize) += 1;
-                }
-            }
-        }
-
-        eprintln!("visible render states ({})", techniques.len());
-        for (state, count) in counts {
-            eprintln!("  {state:?}: {count}");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_render_global_scopes() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        for class in [0x8080B61C, 0x80808070, 0x80808075, 0x808031DC] {
-            eprintln!("class {class:08X}");
-            for (tag, entry) in package_manager().get_all_by_reference(class) {
-                let scan = cache.hashes.get(&tag);
-                eprintln!(
-                    "  {tag} len={} strings={:?} children={:?}",
-                    entry.file_size,
-                    scan.map(|scan| &scan.raw_strings),
-                    scan.into_iter()
-                        .flat_map(|scan| scan.file_hashes.iter())
-                        .map(|child| {
-                            let child_class = package_manager()
-                                .get_entry(child.hash)
-                                .map(|entry| entry.reference)
-                                .unwrap_or_default();
-                            format!("{}@0x{:X}:{child_class:08X}", child.hash, child.offset)
-                        })
-                        .collect_vec()
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_gear_dye_scope_buffers() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let endian = package_manager().version.endian();
-
-        for (scope, entry) in package_manager().get_all_by_reference(0x808031DC) {
-            let Some(name) = cache
-                .hashes
-                .get(&scope)
-                .and_then(|scan| scan.raw_strings.first())
-                .filter(|name| name.starts_with("gear_dye"))
-            else {
-                continue;
-            };
-            let data = package_manager().read_tag(scope).expect("scope data");
-            if name == "gear_dye_skin" && scope.pkg_id() == 0x13A {
-                for (line, bytes) in data[..data.len().min(0x100)].chunks(16).enumerate() {
-                    eprintln!(
-                        "{scope} {:04X}: {}",
-                        line * 16,
-                        bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
-                    );
-                }
-                eprintln!(
-                    "{scope} arrays={:?}",
-                    scan_arrays(&data, endian)
-                        .into_iter()
-                        .map(|array| (
-                            array.class,
-                            array.count,
-                            array.data_offset,
-                            array.end_offset
-                        ))
-                        .collect_vec()
-                );
-            }
-            let constant_buffer = data
-                .get(0xAC..0xB0)
-                .map(|bytes| TagHash(read_u32(bytes, endian)))
-                .filter(|tag| tag.is_some());
-            let payload = constant_buffer
-                .and_then(|header| package_manager().get_entry(header))
-                .map(|entry| TagHash(entry.reference))
-                .and_then(|payload| package_manager().read_tag(payload).ok())
-                .unwrap_or_default();
-            let stages = crate::material::scope_stages(&entry, &data);
-            eprintln!(
-                "{scope} {name} len={} cbuffer={constant_buffer:?} payload={} values={:?} stages={:?}",
-                entry.file_size,
-                payload.len(),
-                payload
-                    .chunks_exact(16)
-                    .take(24)
-                    .map(|chunk| [
-                        read_f32(&chunk[0..4], endian),
-                        read_f32(&chunk[4..8], endian),
-                        read_f32(&chunk[8..12], endian),
-                        read_f32(&chunk[12..16], endian),
-                    ])
-                    .collect_vec(),
-                stages
-                    .iter()
-                    .map(|stage| (
-                        stage.stage,
-                        stage.bytecode.decoded_ops,
-                        stage.bytecode.unknown_ops,
-                        stage
-                            .bytecode
-                            .externs
-                            .iter()
-                            .map(|external| (
-                                external.scope.clone(),
-                                external.byte_offset,
-                                external.value_type,
-                            ))
-                            .collect_vec(),
-                        stage
-                            .bytecode
-                            .expressions
-                            .iter()
-                            .map(|expression| (
-                                expression.target.clone(),
-                                expression.expression.clone(),
-                            ))
-                            .collect_vec(),
-                        stage
-                            .bytecode
-                            .ops
-                            .iter()
-                            .map(|op| (op.name, op.detail.clone()))
-                            .collect_vec(),
-                    ))
-                    .collect_vec()
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_character_part_metadata() {
-        init_goliath_test_package_manager();
-        for tag in [
-            TagHash(0x80B14039),
-            TagHash(0x80B140B7),
-            TagHash(0x80B140E6),
-            TagHash(0x80B6CD7A),
-            TagHash(0x80AA03CA),
-        ] {
-            let data = package_manager().read_tag(tag).expect("geometry resource");
-            let endian = package_manager().version.endian();
-            eprintln!("{tag}: arrays");
-            for array in scan_arrays(&data, endian) {
-                eprintln!(
-                    "  class={:08X} {} count={} data=0x{:X}..0x{:X}",
-                    array.class,
-                    get_class_by_id(array.class)
-                        .map(|class| class.name)
-                        .unwrap_or_else(|| "unknown".into()),
-                    array.count,
-                    array.data_offset,
-                    array.end_offset
-                );
-                if array.class == CLASS_GEOMETRY_BUFFER_SET {
-                    for (line, bytes) in data[array.data_offset..array.end_offset]
-                        .chunks(16)
-                        .enumerate()
-                    {
-                        eprintln!(
-                            "    {:04X}: {}",
-                            line * 16,
-                            bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
-                        );
-                    }
-                }
-            }
-            eprintln!("{tag}: parts");
-            eprintln!(
-                "{tag}: preview part indices={:?}",
-                geometry_preview_part_indices(&data, endian)
-            );
-            for part in geometry_index_range_candidates(&data, endian) {
-                eprintln!(
-                    "  off=0x{:X} tech={} variant={} idx={}+{} prim={} flags=0x{:08X} dye={} lod={} run={}",
-                    part.record_offset,
-                    part.technique,
-                    part.variant_shader_index,
-                    part.index_start,
-                    part.index_count,
-                    part.primitive_type,
-                    part.flags,
-                    part.gear_dye_change_color_index,
-                    part.lod_category,
-                    part.lod_run
-                );
-            }
-            eprintln!(
-                "{tag}: selected={:?}",
-                geometry_primary_index_ranges(&data, endian)
-                    .iter()
-                    .map(|part| (part.part_index, part.technique, part.lod_category))
-                    .collect_vec()
-            );
-            for technique in geometry_primary_index_ranges(&data, endian)
-                .into_iter()
-                .map(|part| part.technique)
-                .unique()
-            {
-                let Some(entry) = package_manager().get_entry(technique) else {
-                    continue;
-                };
-                let Ok(technique_data) = package_manager().read_tag(technique) else {
-                    continue;
-                };
-                let scopes = crate::material::MaterialTagPreview::load(&entry, &technique_data)
-                    .map(|preview| match preview.kind {
-                        crate::material::MaterialPreviewKind::Technique(technique) => {
-                            technique.used_scope_names()
-                        }
-                    })
-                    .unwrap_or_default();
-                eprintln!(
-                    "  material {technique}: scopes={scopes:?} state={:?} ps={:?}",
-                    render_state_for_technique(technique),
-                    texture_bindings_for_technique(&entry, &technique_data)
-                        .into_iter()
-                        .filter(|binding| binding.stage == "PS")
-                        .map(|binding| (binding.slot, binding.tag))
-                        .collect_vec()
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_character_pattern_material_data() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let mut frontier = vec![TagHash(0x80B14039)];
-        let mut seen = rustc_hash::FxHashSet::default();
-
-        while let Some(tag) = frontier.pop() {
-            if !seen.insert(tag) {
-                continue;
-            }
-            let Some(entry) = package_manager().get_entry(tag) else {
-                continue;
-            };
-            let class = get_class_by_id(entry.reference)
-                .map(|class| class.name)
-                .unwrap_or_else(|| "unknown".into());
-            eprintln!("{tag}: class={:08X} {class}", entry.reference);
-            let Some(scan) = cache.hashes.get(&tag) else {
-                continue;
-            };
-            eprintln!("  parents={:?}", scan.references);
-            eprintln!(
-                "  children={:?}",
-                scan.file_hashes
-                    .iter()
-                    .map(|child| {
-                        let class = package_manager()
-                            .get_entry(child.hash)
-                            .map(|entry| entry.reference)
-                            .unwrap_or_default();
-                        format!("{}:{class:08X}", child.hash)
-                    })
-                    .collect_vec()
-            );
-
-            if matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT) {
-                let data = package_manager().read_tag(tag).expect("pattern payload");
-                eprintln!("  payload={} bytes", data.len());
-                for (line, bytes) in data[..data.len().min(0x200)].chunks(16).enumerate() {
-                    eprintln!(
-                        "    {:04X}: {}",
-                        line * 16,
-                        bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
-                    );
-                }
-                for parent in &scan.references {
-                    if package_manager().get_entry(*parent).is_some_and(|entry| {
-                        matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
-                    }) {
-                        frontier.push(*parent);
-                    }
-                }
-                for child in &scan.file_hashes {
-                    if package_manager()
-                        .get_entry(child.hash)
-                        .is_some_and(|entry| {
-                            matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
-                        })
-                    {
-                        frontier.push(child.hash);
-                    }
-                }
-            } else {
-                for parent in &scan.references {
-                    if package_manager().get_entry(*parent).is_some_and(|entry| {
-                        matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
-                    }) {
-                        frontier.push(*parent);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_pattern_value_records() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        for component in (0x80B1403A..=0x80B14042).map(TagHash) {
-            let Some(scan) = cache.hashes.get(&component) else {
-                continue;
-            };
-            eprintln!("component {component}");
-            for child in scan.file_hashes.iter().map(|child| child.hash).unique() {
-                let Some(entry) = package_manager().get_entry(child) else {
-                    continue;
-                };
-                if !matches!(
-                    entry.reference,
-                    0x8080BA53 | 0x8080BAF8 | CLASS_GEOMETRY_RESOURCE
-                ) {
-                    continue;
-                }
-                let data = package_manager().read_tag(child).unwrap_or_default();
-                eprintln!(
-                    "  {child} class={:08X} len={} bytes={} f32={:?}",
-                    entry.reference,
-                    data.len(),
-                    data.iter().map(|byte| format!("{byte:02X}")).join(" "),
-                    data.chunks_exact(4)
-                        .map(|bytes| read_f32(bytes, package_manager().version.endian()))
-                        .collect_vec()
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_character_shader_reflection_strings() {
-        init_goliath_test_package_manager();
-        for texture in [
-            TagHash(0x80B14062),
-            TagHash(0x80B140BB),
-            TagHash(0x80B140BF),
-            TagHash(0x80B140EF),
-            TagHash(0x80B140F1),
-            TagHash(0x80A613F7),
-        ] {
-            let (desc, data, _) = Texture::load_data_d2(texture, false).expect("texture");
-            eprintln!(
-                "texture={texture} {}x{} {:?} bytes={}",
-                desc.width,
-                desc.height,
-                desc.format,
-                data.len()
-            );
-        }
-        for technique in [
-            TagHash(0x80B1247F),
-            TagHash(0x80B1407C),
-            TagHash(0x80B14088),
-            TagHash(0x80B14094),
-            TagHash(0x80B140CC),
-            TagHash(0x80A9F7E6),
-            TagHash(0x80B6CD83),
-        ] {
-            let entry = package_manager().get_entry(technique).expect("technique");
-            let data = package_manager()
-                .read_tag(technique)
-                .expect("technique data");
-            let preview = crate::material::MaterialTagPreview::load(&entry, &data)
-                .expect("technique preview");
-            let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-            let Some(shader) = preview
-                .stages
-                .iter()
-                .find(|stage| stage.stage == "PS")
-                .and_then(|stage| stage.shader)
-            else {
-                continue;
-            };
-            let shader_entry = package_manager().get_entry(shader).expect("shader header");
-            let shader_data = package_manager()
-                .read_tag(TagHash(shader_entry.reference))
-                .expect("shader bytecode");
-            let strings = shader_data
-                .split(|byte| !byte.is_ascii_graphic() && *byte != b' ')
-                .filter(|bytes| bytes.len() >= 4)
-                .filter_map(|bytes| std::str::from_utf8(bytes).ok())
-                .unique()
-                .collect_vec();
-            eprintln!(
-                "tech={technique} shader={shader} data={} magic={:?} strings={:?}",
-                shader_data.len(),
-                shader_data.get(..4),
-                strings.into_iter().take(16).collect_vec()
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_mask_material_constants() {
-        init_goliath_test_package_manager();
-        for technique in [
-            TagHash(0x80B14088),
-            TagHash(0x80B1248B),
-            TagHash(0x80B124CC),
-            TagHash(0x80B140CC),
-        ] {
-            let entry = package_manager().get_entry(technique).expect("technique");
-            let data = package_manager()
-                .read_tag(technique)
-                .expect("technique data");
-            let preview = crate::material::MaterialTagPreview::load(&entry, &data)
-                .expect("technique preview");
-            let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-            eprintln!("technique {technique}");
-            for stage in preview.stages.iter().filter(|stage| stage.stage == "PS") {
-                eprintln!("  textures={:?}", stage.textures);
-                eprintln!("  constants={:?}", stage.constants);
-                eprintln!("  inline={:?}", stage.inline_constants);
-                eprintln!(
-                    "  cbuffer={:?}",
-                    stage
-                        .constant_buffer_preview
-                        .as_ref()
-                        .map(|preview| &preview.first_values)
-                );
-                eprintln!("  expressions={:?}", stage.bytecode.expressions);
-                eprintln!("  externs={:?}", stage.bytecode.externs);
-                eprintln!("  bindings={:?}", stage.bytecode.bindings);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_model_uv_coverage() {
-        init_goliath_test_package_manager();
-
-        let max_models = std::env::var("QUICKTAG_UV_PROBE_LIMIT")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(400);
-        let package_filter = std::env::var("QUICKTAG_UV_PROBE_PACKAGE_FILTER").ok();
-        let tags = package_manager()
-            .get_all_by_reference(CLASS_GEOMETRY_RESOURCE)
-            .into_iter()
-            .filter(|(tag, _entry)| {
-                package_filter.as_ref().is_none_or(|filter| {
-                    package_manager()
-                        .package_paths
-                        .get(&tag.pkg_id())
-                        .is_some_and(|path| path.name.contains(filter))
-                })
-            })
-            .take(max_models)
-            .collect_vec();
-
-        let mut parsed = 0usize;
-        let mut declared = 0usize;
-        let mut heuristic = Vec::new();
-        let mut missing = Vec::new();
-        let mut no_techniques = Vec::new();
-        let mut no_textures = Vec::new();
-        let cache = if std::env::var("QUICKTAG_UV_PROBE_FULL_CACHE").is_ok() {
-            quicktag_scanner::load_tag_cache()
-        } else {
-            TagCache::default()
-        };
-
-        for (tag, entry) in tags {
-            let Some((source, wireframe)) = parse_model_wireframe(tag, &entry) else {
-                continue;
-            };
-            parsed += 1;
-            match wireframe.uv_format.as_deref() {
-                Some(uv) if uv.contains(" layout ") => declared += 1,
-                Some(uv) => heuristic.push((tag, source.input_layout_index, uv.to_string())),
-                None => missing.push((tag, source.input_layout_index)),
-            }
-
-            let techniques = find_model_technique_entries(&cache, tag, &entry);
-            if techniques.is_empty() {
-                no_techniques.push(tag);
-                continue;
-            }
-            if find_model_textures(&cache, tag, &techniques).is_empty() {
-                no_textures.push((tag, techniques.iter().map(|(tag, _)| *tag).collect_vec()));
-            }
-        }
-
-        eprintln!(
-            "goliath uv coverage parsed={parsed} declared={declared} heuristic={} missing={} no_techniques={} no_textures={}",
-            heuristic.len(),
-            missing.len(),
-            no_techniques.len(),
-            no_textures.len()
-        );
-        eprintln!(
-            "heuristic first={:?}",
-            heuristic
-                .iter()
-                .take(16)
-                .map(|(tag, layout, uv)| format!("{tag}:{layout:?}:{uv}"))
-                .collect_vec()
-        );
-        eprintln!(
-            "missing first={:?}",
-            missing
-                .iter()
-                .take(16)
-                .map(|(tag, layout)| format!("{tag}:{layout:?}"))
-                .collect_vec()
-        );
-        eprintln!(
-            "no_techniques first={:?}",
-            no_techniques
-                .iter()
-                .take(16)
-                .map(|tag| format!("{tag}"))
-                .collect_vec()
-        );
-        eprintln!(
-            "no_textures first={:?}",
-            no_textures
-                .iter()
-                .take(16)
-                .map(|(tag, techniques)| format!("{tag}:{}", techniques.len()))
-                .collect_vec()
-        );
-        for (tag, techniques) in no_textures.iter().take(16) {
-            eprintln!(
-                "no_texture tag={tag} techniques={:?}",
-                techniques
-                    .iter()
-                    .take(16)
-                    .map(|technique| format!("{technique}"))
-                    .collect_vec()
-            );
-            for technique in techniques.iter().take(4) {
-                let entry = package_manager()
-                    .get_entry(*technique)
-                    .expect("technique entry");
-                let data = package_manager()
-                    .read_tag(*technique)
-                    .expect("technique data");
-                eprintln!(
-                    "  technique {technique} texture_bindings={:?}",
-                    texture_bindings_for_technique(&entry, &data)
-                );
-            }
-            if let Some(scan) = cache.hashes.get(tag) {
-                eprintln!(
-                    "  parents={:?}",
-                    scan.references
-                        .iter()
-                        .take(16)
-                        .map(|parent| {
-                            let class_name = package_manager()
-                                .get_entry(*parent)
-                                .and_then(|entry| get_class_by_id(entry.reference))
-                                .map(|class| class.name.to_string())
-                                .unwrap_or_else(|| "unknown".to_string());
-                            format!("{parent}:{class_name}")
-                        })
-                        .collect_vec()
-                );
-                for parent in scan.references.iter().take(8) {
-                    let parent_textures =
-                        find_related_tags(&cache, *parent, TagSearchKind::Texture, 4);
-                    let parent_techniques =
-                        find_related_tags(&cache, *parent, TagSearchKind::Technique, 4);
-                    eprintln!(
-                        "  parent {parent}: textures={:?} techniques={:?}",
-                        parent_textures
-                            .iter()
-                            .take(8)
-                            .map(|(tag, _)| format!("{tag}"))
-                            .collect_vec(),
-                        parent_techniques
-                            .iter()
-                            .take(8)
-                            .map(|(tag, _)| format!("{tag}"))
-                            .collect_vec()
-                    );
-                }
-            }
-        }
-
-        assert!(parsed > 0, "probe found no parseable geometry resources");
-        assert!(
-            heuristic.is_empty(),
-            "some parsed models still use heuristic UVs"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn probes_goliath_marathon_tfx_unknown_opcodes() {
-        init_goliath_test_package_manager();
-
-        let mut unknown = std::collections::BTreeMap::<
-            u8,
-            (usize, Vec<(TagHash, &'static str, usize, Vec<u8>)>),
-        >::new();
-        let mut stages = 0usize;
-        let mut complete = 0usize;
-
-        for (tag, entry) in package_manager().get_all_by_reference(0x808031D8) {
-            let Ok(data) = package_manager().read_tag(tag) else {
-                continue;
-            };
-            let Some(preview) = crate::material::MaterialTagPreview::load(&entry, &data) else {
-                continue;
-            };
-            let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-            for stage in preview.stages {
-                if stage.bytecode_len == 0 {
-                    continue;
-                }
-                stages += 1;
-                let Some(op) = stage.bytecode.ops.iter().find(|op| op.name == "unknown") else {
-                    complete += 1;
-                    continue;
-                };
-                let stage_index = match stage.stage {
-                    "VS" => 0,
-                    "GS" => 3,
-                    "PS" => 4,
-                    "CS" => 5,
-                    _ => continue,
-                };
-                let Some(bytecode) = read_array(
-                    &data,
-                    0x58 + stage_index * 0x88 + 0x20,
-                    1,
-                    package_manager().version.endian(),
-                ) else {
-                    continue;
-                };
-                let context_start = op.offset.saturating_sub(8);
-                let context_end = op.offset.saturating_add(24).min(bytecode.len());
-                let row = unknown.entry(op.opcode).or_default();
-                row.0 += 1;
-                if row.1.len() < 8 {
-                    row.1.push((
-                        tag,
-                        stage.stage,
-                        op.offset,
-                        bytecode[context_start..context_end].to_vec(),
-                    ));
-                }
-            }
-        }
-
-        eprintln!("marathon_tfx stages={stages} complete={complete}");
-        let rows = unknown
-            .iter()
-            .map(|(opcode, (count, examples))| (*count, *opcode, examples.first()))
-            .sorted_by_key(|(count, opcode, _example)| (Reverse(*count), *opcode))
-            .collect_vec();
-        for (count, opcode, example) in rows.into_iter().take(40) {
-            eprintln!("opcode=0x{opcode:02X} count={count} first={example:02X?}");
-        }
-        assert!(stages > 0);
-        assert_eq!(
-            complete, stages,
-            "some Marathon TFX stages still stop on unknown opcodes"
-        );
-        assert!(unknown.is_empty());
-    }
-
-    fn init_goliath_test_package_manager() {
-        use std::{path::PathBuf, sync::Arc};
-        use tiger_pkg::{GameVersion, MarathonVersion, PackageManager};
-
-        let packages = std::env::var("QUICKTAG_MARATHON_PACKAGES")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(r"D:\SteamLibrary\steamapps\common\Marathon\packages")
-            });
-        assert!(
-            packages.exists(),
-            "packages path missing: {}",
-            packages.display()
-        );
-
-        let pm = PackageManager::new(
-            packages.to_string_lossy().to_string(),
-            GameVersion::Marathon(MarathonVersion::Marathon),
-            None,
-        )
-        .expect("package manager");
-        tiger_pkg::initialize_package_manager(&Arc::new(pm));
-        quicktag_core::classes::initialize_reference_names();
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages; set QUICKTAG_MARATHON_PACKAGES"]
-    fn loads_investment_decal_atlases_for_weapon_and_runner_geometry() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-
-        for (root, expected_technique, expected_atlas) in [
-            (
-                TagHash(0x80B7B91F),
-                TagHash(0x80A9A2E0),
-                TagHash(0x80A60058),
-            ),
-            (
-                TagHash(0x80B7B9C6),
-                TagHash(0x80A9A2E0),
-                TagHash(0x80A60058),
-            ),
-            (
-                TagHash(0x80A9F88F),
-                TagHash(0x80A9A2E0),
-                TagHash(0x80A60058),
-            ),
-            (
-                TagHash(0x80A9E83E),
-                TagHash(0x80A9E7C9),
-                TagHash(0x80A9BD8A),
-            ),
-        ] {
-            let entry = package_manager().get_entry(root).expect("model root");
-            let model_tags = selected_model_geometry_tags(&cache, root, entry.reference);
-            let model_entries = model_tags
-                .iter()
-                .filter_map(|model_tag| {
-                    package_manager()
-                        .get_entry(*model_tag)
-                        .map(|entry| (*model_tag, entry))
-                })
-                .collect_vec();
-            let techniques = model_entries
-                .iter()
-                .flat_map(|(model_tag, model_entry)| {
-                    find_model_technique_entries(&cache, *model_tag, model_entry)
-                })
-                .unique_by(|(technique, _entry)| *technique)
-                .collect_vec();
-            let textures = model_tags
-                .iter()
-                .flat_map(|model_tag| find_model_textures(&cache, *model_tag, &techniques))
-                .unique_by(|(texture, _entry)| *texture)
-                .collect_vec();
-            let mut matching_ranges = 0;
-
-            for (model_tag, model_entry) in model_entries {
-                let Some((_source, mut wireframe)) = parse_model_wireframe(model_tag, &model_entry)
-                else {
-                    continue;
-                };
-                assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
-                for range in wireframe
-                    .material_ranges
-                    .iter()
-                    .filter(|range| range.technique == Some(expected_technique))
-                {
-                    matching_ranges += 1;
-                    assert_eq!(
-                        range.textures.color,
-                        Some(expected_atlas),
-                        "{root}: investment decal atlas was not promoted"
-                    );
-                    assert!(
-                        !range.textures.aux.contains(&expected_atlas),
-                        "{root}: investment decal atlas remained technical aux data"
-                    );
-                }
-            }
-
-            assert!(
-                matching_ranges > 0,
-                "{root}: expected investment decal technique {expected_technique}"
-            );
-        }
-
-        let resolve = |technique| {
-            let entry = package_manager().get_entry(technique).expect("technique");
-            let data = package_manager()
-                .read_tag(technique)
-                .expect("technique data");
-            let bindings = texture_bindings_for_technique(&entry, &data);
-            investment_decal_for_technique(technique, &bindings).expect("investment decal")
-        };
-
-        let InvestmentDecalResolution::Shader(selector) = resolve(TagHash(0x80B140A0)) else {
-            panic!("runner selector/mask technique was not decoded")
-        };
-        assert_eq!(selector.mode, InvestmentDecalMode::SelectorMask);
-        assert_eq!(selector.color, TagHash(0x80B14333));
-        assert_eq!(selector.mask, TagHash(0x80B14331));
-        assert_eq!(selector.selector_color_count, 2);
-
-        let InvestmentDecalResolution::Shader(detail) = resolve(TagHash(0x80B1443E)) else {
-            panic!("runner detail-selector technique was not decoded")
-        };
-        assert_eq!(detail.mode, InvestmentDecalMode::DetailSelectorMask);
-        assert_eq!(detail.detail, Some(TagHash(0x80A60000)));
-        assert_eq!(detail.color, TagHash(0x80B14474));
-        assert_eq!(detail.mask, TagHash(0x80B14471));
-        assert_eq!(detail.mask_mode, InvestmentDecalMaskMode::UvSplit);
-        assert_eq!(detail.atlas_selector_max, 1);
-
-        let InvestmentDecalResolution::Shader(multi_color) = resolve(TagHash(0x80B7A1DF)) else {
-            panic!("runner multi-colour selector technique was not decoded")
-        };
-        assert_eq!(multi_color.selector_color_count, 5);
-        assert_eq!(multi_color.mask_mode, InvestmentDecalMaskMode::Binary);
-        assert_eq!(multi_color.atlas_selector_max, 0);
-    }
-
-    fn authored_geometry_dyes(
-        geometry: &[TagHash],
-        palette: &[GearDyeMaterial; 6],
-    ) -> Vec<GearDyeMaterial> {
-        geometry
-            .iter()
-            .flat_map(|geometry| {
-                package_manager()
-                    .read_tag(*geometry)
-                    .into_iter()
-                    .flat_map(|data| {
-                        geometry_primary_index_ranges(&data, package_manager().version.endian())
-                    })
-            })
-            .filter_map(|range| {
-                palette
-                    .get(range.gear_dye_change_color_index as usize)
-                    .copied()
-            })
-            .collect()
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn does_not_inject_legacy_implicit_weapon_mods() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        for (model, expected_geometry, rejected_defaults) in [
-            (
-                TagHash(0x80B6E58A),
-                vec![TagHash(0x80B6E588)],
-                vec![TagHash(0x80A61EE2), TagHash(0x80A61D7E)],
-            ),
-            (
-                TagHash(0x80B6DECC),
-                vec![TagHash(0x80B6DEC9)],
-                vec![TagHash(0x80A61E8C)],
-            ),
-        ] {
-            let entry = package_manager().get_entry(model).expect("model Pattern");
-            assert_eq!(
-                selected_model_geometry_tags(&cache, model, entry.reference),
-                expected_geometry
-            );
-            let preview = GeometryTagPreview::load_model_with_weapon_mods(
-                cache.clone(),
-                model,
-                &entry,
-                model,
-                &[],
-            )
-            .expect("unmodified weapon preview");
-            let GeometryPreviewKind::Model(preview) = preview.kind else {
-                panic!("weapon Pattern must load as a model");
-            };
-            assert_eq!(preview.geometry_parts, expected_geometry);
-            assert!(
-                rejected_defaults
-                    .iter()
-                    .all(|default| !preview.geometry_parts.contains(default)),
-                "{model} still contains implicit default mods: {:?}",
-                preview.geometry_parts
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn resolves_authored_weapon_defaults_and_replaces_only_occupied_family() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let socket_index = WeaponModSocketIndex::new();
-        for (weapon, expected) in [
-            (
-                TagHash(0x80A7AD83),
-                vec![TagHash(0x80A61EE7), TagHash(0x80A61D82)],
-            ),
-            (TagHash(0x80A7ACEC), vec![TagHash(0x80A61E8F)]),
-            (
-                TagHash(0x80A7AD6C),
-                vec![
-                    TagHash(0x80A61D31),
-                    TagHash(0x80A9A431),
-                    TagHash(0x80A61D13),
-                ],
-            ),
-            (
-                TagHash(0x80A7C70D),
-                vec![TagHash(0x80A9A231), TagHash(0x80A9A1DA)],
-            ),
-            (
-                TagHash(0x80A7C86E),
-                vec![
-                    TagHash(0x80A9A0A3),
-                    TagHash(0x80A9A036),
-                    TagHash(0x80A617B7),
-                ],
-            ),
-        ] {
-            let socket = socket_index
-                .owner_for(&cache, weapon, &expected)
-                .unwrap_or_else(|| panic!("no authored socket owner for {weapon}"));
-            assert_eq!(
-                weapon_default_mod_patterns(&cache, weapon, socket)
-                    .into_iter()
-                    .collect::<rustc_hash::FxHashSet<_>>(),
-                expected
-                    .iter()
-                    .copied()
-                    .collect::<rustc_hash::FxHashSet<_>>(),
-                "wrong authored defaults for {weapon}"
-            );
-            assert!(expected.iter().all(|default| {
-                weapon_mod_attachment_pose(&cache, socket, *default).is_some()
-                    && !pattern_nearest_geometry_tags(&cache, *default).is_empty()
-            }));
-        }
-
-        let bully_socket = socket_index
-            .owner_for(&cache, TagHash(0x80A7AD83), &[TagHash(0x80A60874)])
-            .expect("Bully socket owner");
-        let bully_defaults = weapon_unoccupied_default_mod_patterns(
-            &cache,
-            TagHash(0x80A7AD83),
-            bully_socket,
-            &[TagHash(0x80A60874)],
-        );
-        assert!(bully_defaults.contains(&TagHash(0x80A61EE7)));
-        assert!(!bully_defaults.contains(&TagHash(0x80A61D82)));
-
-        let misriah_socket = socket_index
-            .owner_for(&cache, TagHash(0x80A7ACEC), &[TagHash(0x80A601B6)])
-            .expect("Misriah socket owner");
-        assert!(
-            weapon_unoccupied_default_mod_patterns(
-                &cache,
-                TagHash(0x80A7ACEC),
-                misriah_socket,
-                &[TagHash(0x80A601B6)],
-            )
-            .is_empty(),
-            "equipped Misriah grip must replace authored default grip"
-        );
-
-        let attachments = bully_defaults
-            .into_iter()
-            .chain([TagHash(0x80A60874)])
-            .map(|model_tag| WeaponModPreviewAttachment {
-                model_tag,
-                rarity: None,
-                unique_id: 0.5,
-            })
-            .collect_vec();
-        let equipped_geometry = pattern_nearest_geometry_tags(&cache, TagHash(0x80A60874));
-        assert!(!equipped_geometry.is_empty());
-        let weapon = TagHash(0x80A7AD83);
-        let entry = package_manager().get_entry(weapon).expect("Bully Pattern");
-        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
-            cache.clone(),
-            weapon,
-            &entry,
-            weapon,
-            bully_socket,
-            &attachments,
-        )
-        .expect("Bully preview");
-        let GeometryPreviewKind::Model(preview) = preview.kind else {
-            panic!("Bully Pattern must load as model");
-        };
-        assert!(preview.geometry_parts.contains(&TagHash(0x80A61EE2)));
-        assert!(!preview.geometry_parts.contains(&TagHash(0x80A61D7E)));
-        assert!(
-            equipped_geometry
-                .iter()
-                .all(|geometry| preview.geometry_parts.contains(geometry))
-        );
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn resolves_current_brrt_mod_attachment_poses() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let weapon_pattern = TagHash(0x80A7B0B0);
-        let modifications = [TagHash(0x80A61F24), TagHash(0x80A6071A)];
-        let socket = WeaponModSocketIndex::new()
-            .owner_for(&cache, weapon_pattern, &modifications)
-            .expect("BRRT authored socket owner");
-        let poses = modifications.map(|modification| {
-            let pose = weapon_mod_attachment_pose(&cache, socket, modification)
-                .unwrap_or_else(|| panic!("no pose for {modification}"));
-            assert!(weapon_mod_authored_families(&cache, modification).contains(&pose.family_id));
-            assert!(pose.translation.iter().all(|value| value.is_finite()));
-            pose
-        });
-        assert_ne!(poses[0].family_id, poses[1].family_id);
-
-        let base = TagHash(0x80AA0CA3);
-        let attachment_geometry = modifications
-            .iter()
-            .flat_map(|modification| weapon_mod_geometry_tags(&cache, *modification))
-            .collect_vec();
-        let entry = package_manager()
-            .get_entry(base)
-            .expect("BRRT current skin pattern");
-        let attachments = modifications.map(|model_tag| WeaponModPreviewAttachment {
-            model_tag,
-            rarity: None,
-            unique_id: 0.5,
-        });
-        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
-            cache.clone(),
-            base,
-            &entry,
-            weapon_pattern,
-            socket,
-            &attachments,
-        )
-        .expect("assembled BRRT preview");
-        let GeometryPreviewKind::Model(model) = preview.kind else {
-            panic!("expected model preview");
-        };
-        for expected in attachment_geometry {
-            assert!(
-                model.geometry_parts.contains(&expected),
-                "assembled preview is missing {expected}: {:?}",
-                model.geometry_parts
-            );
-        }
-        let wireframe = model.wireframe.expect("assembled preview has no geometry");
-        assert!(!wireframe.vertices.is_empty());
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn applies_authored_dont_let_up_mod_material_channels() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let skin = TagHash(0x80AA0CA3);
-        let owner = TagHash(0x80A7D43D);
-        let attachments = [TagHash(0x80A61CF0), TagHash(0x80A6071A)];
-        let palette = weapon_skin_gear_dye_palette(&cache, skin).expect("Don't let up dye palette");
-        assert_eq!(palette[1].color, [0.760525, 0.658375, 0.03434, 1.0]);
-        assert_ne!(
-            palette[0], palette[1],
-            "this regression needs distinct fallback and authored channels"
-        );
-
-        // The adjacent Goliath part bytes are independently authored: +0x1c
-        // selects mesh detail while +0x1d selects the change-color channel.
-        // Darksight has three high-detail dyed parts; Precision Barrel has one.
-        for (geometry, expected) in [
-            (TagHash(0x80A61CE0), vec![0, 0, 0]),
-            (TagHash(0x80A60716), vec![0]),
-        ] {
-            let data = package_manager()
-                .read_tag(geometry)
-                .unwrap_or_else(|error| panic!("{geometry}: {error}"));
-            let endian = package_manager().version.endian();
-            let candidates = geometry_index_range_candidates(&data, endian);
-            let selected = geometry_primary_index_ranges(&data, endian);
-            assert!(
-                candidates.iter().any(|range| range.lod_category == 7),
-                "{geometry} regression fixture must contain a lower-detail mesh"
-            );
-            assert!(
-                selected
-                    .iter()
-                    .all(|range| is_highest_detail_lod(range.lod_category)),
-                "{geometry} must not select a lower-detail mesh"
-            );
-            let channels = selected
-                .into_iter()
-                .filter_map(|range| {
-                    (range.gear_dye_change_color_index < 6)
-                        .then_some(range.gear_dye_change_color_index)
-                })
-                .collect_vec();
-            assert_eq!(channels, expected, "{geometry} authored dye channels");
-        }
-
-        let entry = package_manager().get_entry(skin).expect("skin pattern");
-        let GeometryPreviewKind::Model(model) = GeometryTagPreview::load_model_with_weapon_mods(
-            cache.clone(),
-            skin,
-            &entry,
-            owner,
-            &attachments,
-        )
-        .expect("assembled Don't let up preview")
-        .kind
-        else {
-            panic!("expected model preview");
-        };
-        for expected in [TagHash(0x80A61CE0), TagHash(0x80A60716)] {
-            assert!(
-                model.geometry_parts.contains(&expected),
-                "assembled preview is missing {expected}: {:?}",
-                model.geometry_parts
-            );
-        }
-        let ranges = model
-            .wireframe
-            .expect("assembled preview has no geometry")
-            .material_ranges;
-        let dyed = ranges
-            .iter()
-            .filter_map(|range| range.textures.gear_dye)
-            .collect_vec();
-        assert_eq!(
-            dyed,
-            [vec![palette[0]; 3], vec![palette[0]]].concat(),
-            "mods must consume their mesh-authored channel from the selected skin palette"
-        );
-        assert!(
-            ranges
-                .iter()
-                .filter(|range| range.textures.gear_dye.is_some())
-                .all(|range| matches!(
-                    range.textures.gear_dye_palette,
-                    Some(actual) if actual == palette
-                )),
-            "dyed materials need the selected skin's six-color palette for packed material IDs"
-        );
-        assert_eq!(
-            ranges
-                .iter()
-                .filter(|range| range.textures.gear_dye.is_some() && range.textures.color.is_some())
-                .count(),
-            2,
-            "both textured mod materials must retain their authored color maps"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn follows_engine_material_region_bindings_for_weapon_mods() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-
-        // The compiled general-purpose gear shader samples its packed material
-        // region IDs from PS t3. These two Atrax fixtures previously regressed
-        // because an unrelated adjacent texture replaced that authored binding.
-        for (geometry, expected_control) in [
-            (TagHash(0x80A60D31), TagHash(0x80A6183A)),
-            (TagHash(0x80A60C4B), TagHash(0x80A61800)),
-        ] {
-            let entry = package_manager()
-                .get_entry(geometry)
-                .unwrap_or_else(|| panic!("missing geometry {geometry}"));
-            let mut wireframe = parse_model_wireframe(geometry, &entry)
-                .unwrap_or_else(|| panic!("failed to parse {geometry}"))
-                .1;
-            let techniques = find_model_technique_entries(&cache, geometry, &entry);
-            let textures = find_model_textures(&cache, geometry, &techniques);
-            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
-            let dyed = wireframe
-                .material_ranges
-                .iter()
-                .filter(|range| {
-                    range.gear_dye_change_color_index.is_some() && range.textures.color.is_some()
-                })
-                .collect_vec();
-            assert!(!dyed.is_empty(), "{geometry} has no dyed material range");
-            assert!(
-                dyed.iter()
-                    .all(|range| range.textures.control == Some(expected_control)),
-                "{geometry} did not retain its authored PS t3 material-ID map: {dyed:#?}"
-            );
-        }
-
-        // The same shader's TFX writes six GearDye channels to material IDs
-        // 1..6 in this non-sequential order. This is the engine-authored LUT,
-        // not a display-name, skin, or weapon-family heuristic.
-        let technique = TagHash(0x80A60C3B);
-        let entry = package_manager()
-            .get_entry(technique)
-            .expect("gear technique");
-        let data = package_manager()
-            .read_tag(technique)
-            .expect("gear technique data");
-        let preview = crate::material::MaterialTagPreview::load(&entry, &data)
-            .expect("gear technique preview");
-        let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-        let pixel = preview
-            .stages
-            .iter()
-            .find(|stage| stage.stage == "PS")
-            .expect("pixel stage");
-        let material_id_parameters = [
-            GEAR_DYE_COLOR_PARAMETERS[0],
-            GEAR_DYE_COLOR_PARAMETERS[2],
-            GEAR_DYE_COLOR_PARAMETERS[3],
-            GEAR_DYE_COLOR_PARAMETERS[1],
-            GEAR_DYE_COLOR_PARAMETERS[4],
-            GEAR_DYE_COLOR_PARAMETERS[5],
-        ];
-        for (material_id, parameter) in material_id_parameters.into_iter().enumerate() {
-            let target = format!("output[{}]", material_id + 8);
-            let expression = pixel
-                .bytecode
-                .expressions
-                .iter()
-                .find(|expression| expression.target == target)
-                .unwrap_or_else(|| panic!("missing {target}"));
-            assert!(
-                expression
-                    .expression
-                    .contains(&format!("0x{parameter:08X}")),
-                "material ID {} resolved the wrong GearDye channel: {}",
-                material_id + 1,
-                expression.expression
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn resolves_authored_weapon_skin_dye_palettes() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let cases = [
-            (
-                TagHash(0x80B6CC5D),
-                [
-                    [0.473531, 0.027321, 0.014444],
-                    [0.181164, 0.174647, 0.181164],
-                    [0.473532, 0.027321, 0.014444],
-                    [0.730461, 0.0185, 0.0185],
-                    [0.03434, 0.033105, 0.03434],
-                    [0.723055, 0.693872, 0.708376],
-                ],
-            ),
-            (
-                TagHash(0x80B6E792),
-                [
-                    [0.412543, 0.027321, 0.016807],
-                    [0.046665, 0.046665, 0.046665],
-                    [0.401978, 0.05448, 0.045186],
-                    [0.283149, 0.030713, 0.021219],
-                    [0.401978, 0.082283, 0.074214],
-                    [0.283149, 0.030713, 0.021219],
-                ],
-            ),
-        ];
-        for component in [TagHash(0x80B6CC5C), TagHash(0x80B6E791)] {
-            let data = package_manager()
-                .read_tag(component)
-                .expect("dye component");
-            assert!(
-                decode_weapon_skin_gear_dye_palette(&data).is_some(),
-                "failed to decode {component} directly"
-            );
-        }
-        let expected_roughness = [
-            [-1.4, 1.0, 1.0],
-            [-2.0, 1.2, 1.2],
-            [-1.4, 1.3, 1.3],
-            [-2.0, 1.2, 1.2],
-            [1.4, 0.3, 0.3],
-            [-2.0, 1.2, 1.2],
-        ];
-        for (pattern, expected_colors) in cases {
-            let palette = weapon_skin_gear_dye_palette(&cache, pattern)
-                .unwrap_or_else(|| panic!("no authored palette for {pattern}"));
-            for slot in 0..6 {
-                for channel in 0..3 {
-                    assert!(
-                        (palette[slot].color[channel] - expected_colors[slot][channel]).abs()
-                            < 0.000002,
-                        "{pattern} slot {slot} color: {:?}",
-                        palette[slot].color
-                    );
-                    assert!(
-                        (palette[slot].roughness_remap[channel]
-                            - expected_roughness[slot][channel])
-                            .abs()
-                            < 0.000002,
-                        "{pattern} slot {slot} roughness: {:?}",
-                        palette[slot].roughness_remap
-                    );
-                }
-                assert_eq!(palette[slot].metal_remap, [1.0, 0.0, 0.0, 1.0]);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_atrax_pattern_object_channels() {
-        init_goliath_test_package_manager();
-        let wanted = [
-            0x1B3D64F0, 0x1B3D64F1, 0x1B3D64F3, 0x1B3D64F4, 0x1B3D64F6, 0x1B3D64F7, 0xC8939EB8,
-            0xC8939EBA, 0xC8939EBB, 0xC8939EBC, 0xC8939EBD, 0xC8939EBF, 0x3CC0E328, 0x3CC0E32A,
-            0x3CC0E32B, 0x3CC0E32C, 0x3CC0E32D, 0x3CC0E32F, 0x840253AF, 0x840253A1, 0xA500D3AF,
-            0x6F1709EA, 0xDECA4D7E, 0x7B2426A3, 0x040174F7, 0x51E7A18D, 0x89464871,
-        ];
-        quicktag_strings::wordlist::load_wordlist(|word, hash| {
-            if wanted.contains(&hash) {
-                eprintln!("OBJECT_CHANNEL_WORD {hash:08X}={word}");
-            }
-        });
-        let cache = quicktag_scanner::load_tag_cache();
-
-        let dump_component_nodes = |label: &str, component: TagHash| {
-            let data = package_manager()
-                .read_tag(component)
-                .expect("pattern component");
-            let endian = package_manager().version.endian();
-            let mut pointer_offset = 0x10usize;
-            let mut seen = rustc_hash::FxHashSet::default();
-            for index in 0..64 {
-                let Some(relative) = data
-                    .get(pointer_offset..pointer_offset + 8)
-                    .map(|bytes| read_i64(bytes, endian))
-                else {
-                    break;
-                };
-                if relative == 0 || relative == i64::MAX {
-                    break;
-                }
-                let Some(node_offset) = (pointer_offset as i64)
-                    .checked_add(relative)
-                    .and_then(|offset| usize::try_from(offset).ok())
-                else {
-                    break;
-                };
-                if !seen.insert(node_offset) || node_offset < 4 || node_offset + 0x10 > data.len() {
-                    break;
-                }
-                let class = read_u32_at(&data, node_offset - 4, endian).unwrap_or_default();
-                eprintln!(
-                    "COMPONENT_NODE label={label} component={component} index={index} node=0x{node_offset:X} data=0x{:X} class={class:08X}",
-                    node_offset + 0x10
-                );
-                pointer_offset = node_offset;
-            }
-        };
-        for component in [
-            TagHash(0x80A7C7B5),
-            TagHash(0x80A61AE0),
-            TagHash(0x80A60FA2),
-            TagHash(0x80B6D72D),
-        ] {
-            dump_component_nodes("atrax", component);
-            let data = package_manager()
-                .read_tag(component)
-                .expect("pattern component");
-            eprintln!(
-                "COMPONENT_HEADER component={component} words={:?}",
-                data.chunks_exact(4)
-                    .take(40)
-                    .map(|bytes| format!(
-                        "{:08X}",
-                        read_u32(bytes, package_manager().version.endian())
-                    ))
-                    .collect_vec()
-            );
-        }
-
-        for weapon in [
-            TagHash(0x80A7C7B5),
-            TagHash(0x80A7D43D),
-            TagHash(0x80A96FA4),
-        ] {
-            for node in descendant_pattern_nodes(&cache, weapon, 12) {
-                let poses = weapon_attachment_poses(node);
-                if poses.is_empty() {
-                    continue;
-                }
-                let data = package_manager().read_tag(node).expect("socket component");
-                eprintln!(
-                    "SOCKET_TABLE weapon={weapon} node={node} poses={:?} arrays={:?} children={:?} parents={:?}",
-                    poses
-                        .iter()
-                        .map(|pose| (pose.family_id, pose.variant_id, pose.bone_index))
-                        .collect_vec(),
-                    scan_arrays(&data, package_manager().version.endian())
-                        .into_iter()
-                        .map(|array| (array.class, array.count, array.data_offset))
-                        .collect_vec(),
-                    cache
-                        .hashes
-                        .get(&node)
-                        .into_iter()
-                        .flat_map(|scan| scan.file_hashes.iter().map(|child| child.hash))
-                        .collect_vec(),
-                    cache
-                        .hashes
-                        .get(&node)
-                        .into_iter()
-                        .flat_map(|scan| scan.references.iter().copied())
-                        .collect_vec(),
-                );
-                for array in scan_arrays(&data, package_manager().version.endian()) {
-                    if matches!(array.class, CLASS_PATTERN_CHANNEL_BINDINGS | 0x8080B1F3) {
-                        eprintln!(
-                            "  SOCKET_SWITCH class={:08X} count={} words={:?}",
-                            array.class,
-                            array.count,
-                            data[array.data_offset..array.end_offset]
-                                .chunks_exact(4)
-                                .take(if array.class == CLASS_PATTERN_CHANNEL_BINDINGS {
-                                    6
-                                } else {
-                                    16
-                                })
-                                .map(|bytes| format!(
-                                    "{:08X}",
-                                    read_u32(bytes, package_manager().version.endian())
-                                ))
-                                .collect_vec()
-                        );
-                        if array.class == 0x8080B1F3 {
-                            for (index, record) in
-                                array_records(&data, array, 0x10).into_iter().enumerate()
-                            {
-                                let record_offset = array.data_offset + index * 0x10;
-                                let relative =
-                                    read_i64(&record[0..8], package_manager().version.endian());
-                                if let Some(target) = (record_offset as i64)
-                                    .checked_add(relative)
-                                    .and_then(|target| usize::try_from(target).ok())
-                                {
-                                    eprintln!(
-                                        "  SOCKET_RESOURCE weapon={weapon} node={node} index={index} class={:08X} target=0x{target:X} words={:?}",
-                                        read_u32_at(record, 8, package_manager().version.endian())
-                                            .unwrap_or_default(),
-                                        data[target..(target + 0x100).min(data.len())]
-                                            .chunks_exact(4)
-                                            .map(|bytes| format!(
-                                                "{:08X}",
-                                                read_u32(bytes, package_manager().version.endian())
-                                            ))
-                                            .collect_vec()
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (geometry, socket_variant) in [
-            (TagHash(0x80A60D31), 0x840253AF_u32),
-            (TagHash(0x80A60C4B), 0x840253A1_u32),
-        ] {
-            let geometry_data = package_manager().read_tag(geometry).expect("mod geometry");
-            eprintln!("MOD_VARIANT geometry={geometry} socket_variant={socket_variant:08X}");
-            for part in
-                geometry_index_range_candidates(&geometry_data, package_manager().version.endian())
-            {
-                eprintln!(
-                    "  part={} base={} variant_shader={} dye={} lod={}",
-                    part.part_index,
-                    part.technique,
-                    part.variant_shader_index,
-                    part.gear_dye_change_color_index,
-                    part.lod_category
-                );
-            }
-            for technique in
-                geometry_index_range_candidates(&geometry_data, package_manager().version.endian())
-                    .into_iter()
-                    .map(|part| part.technique)
-                    .unique()
-            {
-                let entry = package_manager()
-                    .get_entry(technique)
-                    .expect("mod technique");
-                let data = package_manager()
-                    .read_tag(technique)
-                    .expect("mod technique data");
-                let preview = crate::material::MaterialTagPreview::load(&entry, &data)
-                    .expect("mod technique preview");
-                let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-                eprintln!(
-                    "  technique={technique} default7={:?} constants7={:?} inline7={:?} bindings={:?} expressions={:?}",
-                    preview
-                        .stages
-                        .iter()
-                        .find(|stage| stage.stage == "PS")
-                        .and_then(|stage| stage.constant_buffer_preview.as_ref())
-                        .and_then(|buffer| buffer.first_values.get(7)),
-                    preview
-                        .stages
-                        .iter()
-                        .find(|stage| stage.stage == "PS")
-                        .and_then(|stage| stage.constants.get(7)),
-                    preview
-                        .stages
-                        .iter()
-                        .find(|stage| stage.stage == "PS")
-                        .and_then(|stage| stage.inline_constants.get(7)),
-                    preview
-                        .stages
-                        .iter()
-                        .filter(|stage| stage.stage == "PS")
-                        .flat_map(|stage| stage.bytecode.bindings.iter())
-                        .filter(|binding| binding.source.contains("object_channel"))
-                        .map(|binding| (&binding.kind, &binding.source, binding.slot))
-                        .collect_vec(),
-                    preview
-                        .stages
-                        .iter()
-                        .filter(|stage| stage.stage == "PS")
-                        .flat_map(|stage| stage.bytecode.expressions.iter())
-                        .filter(|expression| {
-                            expression.expression.contains("object_channel")
-                                || expression.target.starts_with("output[")
-                        })
-                        .map(|expression| (&expression.target, &expression.expression))
-                        .collect_vec()
-                );
-            }
-            for parent in cache
-                .hashes
-                .get(&geometry)
-                .into_iter()
-                .flat_map(|scan| scan.references.iter().copied())
-            {
-                let Some(parent_entry) = package_manager().get_entry(parent) else {
-                    continue;
-                };
-                eprintln!("  parent={parent} class={:08X}", parent_entry.reference);
-                if !matches!(
-                    parent_entry.reference,
-                    CLASS_ENTITY_RESOURCE | CLASS_PATTERN_COMPONENT
-                ) {
-                    continue;
-                }
-                let data = package_manager().read_tag(parent).expect("model component");
-                let endian = package_manager().version.endian();
-                let resource_offset: usize = data
-                    .get(0x18..0x20)
-                    .map(|bytes| read_i64(bytes, endian))
-                    .and_then(|relative| (0x18_i64 + relative).try_into().ok())
-                    .unwrap_or_default();
-                eprintln!(
-                    "    resource=0x{resource_offset:X} model224={:?} model264={:?} socket_variant_offsets={:?}",
-                    read_tag_at(&data, resource_offset + 0x224, endian),
-                    read_tag_at(&data, resource_offset + 0x264, endian),
-                    data.windows(4)
-                        .enumerate()
-                        .filter_map(|(offset, bytes)| {
-                            (read_u32(bytes, endian) == socket_variant).then_some(offset)
-                        })
-                        .collect_vec()
-                );
-                eprintln!(
-                    "    arrays={:?}",
-                    scan_arrays(&data, endian)
-                        .into_iter()
-                        .map(|array| (array.class, array.count, array.data_offset))
-                        .collect_vec()
-                );
-                for array in scan_arrays(&data, endian) {
-                    if matches!(array.class, CLASS_PATTERN_CHANNEL_BINDINGS | 0x8080BAD0) {
-                        let stride = if array.class == CLASS_PATTERN_CHANNEL_BINDINGS {
-                            0x18
-                        } else {
-                            0x08
-                        };
-                        eprintln!(
-                            "    material switches class={:08X} records={:?}",
-                            array.class,
-                            array_records(&data, array, stride)
-                                .into_iter()
-                                .map(|record| record
-                                    .chunks_exact(4)
-                                    .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
-                                    .collect_vec())
-                                .collect_vec()
-                        );
-                    }
-                }
-                for map_offset in [0x3c0, 0x400] {
-                    let records12 = read_array(&data, resource_offset + map_offset, 12, endian)
-                        .map(|records| {
-                            records
-                                .chunks_exact(12)
-                                .map(|record| {
-                                    (
-                                        read_u32_at(record, 0, endian),
-                                        read_u32_at(record, 4, endian),
-                                        read_u32_at(record, 8, endian),
-                                    )
-                                })
-                                .collect_vec()
-                        });
-                    let tags = read_tag_array(&data, resource_offset + map_offset, endian);
-                    eprintln!("    vec+0x{map_offset:X}: records12={records12:?} tags={tags:?}");
-                }
-                let techniques = read_tag_array(&data, resource_offset + 0x400, endian);
-                for technique in techniques {
-                    let Some(entry) = package_manager().get_entry(technique) else {
-                        continue;
-                    };
-                    let Ok(technique_data) = package_manager().read_tag(technique) else {
-                        continue;
-                    };
-                    eprintln!(
-                        "    variant technique={technique} textures={:?} constants={:?}",
-                        texture_bindings_for_technique(&entry, &technique_data)
-                            .into_iter()
-                            .filter(|binding| binding.stage == "PS")
-                            .map(|binding| (binding.slot, binding.tag))
-                            .collect_vec(),
-                        crate::material::material_constants_for_technique(&entry, &technique_data)
-                    );
-                }
-            }
-        }
-        for mod_root in [TagHash(0x80A60D38), TagHash(0x80A60C4F)] {
-            for node in descendant_pattern_nodes(&cache, mod_root, 8) {
-                let data = package_manager().read_tag(node).expect("mod component");
-                let endian = package_manager().version.endian();
-                for offset in (0..data.len().saturating_sub(4)).step_by(4) {
-                    if read_u32_at(&data, offset, endian) != Some(CLASS_WEAPON_MOD_VISUAL_BINDING) {
-                        continue;
-                    }
-                    eprintln!(
-                        "MOD_VISUAL root={mod_root} node={node} offset=0x{offset:X} words={:?}",
-                        (0..24)
-                            .filter_map(|index| read_u32_at(&data, offset + index * 4, endian))
-                            .map(|value| format!("{value:08X}"))
-                            .collect_vec()
-                    );
-                }
-                for array in scan_arrays(&data, endian)
-                    .into_iter()
-                    .filter(|array| array.class == CLASS_PATTERN_CHANNEL_BINDINGS)
-                {
-                    eprintln!(
-                        "MOD_CHANNELS root={mod_root} node={node} count={} words={:?}",
-                        array.count,
-                        data[array.data_offset..array.end_offset]
-                            .chunks_exact(4)
-                            .take(64)
-                            .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
-                            .collect_vec()
-                    );
-                }
-            }
-        }
-        for root in [
-            TagHash(0x80B6D750),
-            TagHash(0x80A7C7B5),
-            TagHash(0x80A60D38),
-            TagHash(0x80A60C4F),
-        ] {
-            for node in descendant_pattern_nodes(&cache, root, 8) {
-                let Some(entry) = package_manager().get_entry(node) else {
-                    continue;
-                };
-                let Ok(data) = package_manager().read_tag(node) else {
-                    continue;
-                };
-                for parameter in [
-                    0xC8939EBF_u32,
-                    0xC8939EBA,
-                    0xC8939EBC,
-                    0xC8939EBD,
-                    0xC8939EBB,
-                    0xC8939EB8,
-                ] {
-                    for offset in (0..data.len().saturating_sub(3))
-                        .step_by(4)
-                        .filter(|offset| {
-                            read_u32_at(&data, *offset, package_manager().version.endian())
-                                == Some(parameter)
-                        })
-                    {
-                        let arrays = scan_arrays(&data, package_manager().version.endian());
-                        eprintln!(
-                            "VARIANT_RAW root={root} node={node} parameter={parameter:08X} offset=0x{offset:X} arrays={:?}",
-                            arrays
-                                .into_iter()
-                                .filter(|array| offset >= array.data_offset
-                                    && offset < array.end_offset)
-                                .map(|array| (array.class, array.count, array.data_offset))
-                                .collect_vec()
-                        );
-                    }
-                }
-                let arrays = scan_arrays(&data, package_manager().version.endian());
-                for array in arrays
-                    .iter()
-                    .copied()
-                    .filter(|array| array.class == 0x8080AF86)
-                {
-                    for (index, record) in array_records(&data, array, 0x70).into_iter().enumerate()
-                    {
-                        let Some(parameter) =
-                            read_u32_at(record, 0, package_manager().version.endian())
-                        else {
-                            continue;
-                        };
-                        if ![
-                            0xC8939EBF_u32,
-                            0xC8939EBA,
-                            0xC8939EBC,
-                            0xC8939EBD,
-                            0xC8939EBB,
-                            0xC8939EB8,
-                        ]
-                        .contains(&parameter)
-                        {
-                            continue;
-                        }
-                        let record_offset = array.data_offset + index * 0x70;
-                        let bytecode = read_array(
-                            &data,
-                            record_offset + 0x08,
-                            1,
-                            package_manager().version.endian(),
-                        )
-                        .unwrap_or_default();
-                        let constants = read_array(
-                            &data,
-                            record_offset + 0x18,
-                            0x10,
-                            package_manager().version.endian(),
-                        )
-                        .unwrap_or_default();
-                        eprintln!(
-                            "VARIANT_EXPRESSION root={root} node={node} parameter={parameter:08X} bytecode={} constants={:?} words={:?}",
-                            bytecode.iter().map(|byte| format!("{byte:02X}")).join(" "),
-                            constants
-                                .chunks_exact(0x10)
-                                .map(|constant| read_vec4_f32(
-                                    constant,
-                                    0,
-                                    package_manager().version.endian()
-                                )
-                                .unwrap())
-                                .collect_vec(),
-                            record
-                                .chunks_exact(4)
-                                .map(|bytes| format!(
-                                    "{:08X}",
-                                    read_u32(bytes, package_manager().version.endian())
-                                ))
-                                .collect_vec()
-                        );
-                    }
-                }
-                for array in arrays
-                    .iter()
-                    .copied()
-                    .filter(|array| array.class == 0x8080AF14)
-                {
-                    for (index, record) in array_records(&data, array, 0x28).into_iter().enumerate()
-                    {
-                        let Some(parameter) =
-                            read_u32_at(record, 0x20, package_manager().version.endian())
-                        else {
-                            continue;
-                        };
-                        if [
-                            0xC8939EBF_u32,
-                            0xC8939EBA,
-                            0xC8939EBC,
-                            0xC8939EBD,
-                            0xC8939EBB,
-                            0xC8939EB8,
-                        ]
-                        .contains(&parameter)
-                        {
-                            let provider = arrays
-                                .iter()
-                                .copied()
-                                .find(|candidate| candidate.class == 0x8080AF13)
-                                .and_then(|provider_array| {
-                                    array_records(&data, provider_array, 0x30)
-                                        .get(index)
-                                        .copied()
-                                })
-                                .map(|provider| {
-                                    provider
-                                        .chunks_exact(4)
-                                        .map(|bytes| {
-                                            format!(
-                                                "{:08X}",
-                                                read_u32(bytes, package_manager().version.endian())
-                                            )
-                                        })
-                                        .collect_vec()
-                                });
-                            eprintln!(
-                                "VARIANT_SELECTOR root={root} node={node} index={index} parameter={parameter:08X} words={:?} provider={provider:?}",
-                                record
-                                    .chunks_exact(4)
-                                    .map(|bytes| format!(
-                                        "{:08X}",
-                                        read_u32(bytes, package_manager().version.endian())
-                                    ))
-                                    .collect_vec()
-                            );
-                        }
-                    }
-                }
-                let singleton_vectors = arrays
-                    .iter()
-                    .copied()
-                    .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
-                    .collect_vec();
-                let vectors = singleton_vectors
-                    .iter()
-                    .copied()
-                    .map(|array| {
-                        read_serialized_dye_vector(&data, array, package_manager().version.endian())
-                    })
-                    .collect::<Option<Vec<_>>>();
-                let Some(vectors) = vectors else {
-                    continue;
-                };
-                for array in arrays
-                    .iter()
-                    .copied()
-                    .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
-                {
-                    for record in array_records(&data, array, 0x0c) {
-                        let Some(scope) =
-                            read_u32_at(record, 0x00, package_manager().version.endian())
-                        else {
-                            continue;
-                        };
-                        let Some(parameter) =
-                            read_u32_at(record, 0x04, package_manager().version.endian())
-                        else {
-                            continue;
-                        };
-                        let Some(index) =
-                            read_u32_at(record, 0x08, package_manager().version.endian())
-                                .map(|value| value as usize)
-                        else {
-                            continue;
-                        };
-                        if let Some(value) = vectors.get(index) {
-                            eprintln!(
-                                "OBJECT_CHANNEL root={root} node={node} class={:08X} scope={scope:08X} parameter={parameter:08X} index={index} value={value:?}",
-                                entry.reference
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        let variant_parameters = [
-            0xC8939EBF, 0xC8939EBA, 0xC8939EBC, 0xC8939EBD, 0xC8939EBB, 0xC8939EB8,
-        ];
-        for (component, _entry) in package_manager().get_all_by_reference(CLASS_PATTERN_COMPONENT) {
-            let Ok(data) = package_manager().read_tag(component) else {
-                continue;
-            };
-            let arrays = scan_arrays(&data, package_manager().version.endian());
-            let vectors = arrays
-                .iter()
-                .copied()
-                .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
-                .map(|array| {
-                    read_serialized_dye_vector(&data, array, package_manager().version.endian())
-                })
-                .collect::<Option<Vec<_>>>();
-            let Some(vectors) = vectors else {
-                continue;
-            };
-            let values = arrays
-                .iter()
-                .copied()
-                .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
-                .flat_map(|array| array_records(&data, array, 0x0c))
-                .filter_map(|record| {
-                    let parameter = read_u32_at(record, 0x04, package_manager().version.endian())?;
-                    variant_parameters.contains(&parameter).then_some(())?;
-                    let index =
-                        read_u32_at(record, 0x08, package_manager().version.endian())? as usize;
-                    Some((parameter, *vectors.get(index)?))
-                })
-                .collect_vec();
-            if values.is_empty() {
-                continue;
-            }
-            eprintln!(
-                "VARIANT_CHANNEL component={component} values={values:?} parents={:?}",
-                cache
-                    .hashes
-                    .get(&component)
-                    .into_iter()
-                    .flat_map(|scan| scan.references.iter().copied())
-                    .map(|parent| {
-                        (
-                            parent,
-                            package_manager()
-                                .get_entry(parent)
-                                .map(|entry| entry.reference),
-                        )
-                    })
-                    .collect_vec()
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages and shader decompiler"]
-    #[cfg(feature = "decompile-shaders")]
-    fn probes_goliath_gear_dye_pixel_shader() {
-        init_goliath_test_package_manager();
-        let shader = TagHash(0x80A6007C);
-        let entry = package_manager().get_entry(shader).expect("shader header");
-        let data = package_manager()
-            .read_tag(TagHash(entry.reference))
-            .expect("shader bytecode");
-        let decompiled = hlsldecompiler::decompile(&data).expect("decompile pixel shader");
-        std::fs::create_dir_all("target/quicktag-model-probe").unwrap();
-        std::fs::write(
-            "target/quicktag-model-probe/gear-dye-80A6007C.hlsl",
-            &decompiled,
-        )
-        .unwrap();
-        eprintln!("GEAR_DYE_SHADER_BEGIN\n{decompiled}\nGEAR_DYE_SHADER_END");
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn extracts_goliath_gear_dye_pixel_shader() {
-        init_goliath_test_package_manager();
-        std::fs::create_dir_all("target/quicktag-model-probe").unwrap();
-        for (shader, stage) in [(TagHash(0x80A6007C), "ps"), (TagHash(0x80A60079), "vs")] {
-            let entry = package_manager().get_entry(shader).expect("shader header");
-            let data = package_manager()
-                .read_tag(TagHash(entry.reference))
-                .expect("shader bytecode");
-            std::fs::write(
-                format!("target/quicktag-model-probe/gear-dye-{shader}-{stage}.bin"),
-                data,
-            )
-            .unwrap();
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn decodes_every_authored_gear_dye_component() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let endian = package_manager().version.endian();
-        let mut same_shape = 0;
-        let mut root_checks = 0;
-        let mut candidates = vec![];
-        let mut failures = vec![];
-        for (tag, _entry) in package_manager().get_all_by_reference(CLASS_PATTERN_COMPONENT) {
-            let Ok(data) = package_manager().read_tag(tag) else {
-                continue;
-            };
-            let arrays = scan_arrays(&data, package_manager().version.endian());
-            let vector_count = arrays
-                .iter()
-                .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
-                .count();
-            if vector_count == 29 {
-                same_shape += 1;
-                let binding_parameters = arrays
-                    .iter()
-                    .copied()
-                    .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
-                    .flat_map(|array| array_records(&data, array, 0x0c))
-                    .filter_map(|record| read_u32_at(record, 0x04, endian))
-                    .collect::<rustc_hash::FxHashSet<_>>();
-                if GEAR_DYE_COLOR_PARAMETERS
-                    .iter()
-                    .any(|parameter| binding_parameters.contains(parameter))
-                {
-                    candidates.push(tag);
-                    let Some(expected) = decode_weapon_skin_gear_dye_palette(&data) else {
-                        failures.push(tag);
-                        continue;
-                    };
-                    for (depth, root) in ancestor_pattern_roots(&cache, tag) {
-                        if depth != 1 {
-                            continue;
-                        }
-                        root_checks += 1;
-                        assert_eq!(
-                            weapon_skin_gear_dye_palette(&cache, root),
-                            Some(expected),
-                            "selected pattern {root} resolved the wrong dye component instead of {tag}"
-                        );
-                    }
-                }
-            }
-        }
-        assert_eq!(same_shape, 223, "unexpected 29-vector component count");
-        assert_eq!(candidates.len(), 214, "unexpected authored gear-dye count");
-        assert_eq!(
-            root_checks, 247,
-            "unexpected direct skin/default pattern coverage"
-        );
-        assert!(
-            failures.is_empty(),
-            "binding-driven dye decode failed for {failures:?}"
-        );
-
-        for (tag, expected) in [
-            (TagHash(0x80B6C2A0), [0.042311, 0.042311, 0.042311]),
-            (TagHash(0x80B6CA95), [0.152284, 0.496933, 0.015574]),
-        ] {
-            let data = package_manager().read_tag(tag).expect("dye component");
-            let palette = decode_weapon_skin_gear_dye_palette(&data).expect("authored palette");
-            for (actual, expected) in palette[0].color.into_iter().zip(expected) {
-                assert!((actual - expected).abs() < 0.000002, "{tag}: {palette:?}");
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn applies_authored_basic_weapon_dye_to_mods() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let base = TagHash(0x80AA0E95);
-        let palette = weapon_skin_gear_dye_palette(&cache, base)
-            .expect("basic weapon must resolve its authored default palette");
-        assert_eq!(palette[0].color, [0.042247, 0.042247, 0.042247, 1.0]);
-        let entry = package_manager()
-            .get_entry(base)
-            .expect("basic weapon pattern");
-        let preview = GeometryTagPreview::load_model_with_weapon_mods(
-            cache,
-            base,
-            &entry,
-            TagHash(0x80A96FA4),
-            &[
-                TagHash(0x80A60313),
-                TagHash(0x80A6068A),
-                TagHash(0x80A600AC),
-            ],
-        )
-        .expect("basic weapon with three attached mods");
-        let GeometryPreviewKind::Model(model) = preview.kind else {
-            panic!("basic weapon preview must be a model");
-        };
-        for expected in [
-            TagHash(0x80A6030F),
-            TagHash(0x80A60687),
-            TagHash(0x80A60099),
-        ] {
-            assert!(
-                model.geometry_parts.contains(&expected),
-                "missing {expected}"
-            );
-        }
-        let ranges = model
-            .wireframe
-            .expect("basic weapon wireframe")
-            .material_ranges;
-        assert!(ranges.iter().any(|range| range.textures.color.is_some()));
-        let applied = ranges
-            .iter()
-            .filter_map(|range| range.textures.gear_dye)
-            .collect_vec();
-        let attachment_geometry = [
-            TagHash(0x80A6030F),
-            TagHash(0x80A60687),
-            TagHash(0x80A60099),
-        ];
-        assert_eq!(
-            applied,
-            authored_geometry_dyes(&attachment_geometry, &palette),
-            "basic skin attachments must consume their mesh-authored palette channels"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn resolves_current_misriah_mod_attachment_poses() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let weapon_pattern = TagHash(0x80A7ACEC);
-        let modifications = [
-            TagHash(0x80A6032C),
-            TagHash(0x80A60B69),
-            TagHash(0x80A60496),
-        ];
-        let socket = WeaponModSocketIndex::new()
-            .owner_for(&cache, weapon_pattern, &modifications)
-            .expect("Misriah authored socket owner");
-        let poses = modifications.map(|modification| {
-            let pose = weapon_mod_attachment_pose(&cache, socket, modification)
-                .unwrap_or_else(|| panic!("no pose for {modification}"));
-            assert!(weapon_mod_authored_families(&cache, modification).contains(&pose.family_id));
-            assert!(pose.translation.iter().all(|value| value.is_finite()));
-            pose
-        });
-        assert_eq!(
-            poses
-                .iter()
-                .map(|pose| pose.family_id)
-                .collect::<rustc_hash::FxHashSet<_>>()
-                .len(),
-            modifications.len()
-        );
-
-        let base = TagHash(0x80B7D13F);
-        let attachment_geometry = modifications
-            .iter()
-            .flat_map(|modification| weapon_mod_geometry_tags(&cache, *modification))
-            .collect_vec();
-        let entry = package_manager()
-            .get_entry(base)
-            .expect("Misriah base pattern");
-        let attachments = modifications.map(|model_tag| WeaponModPreviewAttachment {
-            model_tag,
-            rarity: None,
-            unique_id: 0.5,
-        });
-        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
-            cache.clone(),
-            base,
-            &entry,
-            weapon_pattern,
-            socket,
-            &attachments,
-        )
-        .expect("assembled Misriah preview");
-        let GeometryPreviewKind::Model(model) = preview.kind else {
-            panic!("expected model preview");
-        };
-        for expected in attachment_geometry {
-            assert!(
-                model.geometry_parts.contains(&expected),
-                "assembled preview is missing {expected}: {:?}",
-                model.geometry_parts
-            );
-        }
-        let wireframe = model.wireframe.expect("assembled preview has no geometry");
-        assert!(!wireframe.vertices.is_empty());
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_reference_export_attachment_transforms() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let targets = [
-            ("darksight", 0.2069903_f32, 0.1242157_f32),
-            ("flechette", 0.177225_f32, 0.13954_f32),
-        ];
-
-        for tag in cache.hashes.keys().copied().sorted() {
-            if !matches!(tag.0, 0x80A7D43D | 0x80A970D2) {
-                continue;
-            }
-            let Some(entry) = package_manager().get_entry(tag) else {
-                continue;
-            };
-            if entry.file_size > 2 * 1024 * 1024 {
-                continue;
-            }
-            let Ok(data) = package_manager().read_tag(tag) else {
-                continue;
-            };
-            for (name, x, z) in targets {
-                for offset in (0..data.len().saturating_sub(3)).step_by(4) {
-                    let value = read_f32(
-                        &data[offset..offset + 4],
-                        package_manager().version.endian(),
-                    );
-                    if (value - x).abs() > 0.000001 {
-                        continue;
-                    }
-                    let nearby_z = (offset.saturating_sub(0x40)
-                        ..(offset + 0x80).min(data.len().saturating_sub(3)))
-                        .step_by(4)
-                        .find(|candidate| {
-                            let value = read_f32(
-                                &data[*candidate..*candidate + 4],
-                                package_manager().version.endian(),
-                            );
-                            (value - z).abs() < 0.000001
-                        });
-                    let Some(z_offset) = nearby_z else {
-                        continue;
-                    };
-                    let class = get_class_by_id(entry.reference)
-                        .map(|class| class.name.into_owned())
-                        .unwrap_or_else(|| format!("{:08X}", entry.reference));
-                    let parents = cache
-                        .hashes
-                        .get(&tag)
-                        .into_iter()
-                        .flat_map(|scan| scan.references.iter().copied())
-                        .filter_map(|parent| {
-                            let entry = package_manager().get_entry(parent)?;
-                            Some((parent, entry.reference))
-                        })
-                        .sorted()
-                        .collect_vec();
-                    eprintln!(
-                        "ATTACH_TRANSFORM {name} tag={tag} class={:08X}:{class} size={} x@{offset:X} z@{z_offset:X} parents={parents:08X?}",
-                        entry.reference, entry.file_size,
-                    );
-                }
-            }
-        }
-
-        let mut words = rustc_hash::FxHashMap::default();
-        quicktag_strings::wordlist::load_wordlist(|word, hash| {
-            words.entry(hash).or_insert_with(|| word.to_owned());
-        });
-        if let Ok(extra_words) =
-            std::fs::read_to_string("alkahest/crates/alkahest/wordlist_channels.txt")
-        {
-            for word in extra_words.lines() {
-                let hash = quicktag_core::util::fnv1(word.as_bytes());
-                if [
-                    0x138DE801_u32,
-                    0xA9D208CC,
-                    0xA590EEC6,
-                    0xD4FB5E33,
-                    0xEAA8E3CF,
-                ]
-                .contains(&hash)
-                {
-                    eprintln!("QUICKDRAW_CHANNEL_WORD {hash:08X}={word}");
-                }
-            }
-        }
-        for tag in [TagHash(0x80A7D43D), TagHash(0x80A970D2)] {
-            let data = package_manager()
-                .read_tag(tag)
-                .expect("attachment component");
-            let scan = &cache.hashes[&tag];
-            eprintln!(
-                "ATTACH_COMPONENT tag={tag} arrays={:?}",
-                scan_arrays(&data, package_manager().version.endian())
-                    .into_iter()
-                    .map(|array| (
-                        array.class,
-                        array.count,
-                        array.data_offset,
-                        array.end_offset
-                    ))
-                    .collect_vec()
-            );
-            eprintln!(
-                "ATTACH_COMPONENT_REFS tag={tag} refs={:?} refs64={:?} words={:?}",
-                scan.file_hashes
-                    .iter()
-                    .map(|reference| (reference.offset, reference.hash))
-                    .collect_vec(),
-                scan.file_hashes64
-                    .iter()
-                    .map(|reference| (
-                        reference.offset,
-                        reference.hash,
-                        tag64_to_hash32(reference.hash)
-                    ))
-                    .collect_vec(),
-                scan.wordlist_hashes
-                    .iter()
-                    .filter_map(|word| Some((word.offset, word.hash, words.get(&word.hash)?)))
-                    .collect_vec(),
-            );
-            for (index, record) in data[0x300..0x93c].chunks_exact(0x30).enumerate() {
-                let wide = u64::from_le_bytes(record[0x28..0x30].try_into().unwrap());
-                let visual = tag64_to_hash32(tiger_pkg::TagHash64(wide));
-                let rotation = std::array::from_fn::<_, 4, _>(|axis| {
-                    f32::from_bits(u32::from_le_bytes(
-                        record[axis * 4..0x04 + axis * 4].try_into().unwrap(),
-                    ))
-                });
-                let translation = std::array::from_fn::<_, 4, _>(|axis| {
-                    f32::from_bits(u32::from_le_bytes(
-                        record[0x10 + axis * 4..0x14 + axis * 4].try_into().unwrap(),
-                    ))
-                });
-                eprintln!(
-                    "ATTACH_RECORD tag={tag} index={index} wide={wide:016X} visual={visual:?} rotation={rotation:?} translation={translation:?}"
-                );
-            }
-            for (start, end) in [(0x560, 0x610), (0x7A0, 0x850)] {
-                eprintln!(
-                    "ATTACH_COMPONENT_WORDS tag={tag} range={start:X}..{end:X} {:?}",
-                    data[start..end.min(data.len())]
-                        .chunks_exact(4)
-                        .enumerate()
-                        .map(|(index, bytes)| {
-                            let raw = u32::from_le_bytes(bytes.try_into().unwrap());
-                            format!(
-                                "+{:03X}={raw:08X}/{}",
-                                start + index * 4,
-                                f32::from_bits(raw)
-                            )
-                        })
-                        .collect_vec()
-                );
-            }
-        }
-
-        for (name, identifier, expected_visual) in [
-            ("darksight", 0x6F17_09EA_u32, TagHash(0x80A61398)),
-            ("flechette", 0xA500_D3AF_u32, TagHash(0x80A61CF0)),
-        ] {
-            for tag in cache.hashes.keys().copied().sorted() {
-                let Some(entry) = package_manager().get_entry(tag) else {
-                    continue;
-                };
-                if entry.file_size > 128 * 1024
-                    || !matches!(
-                        entry.reference,
-                        CLASS_PATTERN | CLASS_PATTERN_COMPONENT | 0x8080BA53 | 0x8080BEF0
-                    )
-                {
-                    continue;
-                }
-                let Ok(data) = package_manager().read_tag(tag) else {
-                    continue;
-                };
-                for (offset, _bytes) in data.chunks_exact(4).enumerate().filter(|(_, bytes)| {
-                    u32::from_le_bytes((*bytes).try_into().unwrap()) == identifier
-                }) {
-                    eprintln!(
-                        "ATTACH_IDENTIFIER name={name} identifier={identifier:08X} expected={expected_visual} tag={tag} class={:08X} offset={:X}",
-                        entry.reference,
-                        offset * 4,
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_mod_anchor_tags() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let anchors = [
-            TagHash(0x80AA0E95),
-            TagHash(0x80AA0ECF),
-            TagHash(0x80A60B32),
-            TagHash(0x80A60B36),
-            TagHash(0x80A9A0C1),
-            TagHash(0x80A9A0C3),
-            TagHash(0x80A61398),
-            TagHash(0x80A61CF0),
-            TagHash(0x80A7EF31),
-            TagHash(0x80B6E792),
-        ];
-
-        for anchor in anchors {
-            let entry = package_manager().get_entry(anchor).expect("anchor entry");
-            let package = package_manager()
-                .package_paths
-                .get(&anchor.pkg_id())
-                .map(|path| path.name.clone())
-                .unwrap_or_else(|| "?".to_owned());
-            let class = get_class_by_id(entry.reference)
-                .map(|class| class.name.into_owned())
-                .unwrap_or_else(|| "unknown".to_owned());
-            let transform = (entry.reference == CLASS_GEOMETRY_RESOURCE)
-                .then(|| package_manager().read_tag(anchor).ok())
-                .flatten()
-                .and_then(|data| {
-                    read_geometry_position_transform(&data, package_manager().version.endian())
-                });
-            eprintln!(
-                "ANCHOR tag={anchor} class={:08X}:{class} size={} package={package} transform={transform:?}",
-                entry.reference, entry.file_size
-            );
-
-            let Some(scan) = cache.hashes.get(&anchor) else {
-                eprintln!("  no scan");
-                continue;
-            };
-            let parents = scan
-                .references
-                .iter()
-                .copied()
-                .filter_map(|tag| {
-                    package_manager().get_entry(tag).map(|entry| {
-                        let name = get_class_by_id(entry.reference)
-                            .map(|class| class.name.into_owned())
-                            .unwrap_or_else(|| "unknown".to_owned());
-                        (tag, entry.reference, name)
-                    })
-                })
-                .sorted()
-                .collect_vec();
-            let children = scan
-                .file_hashes
-                .iter()
-                .filter_map(|reference| {
-                    package_manager().get_entry(reference.hash).map(|entry| {
-                        let name = get_class_by_id(entry.reference)
-                            .map(|class| class.name.into_owned())
-                            .unwrap_or_else(|| "unknown".to_owned());
-                        (reference.hash, entry.reference, name)
-                    })
-                })
-                .unique()
-                .sorted()
-                .collect_vec();
-            eprintln!("  parents={parents:?}");
-            let pattern_children = children
-                .iter()
-                .filter(|(_tag, class, _name)| *class == CLASS_PATTERN_COMPONENT)
-                .map(|(tag, _class, _name)| tag.to_string())
-                .collect_vec();
-            eprintln!("  pattern_children={pattern_children:?}");
-            let geometry = pattern_geometry_tags(&cache, anchor);
-            eprintln!(
-                "  geometry={} {:?}",
-                geometry.len(),
-                geometry
-                    .iter()
-                    .map(|tag| {
-                        let transform = package_manager().read_tag(*tag).ok().and_then(|data| {
-                            read_geometry_position_transform(
-                                &data,
-                                package_manager().version.endian(),
-                            )
-                        });
-                        format!("{tag}:{transform:?}")
-                    })
-                    .collect_vec()
-            );
-            if matches!(
-                anchor.0,
-                0x80AA0E95
-                    | 0x80AA0ECF
-                    | 0x80A60B32
-                    | 0x80A60B36
-                    | 0x80A9A0C1
-                    | 0x80A9A0C3
-                    | 0x80A61398
-                    | 0x80A61CF0
-                    | 0x80A7EF31
-                    | 0x80B6E792
-            ) {
-                let nearest = pattern_nearest_geometry_tags(&cache, anchor);
-                eprintln!(
-                    "  nearest_geometry={:?}",
-                    nearest.iter().map(|tag| tag.to_string()).collect_vec()
-                );
-                for tag in nearest {
-                    let geometry_entry = package_manager().get_entry(tag).expect("geometry");
-                    let model = load_model_preview_from_tags(
-                        cache.clone(),
-                        tag,
-                        &geometry_entry,
-                        "Geometry",
-                        vec![tag],
-                        &[],
-                    );
-                    let materials = model
-                        .wireframe
-                        .into_iter()
-                        .flat_map(|wireframe| wireframe.material_ranges)
-                        .map(|range| {
-                            (
-                                range.technique.map(|tag| tag.to_string()),
-                                range.textures.color.map(|tag| tag.to_string()),
-                                range.textures.control.map(|tag| tag.to_string()),
-                                range.textures.color_tint,
-                            )
-                        })
-                        .unique()
-                        .collect_vec();
-                    eprintln!("  material geometry={tag} {materials:?}");
-                }
-            }
-
-            let mut frontier = vec![(anchor, 0usize)];
-            let mut seen = rustc_hash::FxHashSet::default();
-            seen.insert(anchor);
-            while let Some((child, depth)) = frontier.pop() {
-                if depth == 2 {
-                    continue;
-                }
-                for parent in cache
-                    .hashes
-                    .get(&child)
-                    .into_iter()
-                    .flat_map(|scan| scan.references.iter().copied())
-                    .sorted()
-                {
-                    if !seen.insert(parent) {
-                        continue;
-                    }
-                    let Some(parent_entry) = package_manager().get_entry(parent) else {
-                        continue;
-                    };
-                    if matches!(
-                        parent_entry.reference,
-                        CLASS_PATTERN | CLASS_PATTERN_COMPONENT | CLASS_GEOMETRY_RESOURCE
-                    ) {
-                        let name = get_class_by_id(parent_entry.reference)
-                            .map(|class| class.name.into_owned())
-                            .unwrap_or_else(|| "unknown".to_owned());
-                        eprintln!(
-                            "  up depth={} child={child} parent={parent} class={:08X}:{name}",
-                            depth + 1,
-                            parent_entry.reference
-                        );
-                    }
-                    frontier.push((parent, depth + 1));
-                }
-            }
-        }
-
-        let base = cache.hashes.get(&anchors[0]).expect("base scan");
-        let skin = cache.hashes.get(&anchors[1]).expect("skin scan");
-        let base_refs = base
-            .file_hashes
-            .iter()
-            .map(|reference| (reference.offset, reference.hash))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let skin_refs = skin
-            .file_hashes
-            .iter()
-            .map(|reference| (reference.offset, reference.hash))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut transitions = rustc_hash::FxHashSet::default();
-        for offset in base_refs.keys().chain(skin_refs.keys()).unique().sorted() {
-            let before = base_refs.get(offset);
-            let after = skin_refs.get(offset);
-            if before != after {
-                transitions.insert((before.copied(), after.copied()));
-            }
-        }
-        eprintln!(
-            "SKIN_REF_TRANSITIONS {:?}",
-            transitions
-                .into_iter()
-                .map(|(base, skin)| (
-                    base.map(|tag| tag.to_string()),
-                    skin.map(|tag| tag.to_string())
-                ))
-                .sorted()
-                .collect_vec()
-        );
-        for tag in [
-            TagHash(0x80A60B32),
-            TagHash(0x80A60B36),
-            TagHash(0x80A9A0C1),
-            TagHash(0x80A9A0C3),
-        ] {
-            eprintln!(
-                "REAL_MOD tag={tag} nearest={:?} roots={:?}",
-                pattern_nearest_geometry_tags(&cache, tag),
-                ancestor_pattern_roots(&cache, tag)
-            );
-        }
-        for geometry in [
-            TagHash(0x80A61D7E),
-            TagHash(0x80A9A580),
-            TagHash(0x80A60B32),
-            TagHash(0x80A9A0C1),
-            TagHash(0x80A60B66),
-        ] {
-            for component in cache
-                .hashes
-                .get(&geometry)
-                .into_iter()
-                .flat_map(|scan| scan.references.iter().copied())
-                .filter(|tag| {
-                    package_manager()
-                        .get_entry(*tag)
-                        .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
-                })
-            {
-                let data = package_manager().read_tag(component).expect("component");
-                let offsets = cache.hashes[&component]
-                    .file_hashes
-                    .iter()
-                    .filter(|reference| reference.hash == geometry)
-                    .map(|reference| reference.offset as usize)
-                    .collect_vec();
-                eprintln!(
-                    "SOCKET geometry={geometry} component={component} size={} offsets={offsets:X?}",
-                    data.len()
-                );
-                for child in cache.hashes[&component]
-                    .file_hashes
-                    .iter()
-                    .map(|reference| reference.hash)
-                    .unique()
-                {
-                    let Some(entry) = package_manager().get_entry(child) else {
-                        continue;
-                    };
-                    if !matches!(entry.reference, 0x8080BA53 | 0x8080BAF8) {
-                        continue;
-                    }
-                    let child_data = package_manager().read_tag(child).unwrap_or_default();
-                    eprintln!(
-                        "  VALUE tag={child} class={:08X} len={} words={:?}",
-                        entry.reference,
-                        child_data.len(),
-                        child_data
-                            .chunks_exact(4)
-                            .map(|bytes| {
-                                let raw = u32::from_le_bytes(bytes.try_into().unwrap());
-                                format!("{raw:08X}/{}", f32::from_bits(raw))
-                            })
-                            .collect_vec()
-                    );
-                }
-                for offset in offsets {
-                    let start = offset.saturating_sub(64);
-                    let end = (offset + 80).min(data.len());
-                    let words = data[start..end]
-                        .chunks_exact(4)
-                        .enumerate()
-                        .map(|(word, bytes)| {
-                            let raw = u32::from_le_bytes(bytes.try_into().unwrap());
-                            format!(
-                                "+{:04X}={raw:08X}/{}",
-                                start + word * 4,
-                                f32::from_bits(raw)
-                            )
-                        })
-                        .collect_vec();
-                    eprintln!("  WORDS {words:?}");
-                }
-            }
-        }
-        let technique = TagHash(0x80A60B20);
-        let technique_entry = package_manager().get_entry(technique).unwrap();
-        let technique_data = package_manager().read_tag(technique).unwrap();
-        let preview = crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
-            .expect("magazine technique");
-        let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-        for stage in preview.stages {
-            eprintln!(
-                "MAG_TECH stage={} shader={:?} textures={:?} bindings={:?} constants={:?} externs={:?}",
-                stage.stage,
-                stage.shader,
-                stage.textures,
-                stage.bytecode.bindings,
-                stage.constants,
-                stage.bytecode.externs
-            );
-        }
-        for parent in cache.hashes[&TagHash(0x80A617EC)]
-            .references
-            .iter()
-            .copied()
-        {
-            let Some(entry) = package_manager().get_entry(parent) else {
-                continue;
-            };
-            let name = get_class_by_id(entry.reference)
-                .map(|class| class.name.into_owned())
-                .unwrap_or_else(|| "unknown".to_owned());
-            eprintln!(
-                "DECAL_PARENT texture=80A617EC parent={parent} class={:08X}:{name}",
-                entry.reference
-            );
-        }
-        let mut frontier = vec![(TagHash(0x80A60B56), 0usize)];
-        let mut seen = rustc_hash::FxHashSet::default();
-        seen.insert(TagHash(0x80A60B56));
-        while let Some((child, depth)) = frontier.pop() {
-            if depth >= 5 {
-                continue;
-            }
-            for parent in cache
-                .hashes
-                .get(&child)
-                .into_iter()
-                .flat_map(|scan| scan.references.iter().copied())
-            {
-                if !seen.insert(parent) {
-                    continue;
-                }
-                let Some(entry) = package_manager().get_entry(parent) else {
-                    continue;
-                };
-                let name = get_class_by_id(entry.reference)
-                    .map(|class| class.name.into_owned())
-                    .unwrap_or_else(|| "unknown".to_owned());
-                eprintln!(
-                    "DECAL_UP depth={} child={child} parent={parent} class={:08X}:{name}",
-                    depth + 1,
-                    entry.reference
-                );
-                frontier.push((parent, depth + 1));
-            }
-        }
-        let magazine_entry = package_manager().get_entry(TagHash(0x80A60B32)).unwrap();
-        let mut magazine_wireframe = parse_model_wireframe(TagHash(0x80A60B32), &magazine_entry)
-            .unwrap()
-            .1;
-        let magazine_techniques =
-            find_model_technique_entries(&cache, TagHash(0x80A60B32), &magazine_entry);
-        let magazine_textures =
-            find_model_textures(&cache, TagHash(0x80A60B32), &magazine_techniques);
-        assign_wireframe_material_textures(&mut magazine_wireframe, &cache, &magazine_textures);
-        for range in magazine_wireframe.material_ranges {
-            eprintln!(
-                "MAG_RANGE stage={:?} tech={:?} start={} count={} color={:?} control={:?} aux={:?}",
-                range.render_stage,
-                range.technique,
-                range.index_start,
-                range.index_count,
-                range.textures.color,
-                range.textures.control,
-                range.textures.aux
-            );
-        }
-        let magazine_data = package_manager().read_tag(TagHash(0x80A60B32)).unwrap();
-        for range in
-            geometry_index_range_candidates(&magazine_data, package_manager().version.endian())
-        {
-            eprintln!(
-                "MAG_CAND part={} stage={:?} tech={} variant={} start={} count={} lod={} flags={:08X} dye={}",
-                range.part_index,
-                range.render_stage,
-                range.technique,
-                range.variant_shader_index,
-                range.index_start,
-                range.index_count,
-                range.lod_category,
-                range.flags,
-                range.gear_dye_change_color_index
-            );
-        }
-        let root = TagHash(0x80A97015);
-        let mut frontier = vec![(root, 0usize)];
-        let mut seen = rustc_hash::FxHashSet::default();
-        seen.insert(root);
-        while let Some((node, depth)) = frontier.pop() {
-            if depth >= 6 {
-                continue;
-            }
-            for child in cache.hashes.get(&node).into_iter().flat_map(|scan| {
-                scan.file_hashes
-                    .iter()
-                    .map(|reference| reference.hash)
-                    .chain(
-                        scan.file_hashes64
-                            .iter()
-                            .filter_map(|reference| tag64_to_hash32(reference.hash)),
-                    )
-            }) {
-                let Some(entry) = package_manager().get_entry(child) else {
-                    continue;
-                };
-                if !matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
-                    || !seen.insert(child)
-                {
-                    continue;
-                }
-                if entry.reference == CLASS_PATTERN {
-                    let nearest = pattern_nearest_geometry_tags(&cache, child);
-                    if !nearest.is_empty() {
-                        eprintln!(
-                            "ROOT_BRANCH depth={} pattern={child} geometry={:?}",
-                            depth + 1,
-                            nearest.iter().map(|tag| tag.to_string()).collect_vec()
-                        );
-                    }
-                }
-                frontier.push((child, depth + 1));
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_inventory_mod_render_paths() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        for start in [TagHash(0x80A9A582), TagHash(0x80A61D82)] {
-            let mut queue = std::collections::VecDeque::from([(start, vec![start])]);
-            let mut seen = rustc_hash::FxHashSet::default();
-            seen.insert(start);
-            let mut hits = vec![];
-            while let Some((node, path)) = queue.pop_front() {
-                if path.len() > 14 {
-                    continue;
-                }
-                let Some(scan) = cache.hashes.get(&node) else {
-                    continue;
-                };
-                let neighbors = scan
-                    .references
-                    .iter()
-                    .copied()
-                    .chain(scan.file_hashes.iter().map(|reference| reference.hash))
-                    .chain(
-                        scan.file_hashes64
-                            .iter()
-                            .filter_map(|reference| tag64_to_hash32(reference.hash)),
-                    )
-                    .unique()
-                    .collect_vec();
-                for next in neighbors {
-                    if !seen.insert(next) {
-                        continue;
-                    }
-                    let Some(entry) = package_manager().get_entry(next) else {
-                        continue;
-                    };
-                    let mut next_path = path.clone();
-                    next_path.push(next);
-                    if entry.reference == CLASS_GEOMETRY_RESOURCE {
-                        hits.push(next_path.clone());
-                        if hits.len() >= 32 {
-                            break;
-                        }
-                    }
-                    queue.push_back((next, next_path));
-                }
-                if hits.len() >= 32 {
-                    break;
-                }
-            }
-            for path in hits {
-                let annotated = path
-                    .into_iter()
-                    .map(|tag| {
-                        let class = package_manager()
-                            .get_entry(tag)
-                            .map(|entry| entry.reference)
-                            .unwrap_or_default();
-                        format!("{tag}:{class:08X}")
-                    })
-                    .join(" -> ");
-                eprintln!("MOD_PATH {start}: {annotated}");
-            }
-        }
-
-        for tag in [TagHash(0x80AA0E95), TagHash(0x80A9A582)] {
-            let scan = cache.hashes.get(&tag).expect("tag scan");
-            for reference in &scan.file_hashes {
-                let class = package_manager()
-                    .get_entry(reference.hash)
-                    .map(|entry| entry.reference)
-                    .unwrap_or_default();
-                eprintln!(
-                    "MOD_DIRECT {tag} +{:X} -> {}:{class:08X}",
-                    reference.offset, reference.hash
-                );
-            }
-            let data = package_manager().read_tag(tag).expect("tag payload");
-            for array in scan_arrays(&data, package_manager().version.endian()) {
-                eprintln!(
-                    "MOD_ARRAY {tag} class={:08X} count={} data={:X} end={:X}",
-                    array.class, array.count, array.data_offset, array.end_offset
-                );
-                if array.class == 0x8080BAC2 {
-                    for (index, record) in array_records(&data, array, 0x28)
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(_index, record)| {
-                            read_u32_at(record, 0x20, package_manager().version.endian())
-                                == Some(0x80A60015)
-                        })
-                    {
-                        let words = record
-                            .chunks_exact(4)
-                            .map(|bytes| read_u32(bytes, package_manager().version.endian()))
-                            .map(|raw| format!("{raw:08X}"))
-                            .collect_vec();
-                        eprintln!("MOD_ROOT_DESCRIPTOR {tag} index={index} words={words:?}");
-                    }
-                }
-            }
-        }
-        for tag in [TagHash(0x80A9BC45), TagHash(0x80A9BC46)] {
-            eprintln!(
-                "MOD_COMPONENT {tag} nearest={:?}",
-                pattern_nearest_geometry_tags(&cache, tag)
-            );
-            let scan = cache.hashes.get(&tag).expect("component scan");
-            for reference in &scan.file_hashes {
-                let class = package_manager()
-                    .get_entry(reference.hash)
-                    .map(|entry| entry.reference)
-                    .unwrap_or_default();
-                eprintln!(
-                    "MOD_COMPONENT_REF {tag} +{:X} -> {}:{class:08X}",
-                    reference.offset, reference.hash
-                );
-            }
-        }
-        for owner in cache.hashes[&TagHash(0x80A60015)]
-            .references
-            .iter()
-            .copied()
-            .filter(|tag| {
-                package_manager()
-                    .get_entry(*tag)
-                    .is_some_and(|entry| entry.reference == CLASS_PATTERN_COMPONENT)
-            })
-        {
-            let data = package_manager().read_tag(owner).expect("descriptor owner");
-            for reference in cache.hashes[&owner]
-                .file_hashes
-                .iter()
-                .filter(|reference| reference.hash == TagHash(0x80A60015))
-            {
-                let end = reference.offset as usize + 4;
-                let start = end.saturating_sub(0x28);
-                let words = data[start..end]
-                    .chunks_exact(4)
-                    .map(|bytes| read_u32(bytes, package_manager().version.endian()))
-                    .map(|raw| format!("{raw:08X}"))
-                    .collect_vec();
-                eprintln!(
-                    "MOD_DESCRIPTOR_RECORD owner={owner} offset={:X} words={words:?}",
-                    reference.offset
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_magazine_component_pose() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        for (component, geometry) in [
-            (TagHash(0x80A9BC45), TagHash(0x80AA0E92)),
-            (TagHash(0x80A9A357), TagHash(0x80A61D7E)),
-            (TagHash(0x80A9B013), TagHash(0x80A9A580)),
-            (TagHash(0x80A6076C), TagHash(0x80A60B32)),
-        ] {
-            let data = package_manager().read_tag(component).expect("component");
-            let geometry_offsets = cache.hashes[&component]
-                .file_hashes
-                .iter()
-                .filter(|reference| reference.hash == geometry)
-                .map(|reference| reference.offset as usize)
-                .collect_vec();
-            let entry = package_manager()
-                .get_entry(geometry)
-                .expect("geometry entry");
-            let wireframe = parse_model_wireframe(geometry, &entry)
-                .expect("wireframe")
-                .1;
-            eprintln!(
-                "POSE component={component} geometry={geometry} offsets={geometry_offsets:X?} bounds={:?}..{:?}",
-                wireframe.min, wireframe.max
-            );
-            for array in scan_arrays(&data, package_manager().version.endian()) {
-                if geometry_offsets
-                    .iter()
-                    .any(|offset| *offset >= array.data_offset && *offset < array.end_offset)
-                {
-                    let start = array.data_offset;
-                    let end = array.end_offset.min(data.len());
-                    eprintln!(
-                        "POSE_ARRAY class={:08X} count={} data={start:X} end={end:X} bytes={}",
-                        array.class,
-                        array.count,
-                        data[start..end]
-                            .iter()
-                            .map(|byte| format!("{byte:02X}"))
-                            .join(" ")
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_updated_weapon_pattern_words() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let mut wordlist = rustc_hash::FxHashMap::default();
-        quicktag_strings::wordlist::load_wordlist(|word, hash| {
-            wordlist.entry(hash).or_insert_with(|| word.to_owned());
-        });
-        for (name, model) in [
-            ("BRRT SMG", TagHash(0x80A7B0B0)),
-            ("Bully SMG", TagHash(0x80A7AD83)),
-            ("Longshot", TagHash(0x80A7AD6C)),
-            ("Misriah 2442", TagHash(0x80A7ACEC)),
-            ("V11 Punch", TagHash(0x80A7AEC7)),
-            ("V22 Volt Thrower", TagHash(0x80A7ADA4)),
-        ] {
-            let words = descendant_pattern_nodes(&cache, model, 8)
-                .into_iter()
-                .filter_map(|node| cache.hashes.get(&node))
-                .flat_map(|scan| scan.wordlist_hashes.iter().map(|word| word.hash))
-                .unique()
-                .filter_map(|hash| Some((hash, wordlist.get(&hash)?.clone())))
-                .sorted_by_key(|(_hash, word)| word.clone())
-                .collect_vec();
-            eprintln!("WEAPON_PATTERN_WORDS name={name} model={model} words={words:X?}");
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_updated_weapon_socket_ancestry() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        for (name, model) in [
-            ("Bully SMG", TagHash(0x80A7AD83)),
-            ("Misriah 2442", TagHash(0x80A7ACEC)),
-            ("V99 Channel Rifle", TagHash(0x80A7C86E)),
-            ("Biotoxic Disinjector", TagHash(0x80A7E10C)),
-            ("BR33 Volley Rifle", TagHash(0x80A7AA89)),
-            ("BRRT SMG", TagHash(0x80A7B0B0)),
-            ("Copperhead RF", TagHash(0x80A7ADC2)),
-            ("Demolition HMG", TagHash(0x80A7B89F)),
-            ("Longshot", TagHash(0x80A7AD6C)),
-            ("M77 Assault Rifle", TagHash(0x80A7C262)),
-            ("Outland", TagHash(0x80A7C70D)),
-            ("Stryder M1T", TagHash(0x80A7B354)),
-            ("Twin Tap HBR", TagHash(0x80A7B336)),
-            ("V00 ZEUS RG", TagHash(0x80A7AD4A)),
-            ("WSTR Combat Shotgun", TagHash(0x80A7AC1F)),
-        ] {
-            let rooted = rooted_pattern_equivalent(&cache, model);
-            let ancestors = std::iter::once((0usize, model))
-                .chain(rooted.map(|root| (0, root)))
-                .chain(ancestor_pattern_roots(&cache, model))
-                .chain(
-                    rooted
-                        .into_iter()
-                        .flat_map(|root| ancestor_pattern_roots(&cache, root)),
-                )
-                .unique_by(|(_depth, candidate)| *candidate)
-                .map(|(depth, candidate)| {
-                    let tables = descendant_pattern_nodes_with_depth(&cache, candidate, 12)
-                        .into_iter()
-                        .filter_map(|(node, node_depth)| {
-                            let poses = weapon_attachment_poses(node);
-                            (!poses.is_empty()).then_some((
-                                node_depth,
-                                node,
-                                poses.iter().filter(|pose| pose.bone_index != 0).count(),
-                                poses.len(),
-                            ))
-                        })
-                        .collect_vec();
-                    (depth, candidate, tables)
-                })
-                .filter(|(_depth, _candidate, tables)| !tables.is_empty())
-                .collect_vec();
-            eprintln!(
-                "UPDATED_SOCKET_ANCESTRY name={name} model={model} rooted={rooted:?} candidates={ancestors:?}"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_weapon_socket_resources() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let start = TagHash(0x80AA0E95);
-        let targets = [0x80809779, 0x808081DD, 0x80808B66, 0x80806D8A];
-        let mut queue = std::collections::VecDeque::from([(start, vec![start])]);
-        let mut seen = rustc_hash::FxHashSet::default();
-        seen.insert(start);
-        while let Some((node, path)) = queue.pop_front() {
-            if path.len() > 12 || seen.len() > 50_000 {
-                continue;
-            }
-            let Some(scan) = cache.hashes.get(&node) else {
-                continue;
-            };
-            for child in scan
-                .file_hashes
-                .iter()
-                .map(|reference| reference.hash)
-                .chain(
-                    scan.file_hashes64
-                        .iter()
-                        .filter_map(|reference| tag64_to_hash32(reference.hash)),
-                )
-                .chain(scan.references.iter().copied())
-                .unique()
-            {
-                if !seen.insert(child) {
-                    continue;
-                }
-                let Some(entry) = package_manager().get_entry(child) else {
-                    continue;
-                };
-                let mut child_path = path.clone();
-                child_path.push(child);
-                if targets.contains(&entry.reference) {
-                    eprintln!(
-                        "SOCKET_RESOURCE class={:08X} path={}",
-                        entry.reference,
-                        child_path.iter().format(" -> ")
-                    );
-                }
-                queue.push_back((child, child_path));
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_magazine_vertex_streams() {
-        init_goliath_test_package_manager();
-        for geometry in [TagHash(0x80A60B32), TagHash(0x80A61D7E)] {
-            let data = package_manager().read_tag(geometry).expect("geometry");
-            for array in scan_arrays(&data, package_manager().version.endian())
-                .into_iter()
-                .filter(|array| array.class == CLASS_GEOMETRY_BUFFER_SET)
-            {
-                for record in array_records(&data, array, 0x80) {
-                    let refs = (0..0x20)
-                        .step_by(4)
-                        .map(|offset| {
-                            read_u32_at(record, offset, package_manager().version.endian())
-                        })
-                        .collect_vec();
-                    eprintln!(
-                        "STREAMS geometry={geometry} layout={:?} refs={refs:08X?}",
-                        geometry_buffer_set_input_layout_id(record)
-                    );
-                    for tag in refs
-                        .into_iter()
-                        .flatten()
-                        .map(TagHash)
-                        .filter(|tag| package_manager().get_entry(*tag).is_some())
-                    {
-                        let entry = package_manager().get_entry(tag).unwrap();
-                        let payload = package_manager().read_tag(tag).unwrap_or_default();
-                        eprintln!(
-                            "STREAM tag={tag} class={:08X} len={} head={}",
-                            entry.reference,
-                            payload.len(),
-                            payload
-                                .iter()
-                                .take(32)
-                                .map(|byte| format!("{byte:02X}"))
-                                .join(" ")
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_weapon_pattern_owners() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let weapon = TagHash(0x80AA0E95);
-        for owner in cache.hashes[&weapon].references.iter().copied() {
-            let entry = package_manager().get_entry(owner).expect("owner");
-            let data = package_manager().read_tag(owner).unwrap_or_default();
-            eprintln!(
-                "WEAPON_OWNER tag={owner} class={:08X} len={} refs={:?} arrays={:?}",
-                entry.reference,
-                data.len(),
-                cache
-                    .hashes
-                    .get(&owner)
-                    .into_iter()
-                    .flat_map(|scan| scan.file_hashes.iter())
-                    .map(|reference| (
-                        reference.offset,
-                        reference.hash,
-                        package_manager()
-                            .get_entry(reference.hash)
-                            .map(|entry| entry.reference)
-                    ))
-                    .collect_vec(),
-                scan_arrays(&data, package_manager().version.endian())
-                    .into_iter()
-                    .map(|array| (
-                        array.class,
-                        array.count,
-                        array.data_offset,
-                        array.end_offset
-                    ))
-                    .collect_vec()
-            );
-            eprintln!(
-                "WEAPON_OWNER_BYTES {owner} {}",
-                data.iter().map(|byte| format!("{byte:02X}")).join(" ")
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_root_hierarchy_records() {
-        init_goliath_test_package_manager();
-        let data = package_manager()
-            .read_tag(TagHash(0x80A9700D))
-            .expect("root component");
-        for offset in (0x4B0..data.len()).step_by(8) {
-            let bytes = &data[offset..(offset + 8).min(data.len())];
-            eprintln!(
-                "ROOT_WORD {offset:04X} {}",
-                bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
-            );
-        }
-        for offset in [0x188usize, 0x1B8, 0x1E8, 0x218, 0x248, 0x480] {
-            let record = &data[offset..offset + 0x30];
-            eprintln!(
-                "ROOT_RECORD {offset:04X} {:?}",
-                record
-                    .chunks_exact(4)
-                    .map(|bytes| {
-                        let raw = u32::from_le_bytes(bytes.try_into().unwrap());
-                        format!("{raw:08X}/{}", f32::from_bits(raw))
-                    })
-                    .collect_vec()
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_weapon_translation_candidates() {
-        init_goliath_test_package_manager();
-        for tag in [
-            TagHash(0x80AA0E95),
-            TagHash(0x80A9BC45),
-            TagHash(0x80A9700D),
-            TagHash(0x80A97015),
-            TagHash(0x80AA30DD),
-        ] {
-            let data = package_manager().read_tag(tag).unwrap_or_default();
-            for offset in (0..data.len().saturating_sub(4)).step_by(4) {
-                let raw = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                let value = f32::from_bits(raw);
-                if value.is_finite() && (0.08..0.18).contains(&value.abs()) {
-                    eprintln!("TRANSLATION_CANDIDATE tag={tag} offset={offset:X} value={value}");
-                    if tag == TagHash(0x80A97015) {
-                        let start = offset.saturating_sub(0x40);
-                        let end = (offset + 0x44).min(data.len());
-                        eprintln!(
-                            "TRANSLATION_CONTEXT {}",
-                            data[start..end]
-                                .chunks_exact(4)
-                                .enumerate()
-                                .map(|(index, bytes)| {
-                                    let raw = u32::from_le_bytes(bytes.try_into().unwrap());
-                                    format!(
-                                        "+{:X}={raw:08X}/{}",
-                                        start + index * 4,
-                                        f32::from_bits(raw)
-                                    )
-                                })
-                                .join(" ")
-                        );
-                        for array in scan_arrays(&data, package_manager().version.endian())
-                            .into_iter()
-                            .filter(|array| {
-                                offset >= array.data_offset && offset < array.end_offset
-                            })
-                        {
-                            eprintln!(
-                                "TRANSLATION_ARRAY class={:08X} count={} data={:X} end={:X}",
-                                array.class, array.count, array.data_offset, array.end_offset
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_goliath_weapon_pattern_mod_nodes() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let mut words = rustc_hash::FxHashMap::default();
-        quicktag_strings::wordlist::load_wordlist(|word, hash| {
-            words.entry(hash).or_insert_with(|| word.to_owned());
-        });
-        if let Ok(extra_words) =
-            std::fs::read_to_string("alkahest/crates/alkahest/wordlist_channels.txt")
-        {
-            for word in extra_words.lines() {
-                words
-                    .entry(quicktag_core::util::fnv1(word.as_bytes()))
-                    .or_insert_with(|| word.to_owned());
-            }
-        }
-        for word in words.values().unique() {
-            for candidate in [
-                format!("{word}0"),
-                format!("{word}_0"),
-                format!("{word}.0"),
-                format!("parent.{word}0"),
-                format!("parent.{word}_0"),
-            ] {
-                if quicktag_core::util::fnv1(candidate.as_bytes()) == 0xD5754C50 {
-                    eprintln!("resolved D5754C50 channel prefix: {candidate}");
-                }
-            }
-        }
-
-        for selected in [
-            TagHash(0x80B6CD7A),
-            TagHash(0x80AA03CA),
-            TagHash(0x80AA0E95),
-            TagHash(0x80AA0ECF),
-            TagHash(0x80A9A582),
-            TagHash(0x80A61D82),
-        ] {
-            let mut ancestors = vec![selected];
-            let mut seen = rustc_hash::FxHashSet::default();
-            let mut roots = vec![];
-            seen.insert(selected);
-            while let Some(child) = ancestors.pop() {
-                for parent in cache
-                    .hashes
-                    .get(&child)
-                    .into_iter()
-                    .flat_map(|scan| scan.references.iter().copied())
-                {
-                    let class = package_manager()
-                        .get_entry(parent)
-                        .map(|entry| entry.reference)
-                        .unwrap_or_default();
-                    if matches!(class, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
-                        && seen.insert(parent)
-                    {
-                        if class == CLASS_PATTERN {
-                            roots.push(parent);
-                        }
-                        ancestors.push(parent);
-                    }
-                }
-            }
-            roots.sort();
-            roots.dedup();
-            eprintln!("selected={selected} roots={roots:?}");
-
-            for root in roots {
-                let mut frontier = vec![root];
-                let mut visited = rustc_hash::FxHashSet::default();
-                while let Some(node) = frontier.pop() {
-                    if !visited.insert(node) {
-                        continue;
-                    }
-                    let Some(entry) = package_manager().get_entry(node) else {
-                        continue;
-                    };
-                    let scan = cache.hashes.get(&node);
-                    let child_classes = scan
-                        .into_iter()
-                        .flat_map(|scan| {
-                            scan.file_hashes
-                                .iter()
-                                .map(|reference| reference.hash)
-                                .chain(
-                                    scan.file_hashes64
-                                        .iter()
-                                        .filter_map(|reference| tag64_to_hash32(reference.hash)),
-                                )
-                        })
-                        .filter_map(|child| {
-                            package_manager()
-                                .get_entry(child)
-                                .map(|entry| (entry.reference, child))
-                        })
-                        .fold(
-                            rustc_hash::FxHashMap::<u32, rustc_hash::FxHashSet<TagHash>>::default(),
-                            |mut classes, (class, child)| {
-                                classes.entry(class).or_default().insert(child);
-                                classes
-                            },
-                        );
-                    for config in child_classes
-                        .get(&0x8080BA53)
-                        .into_iter()
-                        .flat_map(|tags| tags.iter().copied())
-                    {
-                        let data = package_manager().read_tag(config).unwrap_or_default();
-                        let config_scan = cache.hashes.get(&config);
-                        let config_words = config_scan
-                            .into_iter()
-                            .flat_map(|scan| scan.wordlist_hashes.iter())
-                            .filter_map(|hash| {
-                                words
-                                    .get(&hash.hash)
-                                    .map(|word| (hash.offset, word.clone()))
-                            })
-                            .collect_vec();
-                        let refs = config_scan
-                            .into_iter()
-                            .flat_map(|scan| scan.file_hashes.iter())
-                            .map(|reference| {
-                                let class = package_manager()
-                                    .get_entry(reference.hash)
-                                    .map(|entry| entry.reference)
-                                    .unwrap_or_default();
-                                (reference.offset, reference.hash, class)
-                            })
-                            .collect_vec();
-                        eprintln!(
-                            "    config={config} len={} words={config_words:?} refs={refs:?} arrays={:?}",
-                            data.len(),
-                            scan_arrays(&data, package_manager().version.endian())
-                                .into_iter()
-                                .map(|array| (
-                                    array.class,
-                                    array.count,
-                                    array.data_offset,
-                                    array.end_offset
-                                ))
-                                .collect_vec(),
-                        );
-                        if matches!(config.0, 0x80A9BDA3 | 0x80A9BB64) {
-                            for (line, bytes) in data.chunks(16).enumerate() {
-                                eprintln!(
-                                    "      {config} {:04X}: {}",
-                                    line * 16,
-                                    bytes.iter().map(|byte| format!("{byte:02X}")).join(" ")
-                                );
-                            }
-                        }
-                    }
-                    let names = scan
-                        .into_iter()
-                        .flat_map(|scan| scan.wordlist_hashes.iter())
-                        .filter_map(|hash| words.get(&hash.hash).map(|word| (hash.offset, word)))
-                        .filter(|(_offset, word)| {
-                            let word = word.to_ascii_lowercase();
-                            word.contains("mod")
-                                || word.contains("optic")
-                                || word.contains("muzzle")
-                                || word.contains("magazine")
-                                || word.contains("grip")
-                                || word.contains("socket")
-                                || word.contains("attach")
-                                || word.contains("variant")
-                        })
-                        .collect_vec();
-                    let children = scan
-                        .into_iter()
-                        .flat_map(|scan| scan.file_hashes.iter().map(|reference| reference.hash))
-                        .filter(|child| {
-                            package_manager().get_entry(*child).is_some_and(|entry| {
-                                matches!(
-                                    entry.reference,
-                                    CLASS_PATTERN
-                                        | CLASS_PATTERN_COMPONENT
-                                        | CLASS_GEOMETRY_RESOURCE
-                                )
-                            })
-                        })
-                        .unique()
-                        .collect_vec();
-                    let arrays = package_manager()
-                        .read_tag(node)
-                        .ok()
-                        .map(|data| {
-                            scan_arrays(&data, package_manager().version.endian())
-                                .into_iter()
-                                .map(|array| {
-                                    (
-                                        array.class,
-                                        array.count,
-                                        array.data_offset,
-                                        array.end_offset,
-                                    )
-                                })
-                                .collect_vec()
-                        })
-                        .unwrap_or_default();
-                    if matches!(node.0, 0x80B6CD7B | 0x80B6D76B) {
-                        let data = package_manager().read_tag(node).unwrap_or_default();
-                        for array in scan_arrays(&data, package_manager().version.endian())
-                            .into_iter()
-                            .filter(|array| {
-                                matches!(
-                                    array.class,
-                                    0x8080AF13 | 0x8080AF14 | 0x8080BF07 | 0x8080AF7B
-                                )
-                            })
-                        {
-                            let stride = match array.class {
-                                0x8080AF13 => 0x30,
-                                0x8080AF14 => 0x28,
-                                0x8080BF07 => 0x10,
-                                0x8080AF7B => 0x4,
-                                _ => unreachable!(),
-                            };
-                            for (index, record) in
-                                array_records(&data, array, stride).into_iter().enumerate()
-                            {
-                                let fields = record
-                                    .chunks_exact(4)
-                                    .enumerate()
-                                    .map(|(field, bytes)| {
-                                        let value =
-                                            read_u32(bytes, package_manager().version.endian());
-                                        let meaning =
-                                            words.get(&value).cloned().unwrap_or_default();
-                                        format!("+{:02X}={value:08X}:{meaning}", field * 4)
-                                    })
-                                    .collect_vec();
-                                eprintln!(
-                                    "    selector node={node} class={:08X} index={index}: {fields:?}",
-                                    array.class
-                                );
-                            }
-                        }
-                    }
-                    if node == root {
-                        let data = package_manager().read_tag(node).unwrap_or_default();
-                        let mut descriptors = rustc_hash::FxHashSet::default();
-                        for array in scan_arrays(&data, package_manager().version.endian())
-                            .into_iter()
-                            .filter(|array| {
-                                matches!(array.class, 0x8080BA61 | 0x8080BAC2 | 0x8080BAC0)
-                            })
-                        {
-                            let stride = match array.class {
-                                0x8080BA61 => 0x38,
-                                0x8080BAC2 => 0x28,
-                                0x8080BAC0 => 0x18,
-                                _ => unreachable!(),
-                            };
-                            for (index, record) in
-                                array_records(&data, array, stride).into_iter().enumerate()
-                            {
-                                if array.class == 0x8080BAC2 {
-                                    if let Some(tag) = read_u32_at(
-                                        record,
-                                        0x20,
-                                        package_manager().version.endian(),
-                                    )
-                                    .map(TagHash)
-                                    .filter(|tag| {
-                                        package_manager()
-                                            .get_entry(*tag)
-                                            .is_some_and(|entry| entry.reference == 0x8080BAF8)
-                                    }) {
-                                        descriptors.insert(tag);
-                                    }
-                                }
-                                let fields = record
-                                    .chunks_exact(4)
-                                    .enumerate()
-                                    .map(|(field, bytes)| {
-                                        let value =
-                                            read_u32(bytes, package_manager().version.endian());
-                                        let meaning = words
-                                            .get(&value)
-                                            .cloned()
-                                            .or_else(|| {
-                                                package_manager().get_entry(TagHash(value)).map(
-                                                    |entry| format!("tag:{:08X}", entry.reference),
-                                                )
-                                            })
-                                            .unwrap_or_default();
-                                        format!("+{:02X}={value:08X}:{meaning}", field * 4)
-                                    })
-                                    .collect_vec();
-                                eprintln!(
-                                    "    root_record root={root} class={:08X} index={index}: {fields:?}",
-                                    array.class
-                                );
-                            }
-                        }
-                        for descriptor in descriptors.into_iter().sorted() {
-                            let payload =
-                                package_manager().read_tag(descriptor).unwrap_or_default();
-                            let names = cache
-                                .hashes
-                                .get(&descriptor)
-                                .into_iter()
-                                .flat_map(|scan| scan.wordlist_hashes.iter())
-                                .filter_map(|hash| {
-                                    words
-                                        .get(&hash.hash)
-                                        .map(|word| (hash.offset, word.clone()))
-                                })
-                                .collect_vec();
-                            eprintln!(
-                                "    descriptor root={root} tag={descriptor} names={names:?} bytes={}",
-                                payload.iter().map(|byte| format!("{byte:02X}")).join(" ")
-                            );
-                        }
-                    }
-                    eprintln!(
-                        "  node={node} class={:08X} len={} names={names:?} children={children:?} child_classes={child_classes:?} arrays={arrays:?}",
-                        entry.reference, entry.file_size,
-                    );
-                    frontier.extend(children.iter().copied().filter(|child| {
-                        package_manager().get_entry(*child).is_some_and(|entry| {
-                            matches!(entry.reference, CLASS_PATTERN | CLASS_PATTERN_COMPONENT)
-                        })
-                    }));
-                }
-                let geometry = pattern_geometry_tags(&cache, root);
-                eprintln!("  root={root} geometry_count={}", geometry.len());
-                for tag in geometry {
-                    let transform = package_manager().read_tag(tag).ok().and_then(|data| {
-                        read_geometry_position_transform(&data, package_manager().version.endian())
-                    });
-                    eprintln!("    geometry={tag} transform={transform:?}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn parses_vertex_buffer_header_little_endian() {
-        let data = [
-            0x80, 0x00, 0x00, 0x00, // data_size
-            0x20, 0x00, // stride
-            0x03, 0x00, // vtype
-            0xEF, 0xBE, 0xAD, 0xDE, // marker
-        ];
-
-        let header = VertexBufferHeader::parse(&data, Endian::Little).unwrap();
-        assert_eq!(header.data_size, 0x80);
-        assert_eq!(header.stride, 0x20);
-        assert_eq!(header.vtype, 3);
-        assert_eq!(header.deadbeef, 0xDEADBEEF);
-    }
-
-    #[test]
-    fn parses_index_buffer_header_little_endian() {
-        let data = [
-            0x7F, 0x01, // unk0, is_32bit
-            0x34, 0x12, // unk1
-            0x00, 0x00, 0x00, 0x00, // zero
-            0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // data_size
-            0xEF, 0xBE, 0xAD, 0xDE, // marker
-            0x00, 0x00, 0x00, 0x00, // zero1
-        ];
-
-        let header = IndexBufferHeader::parse(&data, Endian::Little).unwrap();
-        assert_eq!(header.unk0, 0x7F);
-        assert!(header.is_32bit);
-        assert_eq!(header.unk1, 0x1234);
-        assert_eq!(header.data_size, 0x40);
-        assert_eq!(header.deadbeef, 0xDEADBEEF);
-    }
-
-    #[test]
-    fn expands_triangle_strips_across_restart_indices() {
-        assert_eq!(
-            preview_triangles_from_indices(&[0, 1, 2, 3, 0xFFFF, 4, 5, 6], 5),
-            vec![0, 1, 2, 2, 1, 3, 4, 5, 6]
-        );
-    }
-
-    #[test]
-    fn recognizes_all_alkahest_high_detail_lods() {
-        for lod in [0, 1, 2, 3, 10] {
-            assert!(is_highest_detail_lod(lod));
-        }
-        for lod in [4, 7, 8, 9] {
-            assert!(!is_highest_detail_lod(lod));
-        }
-    }
-
-    #[test]
-    fn selects_visible_marathon_render_stages() {
-        let boundaries = [0, 6, 6, 9, 9, 12, 12, 15, 18, 18];
-        assert_eq!(
-            preview_part_indices_from_boundaries(&boundaries, 18),
-            Some((0..9).chain(12..18).collect())
-        );
-        assert!(preview_part_indices_from_boundaries(&[0, 3, 2], 3).is_none());
-
-        let stages = preview_part_stages_from_boundaries(&boundaries, 18).expect("stage map");
-        assert_eq!(stages[0], Some(0));
-        assert_eq!(stages[4], Some(0));
-        assert_eq!(stages[8], Some(2));
-        assert_eq!(stages[12], Some(6));
-        assert_eq!(stages[14], Some(6));
-        assert_eq!(stages[15], Some(7));
-        assert_eq!(stages[10], None);
-    }
-
-    #[test]
-    fn applies_geometry_position_dequantization() {
-        let mut wireframe = WireframePreview {
-            source: "test".into(),
-            position_format: "i16x4.xyz @ +0",
-            uv_format: None,
-            vertices: vec![[-32767.0, 0.0, 32767.0]],
-            normals: None,
-            procedural_positions: Some(vec![[-32767.0, 0.0, 32767.0]]),
-            procedural_normals: None,
-            tangents: None,
-            uvs: None,
-            normal_format: None,
-            tangent_format: None,
-            indices: vec![],
-            material_ranges: vec![],
-            min: [-32767.0, 0.0, 32767.0],
-            max: [-32767.0, 0.0, 32767.0],
-            vertex_count_total: 1,
-            index_count_total: 0,
-        };
-        apply_geometry_position_transform(
-            &mut wireframe,
-            GeometryPositionTransform {
-                scale: [2.0, 4.0, 8.0],
-                offset: [10.0, 20.0, 30.0],
-                procedural_scale: 0.25,
-            },
-        );
-        assert_eq!(wireframe.vertices, vec![[8.0, 20.0, 38.0]]);
-        assert_eq!(wireframe.procedural_positions, Some(vec![[-1.0, 0.0, 1.0]]));
-        assert_eq!(wireframe.min, [8.0, 20.0, 38.0]);
-    }
-
-    #[test]
-    fn socket_pose_preserves_gear_dye_procedural_coordinates() {
-        let geometry = TagHash(1);
-        let source = MeshSourcePreview {
-            kind: "test",
-            buffer_index: 0,
-            technique: None,
-            index_start: 0,
-            index_count: 0,
-            primitive_type: 0,
-            lod_category: 0,
-            input_layout_index: None,
-            index_buffer: TagHash(0),
-            vertex0_buffer: TagHash(0),
-            vertex1_buffer: TagHash(0),
-            color_buffer: TagHash(0),
-            uv_transform: None,
-            shader_constants: vec![],
-        };
-        let wireframe = WireframePreview {
-            source: "test".into(),
-            position_format: "f32x3",
-            uv_format: None,
-            vertices: vec![[1.0, 0.0, 0.0]],
-            normals: Some(vec![[1.0, 0.0, 0.0]]),
-            procedural_positions: None,
-            procedural_normals: None,
-            tangents: None,
-            uvs: None,
-            normal_format: None,
-            tangent_format: None,
-            indices: vec![],
-            material_ranges: vec![],
-            min: [1.0, 0.0, 0.0],
-            max: [1.0, 0.0, 0.0],
-            vertex_count_total: 1,
-            index_count_total: 0,
-        };
-        let half_sqrt = std::f32::consts::FRAC_1_SQRT_2;
-        let attachment = ResolvedWeaponModAttachment {
-            geometry,
-            pose: WeaponModAttachmentPose {
-                family_id: 0,
-                variant_id: 0,
-                bone_index: 0,
-                rotation: [0.0, 0.0, half_sqrt, half_sqrt],
-                translation: [5.0, 6.0, 7.0],
-            },
-            rarity: Some(WeaponModRarity::Enhanced),
-            unique_id: 0.25,
-        };
-        let mut parts = vec![(geometry, source, wireframe)];
-
-        apply_weapon_mod_attachment_poses(&mut parts, &[attachment]);
-
-        let transformed = &parts[0].2;
-        for (actual, expected) in transformed.vertices[0].into_iter().zip([5.0, 7.0, 7.0]) {
-            assert!((actual - expected).abs() < 0.000_01);
-        }
-        assert_eq!(
-            transformed.procedural_positions,
-            Some(vec![[1.0, 0.0, 0.0]])
-        );
-        assert_eq!(transformed.procedural_normals, Some(vec![[1.0, 0.0, 0.0]]));
-    }
-
-    #[test]
-    fn reads_relative_array_payload() {
-        let mut data = vec![0u8; 0x40];
-        data[0x08..0x10].copy_from_slice(&2u64.to_le_bytes());
-        data[0x10..0x18].copy_from_slice(&0x10i64.to_le_bytes());
-        data[0x20..0x28].copy_from_slice(&2u64.to_le_bytes());
-        data[0x28..0x2c].copy_from_slice(&0x80806D37u32.to_le_bytes());
-        data[0x30..0x34].copy_from_slice(&0x11223344u32.to_le_bytes());
-        data[0x34..0x38].copy_from_slice(&0x55667788u32.to_le_bytes());
-
-        let array = read_array(&data, 0x08, 4, Endian::Little).unwrap();
-        assert_eq!(array, &data[0x30..0x38]);
-    }
-
-    #[test]
-    fn reads_static_mesh_technique_tags() {
-        let mut data = vec![0u8; 0xa0];
-        let technique0 = TagHash::new(0x0102, 0x0304);
-        let technique1 = TagHash::new(0x0506, 0x0708);
-        let technique2 = TagHash::new(0x0a0b, 0x0c0d);
-        data[0x10..0x18].copy_from_slice(&2u64.to_le_bytes());
-        data[0x18..0x20].copy_from_slice(&0x28i64.to_le_bytes());
-        data[0x40..0x48].copy_from_slice(&2u64.to_le_bytes());
-        data[0x50..0x54].copy_from_slice(&technique0.0.to_le_bytes());
-        data[0x54..0x58].copy_from_slice(&technique1.0.to_le_bytes());
-
-        data[0x20..0x28].copy_from_slice(&1u64.to_le_bytes());
-        data[0x28..0x30].copy_from_slice(&0x38i64.to_le_bytes());
-        data[0x60..0x68].copy_from_slice(&1u64.to_le_bytes());
-        data[0x90..0x94].copy_from_slice(&technique2.0.to_le_bytes());
-
-        let tags = static_mesh_technique_tags(&data, Endian::Little);
-
-        assert_eq!(tags, vec![technique0, technique1, technique2]);
-    }
-
-    #[test]
-    fn reads_dynamic_mesh_part_technique_tags() {
-        let mut data = vec![0u8; 0xa0];
-        let technique0 = TagHash::new(0x0102, 0x0304);
-        let technique1 = TagHash::new(0x0506, 0x0708);
-        data[0x20..0x28].copy_from_slice(&2u64.to_le_bytes());
-        data[0x28..0x30].copy_from_slice(&0x18i64.to_le_bytes());
-        data[0x40..0x48].copy_from_slice(&2u64.to_le_bytes());
-        data[0x50..0x54].copy_from_slice(&technique0.0.to_le_bytes());
-        data[0x74..0x78].copy_from_slice(&technique1.0.to_le_bytes());
-
-        let tags = dynamic_mesh_technique_tags(&data, Endian::Little);
-
-        assert_eq!(tags, vec![technique0, technique1]);
-    }
-
-    #[test]
-    fn scans_candidate_tag_hashes_in_blob() {
-        let little = TagHash::new(0x0102, 0x0304);
-        let big = TagHash::new(0x0506, 0x0708);
-        let mut data = vec![0u8; 0x10];
-        data[0x04..0x08].copy_from_slice(&little.0.to_le_bytes());
-        data[0x0c..0x10].copy_from_slice(&big.0.to_be_bytes());
-
-        let little_tags = candidate_tag_hashes_in_blob(&data, Endian::Little);
-        let big_tags = candidate_tag_hashes_in_blob(&data, Endian::Big);
-
-        assert!(little_tags.contains(&little));
-        assert!(big_tags.contains(&big));
-    }
-
-    #[test]
-    fn reads_half_float_values() {
-        assert_eq!(read_f16(&0x3c00u16.to_le_bytes(), Endian::Little), 1.0);
-        assert_eq!(read_f16(&0xc000u16.to_le_bytes(), Endian::Little), -2.0);
-        assert_eq!(read_f16(&0x3800u16.to_le_bytes(), Endian::Little), 0.5);
-    }
-
-    #[test]
-    fn finds_half_uv_candidates() {
-        let mut data = vec![0u8; 0x18];
-        data[0x04..0x06].copy_from_slice(&0x0000u16.to_le_bytes());
-        data[0x06..0x08].copy_from_slice(&0x0000u16.to_le_bytes());
-        data[0x0c..0x0e].copy_from_slice(&0x3c00u16.to_le_bytes());
-        data[0x0e..0x10].copy_from_slice(&0x3800u16.to_le_bytes());
-        data[0x14..0x16].copy_from_slice(&0x4000u16.to_le_bytes());
-        data[0x16..0x18].copy_from_slice(&0x3c00u16.to_le_bytes());
-
-        let candidate = candidate_f16x2_uv(&data, 0x08, 0x04, Endian::Little).unwrap();
-
-        assert_eq!(candidate.format, UvFormat::F16x2);
-        assert_eq!(candidate.offset, 0x04);
-        assert_eq!(candidate.valid_vertices, 3);
-        assert_eq!(candidate.min, [0.0, 0.0]);
-        assert_eq!(candidate.max, [2.0, 1.0]);
-    }
-
-    #[test]
-    fn decodes_input_layout_snorm_uvs() {
-        let mut data = vec![0u8; 0x10];
-        data[0x00..0x02].copy_from_slice(&0x4000i16.to_le_bytes());
-        data[0x02..0x04].copy_from_slice(&(-0x4000i16).to_le_bytes());
-        data[0x08..0x0a].copy_from_slice(&0x7fffi16.to_le_bytes());
-        data[0x0a..0x0c].copy_from_slice(&0i16.to_le_bytes());
-
-        let uvs = decode_input_layout_uvs(
-            &data,
-            0x08,
-            Endian::Little,
-            InputLayoutTexcoord {
-                buffer_index: 0,
-                offset: 0,
-                format: InputLayoutFormat::R16G16Snorm,
-            },
-            2,
-        );
-
-        assert_eq!(uvs.len(), 2);
-        assert!((uvs[0][0] - 0.50001526).abs() < 0.00001);
-        assert!((uvs[0][1] + 0.50001526).abs() < 0.00001);
-        assert_eq!(uvs[1], [1.0, 0.0]);
-    }
-
-    #[test]
-    fn decodes_and_normalizes_packed_snorm_tangent() {
-        let mut data = vec![0u8; 0x10];
-        data[0x04..0x06].copy_from_slice(&0x4000i16.to_le_bytes());
-        data[0x06..0x08].copy_from_slice(&0i16.to_le_bytes());
-        data[0x08..0x0a].copy_from_slice(&0x4000i16.to_le_bytes());
-        data[0x0a..0x0c].copy_from_slice(&(-1i16).to_le_bytes());
-
-        let vectors = decode_input_layout_vectors(
-            &data,
-            0x10,
-            Endian::Little,
-            InputLayoutVector {
-                buffer_index: 0,
-                offset: 4,
-                format: InputLayoutFormat::R16G16B16A16Snorm,
-            },
-            1,
-        )
-        .expect("packed tangent");
-        let tangent = normalize_input_layout_vector(vectors[0], true).expect("unit tangent");
-
-        assert!((tangent[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
-        assert_eq!(tangent[1], 0.0);
-        assert!((tangent[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
-        assert_eq!(tangent[3], -1.0);
-    }
-
-    #[test]
-    fn propagates_uv_transform_to_shader_constant() {
-        let constants = shader_constants_from_uv_transform(Some(UvTransformPreview {
-            scale: [2.0, 3.0],
-            offset: [0.25, 0.5],
-        }));
-
-        assert_eq!(constants.len(), 1);
-        assert_eq!(constants[0].name, "uv_scale_offset");
-        assert_eq!(constants[0].value, [2.0, 3.0, 0.25, 0.5]);
-        assert_eq!(constants[0].source, "mesh instance UV transform");
-    }
-
-    #[test]
-    fn reads_geometry_buffer_set_generate_gbuffer_layout() {
-        let mut mesh = vec![0u8; 0x80];
-        mesh[0x62] = 0x57;
-        mesh[0x64] = 0x07;
-
-        assert_eq!(geometry_buffer_set_input_layout_id(&mesh), Some(7));
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_weapon_attachment_channel_sources() {
-        init_goliath_test_package_manager();
-        let cache = quicktag_scanner::load_tag_cache();
-        let endian = package_manager().version.endian();
-        let needles = [
-            0xA500D3AF_u32,
-            0x6F1709EA,
-            0x840253AF,
-            0x840253A1,
-            0x840254D0,
-            0xDECA4D7E,
-            0x7B2426A3,
-            0x040174F7,
-            0xC8939EBF,
-            0xC8939EBA,
-            0xC8939EBC,
-            0xC8939EBD,
-            0xC8939EBB,
-            0xC8939EB8,
-        ];
-        for root in [
-            TagHash(0x80A7C7B5),
-            TagHash(0x80A7D43D),
-            TagHash(0x80A60D38),
-            TagHash(0x80A61CF0),
-        ] {
-            for node in descendant_pattern_nodes(&cache, root, 12) {
-                let Ok(data) = package_manager().read_tag(node) else {
-                    continue;
-                };
-                for offset in (0..data.len().saturating_sub(4)).step_by(4) {
-                    let Some(value) = read_u32_at(&data, offset, endian) else {
-                        continue;
-                    };
-                    if needles.contains(&value) {
-                        eprintln!(
-                            "ATTACHMENT_CHANNEL_HIT root={root} node={node} class={:08X} offset=0x{offset:X} value={value:08X} words={:?}",
-                            package_manager()
-                                .get_entry(node)
-                                .map(|entry| entry.reference)
-                                .unwrap_or_default(),
-                            (offset.saturating_sub(0x20)..(offset + 0x40).min(data.len()))
-                                .step_by(4)
-                                .filter_map(|field| read_u32_at(&data, field, endian))
-                                .map(|word| format!("{word:08X}"))
-                                .collect_vec()
-                        );
-                    }
-                }
-            }
-        }
-        for root in [
-            TagHash(0x80A60D38),
-            TagHash(0x80A60C4F),
-            TagHash(0x80A61CF0),
-            TagHash(0x80A6071A),
-        ] {
-            let root_data = package_manager().read_tag(root).expect("mod pattern root");
-            for array in scan_arrays(&root_data, endian)
-                .into_iter()
-                .filter(|array| array.class == 0x8080BA61)
-            {
-                for (index, record) in array_records(&root_data, array, 0x38)
-                    .into_iter()
-                    .enumerate()
-                {
-                    eprintln!(
-                        "MOD_ROOT_BINDING root={root} index={index} words={:?}",
-                        record
-                            .chunks_exact(4)
-                            .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
-                            .collect_vec()
-                    );
-                }
-            }
-            for node in descendant_pattern_nodes(&cache, root, 8) {
-                let Ok(data) = package_manager().read_tag(node) else {
-                    continue;
-                };
-                for array in scan_arrays(&data, endian)
-                    .into_iter()
-                    .filter(|array| array.class == 0x8080AF86)
-                {
-                    for (channel_index, record) in
-                        array_records(&data, array, 0x70).into_iter().enumerate()
-                    {
-                        let Some(parameter) = read_u32_at(record, 0, endian) else {
-                            continue;
-                        };
-                        if [
-                            0x5A116CBA_u32,
-                            0xF714F29F,
-                            0x3AF60B50,
-                            0xC17A8BB6,
-                            0xC8939EBF,
-                            0xC8939EBA,
-                            0xC8939EBC,
-                            0xC8939EBD,
-                            0xC8939EBB,
-                            0xC8939EB8,
-                        ]
-                        .contains(&parameter)
-                        {
-                            eprintln!(
-                                "MOD_CHANNEL_RECORD root={root} node={node} index={channel_index} parameter={parameter:08X} words={:?}",
-                                record
-                                    .chunks_exact(4)
-                                    .map(|bytes| format!("{:08X}", read_u32(bytes, endian)))
-                                    .collect_vec()
-                            );
-                        }
-                    }
-                }
-                let arrays = scan_arrays(&data, endian);
-                let vectors = arrays
-                    .iter()
-                    .copied()
-                    .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
-                    .map(|array| read_serialized_dye_vector(&data, array, endian))
-                    .collect::<Option<Vec<_>>>();
-                if let Some(vectors) = vectors {
-                    for array in arrays
-                        .into_iter()
-                        .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
-                    {
-                        for record in array_records(&data, array, 0x0c) {
-                            let Some(parameter) = read_u32_at(record, 4, endian) else {
-                                continue;
-                            };
-                            let Some(index) = read_u32_at(record, 8, endian)
-                                .and_then(|index| usize::try_from(index).ok())
-                            else {
-                                continue;
-                            };
-                            if let Some(value) = vectors.get(index) {
-                                eprintln!(
-                                    "MOD_LOCAL_VECTOR root={root} node={node} parameter={parameter:08X} value={value:?}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_quickdraw_grip_age_material() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-        let root = TagHash(0x80A601B6);
-        let endian = package_manager().version.endian();
-        let mut words = rustc_hash::FxHashMap::default();
-        quicktag_strings::wordlist::load_wordlist(|word, hash| {
-            words.entry(hash).or_insert_with(|| word.to_owned());
-        });
-
-        eprintln!("QUICKDRAW root={root}");
-        for node in descendant_pattern_nodes(&cache, root, 10) {
-            let entry = package_manager().get_entry(node).expect("pattern node");
-            let data = package_manager().read_tag(node).expect("pattern node data");
-            let arrays = scan_arrays(&data, endian);
-            eprintln!(
-                "  NODE tag={node} class={:08X} len=0x{:X} arrays={:?}",
-                entry.reference,
-                data.len(),
-                arrays
-                    .iter()
-                    .map(|array| (array.class, array.count, array.data_offset))
-                    .collect_vec()
-            );
-
-            for array in arrays
-                .iter()
-                .copied()
-                .filter(|array| array.class == 0x8080AF86)
-            {
-                for (index, record) in array_records(&data, array, 0x70).into_iter().enumerate() {
-                    let parameter = read_u32_at(record, 0, endian).unwrap_or_default();
-                    let record_offset = array.data_offset + index * 0x70;
-                    let bytecode =
-                        read_array(&data, record_offset + 0x08, 1, endian).unwrap_or_default();
-                    let constants = read_array(&data, record_offset + 0x18, 0x10, endian)
-                        .unwrap_or_default()
-                        .chunks_exact(0x10)
-                        .filter_map(|constant| read_vec4_f32(constant, 0, endian))
-                        .collect_vec();
-                    eprintln!(
-                        "    OBJECT_CHANNEL index={index} parameter={parameter:08X} name={:?} bytecode={} constants={constants:?}",
-                        words.get(&parameter),
-                        bytecode.iter().map(|byte| format!("{byte:02X}")).join(" ")
-                    );
-                }
-            }
-
-            let vectors = arrays
-                .iter()
-                .copied()
-                .filter(|array| array.class == CLASS_VECTOR4 && array.count == 1)
-                .map(|array| read_serialized_dye_vector(&data, array, endian))
-                .collect::<Option<Vec<_>>>()
-                .unwrap_or_default();
-            for array in arrays
-                .iter()
-                .copied()
-                .filter(|array| array.class == CLASS_PATTERN_VECTOR_BINDINGS)
-            {
-                for record in array_records(&data, array, 0x0c) {
-                    let parameter = read_u32_at(record, 4, endian).unwrap_or_default();
-                    let value = read_u32_at(record, 8, endian)
-                        .and_then(|index| vectors.get(index as usize))
-                        .copied();
-                    eprintln!(
-                        "    LOCAL_VECTOR parameter={parameter:08X} name={:?} value={value:?}",
-                        words.get(&parameter),
-                    );
-                }
-            }
-        }
-
-        let geometries = pattern_nearest_geometry_tags(&cache, root);
-        eprintln!("  GEOMETRIES {geometries:?}");
-        for geometry in geometries {
-            let entry = package_manager().get_entry(geometry).expect("mod geometry");
-            let techniques = find_model_technique_entries(&cache, geometry, &entry);
-            let textures = find_model_textures(&cache, geometry, &techniques);
-            let (_source, mut wireframe) =
-                parse_model_wireframe(geometry, &entry).expect("mod wireframe");
-            assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
-            eprintln!(
-                "  GEOMETRY {geometry} techniques={:?} textures={:?}",
-                techniques.iter().map(|(tag, _)| *tag).collect_vec(),
-                textures.iter().map(|(tag, _)| *tag).collect_vec(),
-            );
-            for range in &wireframe.material_ranges {
-                let Some(technique) = range.technique else {
-                    continue;
-                };
-                eprintln!(
-                    "    RANGE indices={}+{} dye={:?} technique={technique} material={:?}",
-                    range.index_start,
-                    range.index_count,
-                    range.gear_dye_change_color_index,
-                    range.textures,
-                );
-                let technique_entry = package_manager().get_entry(technique).expect("technique");
-                let technique_data = package_manager()
-                    .read_tag(technique)
-                    .expect("technique data");
-                for binding in texture_bindings_for_technique(&technique_entry, &technique_data)
-                    .into_iter()
-                    .filter(|binding| binding.stage == "PS")
-                {
-                    let descriptor = Texture::load_data_d2(binding.tag, false)
-                        .map(|(desc, _, _)| {
-                            format!("{}x{} {:?}", desc.width, desc.height, desc.format)
-                        })
-                        .unwrap_or_else(|_| "non-texture".to_owned());
-                    eprintln!("      PS t{}={} {descriptor}", binding.slot, binding.tag);
-                }
-                let preview =
-                    crate::material::MaterialTagPreview::load(&technique_entry, &technique_data)
-                        .expect("technique preview");
-                let crate::material::MaterialPreviewKind::Technique(preview) = preview.kind;
-                if let Some(pixel) = preview.stages.iter().find(|stage| stage.stage == "PS") {
-                    eprintln!(
-                        "      SHADER {:?} bindings={:?} expressions={:?} inline={:?}",
-                        pixel.shader,
-                        pixel
-                            .bytecode
-                            .bindings
-                            .iter()
-                            .map(|binding| (&binding.kind, binding.slot, &binding.source))
-                            .collect_vec(),
-                        pixel
-                            .bytecode
-                            .expressions
-                            .iter()
-                            .map(|expression| (&expression.target, &expression.expression))
-                            .collect_vec(),
-                        pixel.constants,
-                    );
-                    for age in -2..=6 {
-                        let channels = std::collections::HashMap::from([
-                            (0x138D_E801, [age as f32; 4]),
-                            (0xD358_3E54, [0.0; 4]),
-                        ]);
-                        let (_bindings, expressions) =
-                            crate::material::interpret_tfx_stack_with_object_channels(
-                                &pixel.bytecode.ops,
-                                &pixel.constants,
-                                &channels,
-                            );
-                        eprintln!(
-                            "      AGE {age}: {:?}",
-                            expressions
-                                .iter()
-                                .filter(|expression| {
-                                    matches!(
-                                        expression.target.as_str(),
-                                        "output[24]" | "output[42]" | "output[49]"
-                                    )
-                                })
-                                .map(|expression| (&expression.target, expression.value))
-                                .collect_vec()
-                        );
-                    }
-                    for expression in pixel.bytecode.expressions.iter().filter(|expression| {
-                        matches!(
-                            expression.target.as_str(),
-                            "output[24]" | "output[42]" | "output[49]"
-                        )
-                    }) {
-                        let Some(index) = pixel
-                            .bytecode
-                            .ops
-                            .iter()
-                            .position(|op| op.offset == expression.op_offset)
-                        else {
-                            continue;
-                        };
-                        eprintln!("      AGE_OUTPUT_OPS target={}:", expression.target);
-                        for source in &pixel.bytecode.ops[index.saturating_sub(12)..=index] {
-                            eprintln!(
-                                "        {:04X} {:02X} {} {}",
-                                source.offset, source.opcode, source.name, source.detail
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires installed Marathon packages"]
-    fn resolves_authored_three_tier_weapon_mod_condition() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-
-        for (root, expected_technique) in [
-            (TagHash(0x80A601B6), TagHash(0x80A601A2)),
-            (TagHash(0x80A60313), TagHash(0x80A602FF)),
-        ] {
-            let mut wear_materials = Vec::new();
-            let mut resolved_techniques = Vec::new();
-            for geometry in pattern_nearest_geometry_tags(&cache, root) {
-                let entry = package_manager().get_entry(geometry).expect("mod geometry");
-                let technique_entries = find_model_technique_entries(&cache, geometry, &entry);
-                let textures = find_model_textures(&cache, geometry, &technique_entries);
-                let (_source, mut wireframe) =
-                    parse_model_wireframe(geometry, &entry).expect("mod wireframe");
-                assign_wireframe_material_textures(&mut wireframe, &cache, &textures);
-                resolved_techniques.extend(
-                    wireframe
-                        .material_ranges
-                        .iter()
-                        .filter_map(|range| range.technique),
-                );
-                wear_materials.extend(
-                    wireframe
-                        .material_ranges
-                        .into_iter()
-                        .filter_map(|range| range.textures.mod_wear),
-                );
-            }
-
-            assert!(
-                resolved_techniques.contains(&expected_technique),
-                "{root} resolved {resolved_techniques:?}, expected own material {expected_technique}"
-            );
-            assert!(!wear_materials.is_empty(), "{root} has no wear material");
-            for wear in wear_materials {
-                assert_eq!(wear.scratches_projection, [4.0, -4.0, 0.0, 0.0]);
-                assert_eq!(wear.scratches_remap_base, [0.0, 0.0, 0.0, 1.0]);
-                assert_eq!(
-                    wear.scratches_remap_scale,
-                    [0.21404114, 0.21404114, 0.21404114, 0.0]
-                );
-                assert_eq!(wear.condition_blend, 0.5);
-                assert_eq!(wear.grime_projection_unique_delta, [0.0, 0.0, 1.0, 1.0]);
-                assert_eq!(wear.damage_projection_unique_delta, [0.0, 0.0, 1.0, 1.0]);
-                assert_eq!(
-                    wear.condition_controls,
-                    [[1.0, 1.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],
-                    "{root} must use authored Enhanced/Deluxe/Superior TFX outputs"
-                );
-                for projection in [
-                    wear.scratches_projection,
-                    wear.grime_projection,
-                    wear.damage_projection,
-                ] {
-                    assert!(projection.iter().all(|value| value.is_finite()));
-                    assert!(projection[0].abs() > 0.05 && projection[1].abs() > 0.05);
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages"]
-    fn probes_weapon_mod_unique_id_projection() {
-        init_goliath_test_package_manager();
-        let cache = Arc::new(quicktag_scanner::load_tag_cache());
-
-        for (root, expected_technique) in [
-            (TagHash(0x80A601B6), TagHash(0x80A601A2)),
-            (TagHash(0x80A60313), TagHash(0x80A602FF)),
-        ] {
-            let geometry = pattern_nearest_geometry_tags(&cache, root)
-                .into_iter()
-                .next()
-                .expect("mod geometry");
-            let geometry_entry = package_manager()
-                .get_entry(geometry)
-                .expect("geometry entry");
-            let techniques = find_model_technique_entries(&cache, geometry, &geometry_entry);
-            assert!(techniques.iter().any(|(tag, _)| *tag == expected_technique));
-            let technique_entry = package_manager()
-                .get_entry(expected_technique)
-                .expect("technique entry");
-            let technique_data = package_manager()
-                .read_tag(expected_technique)
-                .expect("technique data");
-            let preview = MaterialTagPreview::load(&technique_entry, &technique_data)
-                .expect("technique preview");
-            let MaterialPreviewKind::Technique(preview) = preview.kind;
-            let pixel = preview
-                .stages
-                .iter()
-                .find(|stage| stage.stage == "PS")
-                .expect("pixel stage");
-
-            eprintln!("UNIQUE_ID root={root} technique={expected_technique}");
-            for seed in [0.0_f32, 0.125, 0.25, 0.5, 0.75, 1.0] {
-                let channels = std::collections::HashMap::from([
-                    (WEAPON_MOD_AGE_CHANNEL, [1.0; 4]),
-                    (UNIQUE_ID_CHANNEL, [seed; 4]),
-                ]);
-                let (_bindings, expressions) = interpret_tfx_stack_with_object_channels(
-                    &pixel.bytecode.ops,
-                    &pixel.constants,
-                    &channels,
-                );
-                let values = expressions
-                    .iter()
-                    .filter(|expression| {
-                        matches!(
-                            expression.target.as_str(),
-                            "output[39]"
-                                | "output[40]"
-                                | "output[24]"
-                                | "output[42]"
-                                | "output[49]"
-                        )
-                    })
-                    .map(|expression| (&expression.target, expression.value))
-                    .collect_vec();
-                eprintln!("  seed={seed:.3} {values:?}");
-            }
-        }
-
-        for technique in [
-            TagHash::new(0x130, 7672),
-            TagHash::new(0x130, 3910),
-            TagHash::new(0x130, 3194),
-            TagHash::new(0x130, 4713),
-            TagHash::new(0x130, 954),
-        ] {
-            let entry = package_manager()
-                .get_entry(technique)
-                .expect("technique entry");
-            let data = package_manager()
-                .read_tag(technique)
-                .expect("technique data");
-            let bindings = texture_bindings_for_technique(&entry, &data);
-            let preview = MaterialTagPreview::load(&entry, &data).expect("technique preview");
-            let MaterialPreviewKind::Technique(preview) = preview.kind;
-            let pixel = preview
-                .stages
-                .iter()
-                .find(|stage| stage.stage == "PS")
-                .expect("pixel stage");
-            eprintln!(
-                "ALT_WEAR technique={technique} shader={:?} bindings={bindings:?} inline_len={} c14={:?} c15={:?} c16={:?} c50={:?}",
-                pixel.shader,
-                pixel.inline_constants.len(),
-                pixel.inline_constants.get(14),
-                pixel.inline_constants.get(15),
-                pixel.inline_constants.get(16),
-                pixel.inline_constants.get(50),
-            );
-            let age_targets = pixel
-                .bytecode
-                .expressions
-                .iter()
-                .filter(|expression| expression.expression.contains("object_channel(0x138DE801)"))
-                .filter_map(|expression| {
-                    expression
-                        .target
-                        .strip_prefix("output[")?
-                        .strip_suffix(']')?
-                        .parse::<usize>()
-                        .ok()
-                })
-                .collect_vec();
-            if let [first, _, third] = age_targets.as_slice() {
-                eprintln!(
-                    "  dynamic_inline scratch={:?} remap_base={:?} remap_scale={:?} blend={:?}",
-                    pixel.inline_constants.get(first.saturating_sub(10)),
-                    pixel.inline_constants.get(first.saturating_sub(9)),
-                    pixel.inline_constants.get(first.saturating_sub(8)),
-                    pixel.inline_constants.get(third + 1),
-                );
-            }
-            eprintln!(
-                "  age_expressions={:?}",
-                pixel
-                    .bytecode
-                    .expressions
-                    .iter()
-                    .filter(|expression| {
-                        expression.expression.contains("object_channel(0x138DE801)")
-                            || expression.expression.contains("object_channel(0xD3583E54)")
-                    })
-                    .collect_vec()
-            );
-            for tier in [1.0_f32, 2.0, 3.0] {
-                let channels = std::collections::HashMap::from([
-                    (WEAPON_MOD_AGE_CHANNEL, [tier; 4]),
-                    (UNIQUE_ID_CHANNEL, [0.25; 4]),
-                ]);
-                let (_bindings, expressions) = interpret_tfx_stack_with_object_channels(
-                    &pixel.bytecode.ops,
-                    &pixel.constants,
-                    &channels,
-                );
-                let values = expressions
-                    .iter()
-                    .filter(|expression| {
-                        matches!(
-                            expression.target.as_str(),
-                            "output[24]"
-                                | "output[39]"
-                                | "output[40]"
-                                | "output[42]"
-                                | "output[49]"
-                        )
-                    })
-                    .map(|expression| (&expression.target, expression.value))
-                    .collect_vec();
-                eprintln!("  tier={tier} {values:?}");
-            }
-            eprintln!(
-                "  wear={:?}",
-                weapon_mod_wear_material(technique, &bindings)
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "probe: requires installed Marathon packages and GPU"]
-    fn exports_quickdraw_grip_age_textures() {
-        init_goliath_test_package_manager();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("GPU adapter");
-        let required_features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features,
-            ..Default::default()
-        }))
-        .expect("GPU device");
-        let target_format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let renderer = eframe::egui_wgpu::Renderer::new(
-            &device,
-            target_format,
-            eframe::egui_wgpu::RendererOptions::default(),
-        );
-        let render_state = eframe::egui_wgpu::RenderState {
-            adapter,
-            available_adapters: vec![],
-            device,
-            queue,
-            target_format,
-            renderer: Arc::new(eframe::egui::mutex::RwLock::new(renderer)),
-        };
-
-        let textures = [
-            TagHash(0x80A61633),
-            TagHash(0x80A615D5),
-            TagHash(0x80A4050F),
-            TagHash(0x80A61670),
-            TagHash(0x80A60055),
-            TagHash(0x80A6149D),
-            TagHash(0x80A61508),
-            TagHash(0x80A6149F),
-            TagHash(0x80A46D44),
-        ];
-        let tile = 256_u32;
-        let columns = 3_u32;
-        let rows = textures.len().div_ceil(columns as usize) as u32;
-        let mut sheet = image::RgbaImage::new(columns * tile, rows * tile);
-        let output = std::path::Path::new("target/quicktag-mod-age-probe");
-        std::fs::create_dir_all(output).expect("probe directory");
-        for (index, texture) in textures.into_iter().enumerate() {
-            let loaded = Texture::load(&render_state, texture, false).expect("texture upload");
-            let image = loaded.to_image(&render_state, 0).expect("texture capture");
-            image
-                .save(output.join(format!("{index}-t{index}-{texture}.png")))
-                .expect("texture export");
-            let thumbnail = image.thumbnail(tile, tile).to_rgba8();
-            let x = index as u32 % columns * tile + (tile - thumbnail.width()) / 2;
-            let y = index as u32 / columns * tile + (tile - thumbnail.height()) / 2;
-            image::imageops::overlay(&mut sheet, &thumbnail, x.into(), y.into());
-        }
-        sheet
-            .save(output.join("quickdraw-material-sheet.png"))
-            .expect("contact sheet");
     }
 }

@@ -4,8 +4,10 @@ mod dxgi;
 mod headers_pc;
 mod headers_ps;
 mod headers_xbox;
+mod metadata;
 mod swizzle;
 pub use capture::capture_texture;
+pub use metadata::TextureExpressionMetadata;
 
 use anyhow::Context;
 use binrw::BinReaderExt;
@@ -25,7 +27,7 @@ use tiger_pkg::version::EngineVersion;
 use tiger_pkg::{DestinyVersion, MarathonVersion, package_manager};
 use tiger_pkg::{GameVersion, TagHash, package::PackagePlatform};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TextureHeaderGeneric {
     pub data_size: u32,
     pub format: wgpu::TextureFormat,
@@ -37,6 +39,7 @@ pub struct TextureHeaderGeneric {
 
     pub deswizzle: bool,
     pub psformat: Option<GcnSurfaceFormat>,
+    pub expression_metadata: Option<TextureExpressionMetadata>,
 }
 
 impl TryFrom<TextureHeaderD2Ps4> for TextureHeaderGeneric {
@@ -54,6 +57,7 @@ impl TryFrom<TextureHeaderD2Ps4> for TextureHeaderGeneric {
 
             deswizzle: (v.flags1 & 0xc00) != 0x400,
             psformat: Some(v.format),
+            expression_metadata: None,
         })
     }
 }
@@ -73,6 +77,10 @@ impl TryFrom<TextureHeaderPC> for TextureHeaderGeneric {
 
             deswizzle: false,
             psformat: None,
+            expression_metadata: v.has_tiling_params.then_some(TextureExpressionMetadata {
+                tiling_params: v.tiling_params,
+                tile_count: v.tile_count,
+            }),
         })
     }
 }
@@ -80,6 +88,7 @@ impl TryFrom<TextureHeaderPC> for TextureHeaderGeneric {
 pub struct Texture {
     pub view: wgpu::TextureView,
     pub handle: wgpu::Texture,
+    preview_2d_texture: Option<wgpu::Texture>,
     pub full_cubemap_texture: Option<wgpu::Texture>,
     pub aspect_ratio: f32,
     pub desc: TextureDesc,
@@ -162,7 +171,21 @@ fn compatible_view_formats(format: wgpu::TextureFormat) -> Vec<wgpu::TextureForm
     formats
 }
 
-fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32) -> usize {
+fn compressed_format_with_alpha(format: wgpu::TextureFormat) -> bool {
+    matches!(
+        format,
+        wgpu::TextureFormat::Bc1RgbaUnorm
+            | wgpu::TextureFormat::Bc1RgbaUnormSrgb
+            | wgpu::TextureFormat::Bc2RgbaUnorm
+            | wgpu::TextureFormat::Bc2RgbaUnormSrgb
+            | wgpu::TextureFormat::Bc3RgbaUnorm
+            | wgpu::TextureFormat::Bc3RgbaUnormSrgb
+            | wgpu::TextureFormat::Bc7RgbaUnorm
+            | wgpu::TextureFormat::Bc7RgbaUnormSrgb
+    )
+}
+
+fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32, depth: u32) -> usize {
     let extent = wgpu::Extent3d {
         width: width.max(1),
         height: height.max(1),
@@ -171,7 +194,8 @@ fn mip_level_byte_size(format: wgpu::TextureFormat, width: u32, height: u32) -> 
     .physical_size(format);
     let (block_width, block_height) = format.block_dimensions();
     let block_size = format.block_copy_size(None).unwrap_or(4);
-    ((extent.width / block_width) * (extent.height / block_height) * block_size) as usize
+    ((extent.width / block_width) * (extent.height / block_height) * depth.max(1) * block_size)
+        as usize
 }
 
 /// Infer how much of the tightly packed Tiger mip chain is present.
@@ -191,6 +215,7 @@ fn available_mip_level_count(desc: &TextureDesc, data_len: usize) -> u32 {
             desc.format,
             desc.width.checked_shr(level).unwrap_or(0).max(1),
             desc.height.checked_shr(level).unwrap_or(0).max(1),
+            desc.depth.checked_shr(level).unwrap_or(0).max(1),
         ));
         if per_layer_bytes.saturating_mul(layers) > data_len {
             break;
@@ -225,6 +250,66 @@ impl TextureDesc {
 }
 
 impl Texture {
+    /// Conservative GPU-residency estimate used by the shared texture cache.
+    ///
+    /// TextureDesc does not retain the exact uploaded mip count, so budget the
+    /// complete theoretical mip chain. This intentionally overestimates sparse
+    /// Tiger mip tails a little rather than allowing the cache to grow until
+    /// the OS/GPU driver starts paging or OOMs.
+    pub(crate) fn estimated_gpu_bytes(&self) -> u64 {
+        let mut width = self.desc.width.max(1);
+        let mut height = self.desc.height.max(1);
+        let mut depth = self.desc.depth.max(1);
+        let mut per_layer = 0u64;
+        loop {
+            per_layer =
+                per_layer.saturating_add(
+                    mip_level_byte_size(self.desc.format, width, height, depth) as u64,
+                );
+            if width == 1 && height == 1 && depth == 1 {
+                break;
+            }
+            width = (width / 2).max(1);
+            height = (height / 2).max(1);
+            depth = (depth / 2).max(1);
+        }
+
+        // create_texture() retains one ordinary 2D or 3D allocation. Array
+        // textures additionally retain the full array/cubemap allocation.
+        let retained_layers = 1u64
+            + self
+                .full_cubemap_texture
+                .as_ref()
+                .map_or(0, |_| u64::from(self.desc.array_size.max(1)));
+        let preview_bytes = self.preview_2d_texture.as_ref().map_or(0, |_| {
+            mip_level_byte_size(self.desc.format, self.desc.width, self.desc.height, 1) as u64
+        });
+        per_layer
+            .saturating_mul(retained_layers)
+            .saturating_add(preview_bytes)
+    }
+
+    /// Raw texel view for UI presentation and extraction.
+    ///
+    /// Quicktag's Windows UI target is non-sRGB. Sampling an sRGB view there
+    /// decodes the texels without a matching display encode, making previews
+    /// darker and changing saturation. A format-compatible linear view keeps
+    /// the stored channel values identical to a direct package decode.
+    pub(crate) fn raw_view(&self) -> wgpu::TextureView {
+        self.preview_2d_texture
+            .as_ref()
+            .unwrap_or(&self.handle)
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(linear_texture_format(self.desc.format)),
+                ..Default::default()
+            })
+    }
+
+    /// Reuse a successfully validated D2/Marathon descriptor without retaining pixels.
+    pub(crate) fn validated_descriptor_d2(hash: TagHash) -> anyhow::Result<TextureHeaderGeneric> {
+        metadata::descriptor(hash)
+    }
+
     pub fn load_data_d2(
         hash: TagHash,
         load_full_mip: bool,
@@ -792,7 +877,10 @@ impl Texture {
         if desc.premultiply_alpha
             && matches!(
                 desc.format,
-                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+                wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb
+                    | wgpu::TextureFormat::Bgra8Unorm
+                    | wgpu::TextureFormat::Bgra8UnormSrgb
             )
         {
             for c in data.chunks_exact_mut(4) {
@@ -806,7 +894,7 @@ impl Texture {
         let image_size = wgpu::Extent3d {
             width: desc.width,
             height: desc.height,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: desc.depth.max(1),
         };
 
         {
@@ -835,13 +923,14 @@ impl Texture {
             &rs.queue,
             &wgpu::TextureDescriptor {
                 label: Some(&*format!("Texture {hash}")),
-                size: wgpu::Extent3d {
-                    depth_or_array_layers: 1,
-                    ..image_size
-                },
+                size: wgpu::Extent3d { ..image_size },
                 mip_level_count,
                 sample_count: 1,
-                dimension: TextureDimension::D2,
+                dimension: if desc.depth > 1 {
+                    TextureDimension::D3
+                } else {
+                    TextureDimension::D2
+                },
                 format: desc.format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &view_formats,
@@ -854,7 +943,44 @@ impl Texture {
             ..Default::default()
         });
 
-        let full_texture = if desc.array_size > 1 {
+        // egui accepts only D2 user textures. Preserve its historical
+        // first-slice preview without collapsing the shader-facing resource.
+        let preview_2d_texture = (desc.depth > 1).then(|| {
+            let byte_count = mip_level_byte_size(desc.format, desc.width, desc.height, 1);
+            rs.device.create_texture_with_data(
+                &rs.queue,
+                &wgpu::TextureDescriptor {
+                    label: Some(&format!("Texture {hash} (D3 preview slice)")),
+                    size: wgpu::Extent3d {
+                        width: desc.width,
+                        height: desc.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: desc.format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &view_formats,
+                },
+                wgpu::util::TextureDataOrder::default(),
+                &data[..byte_count],
+            )
+        });
+
+        if desc.premultiply_alpha
+            && desc.array_size == 1
+            && desc.depth == 1
+            && compressed_format_with_alpha(desc.format)
+        {
+            let raw_view = handle.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(linear_texture_format(desc.format)),
+                ..Default::default()
+            });
+            return Self::premultiply_compressed_texture(rs, hash, &raw_view, desc, comment);
+        }
+
+        let full_texture = if desc.array_size > 1 && desc.depth <= 1 {
             let handle = rs.device.create_texture_with_data(
                 &rs.queue,
                 &wgpu::TextureDescriptor {
@@ -882,10 +1008,190 @@ impl Texture {
         Ok(Texture {
             view,
             handle,
+            preview_2d_texture,
             full_cubemap_texture: full_texture,
             aspect_ratio: desc.width as f32 / desc.height as f32,
             desc,
             comment,
+        })
+    }
+
+    fn premultiply_compressed_texture(
+        rs: &RenderState,
+        hash: TagHash,
+        source_view: &wgpu::TextureView,
+        mut desc: TextureDesc,
+        comment: Option<String>,
+    ) -> anyhow::Result<Texture> {
+        // UI blending happens in its encoded, non-sRGB target. Decode the BC
+        // storage through a linear view and premultiply those stored values,
+        // not gamma-decoded linear-light values.
+        let output_format = wgpu::TextureFormat::Rgba8Unorm;
+        let handle = rs.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("Premultiplied texture {hash}")),
+            size: wgpu::Extent3d {
+                width: desc.width,
+                height: desc.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = handle.create_view(&wgpu::TextureViewDescriptor::default());
+        let shader = rs
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Texture alpha premultiplication"),
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@group(0) @binding(0) var source_texture: texture_2d<f32>;
+@group(0) @binding(1) var source_sampler: sampler;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex: u32) -> VertexOutput {
+    var output: VertexOutput;
+    output.uv = vec2<f32>(select(0.0, 2.0, vertex == 1u), select(0.0, 2.0, vertex == 2u));
+    output.position = vec4<f32>(output.uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(source_texture, source_sampler, input.uv);
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+"#
+                    .into(),
+                ),
+            });
+        let bind_group_layout =
+            rs.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Texture alpha premultiplication bind group layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let pipeline_layout = rs
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Texture alpha premultiplication pipeline layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = rs
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Texture alpha premultiplication pipeline"),
+                layout: Some(&pipeline_layout),
+                cache: None,
+                multiview: None,
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: output_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+            });
+        let sampler = rs.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Texture alpha premultiplication sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let bind_group = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Texture alpha premultiplication bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        let mut encoder = rs
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Texture alpha premultiplication encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Texture alpha premultiplication pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        rs.queue.submit(Some(encoder.finish()));
+
+        desc.format = output_format;
+        Ok(Texture {
+            view,
+            handle,
+            preview_2d_texture: None,
+            full_cubemap_texture: None,
+            aspect_ratio: desc.width as f32 / desc.height as f32,
+            desc,
+            comment: Some(format!(
+                "{}\nGPU-premultiplied compressed alpha for UI",
+                comment.unwrap_or_default()
+            )),
         })
     }
 
@@ -920,7 +1226,7 @@ impl Texture {
             render_state,
             TagHash::NONE,
             TextureDesc {
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 width,
                 height,
                 array_size: 1,
@@ -946,45 +1252,4 @@ pub enum TextureType {
     Texture2D,
     Texture3D,
     TextureCube,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{TextureDesc, available_mip_level_count};
-    use eframe::wgpu;
-
-    #[test]
-    fn infers_only_complete_uncompressed_mips() {
-        let desc = TextureDesc {
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            width: 8,
-            height: 4,
-            depth: 1,
-            array_size: 1,
-            premultiply_alpha: false,
-        };
-        assert_eq!(available_mip_level_count(&desc, 8 * 4 * 4), 1);
-        assert_eq!(available_mip_level_count(&desc, (8 * 4 + 4 * 2) * 4), 2);
-        assert_eq!(available_mip_level_count(&desc, (8 * 4 + 4 * 2) * 4 + 4), 2);
-        assert_eq!(
-            available_mip_level_count(&desc, (8 * 4 + 4 * 2 + 2 + 1) * 4),
-            4
-        );
-    }
-
-    #[test]
-    fn infers_block_compressed_array_mips() {
-        let desc = TextureDesc {
-            format: wgpu::TextureFormat::Bc7RgbaUnorm,
-            width: 8,
-            height: 8,
-            depth: 1,
-            array_size: 6,
-            premultiply_alpha: false,
-        };
-        // BC7: 64 + 16 + 16 + 16 bytes per layer for 8, 4, 2, 1.
-        assert_eq!(available_mip_level_count(&desc, 64 * 6), 1);
-        assert_eq!(available_mip_level_count(&desc, (64 + 16) * 6), 2);
-        assert_eq!(available_mip_level_count(&desc, (64 + 16 * 3) * 6), 4);
-    }
 }

@@ -149,6 +149,25 @@ impl AudioPlayer {
         self.sink.stop();
     }
 
+    /// Play a WAV produced by the video decoder without adding it to the tag cache.
+    pub fn play_video_wav(&self, data: Vec<u8>) -> bool {
+        let source = match rodio::Decoder::new(Cursor::new(data)) {
+            Ok(source) => source,
+            Err(error) => {
+                error!("Failed to decode video WAV for playback: {error}");
+                return false;
+            }
+        };
+
+        // A video replaces any ordinary audio preview currently using this sink.
+        self.playing.write().take();
+        self.sink.stop();
+        self.sink.clear();
+        self.sink.append(source);
+        self.sink.play();
+        true
+    }
+
     async fn load_audio_task(hash: TagHash) -> Option<LoadedAudioFile> {
         let data = package_manager().read_tag(hash).ok()?;
         let reader = Cursor::new(data);

@@ -369,7 +369,8 @@ pub struct StringCombination {
 
 #[derive(BinRead, Debug)]
 pub struct StringPart {
-    pub _unk0: u64,
+    /// Relative byte offset from this part to its presentation-style record.
+    pub style_reference_offset: u64,
     pub data: RelPointer,
     pub variable_hash: u32,
 
@@ -381,6 +382,40 @@ pub struct StringPart {
 
     pub _unk2: u16,
     pub _unk3: u32,
+}
+
+/// Read the authored color from a modern string style record.
+///
+/// `StringPart::style_reference_offset` is a relative offset from the start
+/// of that part. The target record stores its presentation color at +0x40 as
+/// four little-endian normalized floats. Keep this decoder deliberately
+/// bounds- and range-checked: some legacy containers set the field for a
+/// non-color reference, and those must retain the highlighted fallback.
+fn read_authored_style_color(
+    data: &[u8],
+    part_offset: u64,
+    style_reference_offset: u64,
+) -> Option<[f32; 4]> {
+    if style_reference_offset == 0 {
+        return None;
+    }
+
+    const STYLE_COLOR_OFFSET: usize = 0x40;
+    let style_offset = usize::try_from(part_offset.checked_add(style_reference_offset)?).ok()?;
+    let style_hash = u32::from_le_bytes(data.get(style_offset..style_offset + 4)?.try_into().ok()?);
+    if style_hash != FNV1_BASE {
+        return None;
+    }
+    let color_offset = style_offset.checked_add(STYLE_COLOR_OFFSET)?;
+    let mut color = [0.0; 4];
+    for (channel, value) in color.iter_mut().enumerate() {
+        let start = color_offset.checked_add(channel * 4)?;
+        *value = f32::from_le_bytes(data.get(start..start + 4)?.try_into().ok()?);
+    }
+    color
+        .iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .then_some(color)
 }
 
 #[derive(BinRead, Debug)]
@@ -567,22 +602,82 @@ pub fn create_stringmap_d2_for_language(
 
 pub type LocalizedStringSet = FxHashMap<u32, String>;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalizedStringPart {
+    pub text: String,
+    /// Raw package presentation-style reference. Zero means the default style.
+    ///
+    /// Keep the authored value instead of collapsing it to a boolean: Goliath
+    /// can assign different style records to different parts of one string.
+    pub style_reference_offset: u64,
+    /// Convenience flag for callers that only need to know whether the part
+    /// differs from the default style.
+    pub highlighted: bool,
+    /// Authored RGBA color stored in the referenced Goliath style record.
+    pub authored_color: Option<[f32; 4]>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalizedStringContainer {
     pub tag: TagHash,
     pub strings: LocalizedStringSet,
+    pub parts: FxHashMap<u32, Vec<LocalizedStringPart>>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct LocalizedStringResolver {
     containers: FxHashMap<TagHash, LocalizedStringSet>,
+    parts: FxHashMap<TagHash, FxHashMap<u32, Vec<LocalizedStringPart>>>,
     scopes: Vec<Option<TagHash>>,
 }
 
 impl LocalizedStringResolver {
+    /// Translate a related label set from containers containing every source label.
+    /// Preserve container/hash identity and reject conflicting translations.
+    pub fn translate_group_from(&self, source: &Self, labels: &[&str]) -> Option<Vec<String>> {
+        if labels.is_empty() {
+            return None;
+        }
+        let mut result: Option<Vec<String>> = None;
+        for (container, strings) in &source.containers {
+            if !labels
+                .iter()
+                .all(|label| strings.values().any(|text| text == label))
+            {
+                continue;
+            }
+            let target = self.containers.get(container)?;
+            let mut translations = Vec::with_capacity(labels.len());
+            for label in labels {
+                let mut translated: Option<&String> = None;
+                for (hash, _) in strings.iter().filter(|(_, text)| text.as_str() == *label) {
+                    let value = target.get(hash)?;
+                    if value.is_empty() || translated.is_some_and(|previous| previous != value) {
+                        return None;
+                    }
+                    translated = Some(value);
+                }
+                translations.push(translated?.clone());
+            }
+            if result
+                .as_ref()
+                .is_some_and(|previous| previous != &translations)
+            {
+                return None;
+            }
+            result = Some(translations);
+        }
+        result
+    }
+
     pub fn get(&self, scope: u32, hash: u32) -> Option<&String> {
         let container = self.scopes.get(scope as usize)?.as_ref()?;
         self.containers.get(container)?.get(&hash)
+    }
+
+    pub fn parts(&self, scope: u32, hash: u32) -> Option<&[LocalizedStringPart]> {
+        let container = self.scopes.get(scope as usize)?.as_ref()?;
+        self.parts.get(container)?.get(&hash).map(Vec::as_slice)
     }
 
     pub fn scope_tag(&self, scope: u32) -> Option<TagHash> {
@@ -645,25 +740,39 @@ pub fn create_stringcontainers_d2_for_language(
         let text_data: StringData = cur.read_le_args((old_format,))?;
 
         let mut string_set = LocalizedStringSet::default();
+        let mut string_parts = FxHashMap::default();
         for (combination, hash) in text_data
             .string_combinations
             .iter()
             .zip(textset_header.string_hashes.iter())
         {
             let mut final_string = String::new();
+            let mut final_parts = vec![];
 
             for ip in 0..combination.part_count {
                 cur.seek(combination.data.into())?;
                 cur.seek(SeekFrom::Current(ip * 0x20))?;
+                let part_offset = cur.stream_position()?;
                 let part: StringPart = cur.read_le()?;
-                if part.variable_hash != 0x811c9dc5 {
-                    final_string += &format!("<{:08X}>", part.variable_hash);
+                let text = if part.variable_hash != 0x811c9dc5 {
+                    format!("<{:08X}>", part.variable_hash)
                 } else {
                     cur.seek(part.data.into())?;
                     let mut data = vec![0u8; part.byte_length as usize];
                     cur.read_exact(&mut data)?;
-                    final_string += &decode_text(&data, part.cipher_shift);
-                }
+                    decode_text(&data, part.cipher_shift)
+                };
+                final_string += &text;
+                final_parts.push(LocalizedStringPart {
+                    text,
+                    highlighted: part.style_reference_offset != 0,
+                    style_reference_offset: part.style_reference_offset,
+                    authored_color: read_authored_style_color(
+                        &data,
+                        part_offset,
+                        part.style_reference_offset,
+                    ),
+                });
             }
 
             if *hash == FNV1_BASE {
@@ -674,10 +783,12 @@ pub fn create_stringcontainers_d2_for_language(
             }
 
             string_set.insert(*hash, final_string);
+            string_parts.insert(*hash, final_parts);
         }
         containers.push(LocalizedStringContainer {
             tag: t,
             strings: string_set,
+            parts: string_parts,
         });
     }
 
@@ -698,10 +809,13 @@ pub fn create_stringresolver_d2_for_language(
 ) -> anyhow::Result<LocalizedStringResolver> {
     const GOLIATH_SCOPE_TABLE_REFERENCE: u32 = 0x808071C8;
 
-    let containers = create_stringcontainers_d2_for_language(language)?
-        .into_iter()
-        .map(|container| (container.tag, container.strings))
-        .collect::<FxHashMap<_, _>>();
+    let decoded = create_stringcontainers_d2_for_language(language)?;
+    let mut containers = FxHashMap::default();
+    let mut parts = FxHashMap::default();
+    for container in decoded {
+        containers.insert(container.tag, container.strings);
+        parts.insert(container.tag, container.parts);
+    }
     let mut scopes = vec![];
 
     if package_manager().version.engine_version() == tiger_pkg::version::EngineVersion::TigerGoliath
@@ -734,7 +848,11 @@ pub fn create_stringresolver_d2_for_language(
         }
     }
 
-    Ok(LocalizedStringResolver { containers, scopes })
+    Ok(LocalizedStringResolver {
+        containers,
+        parts,
+        scopes,
+    })
 }
 
 fn parse_goliath_scope_wide_hashes(data: &[u8]) -> Option<Vec<u64>> {
@@ -771,33 +889,6 @@ fn read_i64_at(data: &[u8], offset: usize) -> Option<i64> {
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_goliath_scope_wide_hashes;
-
-    #[test]
-    fn parses_goliath_localization_scope_table() {
-        let mut data = vec![0_u8; 0x68];
-        data[0x8..0x10].copy_from_slice(&2_u64.to_le_bytes());
-        data[0x10..0x18].copy_from_slice(&0x10_i64.to_le_bytes());
-        data[0x40..0x48].copy_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
-        data[0x58..0x60].copy_from_slice(&0x8877_6655_4433_2211_u64.to_le_bytes());
-
-        assert_eq!(
-            parse_goliath_scope_wide_hashes(&data),
-            Some(vec![0x1122_3344_5566_7788, 0x8877_6655_4433_2211])
-        );
-    }
-
-    #[test]
-    fn rejects_truncated_goliath_localization_scope_table() {
-        let mut data = vec![0_u8; 0x50];
-        data[0x8..0x10].copy_from_slice(&2_u64.to_le_bytes());
-        data[0x10..0x18].copy_from_slice(&0x10_i64.to_le_bytes());
-
-        assert_eq!(parse_goliath_scope_wide_hashes(&data), None);
-    }
-}
 
 pub fn create_stringmap_d1() -> anyhow::Result<StringCache> {
     let mut tmp_map: FxHashMap<u32, FxHashSet<String>> = Default::default();

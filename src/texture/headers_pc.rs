@@ -11,7 +11,13 @@ pub struct TextureHeaderPC {
     pub _unk8: u32,
 
     #[br(if(!prebl))]
-    pub _unkc: [u32; 5],
+    pub _unkc: u32,
+
+    #[br(if(!prebl))]
+    pub tiling_params: [f32; 4],
+
+    #[br(calc(!prebl))]
+    pub has_tiling_params: bool,
 
     #[br(assert(cafe == 0xcafe))]
     pub cafe: u16, // prebl: 0xc / bl: 0x20
@@ -21,7 +27,8 @@ pub struct TextureHeaderPC {
     pub depth: u16,      // prebl: 0x12 / bl: 0x26
     pub array_size: u16, // prebl: 0x14 / bl: 0x28
 
-    pub _pad0: [u16; 7], // prebl: 0x16 / bl: 0x2a
+    pub tile_count: u16, // prebl: 0x16 / bl: 0x2a
+    pub _pad0: [u16; 6],
 
     #[br(if(!prebl))]
     pub _pad1: u32,

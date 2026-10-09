@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::Write, path::PathBuf, sync::Arc};
 
 use eframe::egui::{
     self, Color32, RichText, Sense, Stroke,
@@ -12,24 +12,308 @@ use quicktag_scanner::TagCache;
 use tiger_pkg::{TagHash, manager::PackagePath, package::UEntryHeader, package_manager};
 
 use crate::geometry::{
-    GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, UvTransformPreview,
-    WeaponModPreviewAttachment, WeaponModSocketIndex, WireframeMaterialLayer, WireframePreview,
-    is_model_catalog_reference, model_info_for_reference, weapon_unoccupied_default_mod_patterns,
+    GeometryPreviewKind, GeometryTagPreview, ModelTagInfo, ModelTagRole, RunnerShellAssembly,
+    UvTransformPreview, WeaponModPreviewAttachment, WeaponModSocketIndex, WireframeMaterialLayer,
+    WireframePreview, is_model_catalog_reference, model_has_render_geometry,
+    model_info_for_reference,
+    weapon_unoccupied_default_mod_patterns,
 };
 use crate::gui::common::ResponseExt;
 use crate::gui::tag::format_tag_entry;
 use crate::material::is_sticker_proxy_technique;
+use crate::render::{channels::ModelChannels, tfx::TfxRuntimeInputs};
 use crate::texture::cache::{MaterialTextureKey, TextureCache};
 use crate::util::{format_file_size, ui_image_rotated};
 
-use super::gear::{ModelModEntry, ModelWeaponCatalog, ModelWeaponEntry, ModelWeaponSkinEntry};
-use super::model_renderer::{
-    GpuModelPreview, ModelCameraFrame, ModelEnvironment, ModelPaintCallback,
+use super::gear::{
+    ModelCharmEntry, ModelMeleeSkinEntry, ModelModEntry, ModelRunnerSkinEntry, ModelWeaponCatalog,
+    ModelWeaponEntry, ModelWeaponSkinEntry,
 };
-use super::{View, ViewAction};
+use super::model_renderer::{
+    GpuModelPreview, LightingModel, ModelCameraFrame, ModelEnvironment, ModelExportCamera,
+    ModelLightTransform, ModelPaintCallback, fixed_light_direction_to_view,
+    fixed_view_direction_to_light, light_cast_direction, light_source_position,
+};
+use super::{TOASTS, View, ViewAction};
 
 pub(super) const DEFAULT_MODEL_YAW: f32 = -std::f32::consts::FRAC_PI_2;
+const DEFAULT_WEAPON_YAW: f32 = -24.0_f32.to_radians();
+const DEFAULT_WEAPON_PITCH: f32 = 14.0_f32.to_radians();
+const DEFAULT_PREVIEW_ZOOM: f32 = 2.5;
+const MODEL_EXPORT_WIDTH: u32 = 4198;
+const MODEL_EXPORT_HEIGHT: u32 = 2048;
 const MODEL_PARAMETER_RANGE: std::ops::RangeInclusive<f32> = -10.0..=10.0;
+const MODEL_OVERLAY_INSET: f32 = 8.0;
+const MODEL_OVERLAY_STACK_STEP: f32 = 51.0;
+
+fn model_overlay_frame() -> egui::Frame {
+    egui::Frame::default()
+        .fill(Color32::from_rgba_unmultiplied(10, 13, 18, 238))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(73, 82, 96)))
+        .corner_radius(6)
+        .inner_margin(8)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelExportFormat {
+    #[default]
+    Png,
+    WebP,
+}
+
+impl ModelExportFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::WebP => "WebP",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::WebP => "webp",
+        }
+    }
+
+    fn dialog_label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG image",
+            Self::WebP => "WebP image",
+        }
+    }
+
+    fn image_format(self) -> image::ImageFormat {
+        match self {
+            Self::Png => image::ImageFormat::Png,
+            Self::WebP => image::ImageFormat::WebP,
+        }
+    }
+}
+
+fn model_export_filename(
+    model: TagHash,
+    modifications: &[(TagHash, &'static str)],
+    format: ModelExportFormat,
+) -> String {
+    let suffix = modifications
+        .iter()
+        .map(|(tag, rarity)| format!("{tag}-{rarity}"))
+        .join("_");
+    if suffix.is_empty() {
+        format!("{model}.{}", format.extension())
+    } else {
+        format!("{model}_{suffix}.{}", format.extension())
+    }
+}
+
+fn model_modded_export_filename(model: TagHash) -> String {
+    format!("{model}.zip")
+}
+
+fn high_rarity_mod_combinations(weapon: &ModelWeaponEntry) -> Vec<Vec<ModelModEntry>> {
+    let pools = weapon
+        .slots
+        .iter()
+        .filter_map(|slot| {
+            let mut mods = slot
+                .mods
+                .iter()
+                .filter(|item| matches!(item.rarity_code, "S" | "P" | "C"))
+                .cloned()
+                .collect_vec();
+            mods.sort_by_key(|item| (item.model_tag, item.rarity_code));
+            mods.dedup_by_key(|item| (item.model_tag, item.rarity_code));
+            (!mods.is_empty()).then_some(mods)
+        })
+        .collect_vec();
+    if pools.is_empty() {
+        return vec![];
+    }
+    pools.into_iter().fold(vec![vec![]], |combinations, pool| {
+        combinations
+            .into_iter()
+            .flat_map(|combination| {
+                pool.iter().cloned().map(move |item| {
+                    let mut next = combination.clone();
+                    next.push(item);
+                    next
+                })
+            })
+            .collect()
+    })
+}
+
+struct ModdedExportJob {
+    model_tag: TagHash,
+    weapon: ModelWeaponEntry,
+    combinations: Vec<Vec<ModelModEntry>>,
+    next: usize,
+    show_default_mods: bool,
+    show_stickers: bool,
+    environment: ModelEnvironment,
+    channels: Option<ModelChannels>,
+    export_camera: Option<ModelExportCamera>,
+    format: ModelExportFormat,
+    path: PathBuf,
+    zip: Option<zip::ZipWriter<std::fs::File>>,
+}
+
+impl ModdedExportJob {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        model_tag: TagHash,
+        weapon: ModelWeaponEntry,
+        show_default_mods: bool,
+        show_stickers: bool,
+        environment: ModelEnvironment,
+        channels: Option<ModelChannels>,
+        export_camera: Option<ModelExportCamera>,
+        format: ModelExportFormat,
+        path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let combinations = high_rarity_mod_combinations(&weapon);
+        anyhow::ensure!(
+            !combinations.is_empty(),
+            "current gun has no Superior, Prestige, or Contraband mods"
+        );
+        let zip = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        Ok(Self {
+            model_tag,
+            weapon,
+            combinations,
+            next: 0,
+            show_default_mods,
+            show_stickers,
+            environment,
+            channels,
+            export_camera,
+            format,
+            path,
+            zip: Some(zip),
+        })
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        (self.next, self.combinations.len())
+    }
+
+    fn step(
+        &mut self,
+        cache: &Arc<TagCache>,
+        texture_cache: &TextureCache,
+    ) -> anyhow::Result<bool> {
+        if self.next == self.combinations.len() {
+            self.zip
+                .take()
+                .expect("unfinished export has zip")
+                .finish()?;
+            return Ok(true);
+        }
+        let entry = package_manager()
+            .get_entry(self.model_tag)
+            .ok_or_else(|| anyhow::anyhow!("model {} is unavailable", self.model_tag))?;
+        let socket_owner = self.weapon.socket_owner.unwrap_or(self.weapon.owner_tag);
+        let combination = &self.combinations[self.next];
+        let mut attachments = combination
+            .iter()
+            .map(|item| WeaponModPreviewAttachment {
+                model_tag: item.model_tag,
+                rarity: item.preview_rarity,
+                unique_id: 0.5,
+            })
+            .collect_vec();
+        let equipped = attachments.iter().map(|item| item.model_tag).collect_vec();
+        if self.show_default_mods {
+            attachments.extend(
+                weapon_unoccupied_default_mod_patterns(
+                    &cache,
+                    self.weapon.owner_tag,
+                    socket_owner,
+                    &equipped,
+                )
+                .into_iter()
+                .map(|model_tag| WeaponModPreviewAttachment {
+                    model_tag,
+                    rarity: None,
+                    unique_id: 0.5,
+                }),
+            );
+        }
+        let preview = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            cache.clone(),
+            self.model_tag,
+            &entry,
+            self.weapon.owner_tag,
+            socket_owner,
+            &attachments,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to assemble {} with selected mods", self.model_tag)
+        })?;
+        let GeometryPreviewKind::Model(model) = &preview.kind else {
+            anyhow::bail!("{} did not decode as a model", self.model_tag);
+        };
+        let wireframe = model
+            .wireframe
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("wireframe unavailable for {}", self.model_tag))?;
+        let fallback_color = wireframe_preview_textures(wireframe, &model.textures)
+            .first()
+            .copied();
+        let mut runtime_inputs = TfxRuntimeInputs::for_model_preview(cache, self.weapon.owner_tag);
+        if let Some(channels) = &self.channels { channels.apply_overrides(&mut runtime_inputs); }
+        let gpu = Arc::new(
+            GpuModelPreview::create(
+                &texture_cache.render_state.device,
+                wireframe,
+                fallback_color,
+                &runtime_inputs,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!("failed to create GPU preview for {}", self.model_tag)
+            })?,
+        );
+        let export_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            vec2(MODEL_EXPORT_WIDTH as f32, MODEL_EXPORT_HEIGHT as f32),
+        );
+        let callback = ModelPaintCallback::new(
+            gpu,
+            texture_cache,
+            wireframe,
+            model.preview_uv_transform(),
+            None,
+            DEFAULT_WEAPON_YAW,
+            DEFAULT_WEAPON_PITCH,
+            1.0,
+            egui::Vec2::ZERO,
+            self.show_stickers,
+            export_rect,
+            1.0,
+            self.environment,
+        )
+        .with_export_camera(self.export_camera);
+        let descriptors = combination
+            .iter()
+            .map(|item| (item.model_tag, item.rarity_code))
+            .collect_vec();
+        let zip = self.zip.as_mut().expect("unfinished export has zip");
+        zip.start_file(
+            model_export_filename(self.model_tag, &descriptors, self.format),
+            // Encoded image payloads are already compressed; ZIP deflate only wastes CPU.
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )?;
+        zip.write_all(&callback.export_image_bytes(
+            &texture_cache.render_state,
+            [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
+            self.format.image_format(),
+        )?)?;
+        self.next += 1;
+        Ok(false)
+    }
+}
 
 pub struct ModelsView {
     cache: Arc<TagCache>,
@@ -38,11 +322,20 @@ pub struct ModelsView {
     packages_with_models: Vec<u16>,
     package_filter: String,
     model_filter: String,
+    hide_empty_models: bool,
     models: Vec<ModelListEntry>,
     selected_model: Option<TagHash>,
     preview: Option<GeometryTagPreview>,
     gpu_model_preview: Option<Arc<GpuModelPreview>>,
+    preview_channels: Option<ModelChannels>,
+    preview_runtime_inputs: Option<TfxRuntimeInputs>,
+    /// Object channel values the playing clip last gave the preview.
+    clip_channels: Vec<(u32, f32)>,
+    /// Geometry of the props the playing clip spawns, loaded with the model.
+    clip_props: Vec<TagHash>,
+    channel_render_error: Option<String>,
     preview_camera_frame: Option<ModelCameraFrame>,
+    weapon_export_camera: Option<ModelExportCamera>,
     preview_yaw: f32,
     preview_pitch: f32,
     preview_zoom: f32,
@@ -51,11 +344,15 @@ pub struct ModelsView {
     preview_show_stickers: bool,
     preview_show_default_mods: bool,
     preview_environment: ModelEnvironment,
+    export_all_mods: bool,
+    export_format: ModelExportFormat,
+    modded_export: Option<ModdedExportJob>,
     weapon_catalog: ModelWeaponCatalog,
     active_weapon: Option<usize>,
     selected_mods: Vec<Option<usize>>,
     selected_mod_unique_ids: Vec<Option<f32>>,
     mod_unique_rng: u32,
+    runner_models: rustc_hash::FxHashMap<TagHash, RunnerShellAssembly>,
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +375,258 @@ struct ProjectedTriangle {
 }
 
 impl ModelsView {
+    /// Render one catalog model without the UI, using the viewport's default
+    /// environment and a fitted camera, and write it as PNG.
+    pub(crate) fn export_model_image(
+        render_state: &eframe::egui_wgpu::RenderState,
+        tag: TagHash,
+        yaw_degrees: f32,
+        pitch_degrees: f32,
+        zoom: f32,
+        focus: [f32; 2],
+        time_seconds: f32,
+        lighting: [f32; 9],
+        view: &str,
+        clip: Option<(TagHash, f32)>,
+        list_clips: bool,
+        list_codename: Option<&str>,
+        output: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let cache = Arc::new(quicktag_scanner::load_tag_cache());
+        let texture_cache = TextureCache::new(render_state.clone());
+        let entry = package_manager()
+            .get_entry(tag)
+            .ok_or_else(|| anyhow::anyhow!("model {tag} is unavailable"))?;
+        let runner_shell = RunnerShellAssembly::resolve(&cache, tag).map(|mut shell| {
+            if let Some((runner, dye_row)) = super::gear::GearView::runner_for_skin(&cache, tag) {
+                shell.runner = Some(runner);
+                shell.dye_row = dye_row;
+            }
+            if let Some(clip) = clip.and_then(|(clip_tag, _)| crate::animation::Clip::load(clip_tag)) {
+                shell.props = clip.props().iter().flat_map(|prop| prop.geometry.clone()).collect();
+            }
+            shell
+        });
+        let preview = if let Some(shell) = &runner_shell {
+            shell.load(cache.clone())
+        } else {
+            // A weapon skin is assembled as the Models panel does it: on its
+            // weapon's owner record, with the default mods in the empty slots.
+            let weapon = super::gear::GearView::weapon_for_skin(&cache, tag);
+            let owner = weapon.as_ref().map_or(tag, |weapon| weapon.owner_tag);
+            let socket_owner = weapon.as_ref().and_then(|weapon| weapon.socket_owner).unwrap_or(owner);
+            let attachments = weapon.map_or_else(Vec::new, |_| {
+                weapon_unoccupied_default_mod_patterns(&cache, owner, socket_owner, &[])
+                    .into_iter()
+                    .unique()
+                    .map(|model_tag| WeaponModPreviewAttachment { model_tag, rarity: None, unique_id: 0.5 })
+                    .collect()
+            });
+            GeometryTagPreview::load_model_with_weapon_mod_attachments(
+                cache.clone(),
+                tag,
+                &entry,
+                owner,
+                socket_owner,
+                &attachments,
+            )
+        }
+        .ok_or_else(|| anyhow::anyhow!("failed to assemble {tag}"))?;
+        let GeometryPreviewKind::Model(model) = &preview.kind else {
+            anyhow::bail!("{tag} did not decode as a model");
+        };
+        let wireframe = model
+            .wireframe
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("wireframe unavailable for {tag}"))?;
+        let fallback_color = wireframe_preview_textures(wireframe, &model.textures)
+            .first()
+            .copied();
+        let mut runtime_inputs = TfxRuntimeInputs::for_model_preview(&cache, tag);
+        if let Some(shell) = &runner_shell {
+            runtime_inputs.apply_runner_dye(&shell.dye_channels(), &shell.gear(&cache));
+        }
+        if let Some((clip_tag, frame)) = clip {
+            if let Some(clip) = crate::animation::Clip::load(clip_tag) {
+                runtime_inputs.apply_clip_channels(&clip.channel_values(frame));
+            }
+        }
+        let gpu = Arc::new(
+            GpuModelPreview::create(&render_state.device, wireframe, fallback_color, &runtime_inputs)
+                .ok_or_else(|| anyhow::anyhow!("failed to create GPU preview for {tag}"))?,
+        );
+        if list_clips {
+            match gpu.main_skeleton() {
+                Some(skeleton) => {
+                    println!("SKELETON {} nodes={} runner={}", skeleton.tag, skeleton.names.len(), skeleton.is_runner());
+                    let offered = crate::animation::rig_index().clips_for_model(skeleton, list_codename);
+                    for clip in &offered {
+                        println!(
+                            "OFFERED\t{}\t{}\t{}\t{:08X}\t{:08X}",
+                            clip.tag, clip.frames, clip.slots, clip.rig, clip.name_hash
+                        );
+                    }
+                    let clips = crate::animation::rig_index().model_clips(skeleton);
+                    for (kind, list) in [("own", &clips.own), ("rig", &clips.same_rig)] {
+                        for clip in list {
+                            println!(
+                                "MODELCLIP\t{kind}\t{}\t{}\t{}\t{:08X}\t{:08X}",
+                                clip.tag, clip.frames, clip.slots, clip.rig, clip.name_hash
+                            );
+                        }
+                    }
+                }
+                None => println!("SKELETON none matched"),
+            }
+        }
+        // A negative frame poses the skeleton in its own bind pose, which must
+        // render exactly like the unposed model.
+        let pose = clip
+            .map(|(clip_tag, frame)| -> anyhow::Result<_> {
+                let clip = crate::animation::Clip::load(clip_tag)
+                    .ok_or_else(|| anyhow::anyhow!("{clip_tag} is not an animation clip"))?;
+                let pose = gpu
+                    .clip_pose(&clip, frame)
+                    .ok_or_else(|| anyhow::anyhow!("no runner skeleton matches {tag}"))?;
+                println!(
+                    "ANIMATION clip={clip_tag} slots={} frames={} posed_sources={}/{}",
+                    clip.slots,
+                    clip.frames,
+                    pose.sources.iter().flatten().count(),
+                    pose.sources.len()
+                );
+                Ok(Arc::new(pose))
+            })
+            .transpose()?;
+        for line in gpu.inspection_lines() {
+            println!("{line}");
+        }
+        // Object channels the Pattern graph declares and the vectors it binds.
+        for scope in crate::geometry::pattern_object_channel_evidence(&cache, tag) {
+            println!(
+                "CHANNELS owner={} depth={} declared=[{}]",
+                scope.owner,
+                scope.depth,
+                scope.channels.iter().map(|channel| format!("{:08X}", channel.hash)).join(" ")
+            );
+            for binding in &scope.bindings {
+                println!(
+                    "BINDING owner={} scope={:08X} parameter={:08X} value={:?}",
+                    scope.owner, binding.scope, binding.parameter, binding.value
+                );
+            }
+        }
+        // What the package authors, independent of what the preview selects.
+        let mut techniques = std::collections::BTreeMap::<TagHash, (TagHash, std::collections::BTreeSet<u8>)>::new();
+        for input in &wireframe.authored_inputs {
+            let buffer = |stream: &crate::geometry::AuthoredVertexStreamRef| {
+                format!("{}:stride{}:type{}:count{}", stream.data_tag, stream.stride, stream.vertex_type, stream.element_count)
+            };
+            println!(
+                "INPUT geometry={} streams=[{}] color={} skinning={} uv={:?}",
+                input.geometry,
+                input.vertex_streams.iter().map(|stream| format!("{}={}", stream.stream_index, buffer(stream))).join(", "),
+                input.color_buffer.as_ref().map_or("none".to_string(), buffer),
+                input.skinning_buffer.as_ref().map_or("none".to_string(), buffer),
+                input.uv_transform.map(|uv| (uv.scale, uv.offset)),
+            );
+            for part in crate::geometry::geometry_stage_parts(input.geometry) {
+                println!(
+                    "PART geometry={} stage={} lod={} technique={} indices={}",
+                    input.geometry,
+                    part.stage.map_or("none".to_string(), |stage| stage.to_string()),
+                    part.lod_category,
+                    part.technique,
+                    part.index_count
+                );
+                if let Some(stage) = part.stage {
+                    techniques.entry(part.technique).or_insert_with(|| (input.geometry, Default::default())).1.insert(stage);
+                }
+            }
+        }
+        for (technique_tag, (geometry, stages)) in techniques {
+            let Some(technique) = crate::render::technique::TechniqueDescriptor::load(technique_tag) else {
+                println!("TECHNIQUE {technique_tag} render_stages={stages:?} unreadable");
+                continue;
+            };
+            let inputs = runtime_inputs.for_geometry(geometry);
+            for stage in technique.stages.iter().filter(|stage| stage.shader.is_some() || !stage.tfx.ops.is_empty()) {
+                let registered = stage.shader.map(|shader| {
+                    match crate::render::authored_program::resolve_package_program(shader, stage.stage) {
+                        Ok(Some(program)) => format!("{:?}", program.descriptor_abi),
+                        Ok(None) => "unregistered".to_string(),
+                        Err(error) => format!("error:{error}"),
+                    }
+                });
+                let unknown_ops = stage.tfx.ops.iter()
+                    .filter(|op| op.name.starts_with("unk") || op.name.starts_with("marathon_"))
+                    .map(|op| format!("0x{:02X}", op.opcode)).unique().join(",");
+                let clock = stage.tfx.externs.iter()
+                    .any(|external| external.scope == "Frame" && matches!(external.byte_offset, 0 | 4));
+                // The eight runtime-only View rows behind the reflection highlight lookup.
+                let planes = stage.tfx.externs.iter()
+                    .any(|external| external.scope == "View" && (0x470..=0x4e0).contains(&external.byte_offset));
+                let state = stage.runtime_state(&inputs);
+                println!(
+                    "TECHNIQUE {technique_tag} render_stages={stages:?} shader_stage={:?} shader={} program={} tfx={:?} clock={clock} planes={planes} unknown_ops=[{unknown_ops}] unresolved={:?}",
+                    stage.stage,
+                    stage.shader.map_or("none".to_string(), |shader| shader.to_string()),
+                    registered.unwrap_or_else(|| "none".to_string()),
+                    state.status,
+                    state.unresolved_dependencies,
+                );
+            }
+        }        // Square frame that keeps the full-fidelity targets inside the renderer memory budget.
+        const SIZE: u32 = 1024;
+        let export_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        // Material textures load in the background; each new callback polls them.
+        let callback = loop {
+            let callback = ModelPaintCallback::new(
+                gpu.clone(),
+                &texture_cache,
+                wireframe,
+                model.preview_uv_transform(),
+                None,
+                yaw_degrees.to_radians(),
+                pitch_degrees.to_radians(),
+                1.0,
+                egui::Vec2::ZERO,
+                true,
+                export_rect,
+                1.0,
+                ModelEnvironment {
+                    tfx_time_seconds: time_seconds,
+                    lighting_model: match view {
+                        "albedo" => LightingModel::SurfaceAlbedo,
+                        "normals" => LightingModel::SurfaceNormals,
+                        "properties" => LightingModel::SurfaceProperties,
+                        "emissive" => LightingModel::SurfaceEmissive,
+                        "fallback" => LightingModel::TigerGgxCompatibility,
+                        _ => LightingModel::TigerGgxApproximation,
+                    },
+                    // Channel views are measurements: no filmic curve on them.
+                    tone_mapping: view == "final",
+                    light_color: [lighting[0], lighting[1], lighting[2]],
+                    ambient_sky_color: [lighting[3], lighting[4], lighting[5]],
+                    ambient_ground_color: [lighting[6], lighting[7], lighting[8]],
+                    ..Default::default()
+                },
+            );
+            // Fallback materials draw a placeholder until the cache has theirs.
+            if callback.resources_ready() && !texture_cache.is_loading_textures() {
+                break callback;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        callback.with_pose(pose).with_export_focus(zoom, focus).export_image(
+            render_state,
+            output,
+            [SIZE, SIZE],
+            image::ImageFormat::Png,
+        )
+    }
+
     pub fn new(cache: Arc<TagCache>, texture_cache: TextureCache) -> Self {
         Self {
             cache,
@@ -86,24 +635,35 @@ impl ModelsView {
             packages_with_models: Self::search_models(None),
             package_filter: String::new(),
             model_filter: String::new(),
+            hide_empty_models: true,
             models: vec![],
             selected_model: None,
             preview: None,
             gpu_model_preview: None,
+            preview_channels: None,
+            preview_runtime_inputs: None,
+            clip_channels: vec![],
+            clip_props: vec![],
+            channel_render_error: None,
             preview_camera_frame: None,
-            preview_yaw: DEFAULT_MODEL_YAW,
-            preview_pitch: 0.05,
-            preview_zoom: 1.0,
+            weapon_export_camera: None,
+            preview_yaw: DEFAULT_WEAPON_YAW,
+            preview_pitch: DEFAULT_WEAPON_PITCH,
+            preview_zoom: DEFAULT_PREVIEW_ZOOM,
             preview_pan: vec2(0.0, 0.0),
             preview_show_wireframe: false,
             preview_show_stickers: false,
             preview_show_default_mods: true,
             preview_environment: ModelEnvironment::default(),
+            export_all_mods: false,
+            export_format: ModelExportFormat::default(),
+            modded_export: None,
             weapon_catalog: ModelWeaponCatalog::default(),
             active_weapon: None,
             selected_mods: vec![],
             selected_mod_unique_ids: vec![],
             mod_unique_rng: 0xA341_316C,
+            runner_models: Default::default(),
         }
     }
 
@@ -117,6 +677,7 @@ impl ModelsView {
             .filter_map(|weapon| Some((weapon.owner_tag, weapon.socket_owner?)))
             .collect::<Vec<_>>();
         self.weapon_catalog = catalog;
+        self.refresh_runner_models();
         for weapon in &mut self.weapon_catalog.weapons {
             weapon.socket_owner = previous_owners
                 .iter()
@@ -147,11 +708,13 @@ impl ModelsView {
         }
         if self.selected_model.is_some() {
             self.rebuild_model_preview();
+            self.rebuild_weapon_reference_frames();
         }
     }
 
     pub fn set_cache(&mut self, cache: Arc<TagCache>) {
         self.cache = cache;
+        self.refresh_runner_models();
         for weapon in &mut self.weapon_catalog.weapons {
             weapon.socket_owner = None;
         }
@@ -159,12 +722,14 @@ impl ModelsView {
         self.preview = None;
         self.gpu_model_preview = None;
         self.preview_camera_frame = None;
+        self.weapon_export_camera = None;
         if let Some(tag) = self.selected_model {
             self.load_model(tag);
         }
     }
 
     pub fn show_model(&mut self, tag: TagHash) {
+        let tag = runner_model_root(&self.runner_models, tag).unwrap_or(tag);
         self.package_filter.clear();
         self.model_filter.clear();
         self.packages_with_models = Self::search_models(None);
@@ -204,6 +769,10 @@ impl ModelsView {
         }
     }
 
+    fn refresh_runner_models(&mut self) {
+        self.runner_models = runner_model_index(&self.cache, &self.weapon_catalog);
+    }
+
     fn search_models(search: Option<String>) -> Vec<u16> {
         let pm = package_manager();
         let mut packages: Vec<(u16, PackagePath)> = package_manager()
@@ -232,6 +801,8 @@ impl ModelsView {
     }
 
     fn load_package_models(&mut self, id: u16) {
+        let cache = self.cache.clone();
+        let mut geometry_presence = rustc_hash::FxHashMap::default();
         self.models = package_manager()
             .lookup
             .tag32_entries_by_pkg
@@ -243,32 +814,53 @@ impl ModelsView {
                     return None;
                 }
                 let info = model_info_for_reference(entry.reference)?;
+                let tag = TagHash::new(id, i as u16);
                 Some(ModelListEntry {
                     index: i,
-                    tag: TagHash::new(id, i as u16),
+                    tag,
                     info,
+                    is_empty: !model_has_render_geometry(&cache, tag, &mut geometry_presence),
                     entry: entry.clone(),
                 })
             })
             .collect();
+        self.refresh_runner_models();
         self.selected_model = None;
+        self.preview_channels = None;
+        self.preview_runtime_inputs = None;
+        self.channel_render_error = None;
         self.preview = None;
         self.gpu_model_preview = None;
         self.preview_camera_frame = None;
+        self.weapon_export_camera = None;
         self.active_weapon = None;
         self.selected_mods.clear();
         self.selected_mod_unique_ids.clear();
 
-        if let Some(tag) = self.models.first().map(|entry| entry.tag) {
+        if let Some(tag) = self
+            .models
+            .iter()
+            .find(|entry| !self.hide_empty_models || !entry.is_empty)
+            .map(|entry| entry.tag)
+        {
             self.load_model(tag);
         }
     }
 
     fn load_model(&mut self, tag: TagHash) {
         self.selected_model = Some(tag);
+        self.preview_channels = None;
+        self.preview_runtime_inputs = None;
+        self.channel_render_error = None;
         self.preview_camera_frame = None;
+        self.weapon_export_camera = None;
         self.detect_selected_weapon();
+        if self.active_weapon.is_some() {
+            self.preview_yaw = DEFAULT_WEAPON_YAW;
+            self.preview_pitch = DEFAULT_WEAPON_PITCH;
+        }
         self.rebuild_model_preview();
+        self.rebuild_weapon_reference_frames();
     }
 
     fn detect_selected_weapon(&mut self) {
@@ -298,6 +890,24 @@ impl ModelsView {
                 selected
                     .and_then(|index| slot.mods.get(index))
                     .map(|item| item.model_tag)
+            })
+            .collect()
+    }
+
+    fn selected_mod_export_descriptors(&self) -> Vec<(TagHash, &'static str)> {
+        let Some(weapon) = self
+            .active_weapon
+            .and_then(|index| self.weapon_catalog.weapons.get(index))
+        else {
+            return vec![];
+        };
+        weapon
+            .slots
+            .iter()
+            .zip(&self.selected_mods)
+            .filter_map(|(slot, selected)| {
+                let item = selected.and_then(|index| slot.mods.get(index))?;
+                Some((item.model_tag, item.rarity_code))
             })
             .collect()
     }
@@ -347,6 +957,104 @@ impl ModelsView {
         attachments
     }
 
+    fn rebuild_weapon_reference_frames(&mut self) {
+        self.weapon_export_camera = None;
+        self.preview_environment.light_model_frame = None;
+        let Some(tag) = self.selected_model else {
+            return;
+        };
+        let Some(entry) = package_manager().get_entry(tag) else {
+            return;
+        };
+        let Some(weapon) = self
+            .active_weapon
+            .and_then(|index| self.weapon_catalog.weapons.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let weapon_owner = weapon.socket_owner.unwrap_or(weapon.owner_tag);
+        let default_attachments = weapon_unoccupied_default_mod_patterns(
+            &self.cache,
+            weapon.owner_tag,
+            weapon_owner,
+            &[],
+        )
+        .into_iter()
+        .unique()
+        .map(|model_tag| WeaponModPreviewAttachment {
+            model_tag,
+            rarity: None,
+            unique_id: 0.5,
+        })
+        .collect::<Vec<_>>();
+        let base = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            self.cache.clone(),
+            tag,
+            &entry,
+            weapon.owner_tag,
+            weapon_owner,
+            &default_attachments,
+        );
+        let Some(base_wireframe) = base.as_ref().and_then(GeometryTagPreview::wireframe) else {
+            return;
+        };
+        let vanilla = package_manager()
+            .get_entry(weapon.owner_tag)
+            .and_then(|entry| {
+                GeometryTagPreview::load_model_with_weapon_mod_attachments(
+                    self.cache.clone(),
+                    weapon.owner_tag,
+                    &entry,
+                    weapon.owner_tag,
+                    weapon_owner,
+                    &default_attachments,
+                )
+            });
+        self.preview_environment.light_model_frame = vanilla
+            .as_ref()
+            .and_then(GeometryTagPreview::wireframe)
+            .map(ModelCameraFrame::from_wireframe);
+
+        // Anchor to the authored default presentation, including empty-slot
+        // barrel/stock/etc. meshes. Fit once against every authored attachment
+        // this weapon can display; selected mod only changes pixels.
+        let mut attachments = weapon
+            .slots
+            .iter()
+            .flat_map(|slot| &slot.mods)
+            .map(|item| WeaponModPreviewAttachment {
+                model_tag: item.model_tag,
+                rarity: item.preview_rarity,
+                unique_id: 0.5,
+            })
+            .collect::<Vec<_>>();
+        attachments.extend(default_attachments);
+        attachments = attachments
+            .into_iter()
+            .unique_by(|attachment| attachment.model_tag)
+            .collect();
+        let envelope = GeometryTagPreview::load_model_with_weapon_mod_attachments(
+            self.cache.clone(),
+            tag,
+            &entry,
+            weapon.owner_tag,
+            weapon_owner,
+            &attachments,
+        );
+        let Some(envelope_wireframe) = envelope.as_ref().and_then(GeometryTagPreview::wireframe)
+        else {
+            return;
+        };
+        self.weapon_export_camera = Some(ModelExportCamera::from_wireframes(
+            base_wireframe,
+            envelope_wireframe,
+            MODEL_EXPORT_HEIGHT as f32 / MODEL_EXPORT_WIDTH as f32,
+            DEFAULT_WEAPON_YAW,
+            DEFAULT_WEAPON_PITCH,
+        ));
+    }
+
     /// Same semantic as engine Pattern spawn: one random inclusive 0..1
     /// `unique_id` per attached object. Xorshift keeps this dependency-free and
     /// stable until user removes/replaces that mod instance.
@@ -362,9 +1070,19 @@ impl ModelsView {
         (value as f64 / u32::MAX as f64) as f32
     }
 
+    /// The runner shell behind a skin model, with the props of the playing clip.
+    fn runner_shell(&self, model: TagHash) -> Option<RunnerShellAssembly> {
+        let mut shell = self.runner_models.get(&model)?.clone();
+        shell.props = self.clip_props.clone();
+        Some(shell)
+    }
+
     fn rebuild_model_preview(&mut self) {
         self.preview = None;
         self.gpu_model_preview = None;
+        self.preview_runtime_inputs = None;
+        self.clip_channels.clear();
+        self.channel_render_error = None;
 
         let Some(tag) = self.selected_model else {
             return;
@@ -385,7 +1103,9 @@ impl ModelsView {
         let weapon_owner = active_weapon
             .map(|weapon| weapon.socket_owner.unwrap_or(weapon.owner_tag))
             .unwrap_or(tag);
-        self.preview = if model_info_for_reference(entry.reference).is_some() {
+        self.preview = if let Some(composition) = self.runner_shell(tag) {
+            composition.load(self.cache.clone())
+        } else if model_info_for_reference(entry.reference).is_some() {
             GeometryTagPreview::load_model_with_weapon_mod_attachments(
                 self.cache.clone(),
                 tag,
@@ -408,6 +1128,22 @@ impl ModelsView {
                     .map(ModelCameraFrame::from_wireframe)
             });
         }
+        let mut runtime_inputs = TfxRuntimeInputs::for_model_preview(&self.cache, weapon_pattern);
+        if let Some(shell) = self.runner_shell(tag) {
+            runtime_inputs.apply_runner_dye(&shell.dye_channels(), &shell.gear(&self.cache));
+        }
+        let previous_channels = self.preview_channels.take();
+        self.preview_channels = self.preview.as_ref().and_then(|preview| {
+            let GeometryPreviewKind::Model(model) = &preview.kind else { return None; };
+            let mut channels = ModelChannels::discover(model.wireframe.as_ref()?, &runtime_inputs);
+            if let Some(previous) = &previous_channels { channels.carry_overrides_from(previous); }
+            Some(channels)
+        });
+        self.preview_runtime_inputs = Some(runtime_inputs);
+        let mut evaluated_inputs = self.preview_runtime_inputs.clone();
+        if let (Some(channels), Some(inputs)) = (&self.preview_channels, &mut evaluated_inputs) {
+            channels.apply_overrides(inputs);
+        }
         self.gpu_model_preview = self.preview.as_ref().and_then(|preview| {
             let GeometryPreviewKind::Model(model) = &preview.kind else {
                 return None;
@@ -420,9 +1156,27 @@ impl ModelsView {
                 &self.texture_cache.render_state.device,
                 wireframe,
                 fallback_color,
+                evaluated_inputs.as_ref()?,
             )
             .map(Arc::new)
         });
+    }
+
+    fn apply_preview_channels(&mut self) {
+        let (Some(channels), Some(base), Some(preview), Some(gpu)) = (
+            &self.preview_channels, &self.preview_runtime_inputs, &self.preview, &self.gpu_model_preview,
+        ) else { return; };
+        let GeometryPreviewKind::Model(model) = &preview.kind else { return; };
+        let Some(wireframe) = model.wireframe.as_ref() else { return; };
+        let mut inputs = base.clone();
+        channels.apply(&mut inputs);
+        inputs.apply_clip_channels(&self.clip_channels);
+        if let Some(updated) = gpu.with_channels(&self.texture_cache.render_state.device, wireframe, &inputs) {
+            self.gpu_model_preview = Some(Arc::new(updated));
+            self.channel_render_error = None;
+        } else {
+            self.channel_render_error = Some("Channel values could not be rendered. Previous frame retained.".into());
+        }
     }
 }
 
@@ -454,9 +1208,107 @@ fn weapon_skin_for_model(
     matches.next().is_none().then_some(matched)
 }
 
+fn melee_skins_for_model(
+    catalog: &ModelWeaponCatalog,
+    selected: TagHash,
+) -> Vec<&ModelMeleeSkinEntry> {
+    catalog
+        .melee_skins
+        .iter()
+        .filter(|skin| skin.model_tag == selected)
+        .collect()
+}
+
+fn charms_for_model(catalog: &ModelWeaponCatalog, selected: TagHash) -> Vec<&ModelCharmEntry> {
+    catalog
+        .charms
+        .iter()
+        .filter(|charm| charm.model_tag == selected)
+        .collect()
+}
+
+fn runner_skin_for_model<'a>(
+    catalog: &'a ModelWeaponCatalog,
+    selected: TagHash,
+) -> Option<&'a ModelRunnerSkinEntry> {
+    let mut matches = catalog
+        .runner_skins
+        .iter()
+        .filter(|skin| skin.model_tag == selected);
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
+
+fn runner_model_index(
+    cache: &TagCache,
+    catalog: &ModelWeaponCatalog,
+) -> rustc_hash::FxHashMap<TagHash, RunnerShellAssembly> {
+    catalog
+        .runner_skins
+        .iter()
+        .filter_map(|skin| {
+            let mut assembly = RunnerShellAssembly::resolve(cache, skin.model_tag)?;
+            assembly.runner = skin.runner;
+            assembly.dye_row = skin.dye_row;
+            Some((assembly.pattern, assembly))
+        })
+        .collect()
+}
+
+fn runner_model_root(
+    models: &rustc_hash::FxHashMap<TagHash, RunnerShellAssembly>,
+    tag: TagHash,
+) -> Option<TagHash> {
+    if models.contains_key(&tag) {
+        return Some(tag);
+    }
+    let mut owners = models.iter().filter(|(_, model)| {
+        model.nested_patterns.contains(&tag) || model.parts.iter().any(|part| part.component == tag)
+    });
+    let root = *owners.next()?.0;
+    owners.next().is_none().then_some(root)
+}
+
 impl View for ModelsView {
     fn view(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui) -> Option<ViewAction> {
         let mut action = None;
+
+        // Tell the animation panel which runner is on screen and how runners are named.
+        let mut animation = ModelAnimationState::load(ui.ctx());
+        animation.model_shell = self
+            .selected_model
+            .and_then(|model| runner_skin_for_model(&self.weapon_catalog, model))
+            .map(|skin| skin.shell_name.clone());
+        if animation.runners.is_empty() {
+            animation.runners = Arc::new(
+                self.weapon_catalog
+                    .runner_skins
+                    .iter()
+                    .filter_map(|skin| Some((skin.archetype.clone()?, skin.shell_name.clone())))
+                    .unique()
+                    .collect(),
+            );
+        }
+        // Object channels the playing clip animates reach the materials too.
+        let clip_channels = animation
+            .clip
+            .as_ref()
+            .map_or_else(Vec::new, |clip| clip.channel_values(animation.frame));
+        // Props the clip spawns are part of the model while it plays.
+        let clip_props = animation.clip.as_ref().map_or_else(Vec::new, |clip| {
+            clip.props().iter().flat_map(|prop| prop.geometry.clone()).collect()
+        });
+        animation.store(ui.ctx());
+        if clip_props != self.clip_props {
+            self.clip_props = clip_props;
+            if self.selected_model.is_some_and(|model| self.runner_models.contains_key(&model)) {
+                self.rebuild_model_preview();
+            }
+        }
+        if clip_channels != self.clip_channels && self.gpu_model_preview.is_some() {
+            self.clip_channels = clip_channels;
+            self.apply_preview_channels();
+        }
 
         egui::SidePanel::left("models_left_panel")
             .resizable(true)
@@ -517,6 +1369,8 @@ impl View for ModelsView {
         let texture_cache = &self.texture_cache;
         let gpu_model_preview = self.gpu_model_preview.as_ref();
         let preview_camera_frame = self.preview_camera_frame;
+        let weapon_export_camera = self.weapon_export_camera;
+        let selected_mod_export_descriptors = self.selected_mod_export_descriptors();
         let preview_yaw = &mut self.preview_yaw;
         let preview_pitch = &mut self.preview_pitch;
         let preview_zoom = &mut self.preview_zoom;
@@ -526,12 +1380,20 @@ impl View for ModelsView {
         let default_mods_before = self.preview_show_default_mods;
         let preview_show_default_mods = &mut self.preview_show_default_mods;
         let preview_environment = &mut self.preview_environment;
+        let channel_revision = self.preview_channels.as_ref().map(ModelChannels::revision);
+        let preview_channels = &mut self.preview_channels;
+        let channel_render_error = self.channel_render_error.as_deref();
+        let export_all_mods = &mut self.export_all_mods;
+        let export_format = &mut self.export_format;
         let active_weapon = self
             .active_weapon
             .and_then(|index| self.weapon_catalog.weapons.get(index))
             .cloned();
         let selected_mods = self.selected_mods.clone();
+        let modded_export_active = self.modded_export.is_some();
         let mut mod_selection = None;
+        let mut export_result = None;
+        let mut modded_export_request = None;
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let Some(model) = preview.and_then(|preview| match &preview.kind {
@@ -563,48 +1425,141 @@ impl View for ModelsView {
             });
 
             ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if let Some(wireframe) = &model.wireframe {
-                        let viewport = model_wireframe_ui(
-                            ui,
-                            wireframe,
-                            model.preview_uv_transform(),
-                            texture_cache,
-                            &model.textures,
-                            gpu_model_preview,
-                            preview_camera_frame,
-                            preview_yaw,
-                            preview_pitch,
-                            preview_zoom,
-                            preview_pan,
-                            preview_show_wireframe,
-                            preview_show_stickers,
-                            active_weapon.is_some().then_some(preview_show_default_mods),
-                            preview_environment,
-                        );
+            if let Some(wireframe) = &model.wireframe {
+                let (viewport, texture_action) = model_wireframe_ui(
+                    ui,
+                    wireframe,
+                    model.preview_uv_transform(),
+                    texture_cache,
+                    &model.textures,
+                    gpu_model_preview,
+                    preview_camera_frame,
+                    preview_yaw,
+                    preview_pitch,
+                    preview_zoom,
+                    preview_pan,
+                    preview_show_wireframe,
+                    preview_show_stickers,
+                    active_weapon.is_some().then_some(preview_show_default_mods),
+                    preview_environment,
+                    true,
+                    preview_channels.as_mut(),
+                );
+                if let Some(error) = channel_render_error {
+                    ui.colored_label(Color32::YELLOW, error);
+                }
+                if texture_action.is_some() {
+                    action = texture_action;
+                }
+
+                if model_export_toolbar(
+                    ui.ctx(),
+                    viewport,
+                    export_all_mods,
+                    export_format,
+                    active_weapon.is_some(),
+                    modded_export_active,
+                ) {
+                    let format = *export_format;
+                    if *export_all_mods {
                         if let (Some(tag), Some(weapon)) = (selected_model, active_weapon.as_ref())
                         {
-                            mod_selection = compact_weapon_mod_selector(
-                                ui.ctx(),
-                                viewport,
-                                tag,
-                                weapon,
-                                &selected_mods,
-                            );
+                            let filename = model_modded_export_filename(tag);
+                            match native_dialog::FileDialog::new()
+                                .add_filter("ZIP archive", &["zip"])
+                                .set_filename(&filename)
+                                .show_save_single_file()
+                            {
+                                Ok(Some(mut path)) => {
+                                    if !path.extension().is_some_and(|extension| {
+                                        extension.eq_ignore_ascii_case("zip")
+                                    }) {
+                                        path.set_extension("zip");
+                                    }
+                                    modded_export_request = Some((
+                                        tag,
+                                        weapon.clone(),
+                                        *preview_show_default_mods,
+                                        *preview_show_stickers,
+                                        *preview_environment,
+                                        weapon_export_camera,
+                                        format,
+                                        path,
+                                    ));
+                                }
+                                Ok(None) => {}
+                                Err(error) => export_result = Some(Err(error.into())),
+                            }
                         }
-                    } else {
-                        ui.label(RichText::new("No wireframe assembled yet").italics());
+                    } else if let Some(tag) = selected_model {
+                        let filename =
+                            model_export_filename(tag, &selected_mod_export_descriptors, format);
+                        match native_dialog::FileDialog::new()
+                            .add_filter(format.dialog_label(), &[format.extension()])
+                            .set_filename(&filename)
+                            .show_save_single_file()
+                        {
+                            Ok(Some(mut path)) => {
+                                if !path.extension().is_some_and(|extension| {
+                                    extension.eq_ignore_ascii_case(format.extension())
+                                }) {
+                                    path.set_extension(format.extension());
+                                }
+                                if let Some(gpu_preview) = gpu_model_preview {
+                                    let export_rect = egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        vec2(MODEL_EXPORT_WIDTH as f32, MODEL_EXPORT_HEIGHT as f32),
+                                    );
+                                    let callback = ModelPaintCallback::new(
+                                        gpu_preview.clone(),
+                                        texture_cache,
+                                        wireframe,
+                                        model.preview_uv_transform(),
+                                        None,
+                                        DEFAULT_WEAPON_YAW,
+                                        DEFAULT_WEAPON_PITCH,
+                                        1.0,
+                                        egui::Vec2::ZERO,
+                                        *preview_show_stickers,
+                                        export_rect,
+                                        1.0,
+                                        *preview_environment,
+                                    )
+                                    .with_export_camera(weapon_export_camera);
+                                    export_result = Some(
+                                        callback
+                                            .export_image(
+                                                &texture_cache.render_state,
+                                                &path,
+                                                [MODEL_EXPORT_WIDTH, MODEL_EXPORT_HEIGHT],
+                                                format.image_format(),
+                                            )
+                                            .map(|()| path),
+                                    );
+                                } else {
+                                    export_result = Some(Err(anyhow::anyhow!(
+                                        "GPU model preview is unavailable"
+                                    )));
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => export_result = Some(Err(error.into())),
+                        }
                     }
+                }
 
-                    ui.separator();
-                    if let Some(texture_action) =
-                        model_textures_ui(ui, texture_cache, &model.textures)
-                    {
-                        action = Some(texture_action);
-                    }
-                });
+                if let (Some(tag), Some(weapon)) = (selected_model, active_weapon.as_ref()) {
+                    mod_selection = compact_weapon_mod_selector(
+                        ui.ctx(),
+                        viewport,
+                        tag,
+                        weapon,
+                        &selected_mods,
+                    );
+                }
+            } else {
+                ui.label(RichText::new("No wireframe assembled yet").italics());
+            }
         });
 
         let mut rebuild_preview = *preview_show_default_mods != default_mods_before;
@@ -620,6 +1575,64 @@ impl View for ModelsView {
         }
         if rebuild_preview {
             self.rebuild_model_preview();
+        } else if self.preview_channels.as_ref().map(ModelChannels::revision) != channel_revision {
+            self.apply_preview_channels();
+            ui.ctx().request_repaint();
+        }
+        if let Some(result) = export_result {
+            match result {
+                Ok(path) => {
+                    TOASTS
+                        .lock()
+                        .success(format!("Export saved to {}", path.display()));
+                }
+                Err(error) => {
+                    TOASTS.lock().error(format!("Export failed: {error:#}"));
+                }
+            }
+        }
+        if let Some((tag, weapon, defaults, stickers, environment, camera, format, path)) =
+            modded_export_request
+        {
+            match ModdedExportJob::new(
+                tag,
+                weapon,
+                defaults,
+                stickers,
+                environment,
+                self.preview_channels.clone(),
+                camera,
+                format,
+                path,
+            ) {
+                Ok(job) => self.modded_export = Some(job),
+                Err(error) => {
+                    TOASTS.lock().error(format!("Export failed: {error:#}"));
+                }
+            }
+        }
+        if let Some(mut job) = self.modded_export.take() {
+            let path = job.path.clone();
+            let total = job.progress().1;
+            let format = job.format;
+            match job.step(&self.cache, &self.texture_cache) {
+                Ok(true) => {
+                    TOASTS.lock().success(format!(
+                        "Saved {total} {} images to {}",
+                        format.label(),
+                        path.display()
+                    ));
+                }
+                Ok(false) => {
+                    self.modded_export = Some(job);
+                    ui.ctx().request_repaint();
+                }
+                Err(error) => {
+                    drop(job);
+                    let _ = std::fs::remove_file(path);
+                    TOASTS.lock().error(format!("Export failed: {error:#}"));
+                }
+            }
         }
 
         action
@@ -627,150 +1640,6 @@ impl View for ModelsView {
 }
 
 impl ModelsView {
-    #[cfg(any())]
-    fn model_grid_ui(&mut self, ui: &mut egui::Ui) -> Option<ViewAction> {
-        const GAP: f32 = 10.0;
-        const TARGET_CARD_WIDTH: f32 = 280.0;
-        const IMAGE_ASPECT: f32 = 0.82;
-        const FOOTER_HEIGHT: f32 = 38.0;
-
-        let filter = self.model_filter.to_lowercase();
-        let models = self
-            .models
-            .iter()
-            .filter(|entry| {
-                filter.is_empty()
-                    || entry
-                        .search_label(weapon_skin_for_model(&self.weapon_catalog, entry.tag))
-                        .contains(&filter)
-            })
-            .cloned()
-            .collect_vec();
-        if models.is_empty() {
-            ui.label(RichText::new("No matching model entities").italics());
-            return None;
-        }
-
-        let available_width = ui.available_width().max(TARGET_CARD_WIDTH);
-        let columns = ((available_width + GAP) / (TARGET_CARD_WIDTH + GAP))
-            .floor()
-            .max(1.0) as usize;
-        let card_width = ((available_width - GAP * (columns.saturating_sub(1)) as f32)
-            / columns as f32)
-            .max(160.0);
-        let image_height = card_width * IMAGE_ASPECT;
-        let card_height = image_height + FOOTER_HEIGHT;
-        let row_height = card_height + GAP;
-        let row_count = models.len().div_ceil(columns);
-        let mut action = None;
-        let mut clicked = None;
-
-        egui::ScrollArea::vertical()
-            .id_salt("models_grid")
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, row_count, |ui, rows| {
-                for row in rows {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = GAP;
-                        for entry in models.iter().skip(row * columns).take(columns) {
-                            if !self.thumbnails.contains_key(&entry.tag) {
-                                let thumbnail = ModelThumbnail::load(
-                                    self.cache.clone(),
-                                    &self.texture_cache,
-                                    entry.tag,
-                                );
-                                self.thumbnails.insert(entry.tag, thumbnail);
-                            }
-
-                            let (rect, response) = ui
-                                .allocate_exact_size(vec2(card_width, card_height), Sense::click());
-                            let response = response.tag_context(entry.tag);
-                            let selected = self.selected_model == Some(entry.tag);
-                            let footer = egui::Rect::from_min_max(
-                                pos2(rect.left(), rect.bottom() - FOOTER_HEIGHT),
-                                rect.max,
-                            );
-                            let image_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                pos2(rect.right(), footer.top()),
-                            );
-                            let painter = ui.painter_at(rect);
-                            painter.rect_filled(image_rect, 3.0, Color32::from_rgb(89, 108, 150));
-                            painter.rect_filled(footer, 0.0, Color32::from_rgb(7, 8, 10));
-
-                            if let Some(Some(thumbnail)) = self.thumbnails.get(&entry.tag)
-                                && let GeometryPreviewKind::Model(model) = &thumbnail.preview.kind
-                                && let Some(wireframe) = &model.wireframe
-                            {
-                                let callback = ModelPaintCallback::new(
-                                    thumbnail.gpu.clone(),
-                                    &self.texture_cache,
-                                    wireframe,
-                                    model.preview_uv_transform(),
-                                    None,
-                                    DEFAULT_MODEL_YAW,
-                                    0.05,
-                                    0.9,
-                                    egui::Vec2::ZERO,
-                                    false,
-                                    image_rect,
-                                    ui.ctx().pixels_per_point(),
-                                    ModelEnvironment::default(),
-                                );
-                                ui.painter()
-                                    .add(Callback::new_paint_callback(image_rect, callback));
-                            } else {
-                                painter.text(
-                                    image_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Preview unavailable",
-                                    egui::TextStyle::Small.resolve(ui.style()),
-                                    Color32::GRAY,
-                                );
-                            }
-
-                            painter.text(
-                                pos2(footer.left() + 10.0, footer.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                entry.tag.to_string(),
-                                egui::TextStyle::Monospace.resolve(ui.style()),
-                                Color32::WHITE,
-                            );
-                            painter.rect_stroke(
-                                rect,
-                                3.0,
-                                Stroke::new(
-                                    if selected || response.hovered() {
-                                        2.0
-                                    } else {
-                                        1.0
-                                    },
-                                    if selected {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::DARK_GRAY
-                                    },
-                                ),
-                                egui::StrokeKind::Inside,
-                            );
-
-                            if response.clicked() {
-                                clicked = Some(entry.tag);
-                            }
-                            if response.double_clicked() {
-                                action = Some(ViewAction::OpenTag(entry.tag));
-                            }
-                        }
-                    });
-                }
-            });
-
-        if let Some(tag) = clicked {
-            self.selected_model = Some(tag);
-        }
-        action
-    }
-
     fn model_list_ui(&mut self, ui: &mut egui::Ui) -> Option<ViewAction> {
         let mut action = None;
 
@@ -778,6 +1647,7 @@ impl ModelsView {
             ui.label("Search:");
             ui.text_edit_singleline(&mut self.model_filter);
         });
+        ui.checkbox(&mut self.hide_empty_models, "Hide empty");
 
         ui.separator();
         egui::ScrollArea::vertical()
@@ -796,9 +1666,25 @@ impl ModelsView {
                 let models = self.models.clone();
                 let mut selected = None;
                 for entry in models {
+                    if self.hide_empty_models && entry.is_empty {
+                        continue;
+                    }
                     let detected_skin = weapon_skin_for_model(&self.weapon_catalog, entry.tag);
+                    if !self.runner_models.contains_key(&entry.tag)
+                        && self
+                            .runner_models
+                            .values()
+                            .any(|model| model.nested_patterns.contains(&entry.tag))
+                    {
+                        continue;
+                    }
+                    let runner_skin = runner_skin_for_model(&self.weapon_catalog, entry.tag);
+                    let melee_skins = melee_skins_for_model(&self.weapon_catalog, entry.tag);
+                    let charms = charms_for_model(&self.weapon_catalog, entry.tag);
                     if !filter.is_empty()
-                        && !entry.search_label(detected_skin).contains(filter.as_str())
+                        && !entry
+                            .search_label(detected_skin, runner_skin, &melee_skins, &charms)
+                            .contains(filter.as_str())
                     {
                         continue;
                     }
@@ -807,13 +1693,25 @@ impl ModelsView {
                         .add(
                             egui::Button::selectable(
                                 self.selected_model == Some(entry.tag),
-                                entry.list_label(ui, detected_skin),
+                                entry.list_label(
+                                    ui,
+                                    detected_skin,
+                                    runner_skin,
+                                    &melee_skins,
+                                    &charms,
+                                ),
                             )
-                            .wrap_mode(if detected_skin.is_some() {
-                                egui::TextWrapMode::Wrap
-                            } else {
-                                egui::TextWrapMode::Truncate
-                            }),
+                            .wrap_mode(
+                                if detected_skin.is_some()
+                                    || runner_skin.is_some()
+                                    || !melee_skins.is_empty()
+                                    || !charms.is_empty()
+                                {
+                                    egui::TextWrapMode::Wrap
+                                } else {
+                                    egui::TextWrapMode::Truncate
+                                },
+                            ),
                         )
                         .tag_context(entry.tag);
 
@@ -839,6 +1737,7 @@ struct ModelListEntry {
     index: usize,
     tag: TagHash,
     info: ModelTagInfo,
+    is_empty: bool,
     entry: UEntryHeader,
 }
 
@@ -856,6 +1755,9 @@ impl ModelListEntry {
     fn search_label(
         &self,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
+        runner_skin: Option<&ModelRunnerSkinEntry>,
+        melee_skins: &[&ModelMeleeSkinEntry],
+        charms: &[&ModelCharmEntry],
     ) -> String {
         let identity = detected_skin
             .map(|(weapon, skin)| {
@@ -867,13 +1769,32 @@ impl ModelListEntry {
                 )
             })
             .unwrap_or_default();
-        format!("{} {}{identity}", self.label(), self.info.label).to_lowercase()
+        let runner_identity = runner_skin
+            .map(|skin| format!(" {} {}", skin.shell_name, skin.name,))
+            .unwrap_or_default();
+        let melee_identity = melee_skins
+            .iter()
+            .map(|skin| format!(" {} {}", skin.family_name, skin.name))
+            .collect::<String>();
+        let charm_identity = charms
+            .iter()
+            .map(|charm| format!(" Charm {}", charm.name))
+            .collect::<String>();
+        format!(
+            "{} {}{identity}{runner_identity}{melee_identity}{charm_identity}",
+            self.label(),
+            self.info.label
+        )
+        .to_lowercase()
     }
 
     fn list_label(
         &self,
         ui: &egui::Ui,
         detected_skin: Option<(&ModelWeaponEntry, &ModelWeaponSkinEntry)>,
+        runner_skin: Option<&ModelRunnerSkinEntry>,
+        melee_skins: &[&ModelMeleeSkinEntry],
+        charms: &[&ModelCharmEntry],
     ) -> egui::text::LayoutJob {
         let mut label = egui::text::LayoutJob::default();
         label.append(
@@ -905,6 +1826,39 @@ impl ModelListEntry {
                 },
             );
         }
+        if let Some(skin) = runner_skin {
+            label.append(
+                &format!("\n    └ {}: {}", skin.shell_name, skin.name,),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::TextStyle::Small.resolve(ui.style()),
+                    color: skin.color,
+                    ..Default::default()
+                },
+            );
+        }
+        for skin in melee_skins {
+            label.append(
+                &format!("\n    └ {}: {}", skin.family_name, skin.name),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::TextStyle::Small.resolve(ui.style()),
+                    color: skin.color,
+                    ..Default::default()
+                },
+            );
+        }
+        for charm in charms {
+            label.append(
+                &format!("\n    └ Charm: {}", charm.name),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::TextStyle::Small.resolve(ui.style()),
+                    color: charm.color,
+                    ..Default::default()
+                },
+            );
+        }
         label
     }
 
@@ -930,104 +1884,95 @@ fn compact_weapon_mod_selector(
         return None;
     }
 
-    let width = viewport.width().min(310.0) - 20.0;
-    let height = (52.0 + weapon.slots.len() as f32 * 62.0).min(viewport.height() - 20.0);
-    let position = pos2(
-        viewport.right() - width - 10.0,
-        viewport.bottom() - height - 10.0,
-    );
+    let width = (viewport.width() - MODEL_OVERLAY_INSET * 2.0).min(310.0);
     let mut changed = None;
 
     egui::Area::new(egui::Id::new(("weapon_mod_selector", selected_model.0)))
         .order(egui::Order::Foreground)
-        .fixed_pos(position)
+        .fixed_pos(viewport.right_bottom() + vec2(-MODEL_OVERLAY_INSET, -MODEL_OVERLAY_INSET))
+        .pivot(egui::Align2::RIGHT_BOTTOM)
         .show(ctx, |ui| {
-            egui::Frame::default()
-                .fill(Color32::from_rgba_unmultiplied(10, 13, 18, 238))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(73, 82, 96)))
-                .corner_radius(6)
-                .inner_margin(10)
-                .show(ui, |ui| {
-                    ui.set_width(width - 20.0);
-                    ui.horizontal(|ui| {
-                        ui.strong("Mods");
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(&weapon.name).small().color(Color32::GRAY));
-                    });
-                    ui.separator();
+            model_overlay_frame().show(ui, |ui| {
+                ui.set_width(width - MODEL_OVERLAY_INSET * 2.0);
+                ui.horizontal(|ui| {
+                    ui.strong("Mods");
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&weapon.name).small().color(Color32::GRAY));
+                });
+                ui.separator();
 
-                    for (slot_index, slot) in weapon.slots.iter().enumerate() {
-                        let selected_index = selections.get(slot_index).copied().flatten();
-                        let selected = selected_index.and_then(|index| slot.mods.get(index));
-                        let accent = selected
-                            .map(|item| item.color)
-                            .unwrap_or(Color32::from_rgb(90, 98, 110));
-                        ui.label(RichText::new(&slot.name).small().strong());
-                        ui.horizontal(|ui| {
-                            let button_width = if selected.is_some() {
-                                ui.available_width() - 30.0
-                            } else {
-                                ui.available_width()
-                            };
-                            egui::Frame::default()
-                                .fill(accent.gamma_multiply(0.22))
-                                .stroke(Stroke::new(1.0, accent))
-                                .corner_radius(4)
-                                .inner_margin(2)
-                                .show(ui, |ui| {
-                                    ui.set_width(button_width.max(120.0));
-                                    ui.menu_button(
-                                        RichText::new(
-                                            selected
-                                                .map(|item| item.name.as_str())
-                                                .unwrap_or("Select mod…"),
-                                        )
-                                        .color(
-                                            if selected.is_some() {
-                                                Color32::WHITE
-                                            } else {
-                                                Color32::GRAY
-                                            },
-                                        ),
-                                        |ui| {
-                                            ui.set_min_width((width - 36.0).max(180.0));
-                                            if ui
-                                                .add_sized(
-                                                    [ui.available_width(), 28.0],
-                                                    egui::Button::new("None"),
-                                                )
-                                                .clicked()
-                                            {
-                                                changed = Some((slot_index, None));
+                for (slot_index, slot) in weapon.slots.iter().enumerate() {
+                    let selected_index = selections.get(slot_index).copied().flatten();
+                    let selected = selected_index.and_then(|index| slot.mods.get(index));
+                    let accent = selected
+                        .map(|item| item.color)
+                        .unwrap_or(Color32::from_rgb(90, 98, 110));
+                    ui.label(RichText::new(&slot.name).small().strong());
+                    ui.horizontal(|ui| {
+                        let button_width = if selected.is_some() {
+                            ui.available_width() - 30.0
+                        } else {
+                            ui.available_width()
+                        };
+                        egui::Frame::default()
+                            .fill(accent.gamma_multiply(0.22))
+                            .stroke(Stroke::new(1.0, accent))
+                            .corner_radius(4)
+                            .inner_margin(2)
+                            .show(ui, |ui| {
+                                ui.set_width(button_width.max(120.0));
+                                ui.menu_button(
+                                    RichText::new(
+                                        selected
+                                            .map(|item| item.name.as_str())
+                                            .unwrap_or("Select mod…"),
+                                    )
+                                    .color(
+                                        if selected.is_some() {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::GRAY
+                                        },
+                                    ),
+                                    |ui| {
+                                        ui.set_min_width((width - 36.0).max(180.0));
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width(), 28.0],
+                                                egui::Button::new("None"),
+                                            )
+                                            .clicked()
+                                        {
+                                            changed = Some((slot_index, None));
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        for (mod_index, modification) in
+                                            slot.mods.iter().enumerate()
+                                        {
+                                            if mod_option_button(ui, modification).clicked() {
+                                                changed = Some((
+                                                    slot_index,
+                                                    (selected_index != Some(mod_index))
+                                                        .then_some(mod_index),
+                                                ));
                                                 ui.close();
                                             }
-                                            ui.separator();
-                                            for (mod_index, modification) in
-                                                slot.mods.iter().enumerate()
-                                            {
-                                                if mod_option_button(ui, modification).clicked() {
-                                                    changed = Some((
-                                                        slot_index,
-                                                        (selected_index != Some(mod_index))
-                                                            .then_some(mod_index),
-                                                    ));
-                                                    ui.close();
-                                                }
-                                            }
-                                        },
-                                    );
-                                });
-                            if selected.is_some()
-                                && ui
-                                    .add_sized([26.0, 26.0], egui::Button::new("×"))
-                                    .on_hover_text("Remove mod")
-                                    .clicked()
-                            {
-                                changed = Some((slot_index, None));
-                            }
-                        });
-                    }
-                });
+                                        }
+                                    },
+                                );
+                            });
+                        if selected.is_some()
+                            && ui
+                                .add_sized([26.0, 26.0], egui::Button::new("×"))
+                                .on_hover_text("Remove mod")
+                                .clicked()
+                        {
+                            changed = Some((slot_index, None));
+                        }
+                    });
+                }
+            });
         });
 
     changed
@@ -1042,17 +1987,847 @@ fn mod_option_button(ui: &mut egui::Ui, modification: &ModelModEntry) -> egui::R
     )
 }
 
-fn normalize_light_position(position: &mut [f32; 3]) {
-    let length = position
+fn normalize_direction(direction: &mut [f32; 3], fallback: [f32; 3]) {
+    let length = direction
         .iter()
         .map(|value| value * value)
         .sum::<f32>()
         .sqrt();
     if length <= 0.0001 {
-        *position = ModelEnvironment::default().light_position;
+        *direction = fallback;
     } else {
-        position.iter_mut().for_each(|value| *value /= length);
+        direction.iter_mut().for_each(|value| *value /= length);
     }
+}
+
+fn render_evidence_panel(ui: &mut egui::Ui, gpu_preview: &GpuModelPreview) {
+    ui.set_min_width(440.0);
+    egui::ScrollArea::vertical()
+        .max_height(520.0)
+        .show(ui, |ui| {
+            for line in gpu_preview.inspection_lines() {
+                ui.monospace(line);
+            }
+        });
+}
+
+fn lighting_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
+    ui.set_min_width(440.0);
+    egui::ScrollArea::vertical()
+        .max_height(560.0)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Model");
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::TigerGgxApproximation,
+                    "Tiger GGX",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::TigerGgxCompatibility,
+                    "Compatibility",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::DebugLambert,
+                    "Debug Lambert",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceNormals,
+                    "Normals",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceProperties,
+                    "M/R/AO",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceEmissive,
+                    "Emissive",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceFlags,
+                    "Flags",
+                );
+                ui.selectable_value(
+                    &mut environment.lighting_model,
+                    LightingModel::SurfaceAlbedo,
+                    "Albedo MRT",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut environment.light_gizmo, "Spotlight gizmo");
+                if ui.button("Reset lighting").clicked() {
+                    let defaults = ModelEnvironment::default();
+                    environment.light_target = defaults.light_target;
+                    environment.light_orbit_position = defaults.light_orbit_position;
+                    environment.light_orbit_center = defaults.light_orbit_center;
+                    environment.light_orbit_radius = defaults.light_orbit_radius;
+                    environment.light_range = defaults.light_range;
+                    environment.light_cone_angle = defaults.light_cone_angle;
+                    environment.light_size = defaults.light_size;
+                    environment.light_scale_with_model = defaults.light_scale_with_model;
+                    environment.shadow_strength = defaults.shadow_strength;
+                    environment.sun_intensity = defaults.sun_intensity;
+                    environment.ambient_intensity = defaults.ambient_intensity;
+                    environment.light_color = defaults.light_color;
+                    environment.ambient_sky_color = defaults.ambient_sky_color;
+                    environment.ambient_ground_color = defaults.ambient_ground_color;
+                    environment.specular_ibl_intensity = defaults.specular_ibl_intensity;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Material channel");
+                let channel_name = match environment.diagnostic_pass {
+                    0 => "Final",
+                    1 => "Albedo",
+                    2 => "Diffuse",
+                    3 => "Ambient Occlusion",
+                    4 => "Specular",
+                    5 => "Pre-tone HDR",
+                    6 => "Normal",
+                    7 => "Emission",
+                    8 => "Flags",
+                    9 => "Dye",
+                    10 => "Worn Dye",
+                    11 => "Dye Detail",
+                    12 => "Roughness",
+                    13 => "Smoothness",
+                    14 => "Emission Intensity",
+                    15 => "Transparency",
+                    16 => "Metalness",
+                    17 => "Transmission",
+                    18 => "Iridescence ID",
+                    19 => "Dye Mask",
+                    20 => "Wear Mask",
+                    21 => "Coating Face Color",
+                    22 => "Coating Grazing Color",
+                    23 => "Coating Incidence",
+                    24 => "Coating Coverage",
+                    25 => "Coating Detail Response",
+                    26 => "Coating Sharp Specular",
+                    27 => "Coating Broad Specular",
+                    28 => "Coating Environment",
+                    29 => "Coating Premultiplied Output",
+                    _ => "Unknown",
+                };
+                egui::ComboBox::from_id_salt("model_material_channel")
+                    .selected_text(channel_name)
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            (0, "Final"),
+                            (1, "Albedo"),
+                            (9, "Dye"),
+                            (10, "Worn Dye"),
+                            (11, "Dye Detail"),
+                            (19, "Dye Mask"),
+                            (20, "Wear Mask"),
+                            (21, "Coating Face Color"),
+                            (22, "Coating Grazing Color"),
+                            (23, "Coating Incidence"),
+                            (24, "Coating Coverage"),
+                            (25, "Coating Detail Response"),
+                            (26, "Coating Sharp Specular"),
+                            (27, "Coating Broad Specular"),
+                            (28, "Coating Environment"),
+                            (29, "Coating Premultiplied Output"),
+                            (3, "Ambient Occlusion"),
+                            (12, "Roughness"),
+                            (13, "Smoothness"),
+                            (7, "Emission"),
+                            (14, "Emission Intensity"),
+                            (15, "Transparency"),
+                            (16, "Metalness"),
+                            (17, "Transmission"),
+                            (18, "Iridescence ID"),
+                            (6, "Normal"),
+                            (8, "Flags"),
+                            (2, "Diffuse"),
+                            (4, "Specular"),
+                            (5, "Pre-tone HDR"),
+                        ] {
+                            ui.selectable_value(&mut environment.diagnostic_pass, value, label);
+                        }
+                    });
+            });
+            ui.label("Spotlight beam target (world space)");
+            for axis in 0..3 {
+                ui.add(
+                    egui::Slider::new(
+                        &mut environment.light_target[axis],
+                        MODEL_PARAMETER_RANGE.clone(),
+                    )
+                    .text(["Target X", "Target Y", "Target Z"][axis]),
+                );
+            }
+            ui.separator();
+            ui.label("Spotlight source orbit");
+            ui.label("Point on sphere");
+            for axis in 0..3 {
+                ui.add(
+                    egui::Slider::new(&mut environment.light_orbit_position[axis], -1.0..=1.0)
+                        .text(["Point X", "Point Y", "Point Z"][axis]),
+                );
+            }
+            ui.label("Sphere center");
+            for axis in 0..3 {
+                ui.add(
+                    egui::Slider::new(
+                        &mut environment.light_orbit_center[axis],
+                        MODEL_PARAMETER_RANGE.clone(),
+                    )
+                    .text(["Center X", "Center Y", "Center Z"][axis]),
+                );
+            }
+            ui.add(
+                egui::Slider::new(&mut environment.light_orbit_radius, 0.25..=10.0)
+                    .text("Source distance"),
+            );
+            ui.checkbox(&mut environment.light_scale_with_model, "Scale lighting with model")
+                .on_hover_text("Fit the rig to the base model with default mods. Barrel swaps keep the same lighting. Distances use model-size units; brightness stays consistent.");
+            ui.add(
+                egui::Slider::new(&mut environment.light_range, 0.25..=20.0)
+                    .text("Beam range"),
+            );
+            ui.add(
+                egui::Slider::new(&mut environment.light_cone_angle, 1.0..=89.0)
+                    .text("Beam half-angle"),
+            );
+            ui.add(
+                egui::Slider::new(&mut environment.light_size, 0.0..=10.0)
+                    .text("Light size"),
+            );
+            ui.add(
+                egui::Slider::new(
+                    &mut environment.sun_intensity,
+                    MODEL_PARAMETER_RANGE.clone(),
+                )
+                .text("Key light"),
+            );
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut environment.light_color);
+                ui.label("Key light colour");
+            });
+            ui.add(
+                egui::Slider::new(
+                    &mut environment.shadow_strength,
+                    MODEL_PARAMETER_RANGE.clone(),
+                )
+                .text("Shadows"),
+            );
+            ui.add(
+                egui::Slider::new(
+                    &mut environment.ambient_intensity,
+                    MODEL_PARAMETER_RANGE.clone(),
+                )
+                .text("Ambient light"),
+            );
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut environment.ambient_sky_color);
+                ui.label("Sky ambient colour");
+                ui.color_edit_button_rgb(&mut environment.ambient_ground_color);
+                ui.label("Ground ambient colour");
+            })
+            .response
+            .on_hover_text("Ambient light on surfaces facing up and down, weighted as in Tiger's global light.");
+            ui.add(
+                egui::Slider::new(
+                    &mut environment.specular_ibl_intensity,
+                    MODEL_PARAMETER_RANGE.clone(),
+                )
+                .text("Reflections"),
+            );
+        });
+}
+
+/// Clip playback chosen in the model viewport. Kept in egui memory so every
+/// viewport shares it and switching skins keeps the clip playing.
+#[derive(Clone)]
+struct ModelAnimationState {
+    clip: Option<Arc<crate::animation::Clip>>,
+    playing: bool,
+    frame: f32,
+    speed: f32,
+    filter: String,
+    group: ClipGroupChoice,
+    /// Runner codenames with the shell name each one is shown as.
+    runners: Arc<Vec<(String, String)>>,
+    /// The viewed model's clips, kept per skeleton and runner codename.
+    offered: Option<(TagHash, Option<String>, Arc<Vec<crate::animation::ClipInfo>>)>,
+    /// The selected clip cannot drive the viewed model.
+    unposable: bool,
+    /// Shell name of the runner whose skin the Models view has selected.
+    model_shell: Option<String>,
+}
+
+/// Which clips the animation panel lists.
+#[derive(Clone, PartialEq)]
+enum ClipGroupChoice {
+    /// The clips the packages tie to whichever model the viewport shows.
+    ViewedRunner,
+    Runner(String),
+    /// A rig the packages do not name, identified by its first clip.
+    Rig(TagHash),
+    All,
+}
+
+impl Default for ModelAnimationState {
+    fn default() -> Self {
+        Self {
+            clip: None,
+            playing: true,
+            frame: 0.0,
+            speed: 1.0,
+            filter: String::new(),
+            group: ClipGroupChoice::ViewedRunner,
+            runners: Default::default(),
+            model_shell: None,
+            offered: None,
+            unposable: false,
+        }
+    }
+}
+
+impl ModelAnimationState {
+    fn id() -> egui::Id {
+        egui::Id::new("model_animation_state")
+    }
+
+    fn load(ctx: &egui::Context) -> Self {
+        ctx.data(|data| data.get_temp(Self::id())).unwrap_or_default()
+    }
+
+    fn store(self, ctx: &egui::Context) {
+        ctx.data_mut(|data| data.insert_temp(Self::id(), self));
+    }
+
+    /// Advance playback and pose `preview` at the current frame. Models that
+    /// the clip was not authored for stay unposed.
+    fn pose(&mut self, ui: &egui::Ui, preview: &GpuModelPreview) -> Option<Arc<crate::animation::ModelPose>> {
+        let clip = self.clip.clone()?;
+        let pose = preview.clip_pose(&clip, self.frame);
+        self.unposable = pose.is_none();
+        let pose = pose?;
+        if self.playing && clip.frames > 1 {
+            let step = ui.input(|input| input.stable_dt) * crate::animation::CLIP_FRAMES_PER_SECOND * self.speed;
+            self.frame = (self.frame + step).rem_euclid((clip.frames - 1) as f32);
+            ui.ctx().request_repaint();
+        }
+        Some(Arc::new(pose))
+    }
+}
+
+/// A clip's recovered name, or its name hash when the wordlist has no match.
+fn clip_label(name_hash: u32) -> String {
+    crate::animation::runner_clip_names_if_ready()
+        .and_then(|names| names.get(&name_hash))
+        .cloned()
+        .unwrap_or_else(|| format!("{name_hash:08X}"))
+}
+
+fn model_animation_panel(ui: &mut egui::Ui, preview: Option<&GpuModelPreview>) {
+    // A fixed width keeps the popup still while clip names resolve.
+    ui.set_width(420.0);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    let mut state = ModelAnimationState::load(ui.ctx());
+    ui.strong("Animation");
+    match state.clip.clone() {
+        Some(clip) => {
+            ui.horizontal(|ui| {
+                ui.monospace(format!("{}  {}", clip.tag, clip_label(clip.name_hash)));
+                if ui.button("Clear").clicked() {
+                    state.clip = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button(if state.playing { "Pause" } else { "Play" }).clicked() {
+                    state.playing = !state.playing;
+                }
+                if ui.button("Restart").clicked() {
+                    state.frame = 0.0;
+                }
+                ui.label(format!("{:.1} s", clip.duration_seconds()));
+            });
+            let last_frame = (clip.frames - 1) as f32;
+            if ui.add(egui::Slider::new(&mut state.frame, 0.0..=last_frame.max(1.0)).text("Frame")).changed() {
+                state.playing = false;
+            }
+            ui.add(egui::Slider::new(&mut state.speed, 0.0..=2.0).text("Speed"));
+            if state.unposable {
+                ui.colored_label(ui.visuals().warn_fg_color, "This clip was not authored for the rig of the viewed model.");
+            }
+        }
+        None => {
+            ui.label("Pick a clip to pose the model shown in the viewport.");
+        }
+    }
+    ui.separator();
+
+    let groups = crate::animation::runner_clip_groups();
+    let runners = state.runners.clone();
+    let model_shell = state.model_shell.clone();
+    let runner_label = |codename: &str| {
+        runners
+            .iter()
+            .find(|(candidate, _)| candidate == codename)
+            .map_or_else(|| codename.to_owned(), |(_, shell)| format!("{shell} ({codename})"))
+    };
+    // The viewed model's clips: a named runner's by codename, anything else
+    // through the entity definitions built on its skeleton.
+    let viewed_codename = model_shell
+        .as_ref()
+        .and_then(|shell| runners.iter().find(|(_, candidate)| candidate == shell))
+        .map(|(codename, _)| codename.as_str());
+    let viewed_skeleton = preview.and_then(GpuModelPreview::main_skeleton);
+    // Entity definitions tie the model's skeleton to its clips; indexing them
+    // happens once, off the UI thread.
+    let index = crate::animation::rig_index_if_ready();
+    if index.is_none() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Indexing animations…");
+        });
+        ui.ctx().request_repaint();
+    }
+    // Resolving a model's clips reads clip data, so keep the answer per model.
+    let viewed_clips = match (index, viewed_skeleton) {
+        (Some(index), Some(skeleton)) => {
+            let key = (skeleton.tag, viewed_codename.map(str::to_owned));
+            if state.offered.as_ref().is_none_or(|(tag, codename, _)| (*tag, codename) != (key.0, &key.1)) {
+                let clips = index.clips_for_model(skeleton, viewed_codename);
+                state.offered = Some((key.0, key.1, Arc::new(clips)));
+            }
+            state.offered.as_ref().map(|(_, _, clips)| clips.clone())
+        }
+        _ => None,
+    };
+    // Only runners can fall back to the clips every runner shares.
+    let viewed_is_runner = viewed_skeleton.is_none_or(|skeleton| skeleton.is_runner());
+    let choice_label = |choice: &ClipGroupChoice| match choice {
+        ClipGroupChoice::ViewedRunner => match &model_shell {
+            Some(shell) => format!("This model: {shell}"),
+            None => "This model".to_owned(),
+        },
+        ClipGroupChoice::Runner(codename) => runner_label(codename),
+        ClipGroupChoice::Rig(first_clip) => groups
+            .iter()
+            .find(|group| group.clips[0].tag == *first_clip)
+            .map_or_else(String::new, |group| {
+                let sizes = group.slot_counts.iter().join("/");
+                format!("Unnamed rig, {sizes} nodes ({} clips)", group.clips.len())
+            }),
+        ClipGroupChoice::All => "All shared clips".to_owned(),
+    };
+    egui::ComboBox::from_label("Clips")
+        .width(300.0)
+        .selected_text(choice_label(&state.group))
+        .show_ui(ui, |ui| {
+            let options = [ClipGroupChoice::ViewedRunner]
+                .into_iter()
+                .chain(groups.iter().map(|group| match &group.codename {
+                    Some(codename) => ClipGroupChoice::Runner(codename.clone()),
+                    None => ClipGroupChoice::Rig(group.clips[0].tag),
+                }))
+                .chain([ClipGroupChoice::All]);
+            for option in options {
+                let label = choice_label(&option);
+                ui.selectable_value(&mut state.group, option, label);
+            }
+        });
+    // A runner the packages give no clips of its own falls back to the shared list.
+    let listed = match &state.group {
+        ClipGroupChoice::ViewedRunner => viewed_clips
+            .filter(|clips| !clips.is_empty() || !viewed_is_runner)
+            .map(|clips| clips.to_vec()),
+        ClipGroupChoice::Runner(codename) => groups
+            .iter()
+            .find(|group| group.codename.as_deref() == Some(codename.as_str()))
+            .map(|group| group.clips.clone()),
+        ClipGroupChoice::Rig(first_clip) => {
+            groups.iter().find(|group| group.clips[0].tag == *first_clip).map(|group| group.clips.clone())
+        }
+        ClipGroupChoice::All => None,
+    }
+    .unwrap_or_else(|| crate::animation::runner_clips().to_vec());
+
+    ui.horizontal(|ui| {
+        ui.label("Filter");
+        ui.add(egui::TextEdit::singleline(&mut state.filter).desired_width(f32::INFINITY));
+    });
+    let filter = state.filter.trim().to_lowercase();
+    let clips = listed
+        .iter()
+        .filter(|clip| {
+            filter.is_empty()
+                || clip.tag.to_string().to_lowercase().contains(&filter)
+                || clip_label(clip.name_hash).to_lowercase().contains(&filter)
+        })
+        .collect_vec();
+    ui.label(format!("{} clips", clips.len()));
+    let row_height = ui.spacing().interact_size.y;
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, clips.len(), |ui, rows| {
+            // Every row spans the list so rows never resize with their text.
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                for clip in &clips[rows] {
+                    let selected = state.clip.as_ref().is_some_and(|current| current.tag == clip.tag);
+                    let label = format!("{}  {:>4}f  {}", clip.tag, clip.frames, clip_label(clip.name_hash));
+                    if ui.selectable_label(selected, egui::RichText::new(label).monospace()).clicked() {
+                        state.clip = crate::animation::Clip::load(clip.tag).map(Arc::new);
+                        state.frame = 0.0;
+                        state.playing = true;
+                    }
+                }
+            });
+        });
+    state.store(ui.ctx());
+}
+
+fn image_panel(ui: &mut egui::Ui, environment: &mut ModelEnvironment) {
+    ui.set_min_width(360.0);
+
+    ui.strong("TFX runtime");
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut environment.tfx_paused, "Paused");
+        if ui.button("Reset time").clicked() {
+            environment.tfx_time_seconds = 0.0;
+        }
+    });
+    ui.add(egui::Slider::new(&mut environment.tfx_time_seconds, 0.0..=120.0).text("Time (s)"));
+    ui.add(egui::Slider::new(&mut environment.tfx_speed, 0.0..=4.0).text("Speed"));
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.strong("Image");
+        if ui.button("Reset image").clicked() {
+            let defaults = ModelEnvironment::default();
+            environment.brightness = defaults.brightness;
+            environment.contrast = defaults.contrast;
+            environment.saturation = defaults.saturation;
+            environment.gamma = defaults.gamma;
+            environment.exposure = defaults.exposure;
+            environment.bloom_strength = defaults.bloom_strength;
+        }
+    });
+    ui.add(
+        egui::Slider::new(&mut environment.brightness, MODEL_PARAMETER_RANGE.clone())
+            .text("Brightness"),
+    );
+    ui.add(
+        egui::Slider::new(&mut environment.contrast, MODEL_PARAMETER_RANGE.clone())
+            .text("Contrast"),
+    );
+    ui.add(
+        egui::Slider::new(&mut environment.saturation, MODEL_PARAMETER_RANGE.clone())
+            .text("Saturation"),
+    );
+    ui.add(egui::Slider::new(&mut environment.gamma, MODEL_PARAMETER_RANGE.clone()).text("Gamma"));
+    ui.add(
+        egui::Slider::new(&mut environment.exposure, MODEL_PARAMETER_RANGE.clone()).text(
+            if environment.auto_exposure {
+                "Exposure compensation"
+            } else {
+                "Exposure"
+            },
+        ),
+    );
+    ui.checkbox(&mut environment.auto_exposure, "Autoexposure");
+    ui.add(
+        egui::Slider::new(
+            &mut environment.bloom_strength,
+            MODEL_PARAMETER_RANGE.clone(),
+        )
+        .text("Bloom"),
+    );
+    ui.checkbox(&mut environment.tone_mapping, "Filmic tone mapping");
+
+    ui.separator();
+    ui.strong("Environment & effects");
+    ui.add(
+        egui::Slider::new(
+            &mut environment.vertex_ao_strength,
+            MODEL_PARAMETER_RANGE.clone(),
+        )
+        .text("Vertex AO"),
+    );
+    ui.checkbox(&mut environment.hiz_culling, "HiZ culling");
+    ui.checkbox(&mut environment.fxaa, "FXAA");
+    ui.add(
+        egui::Slider::new(
+            &mut environment.ssao_strength,
+            MODEL_PARAMETER_RANGE.clone(),
+        )
+        .text("SSAO"),
+    );
+}
+
+/// A panel toggled by a toolbar button. Unlike egui's memory-tracked popups it
+/// stays open while a dropdown inside it is open or was just used: a combo box
+/// is a popup of its own, and clicking one of its items is a click outside the panel.
+fn toolbar_popup(button: &egui::Response, content: impl FnOnce(&mut egui::Ui)) {
+    let ctx = button.ctx.clone();
+    let open_slot = egui::Id::new("model_toolbar_open_panel");
+    let nested_slot = egui::Id::new("model_toolbar_nested_popup");
+    let id = egui::Popup::default_response_id(button);
+    let mut open_panel = ctx.data(|data| data.get_temp::<Option<egui::Id>>(open_slot)).flatten();
+    if button.clicked() {
+        open_panel = (open_panel != Some(id)).then_some(id);
+    }
+    let mut open = open_panel == Some(id);
+    if open {
+        let nested_before = ctx.data(|data| data.get_temp::<bool>(nested_slot)).unwrap_or(false);
+        let response = egui::Popup::from_response(button)
+            .open_bool(&mut open)
+            .align(egui::RectAlign::BOTTOM_END)
+            .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+            .show(content);
+        let nested_now = egui::Popup::is_any_open(&ctx);
+        let clicked_outside = response.is_some_and(|response| response.response.clicked_elsewhere());
+        if !open || (clicked_outside && !button.clicked() && !nested_before && !nested_now) {
+            open_panel = None;
+        }
+        ctx.data_mut(|data| data.insert_temp(nested_slot, nested_now));
+    }
+    ctx.data_mut(|data| data.insert_temp(open_slot, open_panel));
+}
+
+fn model_viewport_toolbar(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    texture_cache: &TextureCache,
+    textures: &[(TagHash, UEntryHeader)],
+    gpu_preview: Option<&Arc<GpuModelPreview>>,
+    environment: &mut ModelEnvironment,
+    show_textures: bool,
+    channels: Option<&mut ModelChannels>,
+) -> Option<ViewAction> {
+    let mut action = None;
+    egui::Area::new(egui::Id::new("model_viewport_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.right_top() + vec2(-MODEL_OVERLAY_INSET, MODEL_OVERLAY_INSET))
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let lighting = ui.button("Lighting");
+                    toolbar_popup(&lighting, |ui| lighting_panel(ui, environment));
+
+                    let channel = ui.add_enabled(channels.is_some(), egui::Button::new("Channel"));
+                    toolbar_popup(&channel, |ui| {
+                            if let Some(channels) = channels {
+                                model_channel_panel(ui, channels);
+                            }
+                        });
+
+                    let image = ui.button("Image");
+                    toolbar_popup(&image, |ui| image_panel(ui, environment));
+
+                    let animation =
+                        ui.add_enabled(gpu_preview.is_some(), egui::Button::new("Animation"));
+                    toolbar_popup(&animation, |ui| model_animation_panel(ui, gpu_preview.map(Arc::as_ref)));
+
+                    if show_textures {
+                        let textures_button = ui.button("Textures");
+                        toolbar_popup(&textures_button, |ui| {
+                                ui.set_min_width(500.0);
+                                egui::ScrollArea::vertical()
+                                    .max_height(560.0)
+                                    .show(ui, |ui| {
+                                        if let Some(texture_action) =
+                                            model_textures_ui(ui, texture_cache, textures)
+                                        {
+                                            action = Some(texture_action);
+                                        }
+                                    });
+                            });
+                    }
+
+                    let evidence =
+                        ui.add_enabled(gpu_preview.is_some(), egui::Button::new("Render evidence"));
+                    toolbar_popup(&evidence, |ui| {
+                            if let Some(gpu_preview) = gpu_preview {
+                                render_evidence_panel(ui, gpu_preview);
+                            }
+                        });
+                });
+            });
+        });
+    action
+}
+
+fn model_channel_panel(ui: &mut egui::Ui, channels: &mut ModelChannels) {
+    ui.set_min_width(490.0);
+    ui.label("Used channels · edits apply live");
+    ui.horizontal(|ui| {
+        if ui.button("Reset channels").clicked() { channels.reset(); }
+    });
+    if channels.rows().is_empty() {
+        ui.label("This model reads no channels.");
+        return;
+    }
+    let mut changed = false;
+    egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+        for row in channels.rows_mut() {
+            ui.push_id(row.key(), |ui| {
+                let name = row.hash.and_then(super::get_string_for_hash)
+                    .unwrap_or_else(|| row.hash.map_or_else(|| format!("Global {}", row.id), |hash| format!("unk_{hash:08X}")));
+                let label = row.hash.map_or(name.clone(), |hash| format!("{name} (0x{hash:08X})"));
+                ui.label(label).on_hover_text(format!("{:?} channel · binding {}", row.domain, row.id));
+                ui.horizontal(|ui| {
+                    for (lane, label) in ["X", "Y", "Z", "W"].iter().enumerate() {
+                        ui.label(*label);
+                        let response = ui.add(egui::TextEdit::singleline(&mut row.buffers[lane])
+                            .desired_width(75.0).hint_text("Unknown"));
+                        changed |= response.changed();
+                        if let Some(error) = &row.errors[lane] { response.on_hover_text(error); }
+                    }
+                });
+                if row.errors.iter().any(Option::is_some) {
+                    ui.colored_label(Color32::YELLOW, "Enter four finite numbers.");
+                } else if row.default_value.is_none() {
+                    ui.weak("No single default value in this model's scopes.");
+                }
+                ui.separator();
+            });
+        }
+    });
+    if changed { let _ = channels.commit(); }
+}
+
+fn model_view_options_toolbar(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    show_wireframe: &mut bool,
+    show_stickers: &mut bool,
+    show_default_mods: Option<&mut bool>,
+    yaw: &mut f32,
+    pitch: &mut f32,
+    zoom: &mut f32,
+    pan: &mut egui::Vec2,
+) {
+    let is_weapon = show_default_mods.is_some();
+    egui::Area::new(egui::Id::new("model_view_options_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(
+            rect.right_top()
+                + vec2(
+                    -MODEL_OVERLAY_INSET,
+                    MODEL_OVERLAY_INSET + MODEL_OVERLAY_STACK_STEP,
+                ),
+        )
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(show_wireframe, "Wireframe");
+                    ui.checkbox(show_stickers, "Stickers");
+                    if let Some(show_default_mods) = show_default_mods {
+                        ui.checkbox(show_default_mods, "Default mods")
+                            .on_hover_text("Show authored empty-slot weapon meshes");
+                    }
+                    if ui.button("Reset view").clicked() {
+                        *yaw = if is_weapon {
+                            DEFAULT_WEAPON_YAW
+                        } else {
+                            DEFAULT_MODEL_YAW
+                        };
+                        *pitch = if is_weapon {
+                            DEFAULT_WEAPON_PITCH
+                        } else {
+                            0.05
+                        };
+                        *zoom = DEFAULT_PREVIEW_ZOOM;
+                        *pan = vec2(0.0, 0.0);
+                    }
+                });
+            });
+        });
+}
+
+fn model_view_info_overlay(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    wireframe: &WireframePreview,
+    yaw: f32,
+    pitch: f32,
+) {
+    egui::Area::new(egui::Id::new("model_view_info"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.left_top() + vec2(MODEL_OVERLAY_INSET, MODEL_OVERLAY_INSET))
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Yaw {:+.1}°  Pitch {:+.1}°  Roll {:+.1}°",
+                        yaw.to_degrees(),
+                        pitch.to_degrees(),
+                        0.0_f32,
+                    ))
+                    .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} vertices, {} indices ({})",
+                        wireframe.vertex_count_total,
+                        wireframe.index_count_total,
+                        wireframe.position_format
+                    ))
+                    .small()
+                    .color(Color32::GRAY),
+                );
+            });
+        });
+}
+
+fn model_export_toolbar(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    all_mods: &mut bool,
+    format: &mut ModelExportFormat,
+    all_mods_available: bool,
+    exporting: bool,
+) -> bool {
+    if !all_mods_available {
+        *all_mods = false;
+    }
+
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new("model_export_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(
+            rect.right_top()
+                + vec2(
+                    -MODEL_OVERLAY_INSET,
+                    MODEL_OVERLAY_INSET + MODEL_OVERLAY_STACK_STEP * 2.0,
+                ),
+        )
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ctx, |ui| {
+            model_overlay_frame().show(ui, |ui| {
+                ui.add_enabled_ui(!exporting, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            all_mods_available,
+                            egui::Checkbox::new(all_mods, "All Mods"),
+                        );
+                        egui::ComboBox::from_id_salt("model_export_format")
+                            .selected_text(format.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(format, ModelExportFormat::Png, "PNG");
+                                ui.selectable_value(format, ModelExportFormat::WebP, "WebP");
+                            });
+                        clicked = ui.button("Export").clicked();
+                    });
+                });
+            });
+        });
+    clicked
 }
 
 pub(super) fn model_wireframe_ui(
@@ -1071,206 +2846,118 @@ pub(super) fn model_wireframe_ui(
     show_stickers: &mut bool,
     show_default_mods: Option<&mut bool>,
     environment: &mut ModelEnvironment,
-) -> egui::Rect {
-    ui.horizontal(|ui| {
-        ui.label(format!(
-            "{} vertices, {} indices ({})",
-            wireframe.vertex_count_total, wireframe.index_count_total, wireframe.position_format
-        ));
-        ui.checkbox(show_wireframe, "Wireframe");
-        ui.checkbox(show_stickers, "Stickers");
-        if let Some(show_default_mods) = show_default_mods {
-            ui.checkbox(show_default_mods, "Default mods")
-                .on_hover_text("Show authored empty-slot weapon meshes");
-        }
-        if ui.button("Reset view").clicked() {
-            *yaw = DEFAULT_MODEL_YAW;
-            *pitch = 0.05;
-            *zoom = 1.0;
-            *pan = vec2(0.0, 0.0);
-        }
-    });
-    egui::CollapsingHeader::new("Lighting")
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut environment.light_gizmo, "Orbit gizmo");
-                if ui.button("Reset lighting").clicked() {
-                    let defaults = ModelEnvironment::default();
-                    environment.light_position = defaults.light_position;
-                    environment.light_orbit_radius = defaults.light_orbit_radius;
-                    environment.light_size = defaults.light_size;
-                    environment.shadow_strength = defaults.shadow_strength;
-                    environment.sun_intensity = defaults.sun_intensity;
-                    environment.ambient_intensity = defaults.ambient_intensity;
-                    environment.specular_ibl_intensity = defaults.specular_ibl_intensity;
-                }
-            });
-            ui.label("Drag the yellow light on the orbit sphere, or edit its axes.");
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.light_position[0],
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit X"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.light_position[1],
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit Y"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.light_position[2],
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit Z"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.light_orbit_radius,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Orbit radius"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.light_size, MODEL_PARAMETER_RANGE.clone())
-                    .text("Light size"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.sun_intensity,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Key light"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.shadow_strength,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Shadows"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.shadow_softness,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Shadow softness"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.ambient_intensity,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Ambient light"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.specular_ibl_intensity,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Reflections"),
-            );
-        });
-    egui::CollapsingHeader::new("Image")
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Reset image").clicked() {
-                    let defaults = ModelEnvironment::default();
-                    environment.brightness = defaults.brightness;
-                    environment.contrast = defaults.contrast;
-                    environment.saturation = defaults.saturation;
-                    environment.gamma = defaults.gamma;
-                    environment.exposure = defaults.exposure;
-                    environment.bloom_strength = defaults.bloom_strength;
-                }
-            });
-            ui.add(
-                egui::Slider::new(&mut environment.brightness, MODEL_PARAMETER_RANGE.clone())
-                    .text("Brightness"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.contrast, MODEL_PARAMETER_RANGE.clone())
-                    .text("Contrast"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.saturation, MODEL_PARAMETER_RANGE.clone())
-                    .text("Saturation"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.gamma, MODEL_PARAMETER_RANGE.clone())
-                    .text("Gamma"),
-            );
-            ui.add(
-                egui::Slider::new(&mut environment.exposure, MODEL_PARAMETER_RANGE.clone()).text(
-                    if environment.auto_exposure {
-                        "Exposure compensation"
-                    } else {
-                        "Exposure"
-                    },
-                ),
-            );
-            ui.checkbox(&mut environment.auto_exposure, "Autoexposure");
-            ui.add(
-                egui::Slider::new(
-                    &mut environment.bloom_strength,
-                    MODEL_PARAMETER_RANGE.clone(),
-                )
-                .text("Bloom"),
-            );
-            ui.checkbox(&mut environment.tone_mapping, "Filmic tone mapping");
-        });
-    ui.collapsing("Environment & effects", |ui| {
-        ui.add(
-            egui::Slider::new(
-                &mut environment.vertex_ao_strength,
-                MODEL_PARAMETER_RANGE.clone(),
-            )
-            .text("Vertex AO"),
-        );
-        ui.checkbox(&mut environment.hiz_culling, "HiZ culling");
-        ui.checkbox(&mut environment.fxaa, "FXAA");
-        ui.add(
-            egui::Slider::new(
-                &mut environment.ssao_strength,
-                MODEL_PARAMETER_RANGE.clone(),
-            )
-            .text("SSAO"),
-        );
-    });
+    show_textures: bool,
+    channels: Option<&mut ModelChannels>,
+) -> (egui::Rect, Option<ViewAction>) {
+    if !environment.tfx_paused {
+        environment.tfx_time_seconds += ui.input(|input| input.stable_dt) * environment.tfx_speed;
+        ui.ctx().request_repaint();
+    }
     let preview_textures = wireframe_preview_textures(wireframe, textures);
 
     let available = ui.available_size();
-    let size = vec2(available.x.max(320.0), available.y.clamp(320.0, 620.0));
+    let size = vec2(available.x.max(320.0), available.y.max(320.0));
     let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
+    let toolbar_action = model_viewport_toolbar(
+        ui.ctx(),
+        rect,
+        texture_cache,
+        textures,
+        gpu_preview,
+        environment,
+        show_textures,
+        channels,
+    );
+    model_view_options_toolbar(
+        ui.ctx(),
+        rect,
+        show_wireframe,
+        show_stickers,
+        show_default_mods,
+        yaw,
+        pitch,
+        zoom,
+        pan,
+    );
+    model_view_info_overlay(ui.ctx(), rect, wireframe, *yaw, *pitch);
 
-    let mut gizmo_light_position = environment.light_position;
-    normalize_light_position(&mut gizmo_light_position);
-    let gizmo_center = rect.center() + *pan;
-    let gizmo_radius = rect
-        .width()
-        .min(rect.height())
-        .mul_add(0.32 * environment.light_orbit_radius.abs(), 0.0)
-        .max(24.0);
-    let light_handle = gizmo_center
-        + vec2(
-            -gizmo_light_position[0] * gizmo_radius,
-            -gizmo_light_position[1] * gizmo_radius,
-        );
-    let light_handle_radius = (6.0 * environment.light_size.abs().sqrt()).clamp(5.0, 12.0);
-    let light_gizmo_response = environment.light_gizmo.then(|| {
+    let defaults = ModelEnvironment::default();
+    let mut orbit_position = environment.light_orbit_position;
+    normalize_direction(&mut orbit_position, defaults.light_orbit_position);
+    let orbit_view = fixed_light_direction_to_view(orbit_position);
+    let light_transform = ModelLightTransform::new(environment, wireframe);
+    let light_world_position = light_transform.to_model(light_source_position(environment));
+    let orbit_center_world = light_transform.to_model(environment.light_orbit_center);
+    let mut cast_direction = light_cast_direction(environment);
+    let cast_length = cast_direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    normalize_direction(&mut cast_direction, [0.276, -0.627, -0.728]);
+    let cast_view = fixed_light_direction_to_view(cast_direction);
+    let camera_frame = camera_frame.unwrap_or_else(|| ModelCameraFrame::from_wireframe(wireframe));
+    let viewport_center = rect.center() + *pan;
+    let pixels_per_world_unit =
+        0.84 * *zoom / camera_frame.radius.max(0.0001) * rect.height() * 0.5;
+    let project_model_point = |position: [f32; 3]| {
+        let relative = std::array::from_fn(|axis| position[axis] - camera_frame.center[axis]);
+        let view = fixed_light_direction_to_view(relative);
+        viewport_center
+            + vec2(
+                -view[0] * pixels_per_world_unit,
+                -view[1] * pixels_per_world_unit,
+            )
+    };
+    let gizmo_center = project_model_point(orbit_center_world);
+    let light_handle = project_model_point(light_world_position);
+    let center_relative =
+        std::array::from_fn(|axis| orbit_center_world[axis] - camera_frame.center[axis]);
+    let center_view = fixed_light_direction_to_view(center_relative);
+    let orbit_radius_world = environment.light_orbit_radius.max(0.0) * light_transform.scale;
+    let gizmo_radius = (0..=64)
+        .map(|step| {
+            let angle = step as f32 / 64.0 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            let point = [
+                orbit_center_world[0] + cos * orbit_radius_world,
+                orbit_center_world[1],
+                orbit_center_world[2] + sin * orbit_radius_world,
+            ];
+            project_model_point(point).distance(gizmo_center)
+        })
+        .fold(24.0_f32, f32::max);
+    let direction_length = 64.0_f32;
+    let direction_world_length = direction_length / pixels_per_world_unit.max(0.0001);
+    let direction_handle = project_model_point(std::array::from_fn(|axis| {
+        light_world_position[axis] + cast_direction[axis] * direction_world_length
+    }));
+    let light_handle_radius = (6.0 * environment.light_size.sqrt()).clamp(5.0, 12.0);
+    let orbit_gizmo_response = environment.light_gizmo.then(|| {
         ui.interact(
             egui::Rect::from_center_size(light_handle, vec2(32.0, 32.0)),
-            ui.id().with("model_light_orbit_gizmo"),
+            ui.id().with("model_light_orbit_point"),
             Sense::drag(),
         )
-        .on_hover_text("Drag light around mesh")
+        .on_hover_text("Move spotlight source on orbit sphere")
     });
-    if let Some(gizmo) = &light_gizmo_response
+    let direction_gizmo_response = environment.light_gizmo.then(|| {
+        ui.interact(
+            egui::Rect::from_center_size(direction_handle, vec2(28.0, 28.0)),
+            ui.id().with("model_light_direction"),
+            Sense::drag(),
+        )
+        .on_hover_text("Move spotlight beam target")
+    });
+    let center_gizmo_response = environment.light_gizmo.then(|| {
+        ui.interact(
+            egui::Rect::from_center_size(gizmo_center, vec2(26.0, 26.0)),
+            ui.id().with("model_light_orbit_center"),
+            Sense::drag(),
+        )
+        .on_hover_text("Move spotlight orbit center")
+    });
+    if let Some(gizmo) = &orbit_gizmo_response
         && gizmo.dragged()
         && let Some(pointer) = gizmo.interact_pointer_pos()
     {
@@ -1283,19 +2970,58 @@ pub(super) fn model_wireframe_ui(
         } else {
             (x, y)
         };
-        let z_sign = if environment.light_position[2] < 0.0 {
-            -1.0
+        let z_sign = if orbit_view[2] < 0.0 { -1.0 } else { 1.0 };
+        environment.light_orbit_position =
+            fixed_view_direction_to_light([x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign]);
+        ui.ctx().request_repaint();
+    }
+    if let Some(gizmo) = &direction_gizmo_response
+        && gizmo.dragged()
+        && let Some(pointer) = gizmo.interact_pointer_pos()
+    {
+        let offset = pointer - light_handle;
+        let x = (-offset.x / direction_length).clamp(-1.0, 1.0);
+        let y = (-offset.y / direction_length).clamp(-1.0, 1.0);
+        let planar_length = (x * x + y * y).sqrt();
+        let (x, y) = if planar_length > 1.0 {
+            (x / planar_length, y / planar_length)
         } else {
-            1.0
+            (x, y)
         };
-        environment.light_position = [x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign];
+        let z_sign = if cast_view[2] < 0.0 { -1.0 } else { 1.0 };
+        let cast_direction =
+            fixed_view_direction_to_light([x, y, (1.0 - x * x - y * y).max(0.0).sqrt() * z_sign]);
+        let target_distance = cast_length.max(0.25) * light_transform.scale;
+        environment.light_target = light_transform.to_rig(std::array::from_fn(|axis| {
+            light_world_position[axis] + cast_direction[axis] * target_distance
+        }));
+        ui.ctx().request_repaint();
+    }
+    if let Some(gizmo) = &center_gizmo_response
+        && gizmo.dragged()
+        && let Some(pointer) = gizmo.interact_pointer_pos()
+    {
+        let offset = pointer - gizmo_center;
+        let center_relative = fixed_view_direction_to_light([
+            center_view[0] - offset.x / pixels_per_world_unit.max(0.0001),
+            center_view[1] - offset.y / pixels_per_world_unit.max(0.0001),
+            center_view[2],
+        ]);
+        environment.light_orbit_center = light_transform.to_rig(std::array::from_fn(|axis| {
+            camera_frame.center[axis] + center_relative[axis]
+        }));
         ui.ctx().request_repaint();
     }
 
     let pointer_delta = ui.input(|i| i.pointer.delta());
-    let dragging_light = light_gizmo_response
-        .as_ref()
-        .is_some_and(|gizmo| gizmo.dragged() || gizmo.hovered());
+    let dragging_light = [
+        orbit_gizmo_response.as_ref(),
+        direction_gizmo_response.as_ref(),
+        center_gizmo_response.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|gizmo| gizmo.dragged() || gizmo.hovered());
 
     if response.dragged_by(egui::PointerButton::Primary) && !dragging_light {
         // Left mouse button: horizontal rotation only
@@ -1339,16 +3065,12 @@ pub(super) fn model_wireframe_ui(
         && wireframe.uvs.is_some()
         && !preview_textures.is_empty()
     {
-        if gpu_preview.has_animated_material() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(16));
-        }
         let callback = ModelPaintCallback::new(
             gpu_preview.clone(),
             texture_cache,
             wireframe,
             uv_transform,
-            camera_frame,
+            Some(camera_frame),
             *yaw,
             *pitch,
             *zoom,
@@ -1358,6 +3080,10 @@ pub(super) fn model_wireframe_ui(
             ui.ctx().pixels_per_point(),
             *environment,
         );
+        let mut animation = ModelAnimationState::load(ui.ctx());
+        let callback = callback.with_pose(animation.pose(ui, gpu_preview));
+        animation.store(ui.ctx());
+        callback.show_loading_status(ui, rect);
         ui.painter()
             .add(Callback::new_paint_callback(rect, callback));
         true
@@ -1367,7 +3093,6 @@ pub(super) fn model_wireframe_ui(
 
     if environment.light_gizmo {
         let sphere_stroke = Stroke::new(1.0, Color32::from_white_alpha(90));
-        painter.circle_stroke(gizmo_center, gizmo_radius, sphere_stroke);
         for (axis, color) in [
             (0, Color32::from_rgba_unmultiplied(245, 90, 90, 125)),
             (1, Color32::from_rgba_unmultiplied(90, 220, 120, 125)),
@@ -1376,18 +3101,30 @@ pub(super) fn model_wireframe_ui(
                 .map(|step| {
                     let angle = step as f32 / 64.0 * std::f32::consts::TAU;
                     let (sin, cos) = angle.sin_cos();
-                    if axis == 0 {
-                        gizmo_center + vec2(cos * gizmo_radius, sin * gizmo_radius * 0.28)
+                    let offset = if axis == 0 {
+                        [cos * orbit_radius_world, 0.0, sin * orbit_radius_world]
                     } else {
-                        gizmo_center + vec2(cos * gizmo_radius * 0.28, sin * gizmo_radius)
-                    }
+                        [0.0, cos * orbit_radius_world, sin * orbit_radius_world]
+                    };
+                    project_model_point(std::array::from_fn(|component| {
+                        orbit_center_world[component] + offset[component]
+                    }))
                 })
                 .collect::<Vec<_>>();
             painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
         }
+        painter.circle_stroke(gizmo_center, gizmo_radius, sphere_stroke);
         painter.line_segment(
             [gizmo_center, light_handle],
             Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 220, 105, 170)),
+        );
+        painter.line_segment(
+            [gizmo_center - vec2(7.0, 0.0), gizmo_center + vec2(7.0, 0.0)],
+            Stroke::new(1.5, Color32::from_rgb(115, 210, 255)),
+        );
+        painter.line_segment(
+            [gizmo_center - vec2(0.0, 7.0), gizmo_center + vec2(0.0, 7.0)],
+            Stroke::new(1.5, Color32::from_rgb(115, 210, 255)),
         );
         painter.circle_filled(
             light_handle,
@@ -1399,12 +3136,24 @@ pub(super) fn model_wireframe_ui(
             light_handle_radius,
             Stroke::new(1.5, Color32::WHITE),
         );
+        painter.arrow(
+            light_handle,
+            direction_handle - light_handle,
+            Stroke::new(2.0, Color32::from_rgb(255, 126, 82)),
+        );
+        painter.circle_filled(direction_handle, 4.5, Color32::from_rgb(255, 126, 82));
     }
 
-    let Some(projected) =
-        project_vertices(wireframe, camera_frame, *yaw, *pitch, *zoom, *pan, rect)
-    else {
-        return rect;
+    let Some(projected) = project_vertices(
+        wireframe,
+        Some(camera_frame),
+        *yaw,
+        *pitch,
+        *zoom,
+        *pan,
+        rect,
+    ) else {
+        return (rect, toolbar_action);
     };
 
     if wireframe.indices.len() >= 3 {
@@ -1443,28 +3192,7 @@ pub(super) fn model_wireframe_ui(
         }
     }
 
-    let camera_text = format!(
-        "Yaw {:+.1}°  Pitch {:+.1}°  Roll {:+.1}°",
-        yaw.to_degrees(),
-        pitch.to_degrees(),
-        0.0_f32,
-    );
-    let text_position = rect.left_top() + vec2(10.0, 10.0);
-    let text_galley = painter.layout_no_wrap(
-        camera_text,
-        egui::FontId::monospace(12.0),
-        Color32::from_gray(225),
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_size(
-            text_position - vec2(5.0, 4.0),
-            text_galley.size() + vec2(10.0, 8.0),
-        ),
-        3.0,
-        Color32::from_black_alpha(165),
-    );
-    painter.galley(text_position, text_galley, Color32::WHITE);
-    rect
+    (rect, toolbar_action)
 }
 
 fn draw_textured_model_mesh(
@@ -1509,7 +3237,7 @@ fn draw_textured_model_mesh(
         let texture_id = texture_cache
             .get_material_or_load(key)
             .map(|(_texture, texture_id)| texture_id)
-            .unwrap_or_else(|| texture_cache.get_or_default(key.color).1);
+            .unwrap_or_else(|| texture_cache.get_or_default(key.color.expect("textured triangle")).1);
         let texture_triangles = triangles
             .iter()
             .copied()
@@ -1536,7 +3264,7 @@ fn triangle_material_key(
     fallback_texture: Option<TagHash>,
 ) -> Option<MaterialTextureKey> {
     Some(MaterialTextureKey {
-        color: triangle.texture.or(fallback_texture)?,
+        color: Some(triangle.texture.or(fallback_texture)?),
         normal: triangle.normal,
         emissive: triangle.emissive,
         color_tint: triangle.color_tint,
@@ -1879,111 +3607,4 @@ fn model_textures_ui(
     });
 
     action
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detects_only_exact_authored_weapon_models_and_skins() {
-        let catalog = ModelWeaponCatalog {
-            weapons: vec![ModelWeaponEntry {
-                name: "Misriah 2442".to_owned(),
-                owner_tag: TagHash(0x80a7acec),
-                socket_owner: None,
-                model_tags: vec![TagHash(0x80aa0e95), TagHash(0x80b6cc5d)],
-                skins: vec![ModelWeaponSkinEntry {
-                    name: "Yōkai's Claw".to_owned(),
-                    model_tag: TagHash(0x80b6cc5d),
-                    rarity: Some("Prestige".to_owned()),
-                    color: Color32::from_rgb(232, 184, 72),
-                }],
-                slots: vec![],
-            }],
-        };
-
-        assert_eq!(
-            weapon_index_for_model(&catalog, TagHash(0x80b6cc5d)),
-            Some(0)
-        );
-        assert_eq!(
-            weapon_index_for_model(&catalog, TagHash(0x80aa0e95)),
-            Some(0)
-        );
-        assert_eq!(weapon_index_for_model(&catalog, TagHash(0x80a7aced)), None);
-        let (weapon, skin) =
-            weapon_skin_for_model(&catalog, TagHash(0x80b6cc5d)).expect("exact skin tag");
-        assert_eq!(weapon.name, "Misriah 2442");
-        assert_eq!(skin.name, "Yōkai's Claw");
-        assert_eq!(skin.rarity.as_deref(), Some("Prestige"));
-        assert!(weapon_skin_for_model(&catalog, TagHash(0x80b6cc5e)).is_none());
-    }
-
-    #[test]
-    fn rejects_model_tags_claimed_by_multiple_weapons() {
-        let shared = TagHash(0x80b6cc5d);
-        let catalog = ModelWeaponCatalog {
-            weapons: ["ARES RG", "V00 ZEUS RG"]
-                .into_iter()
-                .map(|name| ModelWeaponEntry {
-                    name: name.to_owned(),
-                    owner_tag: shared,
-                    socket_owner: None,
-                    model_tags: vec![shared],
-                    skins: vec![ModelWeaponSkinEntry {
-                        name: format!("{name} skin"),
-                        model_tag: shared,
-                        rarity: None,
-                        color: Color32::WHITE,
-                    }],
-                    slots: vec![],
-                })
-                .collect(),
-        };
-
-        assert_eq!(weapon_index_for_model(&catalog, shared), None);
-        assert!(weapon_skin_for_model(&catalog, shared).is_none());
-    }
-
-    #[test]
-    fn identified_skin_rows_override_single_line_truncation() {
-        let ctx = egui::Context::default();
-        let mut single_line_height = 0.0;
-        let mut skin_row_height = 0.0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_width(420.0);
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                single_line_height = ui
-                    .add(egui::Button::selectable(
-                        false,
-                        "1610: Model container 80B6E64A (3.33 KB)",
-                    ))
-                    .rect
-                    .height();
-
-                let mut label = egui::text::LayoutJob::default();
-                label.append(
-                    "1610: Model container 80B6E64A (3.33 KB)",
-                    0.0,
-                    egui::TextFormat::default(),
-                );
-                label.append(
-                    "\n    └ KKV-9SD: TAC Standard",
-                    0.0,
-                    egui::TextFormat::default(),
-                );
-                skin_row_height = ui
-                    .add(egui::Button::selectable(false, label).wrap_mode(egui::TextWrapMode::Wrap))
-                    .rect
-                    .height();
-            });
-        });
-
-        assert!(
-            skin_row_height > single_line_height * 1.5,
-            "skin identity was clipped: single={single_line_height}, skin={skin_row_height}"
-        );
-    }
 }

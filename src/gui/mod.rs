@@ -5,17 +5,25 @@ mod common;
 mod external_file;
 mod gear;
 mod hexview;
+mod implant_stats;
+mod item_effect;
+mod perk_data;
 mod model_renderer;
 mod modellist;
 mod named_tags;
 mod packages;
+mod profile_texture;
+mod prop_handoff;
 mod raw_strings;
 mod signatures;
 mod space_usage;
+mod sticker_texture;
 mod strings;
 mod style;
 mod tag;
 mod texturelist;
+mod video;
+mod weapon_stats;
 
 use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hasher};
@@ -50,14 +58,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use strings::StringViewVariant;
 use tiger_pkg::{TagHash, package_manager};
 
-use self::gear::GearView;
-use self::modellist::ModelsView;
+pub(crate) use self::gear::GearView;
+pub(crate) use self::modellist::ModelsView;
 use self::named_tags::NamedTagView;
 use self::packages::PackagesView;
 use self::raw_strings::RawStringsView;
 use self::strings::StringsView;
 use self::tag::TagView;
 use self::texturelist::TexturesView;
+use self::video::VideoView;
 use crate::gui::external_file::ExternalFileScanView;
 use crate::gui::signatures::SignaturesView;
 use crate::gui::space_usage::SpaceUsageView;
@@ -73,6 +82,7 @@ pub enum Panel {
     Models,
     Gear,
     Audio,
+    Video,
     AudioEvents,
     Strings,
     SpaceUsage,
@@ -228,6 +238,7 @@ pub struct QuickTagApp {
     models_view: ModelsView,
     gear_view: GearView,
     audio_view: audio_list::AudioView,
+    video_view: VideoView,
     audio_events_view: audio_events::AudioEventView,
     strings_view: StringsView,
     raw_strings_view: RawStringsView,
@@ -363,6 +374,7 @@ impl QuickTagApp {
             models_view,
             gear_view,
             audio_view: audio_list::AudioView::new(),
+            video_view: VideoView::new(),
             audio_events_view: audio_events::AudioEventView::new(),
             strings_view: StringsView::new(
                 strings.clone(),
@@ -416,6 +428,7 @@ impl eframe::App for QuickTagApp {
             )
         {
             quicktag_core::classes::load_schemafile();
+            crate::geometry::invalidate_cached_models();
             info!("Reloaded schema file");
         }
 
@@ -735,6 +748,7 @@ impl eframe::App for QuickTagApp {
                     ui.selectable_value(&mut self.open_panel, Panel::Models, "Models");
                     ui.selectable_value(&mut self.open_panel, Panel::Gear, "Gear");
                     ui.selectable_value(&mut self.open_panel, Panel::Audio, "Audio");
+                    ui.selectable_value(&mut self.open_panel, Panel::Video, "Video");
                     ui.selectable_value(&mut self.open_panel, Panel::AudioEvents, "Wwise Events");
                     ui.selectable_value(&mut self.open_panel, Panel::Strings, "Strings");
                     ui.selectable_value(&mut self.open_panel, Panel::SpaceUsage, "Space Usage");
@@ -772,8 +786,9 @@ impl eframe::App for QuickTagApp {
                     Panel::Packages => self.packages_view.view(ctx, ui),
                     Panel::Textures => self.textures_view.view(ctx, ui),
                     Panel::Models => self.models_view.view(ctx, ui),
-                    Panel::Gear => self.gear_view.view(ctx, ui),
+                    Panel::Gear => self.gear_view.view(ctx, ui, &self.texture_cache),
                     Panel::Audio => self.audio_view.view(ctx, ui),
+                    Panel::Video => self.video_view.view(ctx, ui),
                     Panel::AudioEvents => self.audio_events_view.view(ctx, ui),
                     Panel::Strings => match self.strings_panel {
                         StringsPanel::Localized => self.strings_view.view(ctx, ui),

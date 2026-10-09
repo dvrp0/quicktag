@@ -304,9 +304,10 @@ impl TagView {
 
         let texture = if tag_type.is_texture() && tag_type.is_header() {
             Texture::load(&render_state, tag, true).map(|t| {
+                let raw_view = t.raw_view();
                 let egui_handle = render_state.renderer.write().register_native_texture(
                     &render_state.device,
-                    &t.view,
+                    &raw_view,
                     wgpu::FilterMode::Linear,
                 );
 
@@ -2273,8 +2274,8 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
                         ui.monospace(stage.textures.len().to_string());
                         ui.end_row();
 
-                        ui.label("Samplers");
-                        ui.monospace(stage.samplers.len().to_string());
+                        ui.label("Indexed resources");
+                        ui.monospace(stage.indexed_resources.len().to_string());
                         ui.end_row();
 
                         ui.label("Constants");
@@ -2304,7 +2305,7 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
                         "constant buffer payload: header={} ({} bytes) data={} ({} bytes)",
                         buffer.header_tag, buffer.header_len, buffer.data_tag, buffer.data_len
                     ));
-                    constants_preview_ui(ui, "Constant buffer first vec4s", &buffer.first_values);
+                    constants_preview_ui(ui, "Constant buffer registers", &buffer.values);
                 }
 
                 if !stage.textures.is_empty() {
@@ -2312,9 +2313,9 @@ fn technique_preview_ui(ui: &mut egui::Ui, technique: &TechniquePreview) -> Opti
                     open_new_tag = open_new_tag.or(texture_slot_bindings_ui(ui, &stage.textures));
                 }
 
-                if !stage.samplers.is_empty() {
+                if !stage.indexed_resources.is_empty() {
                     ui.separator();
-                    open_new_tag = open_new_tag.or(sampler_bindings_ui(ui, &stage.samplers));
+                    open_new_tag = open_new_tag.or(indexed_resource_bindings_ui(ui, &stage.indexed_resources));
                 }
 
                 if !stage.constants.is_empty() || !stage.inline_constants.is_empty() {
@@ -2346,16 +2347,16 @@ fn scope_bits_ui(ui: &mut egui::Ui, label: &str, scopes: &[&str]) {
     });
 }
 
-fn sampler_bindings_ui(ui: &mut egui::Ui, samplers: &[WideHashPreview]) -> Option<TagHash> {
+fn indexed_resource_bindings_ui(ui: &mut egui::Ui, samplers: &[WideHashPreview]) -> Option<TagHash> {
     let mut open_new_tag = None;
-    CollapsingHeader::new(format!("Samplers ({})", samplers.len()))
+    CollapsingHeader::new(format!("Indexed resources ({})", samplers.len()))
         .default_open(true)
         .show(ui, |ui| {
             egui::Grid::new(ui.next_auto_id())
                 .striped(true)
                 .show(ui, |ui| {
                     ui.strong("Index");
-                    ui.strong("Sampler");
+                    ui.strong("Resource");
                     ui.strong("Resolved");
                     ui.end_row();
 
@@ -2413,6 +2414,16 @@ fn tfx_bytecode_ui(ui: &mut egui::Ui, bytecode: &TfxBytecodePreview) {
         "TFX bytecode: {} bytes, {} decoded ops, {} unknown",
         bytecode.total_bytes, bytecode.decoded_ops, bytecode.unknown_ops
     ));
+    ui.label(format!("Execution status: {:?}", bytecode.status));
+    if let Some(offset) = bytecode.undecoded_offset {
+        ui.label(
+            RichText::new(format!(
+                "Stopped at byte 0x{offset:X}; {} raw bytes preserved",
+                bytecode.undecoded_bytes.len()
+            ))
+            .color(Color32::YELLOW),
+        );
+    }
     if bytecode.truncated {
         ui.label(RichText::new("Opcode list truncated for UI").color(Color32::YELLOW));
     }
@@ -2764,6 +2775,8 @@ fn model_preview_ui(
             orbit.show_stickers,
             None,
             &mut environment,
+            false,
+            None,
         );
     } else {
         ui.label(RichText::new("No fallback wireframe could be assembled").color(Color32::YELLOW));

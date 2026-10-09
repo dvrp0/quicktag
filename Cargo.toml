@@ -63,6 +63,7 @@ egui-notify = "0.21.0"
 native-dialog = "0.7.0"
 opener = "0.7.0"
 poll-promise = { version = "0.3.0", features = ["tokio"] }
+pollster = "0.4.0"
 rayon = "1.8.0"
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulkan"] }
 
@@ -71,8 +72,9 @@ base64 = "0.22.0"
 bincode = "2.0.0-rc.3"
 binrw.workspace = true
 either = "1.10.0"
-image = { version = "0.25.1", features = ["png"], default-features = false }
+image = { version = "0.25.1", features = ["png", "webp"], default-features = false }
 regex = "1.10.4"
+sha2 = "0.10"
 rodio = "0.18.1"
 serde = { version = "1.0.188", features = ["derive"] }
 serde_json = "1.0.108"
@@ -80,6 +82,7 @@ tiger-pkg.workspace = true
 tokio = { version = "1.37.0", features = ["rt", "macros"] }
 ww2ogg = { git = "https://github.com/cohaereo/ww2ogg-rs" }
 lewton = "0.10.2"
+zip = { version = "2.4", default-features = false }
 downmixer = "0.0.5"
 
 # tiger-parse structure crates
@@ -98,10 +101,6 @@ xbox-one-deswizzler = ["xg"]
 opt-level = 3
 # cohae: Overflow checks are nice for some, but not for us
 overflow-checks = false
-
-[dev-dependencies]
-naga = { version = "27.0.3", features = ["wgsl-in"] }
-pollster = "0.4.0"
 
 [profile.release]
 debug = "limited"

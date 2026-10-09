@@ -18,15 +18,17 @@ use tiger_pkg::TagHash;
 
 pub type LoadedTexture = (Arc<Texture>, TextureId);
 
+pub(crate) type TextureCacheKey = (TagHash, bool);
+
 pub(crate) type TextureCacheMap = LinkedHashMap<
-    TagHash,
+    TextureCacheKey,
     Either<Option<LoadedTexture>, Promise<Option<LoadedTexture>>>,
     BuildHasherDefault<FxHasher>,
 >;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaterialTextureKey {
-    pub color: TagHash,
+    pub color: Option<TagHash>,
     pub normal: Option<TagHash>,
     pub emissive: Option<TagHash>,
     pub color_tint: [u8; 4],
@@ -82,29 +84,75 @@ impl TextureCache {
     }
 
     pub fn get_or_load(&self, hash: TagHash) -> Option<LoadedTexture> {
+        self.get_or_load_with_alpha_mode(hash, true)
+    }
+
+    pub(crate) fn get_or_default_material(&self, hash: TagHash) -> LoadedTexture {
+        self.get_or_load_material(hash)
+            .unwrap_or_else(|| self.loading_placeholder.clone())
+    }
+
+    pub(crate) fn get_or_load_material(&self, hash: TagHash) -> Option<LoadedTexture> {
+        // A slot a technique leaves empty reads as zero, like an unbound
+        // shader resource: one transparent black texel stands for it.
+        if hash == TagHash::NONE {
+            let key = (hash, false);
+            if let Some(Either::Left(Some(found))) = self.cache.read().get(&key) {
+                return Some(found.clone());
+            }
+            let texture = Texture::from_rgba8(&self.render_state, 1, 1, vec![0; 4], Some("empty texture slot".into())).ok()?;
+            let id = self.render_state.renderer.write().register_native_texture(
+                &self.render_state.device,
+                &texture.view,
+                wgpu::FilterMode::Linear,
+            );
+            let loaded = (Arc::new(texture), id);
+            self.cache.write().insert(key, Left(Some(loaded.clone())));
+            return Some(loaded);
+        }
+        self.get_or_load_with_alpha_mode(hash, false)
+    }
+
+    pub(crate) fn material_texture_failed(&self, hash: TagHash) -> bool {
+        matches!(self.cache.read().get(&(hash, false)), Some(Either::Left(None)))
+    }
+
+    fn get_or_load_with_alpha_mode(
+        &self,
+        hash: TagHash,
+        premultiply_alpha: bool,
+    ) -> Option<LoadedTexture> {
+        let key = (hash, premultiply_alpha);
         let mut cache = self.cache.write();
 
-        let c = cache.remove(&hash);
+        let c = cache.remove(&key);
 
         let texture = if let Some(Either::Left(r)) = c {
-            cache.insert(hash, Left(r.clone()));
+            cache.insert(key, Left(r.clone()));
             r.clone()
         } else if let Some(Either::Right(p)) = c {
             if let std::task::Poll::Ready(r) = p.poll() {
-                cache.insert(hash, Left(r.clone()));
-                return r.clone();
+                cache.insert(key, Left(r.clone()));
+                r.clone()
             } else {
-                cache.insert(hash, Either::Right(p));
+                cache.insert(key, Either::Right(p));
                 None
             }
         } else if c.is_none() {
-            cache.insert(
-                hash,
-                Either::Right(Promise::spawn_async(Self::load_texture_task(
-                    self.render_state.clone(),
-                    hash,
-                ))),
-            );
+            let pending = cache
+                .values()
+                .filter(|value| matches!(value, Either::Right(_)))
+                .count();
+            if pending < Self::MAX_PENDING_TEXTURE_LOADS {
+                cache.insert(
+                    key,
+                    Either::Right(Promise::spawn_async(Self::load_texture_task(
+                        self.render_state.clone(),
+                        hash,
+                        premultiply_alpha,
+                    ))),
+                );
+            }
 
             None
         } else {
@@ -120,8 +168,9 @@ impl TextureCache {
     pub(crate) async fn load_texture_task(
         render_state: RenderState,
         hash: TagHash,
+        premultiply_alpha: bool,
     ) -> Option<LoadedTexture> {
-        let texture = match Texture::load(&render_state, hash, true) {
+        let texture = match Texture::load(&render_state, hash, premultiply_alpha) {
             Ok(t) => t,
             Err(e) => {
                 log::error!("Failed to load texture {hash}: {e}");
@@ -129,9 +178,10 @@ impl TextureCache {
             }
         };
 
+        let raw_view = texture.raw_view();
         let id = render_state.renderer.write().register_native_texture(
             &render_state.device,
-            &texture.view,
+            &raw_view,
             wgpu::FilterMode::Linear,
         );
         Some((Arc::new(texture), id))
@@ -139,7 +189,7 @@ impl TextureCache {
 
     pub fn get_material_or_load(&self, key: MaterialTextureKey) -> Option<LoadedTexture> {
         if !key.has_composite_layers() {
-            return self.get_or_load(key.color);
+            return self.get_or_load(key.color?);
         }
 
         {
@@ -150,7 +200,7 @@ impl TextureCache {
             }
         }
 
-        let color = self.get_or_load(key.color)?;
+        let color = self.get_or_load(key.color?)?;
         let normal = match key.normal {
             Some(tag) => self.get_or_load(tag),
             None => None,
@@ -227,14 +277,15 @@ impl TextureCache {
             height,
             out,
             Some(format!(
-                "composited material color={} normal={:?} emissive={:?} tint={:?} emissive_strength={}",
+                "composited material color={:?} normal={:?} emissive={:?} tint={:?} emissive_strength={}",
                 key.color, key.normal, key.emissive, key.color_tint, key.emissive_strength
             )),
         )
         .ok()?;
+        let raw_view = texture.raw_view();
         let id = self.render_state.renderer.write().register_native_texture(
             &self.render_state.device,
-            &texture.view,
+            &raw_view,
             wgpu::FilterMode::Linear,
         );
 
@@ -286,21 +337,75 @@ impl TextureCache {
         }
     }
 
-    pub(crate) const MAX_TEXTURES: usize = 1024;
+    // Count-only limits are unsafe for modern Tiger assets: a handful of 4K
+    // RGBA textures can outweigh hundreds of small BC maps. Keep both a hard
+    // entry ceiling and a conservative GPU-byte budget so browsing models
+    // cannot accumulate several gigabytes of resident textures.
+    pub(crate) const MAX_TEXTURES: usize = 256;
+    pub(crate) const MAX_PENDING_TEXTURE_LOADS: usize = 8;
+    pub(crate) const MAX_TEXTURE_GPU_BYTES: u64 = 384 * 1024 * 1024;
+
     pub(crate) fn truncate(&self) {
         let mut cache = self.cache.write();
-        while cache.len() > Self::MAX_TEXTURES {
-            if let Some((_, Either::Left(Some((_, tid))))) = cache.pop_front() {
+
+        // A spawned Promise can already own a completed GPU texture even when
+        // its key is never requested again (common while rapidly browsing
+        // models). Promote completed promises before accounting so those
+        // allocations cannot sit outside the byte budget indefinitely.
+        for (_key, value) in cache.iter_mut() {
+            let completed = match value {
+                Either::Right(promise) => match promise.poll() {
+                    std::task::Poll::Ready(result) => Some(result.clone()),
+                    std::task::Poll::Pending => None,
+                },
+                Either::Left(_) => None,
+            };
+            if let Some(result) = completed {
+                *value = Either::Left(result);
+            }
+        }
+
+        let mut estimated_bytes = cache
+            .values()
+            .filter_map(|value| match value {
+                Either::Left(Some((texture, _))) => Some(texture.estimated_gpu_bytes()),
+                _ => None,
+            })
+            .fold(0u64, u64::saturating_add);
+
+        while cache.len() > Self::MAX_TEXTURES || estimated_bytes > Self::MAX_TEXTURE_GPU_BYTES {
+            let Some((_, value)) = cache.pop_front() else {
+                break;
+            };
+            if let Either::Left(Some((texture, tid))) = value {
+                estimated_bytes = estimated_bytes.saturating_sub(texture.estimated_gpu_bytes());
                 self.render_state.renderer.write().free_texture(&tid);
             }
         }
     }
 
-    pub(crate) const MAX_MATERIAL_TEXTURES: usize = 256;
+    pub(crate) const MAX_MATERIAL_TEXTURES: usize = 64;
+    pub(crate) const MAX_MATERIAL_TEXTURE_GPU_BYTES: u64 = 128 * 1024 * 1024;
+
     pub(crate) fn truncate_materials(&self) {
         let mut cache = self.material_cache.write();
-        while cache.len() > Self::MAX_MATERIAL_TEXTURES {
-            if let Some((_, Some((_, tid)))) = cache.pop_front() {
+        let mut estimated_bytes = cache
+            .values()
+            .filter_map(|value| {
+                value
+                    .as_ref()
+                    .map(|(texture, _)| texture.estimated_gpu_bytes())
+            })
+            .fold(0u64, u64::saturating_add);
+
+        while cache.len() > Self::MAX_MATERIAL_TEXTURES
+            || estimated_bytes > Self::MAX_MATERIAL_TEXTURE_GPU_BYTES
+        {
+            let Some((_, value)) = cache.pop_front() else {
+                break;
+            };
+            if let Some((texture, tid)) = value {
+                estimated_bytes = estimated_bytes.saturating_sub(texture.estimated_gpu_bytes());
                 self.render_state.renderer.write().free_texture(&tid);
             }
         }
